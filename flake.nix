@@ -54,6 +54,10 @@
               {
                 checks = {
                   nixos-vm-test-basic = pkgs.callPackage ./nix/tests/basic.nix { inherit self; };
+                  nixos-vm-test-secrets-sops = pkgs.callPackage ./nix/tests/secrets-sops.nix {
+                    inherit (inputs) sops-nix;
+                  };
+                  nixos-vm-test-secrets-aws = pkgs.callPackage ./nix/tests/secrets-aws.nix { };
                 };
 
                 # ── Formatting (consumed by git-hooks via treefmt hook) ──
