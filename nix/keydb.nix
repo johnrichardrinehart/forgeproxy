@@ -225,9 +225,6 @@ in
       ];
     };
 
-    # ── Audit daemon ───────────────────────────────────────────────────
-    security.auditd.enable = true;
-
     # ── Log directory via tmpfiles ─────────────────────────────────────
     systemd.tmpfiles.rules = [
       "d /var/log/keydb 0750 ${cfg.user} ${cfg.group} -"

@@ -6,11 +6,11 @@
   openssl,
   go,
   perl,
-  fipsEnabled ? true,
+  fipsEnabled ? false,
 }:
 
 rustPlatform.buildRustPackage {
-  pname = "gheproxy";
+  pname = "forgecache";
   version = "0.1.0";
 
   src = ../src;
@@ -36,9 +36,9 @@ rustPlatform.buildRustPackage {
   OPENSSL_NO_VENDOR = 1;
 
   meta = with lib; {
-    description = "GHE Caching Reverse Proxy with bundle-uri support";
+    description = "Git Caching Reverse Proxy";
     license = licenses.mit;
     platforms = platforms.linux;
-    mainProgram = "gheproxy";
+    mainProgram = "forgecache";
   };
 }

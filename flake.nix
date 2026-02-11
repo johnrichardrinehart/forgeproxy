@@ -1,5 +1,5 @@
 {
-  description = "GHE Caching Reverse Proxy - NixOS AMI";
+  description = "Git Caching Reverse Proxy";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -58,6 +58,8 @@
                     inherit (inputs) sops-nix;
                   };
                   nixos-vm-test-secrets-aws = pkgs.callPackage ./nix/tests/secrets-aws.nix { };
+                  nixos-vm-test-compliance = pkgs.callPackage ./nix/tests/compliance.nix { inherit self; };
+                  nixos-vm-test-backend = pkgs.callPackage ./nix/tests/backend.nix { inherit self; };
                 };
 
                 # ── Formatting (consumed by git-hooks via treefmt hook) ──
@@ -155,9 +157,9 @@
           };
 
           packages = {
-            gheproxy = pkgs.callPackage ./nix/package.nix { };
-            gheproxy-test = pkgs.callPackage ./nix/package.nix { fipsEnabled = false; };
-            default = config.packages.gheproxy;
+            forgecache = pkgs.callPackage ./nix/package.nix { };
+            forgecache-fips = pkgs.callPackage ./nix/package.nix { fipsEnabled = true; };
+            default = config.packages.forgecache;
           };
         };
 
@@ -166,28 +168,32 @@
       # ────────────────────────────────────────────────────────────────────
       flake = {
         overlays.default = final: prev: {
-          gheproxy = final.callPackage ./nix/package.nix { };
-          gheproxy-test = final.callPackage ./nix/package.nix { fipsEnabled = false; };
+          forgecache = final.callPackage ./nix/package.nix { };
+          forgecache-fips = final.callPackage ./nix/package.nix { fipsEnabled = true; };
         };
 
         nixosModules = {
-          gheproxy = ./nix/module.nix;
+          forgecache = ./nix/module.nix;
           keydb = ./nix/keydb.nix;
           nginx = ./nix/nginx.nix;
           hardening = ./nix/hardening.nix;
           secrets = ./nix/secrets.nix;
           ami = ./nix/ami.nix;
+          backend = ./nix/backend.nix;
+          compliance = ./nix/compliance/default.nix;
           proxy-host = ./nix/proxy-host.nix;
           keydb-host = ./nix/keydb-host.nix;
         };
 
-        nixosConfigurations.gheproxy = inputs.nixpkgs.lib.nixosSystem {
+        nixosConfigurations.forgecache = inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
           modules = [
             { nixpkgs.overlays = [ self.overlays.default ]; }
             inputs.sops-nix.nixosModules.sops
             self.nixosModules.proxy-host
             self.nixosModules.ami
+            # FedRAMP compliance is opt-in:
+            # { services.forgecache.compliance.fedramp.enable = true; }
           ];
         };
 

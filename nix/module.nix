@@ -6,47 +6,47 @@
 }:
 
 let
-  cfg = config.services.gheproxy;
+  cfg = config.services.forgecache;
 in
 {
-  options.services.gheproxy = {
-    enable = lib.mkEnableOption "GHE Caching Reverse Proxy service";
+  options.services.forgecache = {
+    enable = lib.mkEnableOption "Git Caching Reverse Proxy service";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.gheproxy;
-      description = "The gheproxy package to use.";
+      default = pkgs.forgecache;
+      description = "The forgecache package to use.";
     };
 
     configFile = lib.mkOption {
       type = lib.types.path;
-      default = "/etc/gheproxy/config.yaml";
-      description = "Path to the gheproxy configuration file.";
+      default = "/etc/forgecache/config.yaml";
+      description = "Path to the forgecache configuration file.";
     };
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "gheproxy";
-      description = "System user to run the gheproxy service.";
+      default = "forgecache";
+      description = "System user to run the forgecache service.";
     };
 
     group = lib.mkOption {
       type = lib.types.str;
-      default = "gheproxy";
-      description = "System group for the gheproxy service.";
+      default = "forgecache";
+      description = "System group for the forgecache service.";
     };
 
     cacheDir = lib.mkOption {
       type = lib.types.path;
-      default = "/var/cache/gheproxy";
-      description = "Directory used for gheproxy cache data.";
+      default = "/var/cache/forgecache";
+      description = "Directory used for forgecache cache data.";
     };
 
     logLevel = lib.mkOption {
       type = lib.types.str;
       default = "info";
       example = "debug";
-      description = "Log verbosity level for the gheproxy binary.";
+      description = "Log verbosity level for the forgecache binary.";
     };
   };
 
@@ -57,14 +57,14 @@ in
       group = cfg.group;
       home = cfg.cacheDir;
       createHome = true;
-      description = "GHE Caching Reverse Proxy service user";
+      description = "Git Caching Reverse Proxy service user";
     };
 
     users.groups.${cfg.group} = { };
 
     # ── systemd service ────────────────────────────────────────────────
-    systemd.services.gheproxy = {
-      description = "GHE Caching Reverse Proxy";
+    systemd.services.forgecache = {
+      description = "Git Caching Reverse Proxy";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
@@ -80,15 +80,15 @@ in
         User = cfg.user;
         Group = cfg.group;
 
-        ExecStart = "${cfg.package}/bin/gheproxy --config ${cfg.configFile}";
+        ExecStart = "${cfg.package}/bin/forgecache --config ${cfg.configFile}";
 
         Restart = "on-failure";
         RestartSec = 5;
 
         # Directories managed by systemd (created automatically).
-        StateDirectory = "gheproxy";
-        CacheDirectory = "gheproxy";
-        RuntimeDirectory = "gheproxy";
+        StateDirectory = "forgecache";
+        CacheDirectory = "forgecache";
+        RuntimeDirectory = "forgecache";
 
         # ── Hardening ────────────────────────────────────────────────
         ProtectSystem = "strict";

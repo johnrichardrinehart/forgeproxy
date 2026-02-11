@@ -1,16 +1,16 @@
 [package]
-name = "gheproxy"
+name = "forgecache"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "GHE Caching Reverse Proxy with bundle-uri support"
+description = "Git Caching Reverse Proxy with bundle-uri support"
 
 [features]
 default = []
 fips = ["rustls/fips"]
 
 [[bin]]
-name = "gheproxy"
+name = "forgecache"
 path = "src/main.rs"
 
 [dependencies]

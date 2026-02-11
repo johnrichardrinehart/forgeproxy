@@ -1454,6 +1454,51 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "forgecache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-sdk-secretsmanager",
+ "aws-smithy-types",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "fred",
+ "futures",
+ "gethostname",
+ "hex",
+ "hmac",
+ "hyper 1.8.1",
+ "hyper-util",
+ "linux-keyutils",
+ "prometheus-client",
+ "reqwest",
+ "russh",
+ "russh-keys",
+ "rustls 0.23.36",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1666,51 +1711,6 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
-]
-
-[[package]]
-name = "gheproxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-sdk-s3",
- "aws-sdk-secretsmanager",
- "aws-smithy-types",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "fred",
- "futures",
- "gethostname",
- "hex",
- "hmac",
- "hyper 1.8.1",
- "hyper-util",
- "linux-keyutils",
- "prometheus-client",
- "reqwest",
- "russh",
- "russh-keys",
- "rustls 0.23.36",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]

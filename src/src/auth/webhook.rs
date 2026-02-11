@@ -32,9 +32,10 @@ pub async fn handle_webhook_payload(
         return Ok((StatusCode::UNAUTHORIZED, "invalid signature").into_response());
     }
 
-    // 2. Extract event type.
+    // 2. Extract event type (prefer normalized header from nginx, fall back to GitHub-specific).
     let event_type = headers
-        .get("X-GitHub-Event")
+        .get("X-Webhook-Event")
+        .or_else(|| headers.get("X-GitHub-Event"))
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
 
@@ -58,15 +59,19 @@ pub async fn handle_webhook_payload(
     Ok(StatusCode::OK.into_response())
 }
 
-/// Verify the HMAC-SHA256 signature from the `X-Hub-Signature-256` header.
+/// Verify the HMAC-SHA256 signature from the webhook signature header.
+///
+/// Checks the normalized `X-Webhook-Signature` header first (set by nginx for
+/// non-GitHub backends), then falls back to `X-Hub-Signature-256`.
 fn verify_signature(state: &AppState, headers: &HeaderMap, body: &Bytes) -> anyhow::Result<()> {
     let secret = std::env::var(&state.config.auth.webhook_secret_env)
         .map_err(|_| anyhow::anyhow!("webhook secret env var not set"))?;
 
     let sig_header = headers
-        .get("X-Hub-Signature-256")
+        .get("X-Webhook-Signature")
+        .or_else(|| headers.get("X-Hub-Signature-256"))
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("missing X-Hub-Signature-256 header"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing webhook signature header"))?;
 
     let sig_hex = sig_header
         .strip_prefix("sha256=")
@@ -143,8 +148,8 @@ async fn handle_repository(state: &AppState, payload: &serde_json::Value) {
     }
 
     // Invalidate all auth entries for this specific repo.
-    let http_pattern = format!("gheproxy:http:auth:*:{full_name}");
-    let ssh_pattern = format!("gheproxy:ssh:access:*:{full_name}");
+    let http_pattern = format!("forgecache:http:auth:*:{full_name}");
+    let ssh_pattern = format!("forgecache:ssh:access:*:{full_name}");
 
     let http_count = cache::invalidate_auth(&state.keydb, &http_pattern)
         .await
@@ -163,8 +168,8 @@ async fn handle_repository(state: &AppState, payload: &serde_json::Value) {
 
 /// Invalidate all auth cache entries for an entire organization.
 async fn invalidate_org_auth(state: &AppState, org: &str) {
-    let http_pattern = format!("gheproxy:http:auth:*:{org}/*");
-    let ssh_pattern = format!("gheproxy:ssh:access:*:{org}/*");
+    let http_pattern = format!("forgecache:http:auth:*:{org}/*");
+    let ssh_pattern = format!("forgecache:ssh:access:*:{org}/*");
 
     let http_count = cache::invalidate_auth(&state.keydb, &http_pattern)
         .await

@@ -43,11 +43,11 @@ pub struct FetchSchedule {
 // ---------------------------------------------------------------------------
 
 fn repo_key(owner_repo: &str) -> String {
-    format!("gheproxy:repo:{owner_repo}")
+    format!("forgecache:repo:{owner_repo}")
 }
 
 fn fetch_schedule_key(owner_repo: &str) -> String {
-    format!("gheproxy:repo:{owner_repo}:fetch_schedule")
+    format!("forgecache:repo:{owner_repo}:fetch_schedule")
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +314,7 @@ pub async fn ensure_repo_cloned(
     auth_header: &str,
 ) -> Result<()> {
     let owner_repo = format!("{owner}/{repo}");
-    let lock_key = format!("gheproxy:lock:clone:{owner_repo}");
+    let lock_key = format!("forgecache:lock:clone:{owner_repo}");
     let node_id = crate::coordination::node::node_id();
 
     // Try to acquire the distributed clone lock.
@@ -346,7 +346,7 @@ pub async fn ensure_repo_cloned(
 
         let clone_url = format!(
             "https://x-access-token:{token}@{}/{owner}/{repo}.git",
-            state.config.ghe.hostname,
+            state.config.upstream.hostname,
         );
 
         // Acquire the clone semaphore to respect concurrency limits.
@@ -384,7 +384,7 @@ pub async fn ensure_repo_cloned(
     result
 }
 
-/// List all tracked repository names by scanning for `gheproxy:repo:*` keys
+/// List all tracked repository names by scanning for `forgecache:repo:*` keys
 /// (excluding `:fetch_schedule` sub-keys).
 ///
 /// Uses the `KEYS` command which is acceptable for small-to-moderate key
@@ -393,16 +393,16 @@ pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
     let keys: Vec<String> = pool
         .custom(
             CustomCommand::new_static("KEYS", None::<u16>, false),
-            vec!["gheproxy:repo:*".to_string()],
+            vec!["forgecache:repo:*".to_string()],
         )
         .await
-        .context("KEYS gheproxy:repo:*")?;
+        .context("KEYS forgecache:repo:*")?;
 
     let repos: Vec<String> = keys
         .into_iter()
         .filter_map(|k| {
-            // Skip sub-keys like gheproxy:repo:owner/name:fetch_schedule
-            let stripped = k.strip_prefix("gheproxy:repo:")?;
+            // Skip sub-keys like forgecache:repo:owner/name:fetch_schedule
+            let stripped = k.strip_prefix("forgecache:repo:")?;
             // A valid owner/repo has exactly one '/' and no trailing sub-key
             if stripped.matches(':').count() > 0 {
                 return None;

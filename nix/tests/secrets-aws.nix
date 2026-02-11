@@ -26,7 +26,7 @@ let
   };
 in
 pkgs.testers.runNixOSTest {
-  name = "gheproxy-secrets-aws";
+  name = "forgecache-secrets-aws";
   globalTimeout = 120;
 
   nodes = {
@@ -85,10 +85,10 @@ pkgs.testers.runNixOSTest {
             ExecStart = pkgs.writeShellScript "seed-moto-secrets" ''
               set -euo pipefail
               aws secretsmanager create-secret \
-                --name gheproxy/default-pat \
+                --name forgecache/default-pat \
                 --secret-string "ghp_AWSTEST1234567890abcdef"
               aws secretsmanager create-secret \
-                --name gheproxy/webhook-secret \
+                --name forgecache/webhook-secret \
                 --secret-string "whsec_awstest456"
             '';
           };
@@ -117,18 +117,18 @@ pkgs.testers.runNixOSTest {
             " AWS_SECRET_ACCESS_KEY=testing"
             " AWS_DEFAULT_REGION=us-east-1"
             " AWS_ENDPOINT_URL=http://mock-aws:5000"
-            " SECRETS='gheproxy/default-pat gheproxy/webhook-secret'"
+            " SECRETS='forgecache/default-pat forgecache/webhook-secret'"
             " && ${awsProvider}"
         )
 
     with subtest("default-pat secret is in the keyring"):
-        key_id = proxy.succeed("keyctl search @s user gheproxy-default-pat").strip()
+        key_id = proxy.succeed("keyctl search @s user forgecache-default-pat").strip()
         assert key_id, "keyctl search returned empty key ID"
         value = proxy.succeed(f"keyctl pipe {key_id}").strip()
         assert value == "ghp_AWSTEST1234567890abcdef", f"unexpected value: {value}"
 
     with subtest("webhook-secret is in the keyring"):
-        key_id = proxy.succeed("keyctl search @s user gheproxy-webhook-secret").strip()
+        key_id = proxy.succeed("keyctl search @s user forgecache-webhook-secret").strip()
         assert key_id, "keyctl search returned empty key ID"
         value = proxy.succeed(f"keyctl pipe {key_id}").strip()
         assert value == "whsec_awstest456", f"unexpected value: {value}"

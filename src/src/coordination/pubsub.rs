@@ -19,7 +19,7 @@ pub async fn publish_ready(
     owner_repo: &str,
     node_id: &str,
 ) -> Result<()> {
-    let channel = format!("gheproxy:notify:repo:{owner_repo}");
+    let channel = format!("forgecache:notify:repo:{owner_repo}");
     let message = format!("ready:{node_id}");
     let _: () = pool
         .next()
@@ -42,7 +42,7 @@ pub async fn subscribe_ready(
     owner_repo: &str,
     timeout: Duration,
 ) -> Result<Option<String>> {
-    let channel = format!("gheproxy:notify:repo:{owner_repo}");
+    let channel = format!("forgecache:notify:repo:{owner_repo}");
 
     // Create a dedicated subscriber client from the same config as the pool.
     let client = pool.next();

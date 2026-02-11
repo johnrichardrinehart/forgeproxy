@@ -71,8 +71,8 @@ pub struct Metrics {
     pub s3_upload_bytes: Counter,
     pub s3_download_bytes: Counter,
 
-    // -- GHE API --
-    pub ghe_api_calls: Family<EndpointLabels, Counter>,
+    // -- upstream API --
+    pub upstream_api_calls: Family<EndpointLabels, Counter>,
 
     // -- gauges --
     pub active_connections: Family<ProtocolLabels, Gauge>,
@@ -86,7 +86,7 @@ impl Metrics {
     pub fn new(registry: &mut Registry) -> Self {
         let clone_total = Family::<CloneLabels, Counter>::default();
         registry.register(
-            "gheproxy_clone_total",
+            "forgecache_clone_total",
             "Total clone requests by protocol and cache status",
             clone_total.clone(),
         );
@@ -96,98 +96,98 @@ impl Metrics {
                 Histogram::new(exponential_buckets(0.01, 2.0, 14))
             });
         registry.register(
-            "gheproxy_clone_duration_seconds",
+            "forgecache_clone_duration_seconds",
             "Clone request latency in seconds",
             clone_duration_seconds.clone(),
         );
 
         let bundle_generation_total = Counter::default();
         registry.register(
-            "gheproxy_bundle_generation_total",
+            "forgecache_bundle_generation_total",
             "Total bundle generation operations",
             bundle_generation_total.clone(),
         );
 
         let bundle_generation_duration_seconds = Histogram::new(exponential_buckets(1.0, 2.0, 12));
         registry.register(
-            "gheproxy_bundle_generation_duration_seconds",
+            "forgecache_bundle_generation_duration_seconds",
             "Bundle generation latency in seconds",
             bundle_generation_duration_seconds.clone(),
         );
 
         let auth_cache_hits = Counter::default();
         registry.register(
-            "gheproxy_auth_cache_hits_total",
+            "forgecache_auth_cache_hits_total",
             "Auth cache hits",
             auth_cache_hits.clone(),
         );
 
         let auth_cache_misses = Counter::default();
         registry.register(
-            "gheproxy_auth_cache_misses_total",
+            "forgecache_auth_cache_misses_total",
             "Auth cache misses",
             auth_cache_misses.clone(),
         );
 
         let lock_acquisitions = Counter::default();
         registry.register(
-            "gheproxy_lock_acquisitions_total",
+            "forgecache_lock_acquisitions_total",
             "Distributed lock acquisitions",
             lock_acquisitions.clone(),
         );
 
         let lock_waits = Counter::default();
         registry.register(
-            "gheproxy_lock_waits_total",
+            "forgecache_lock_waits_total",
             "Distributed lock wait events",
             lock_waits.clone(),
         );
 
         let lock_timeouts = Counter::default();
         registry.register(
-            "gheproxy_lock_timeouts_total",
+            "forgecache_lock_timeouts_total",
             "Distributed lock timeout events",
             lock_timeouts.clone(),
         );
 
         let s3_upload_bytes = Counter::default();
         registry.register(
-            "gheproxy_s3_upload_bytes_total",
+            "forgecache_s3_upload_bytes_total",
             "Total bytes uploaded to S3",
             s3_upload_bytes.clone(),
         );
 
         let s3_download_bytes = Counter::default();
         registry.register(
-            "gheproxy_s3_download_bytes_total",
+            "forgecache_s3_download_bytes_total",
             "Total bytes downloaded from S3",
             s3_download_bytes.clone(),
         );
 
-        let ghe_api_calls = Family::<EndpointLabels, Counter>::default();
+        let upstream_api_calls = Family::<EndpointLabels, Counter>::default();
         registry.register(
-            "gheproxy_ghe_api_calls_total",
-            "GHE API call count by endpoint",
-            ghe_api_calls.clone(),
+            "forgecache_ghe_api_calls_total",
+            "upstream API call count by endpoint",
+            upstream_api_calls.clone(),
         );
 
         let active_connections = Family::<ProtocolLabels, Gauge>::default();
         registry.register(
-            "gheproxy_active_connections",
+            "forgecache_active_connections",
             "Currently active connections by protocol",
             active_connections.clone(),
         );
 
         let cache_size_bytes: Gauge = Gauge::default();
         registry.register(
-            "gheproxy_cache_size_bytes",
+            "forgecache_cache_size_bytes",
             "Current local cache disk usage in bytes",
             cache_size_bytes.clone(),
         );
 
         let cache_repos_total: Gauge = Gauge::default();
         registry.register(
-            "gheproxy_cache_repos_total",
+            "forgecache_cache_repos_total",
             "Number of repos currently cached locally",
             cache_repos_total.clone(),
         );
@@ -204,7 +204,7 @@ impl Metrics {
             lock_timeouts,
             s3_upload_bytes,
             s3_download_bytes,
-            ghe_api_calls,
+            upstream_api_calls,
             active_connections,
             cache_size_bytes,
             cache_repos_total,

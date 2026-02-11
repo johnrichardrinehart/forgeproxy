@@ -114,7 +114,7 @@ async fn handle_info_refs(
     // 3. Proxy the info/refs request to upstream GHE.
     let ghe_url = format!(
         "https://{}/{}/{}/info/refs?service=git-upload-pack",
-        state.config.ghe.hostname, owner, repo,
+        state.config.upstream.hostname, owner, repo,
     );
 
     debug!(%ghe_url, "proxying info/refs to GHE");
@@ -380,7 +380,7 @@ async fn proxy_upload_pack_to_ghe(
 ) -> Result<Response, AppError> {
     let ghe_url = format!(
         "https://{}/{}/{}/git-upload-pack",
-        state.config.ghe.hostname, owner, repo,
+        state.config.upstream.hostname, owner, repo,
     );
 
     let upstream_resp = state
@@ -440,7 +440,7 @@ impl IntoResponse for AppError {
         match self {
             AppError::Unauthorized(msg) => (
                 StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Basic realm=\"gheproxy\"")],
+                [(header::WWW_AUTHENTICATE, "Basic realm=\"forgecache\"")],
                 msg,
             )
                 .into_response(),

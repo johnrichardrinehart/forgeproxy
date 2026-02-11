@@ -3,6 +3,7 @@
   imports = [
     ./keydb.nix
     ./hardening.nix
+    ./compliance/default.nix
   ];
 
   config = {

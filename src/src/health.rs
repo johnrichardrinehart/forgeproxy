@@ -206,7 +206,7 @@ fn aggregate_status(checks: &HealthChecks) -> HealthStatus {
 pub async fn health_handler(State(state): State<HealthState>) -> impl IntoResponse {
     let (keydb, ghe, disk) = tokio::join!(
         check_keydb(&state.keydb),
-        check_ghe(&state.http_client, &state.config.ghe.api_url),
+        check_ghe(&state.http_client, &state.config.upstream.api_url),
         check_disk(&state.config),
     );
 

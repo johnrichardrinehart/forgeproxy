@@ -9,7 +9,7 @@ let
   # Test TLS certificates (generated at Nix eval time)
   # ---------------------------------------------------------------------------
   testCerts =
-    pkgs.runCommand "gheproxy-test-certs"
+    pkgs.runCommand "forgecache-test-certs"
       {
         nativeBuildInputs = [ pkgs.openssl ];
       }
@@ -20,7 +20,7 @@ let
         openssl req -new -x509 -nodes -days 365 \
           -newkey rsa:2048 \
           -keyout $out/ca.key -out $out/ca.crt \
-          -subj "/CN=GHEProxy Test CA"
+          -subj "/CN=ForgeCache Test CA"
 
         # GHE server certificate (SAN: DNS:ghe)
         openssl req -new -nodes -newkey rsa:2048 \
@@ -42,13 +42,13 @@ let
       '';
 
   # ---------------------------------------------------------------------------
-  # gheproxy configuration YAML for the test environment
+  # forgecache configuration YAML for the test environment
   # ---------------------------------------------------------------------------
-  testConfigYaml = pkgs.writeText "gheproxy-test-config.yaml" ''
-    ghe:
+  testConfigYaml = pkgs.writeText "forgecache-test-config.yaml" ''
+    upstream:
       hostname: "ghe"
       api_url: "http://ghe:3000/api/v1"
-      admin_token_env: "GHE_ADMIN_TOKEN"
+      admin_token_env: "FORGE_ADMIN_TOKEN"
 
     upstream_credentials:
       default_mode: "pat"
@@ -72,8 +72,8 @@ let
       freshness_threshold: 60
       lock_ttl: 60
       lock_wait_timeout: 120
-      max_concurrent_ghe_clones: 5
-      max_concurrent_ghe_fetches: 10
+      max_concurrent_upstream_clones: 5
+      max_concurrent_upstream_fetches: 10
 
     fetch_schedule:
       default_interval: 1800
@@ -91,7 +91,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/gheproxy/repos"
+        path: "/var/cache/forgecache/repos"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75
@@ -106,7 +106,7 @@ let
 
 in
 pkgs.testers.runNixOSTest {
-  name = "gheproxy-basic";
+  name = "forgecache-basic";
   globalTimeout = 300;
 
   # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ pkgs.testers.runNixOSTest {
         networking.firewall.allowedTCPPorts = [ 6379 ];
       };
 
-    # ── gheproxy + nginx TLS termination ────────────────────────────────
+    # ── forgecache + nginx TLS termination ────────────────────────────────
     proxy =
       {
         config,
@@ -205,18 +205,18 @@ pkgs.testers.runNixOSTest {
       }:
       {
         imports = [
-          self.nixosModules.gheproxy
+          self.nixosModules.forgecache
           self.nixosModules.nginx
         ];
 
-        services.gheproxy = {
+        services.forgecache = {
           enable = true;
-          package = pkgs.gheproxy-test;
+          package = pkgs.forgecache;
           configFile = testConfigYaml;
           logLevel = "debug";
         };
 
-        services.gheproxy-nginx = {
+        services.forgecache-nginx = {
           enable = true;
           serverName = "proxy";
           sslCertificate = "${testCerts}/proxy.crt";
@@ -226,7 +226,7 @@ pkgs.testers.runNixOSTest {
         };
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
-        systemd.services.gheproxy.environment = {
+        systemd.services.forgecache.environment = {
           AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
           AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
           AWS_DEFAULT_REGION = "us-east-1";
@@ -241,7 +241,7 @@ pkgs.testers.runNixOSTest {
           jq
         ];
 
-        # Trust the test CA so gheproxy (reqwest) validates the mock GHE cert
+        # Trust the test CA so forgecache (reqwest) validates the mock GHE cert
         security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
 
         networking.firewall.allowedTCPPorts = [
@@ -335,8 +335,8 @@ pkgs.testers.runNixOSTest {
         )
 
     # ── Proxy services come up ────────────────────────────────────────────
-    with subtest("gheproxy service starts"):
-        proxy.wait_for_unit("gheproxy.service")
+    with subtest("forgecache service starts"):
+        proxy.wait_for_unit("forgecache.service")
         proxy.wait_for_open_port(8080)
 
     with subtest("Proxy nginx starts"):
@@ -353,7 +353,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Metrics endpoint responds"):
         result = proxy.succeed("curl -sf http://localhost:8080/metrics")
-        assert "# EOF" in result or "gheproxy" in result.lower() or "process" in result.lower(), \
+        assert "# EOF" in result or "forgecache" in result.lower() or "process" in result.lower(), \
             f"Metrics endpoint did not return expected content: {result[:200]}"
 
     # ── Push rejection ────────────────────────────────────────────────────

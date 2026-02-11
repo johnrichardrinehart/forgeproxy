@@ -6,11 +6,11 @@
 }:
 
 let
-  cfg = config.services.gheproxy-secrets;
+  cfg = config.services.forgecache-secrets;
 in
 {
-  options.services.gheproxy-secrets = {
-    enable = lib.mkEnableOption "kernel keyring secrets loader for gheproxy";
+  options.services.forgecache-secrets = {
+    enable = lib.mkEnableOption "kernel keyring secrets loader for forgecache";
 
     providerScript = lib.mkOption {
       type = lib.types.package;
@@ -27,11 +27,11 @@ in
     };
   };
 
-  # Inject the provider as ExecStartPre into gheproxy.service.
-  # Keys land in gheproxy's own private session keyring — no cross-service
+  # Inject the provider as ExecStartPre into forgecache.service.
+  # Keys land in forgecache's own private session keyring — no cross-service
   # keyring sharing required.
-  config = lib.mkIf (cfg.enable && (config.services.gheproxy.enable or false)) {
-    systemd.services.gheproxy = {
+  config = lib.mkIf (cfg.enable && (config.services.forgecache.enable or false)) {
+    systemd.services.forgecache = {
       path = [ pkgs.keyutils ];
       environment = cfg.environment;
       serviceConfig.ExecStartPre = [ "${cfg.providerScript}" ];
