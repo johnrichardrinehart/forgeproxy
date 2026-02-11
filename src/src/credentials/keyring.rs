@@ -99,7 +99,7 @@ mod tests {
         // Attempting to read a non-existent key should return an error.
         // This test may behave differently depending on whether a session
         // keyring is available in the test environment.
-        let result = read_key_native("gheproxy_test_nonexistent_key_12345");
+        let result = read_key_native("forgecache_test_nonexistent_key_12345");
         assert!(result.is_err());
     }
 
@@ -107,7 +107,7 @@ mod tests {
     async fn test_key_exists_missing() {
         // A key that almost certainly does not exist should return false
         // (or an error that we map to false).
-        let exists = key_exists("gheproxy_test_nonexistent_key_12345").await;
+        let exists = key_exists("forgecache_test_nonexistent_key_12345").await;
         // key_exists returns Ok(false) when the key is not found
         if let Ok(val) = exists {
             assert!(!val);

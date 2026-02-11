@@ -34,7 +34,7 @@ pub async fn validate_http_auth(
         hex::encode(hasher.finalize())
     };
 
-    let cache_key = format!("gheproxy:http:auth:{token_hash}:{owner}/{repo}");
+    let cache_key = format!("forgecache:http:auth:{token_hash}:{owner}/{repo}");
 
     // 2. Check KeyDB cache.
     if let Some(cached) = cache::get_cached_auth(&state.keydb, &cache_key).await? {
@@ -48,16 +48,16 @@ pub async fn validate_http_auth(
     }
 
     // 3. Call GHE API: GET /repos/{owner}/{repo} with the caller's auth header.
-    let url = format!("{}/repos/{owner}/{repo}", state.config.ghe.api_url);
+    let url = format!("{}/repos/{owner}/{repo}", state.config.upstream.api_url);
 
     let resp = state
         .http_client
         .get(&url)
         .header("Authorization", auth_header)
-        .header("Accept", "application/vnd.github.v3+json")
+        .header("Accept", state.config.backend_type.accept_header())
         .send()
         .await
-        .context("GHE API request failed")?;
+        .context("upstream API request failed")?;
 
     if !resp.status().is_success() {
         let status = resp.status();

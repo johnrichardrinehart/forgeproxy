@@ -23,7 +23,7 @@ use super::lfu;
 /// Manages the local bare-repo cache on EBS-backed storage.
 #[derive(Debug, Clone)]
 pub struct CacheManager {
-    /// Root directory for cached bare repos (e.g. `/var/cache/gheproxy/repos`).
+    /// Root directory for cached bare repos (e.g. `/var/cache/forgecache/repos`).
     pub base_path: PathBuf,
     /// Hard ceiling for total cache usage in bytes.
     pub max_bytes: u64,
@@ -121,7 +121,7 @@ impl CacheManager {
             }
 
             // Safety: never evict a repo that has no S3 bundle backup.
-            let bundle_key = format!("gheproxy:repo:{owner_repo}");
+            let bundle_key = format!("forgecache:repo:{owner_repo}");
             let has_bundle: Option<String> =
                 HashesInterface::hget(&state.keydb, &bundle_key, "bundle_list_key")
                     .await
@@ -145,7 +145,7 @@ impl CacheManager {
             }
 
             // Update KeyDB registry: mark repo as not locally cached.
-            let registry_key = format!("gheproxy:repo:{owner_repo}");
+            let registry_key = format!("forgecache:repo:{owner_repo}");
             HashesInterface::hset::<(), _, _>(
                 &state.keydb,
                 &registry_key,
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn repo_path_splits_owner_and_repo() {
         let mgr = CacheManager {
-            base_path: PathBuf::from("/var/cache/gheproxy/repos"),
+            base_path: PathBuf::from("/var/cache/forgecache/repos"),
             max_bytes: 100_000_000_000,
             high_water: 0.90,
             low_water: 0.75,
@@ -276,7 +276,7 @@ mod tests {
         let path = mgr.repo_path("acme-corp/my-service");
         assert_eq!(
             path,
-            PathBuf::from("/var/cache/gheproxy/repos/acme-corp/my-service.git")
+            PathBuf::from("/var/cache/forgecache/repos/acme-corp/my-service.git")
         );
     }
 }

@@ -46,7 +46,7 @@ pub async fn handle_archive(
     // ---------- proxy to upstream ----------
     let upstream_url = format!(
         "https://{}{}",
-        state.config.ghe.hostname,
+        state.config.upstream.hostname,
         uri.path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or(uri.path()),

@@ -37,10 +37,10 @@ use crate::metrics::MetricsRegistry;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "gheproxy", about = "GHE Caching Reverse Proxy")]
+#[command(name = "forgecache", about = "Git Caching Reverse Proxy")]
 struct Cli {
     /// Path to the YAML configuration file.
-    #[arg(short, long, default_value = "/etc/gheproxy/config.yaml")]
+    #[arg(short, long, default_value = "/etc/forgecache/config.yaml")]
     config: String,
 }
 
@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
-    tracing::info!(config_path = %cli.config, "starting gheproxy");
+    tracing::info!(config_path = %cli.config, "starting forgecache");
 
     // ---- Ensure local cache directory exists ----
     tokio::fs::create_dir_all(&config.storage.local.path)
@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
     let s3 = build_s3_client(&config).await?;
 
     let http_client = reqwest::Client::builder()
-        .user_agent("gheproxy/0.1")
+        .user_agent("forgecache/0.1")
         .build()
         .context("failed to build reqwest client")?;
 
@@ -276,8 +276,8 @@ async fn main() -> Result<()> {
         http_client,
         cache_manager,
         node_id,
-        clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_ghe_clones)),
-        fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_ghe_fetches)),
+        clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_clones)),
+        fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
     };
 
     // ---- Spawn services ----
@@ -322,6 +322,6 @@ async fn main() -> Result<()> {
     // see it through its own `shutdown_signal()` future and wind down.
     let _ = tokio::try_join!(http_handle, ssh_handle, bundle_handle, heartbeat_handle);
 
-    tracing::info!("gheproxy shut down cleanly");
+    tracing::info!("forgecache shut down cleanly");
     Ok(())
 }

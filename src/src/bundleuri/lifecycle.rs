@@ -99,7 +99,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     }
 
     // 3. Check minimum clone count threshold before investing in bundles.
-    let repo_key = format!("gheproxy:repo:{owner_repo}");
+    let repo_key = format!("forgecache:repo:{owner_repo}");
     let clone_count: Option<i64> = HashesInterface::hget(&state.keydb, &repo_key, "clone_count")
         .await
         .unwrap_or(None);
@@ -115,7 +115,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     }
 
     // 4. Attempt to acquire the distributed fetch/bundle lock.
-    let lock_key = format!("gheproxy:lock:bundle:{owner_repo}");
+    let lock_key = format!("forgecache:lock:bundle:{owner_repo}");
     let lock_ttl = state.config.bundles.bundle_lock_ttl;
     let node_id = crate::coordination::node::node_id();
     let lock_acquired =
@@ -135,8 +135,11 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
     let fetch_result = if repo_path.exists() && repo_path.join("HEAD").is_file() {
         // Repo is locally cached -- do an incremental fetch.
-        let ghe_url = format!("https://{}/{}.git", state.config.ghe.hostname, owner_repo,);
-        let admin_token = std::env::var(&state.config.ghe.admin_token_env).unwrap_or_default();
+        let ghe_url = format!(
+            "https://{}/{}.git",
+            state.config.upstream.hostname, owner_repo,
+        );
+        let admin_token = std::env::var(&state.config.upstream.admin_token_env).unwrap_or_default();
         let env_vars = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
         let env_with_auth: Vec<(String, String)> = if admin_token.is_empty() {
             env_vars
@@ -151,7 +154,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
         } else {
             format!(
                 "https://x-access-token:{admin_token}@{}/{}.git",
-                state.config.ghe.hostname, owner_repo,
+                state.config.upstream.hostname, owner_repo,
             )
         };
 
@@ -426,7 +429,7 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
                 );
 
                 // Update registry with new bundle info.
-                let repo_key = format!("gheproxy:repo:{owner_repo}");
+                let repo_key = format!("forgecache:repo:{owner_repo}");
                 let s3_key = format!(
                     "{}{}/bundles/daily-{}.bundle",
                     state.config.storage.s3.prefix,
@@ -532,7 +535,7 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
                     "weekly consolidation (base) bundle generated"
                 );
 
-                let repo_key = format!("gheproxy:repo:{owner_repo}");
+                let repo_key = format!("forgecache:repo:{owner_repo}");
                 let s3_key = format!(
                     "{}{}/bundles/base-{}.bundle",
                     state.config.storage.s3.prefix,

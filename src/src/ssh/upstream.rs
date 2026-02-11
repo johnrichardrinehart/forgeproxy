@@ -100,17 +100,20 @@ fn resolve_upstream_url_and_creds(
                 .orgs
                 .get(owner)
                 .map(|oc| oc.keyring_key_name.as_str())
-                .unwrap_or(&config.ghe.admin_token_env);
+                .unwrap_or(&config.upstream.admin_token_env);
 
             let token = std::env::var(token_env).unwrap_or_default();
 
             // HTTPS clone URL with embedded token for authentication.
             let url = if token.is_empty() {
-                format!("https://{}/{}/{}.git", config.ghe.hostname, owner, repo)
+                format!(
+                    "https://{}/{}/{}.git",
+                    config.upstream.hostname, owner, repo
+                )
             } else {
                 format!(
                     "https://x-access-token:{token}@{}/{}/{}.git",
-                    config.ghe.hostname, owner, repo,
+                    config.upstream.hostname, owner, repo,
                 )
             };
 
@@ -121,7 +124,7 @@ fn resolve_upstream_url_and_creds(
         }
 
         CredentialMode::Ssh => {
-            let url = format!("git@{}:{}/{}.git", config.ghe.hostname, owner, repo,);
+            let url = format!("git@{}:{}/{}.git", config.upstream.hostname, owner, repo,);
 
             // For SSH mode the key should be available via ssh-agent or the
             // kernel keyring; no extra env vars needed beyond disabling prompts.

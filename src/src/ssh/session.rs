@@ -145,7 +145,7 @@ impl Handler for SshSession {
         // We use the GHE API endpoint: GET /api/v3/admin/ssh-keys/{fingerprint}
         // For now we accept if the upstream returns a valid user, and cache
         // the result in KeyDB.
-        let cache_key = format!("gheproxy:ssh_auth:{fp}");
+        let cache_key = format!("forgecache:ssh_auth:{fp}");
         let cached_user: Option<String> = {
             use fred::interfaces::HashesInterface;
             let result: Option<String> =
@@ -170,10 +170,11 @@ impl Handler for SshSession {
         let fp_query = fp.strip_prefix("SHA256:").unwrap_or(&fp);
         let api_url = format!(
             "{}/admin/keys?fingerprint={}",
-            self.state.config.ghe.api_url, fp_query,
+            self.state.config.upstream.api_url, fp_query,
         );
 
-        let admin_token = std::env::var(&self.state.config.ghe.admin_token_env).unwrap_or_default();
+        let admin_token =
+            std::env::var(&self.state.config.upstream.admin_token_env).unwrap_or_default();
 
         let response = self
             .state
