@@ -115,24 +115,22 @@ fn resolve_upstream_url_and_creds(
             };
 
             // Set GIT_TERMINAL_PROMPT=0 to prevent interactive prompts.
-            let env_vars = vec![
-                ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-            ];
+            let env_vars = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
 
             Ok((url, env_vars))
         }
 
         CredentialMode::Ssh => {
-            let url = format!(
-                "git@{}:{}/{}.git",
-                config.ghe.hostname, owner, repo,
-            );
+            let url = format!("git@{}:{}/{}.git", config.ghe.hostname, owner, repo,);
 
             // For SSH mode the key should be available via ssh-agent or the
             // kernel keyring; no extra env vars needed beyond disabling prompts.
             let env_vars = vec![
                 ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-                ("GIT_SSH_COMMAND".to_string(), "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null".to_string()),
+                (
+                    "GIT_SSH_COMMAND".to_string(),
+                    "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null".to_string(),
+                ),
             ];
 
             Ok((url, env_vars))
@@ -174,7 +172,11 @@ async fn git_upload_pack_remote(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("git ls-remote failed (status {}): {}", output.status, stderr);
+            bail!(
+                "git ls-remote failed (status {}): {}",
+                output.status,
+                stderr
+            );
         }
 
         return Ok(output.stdout);

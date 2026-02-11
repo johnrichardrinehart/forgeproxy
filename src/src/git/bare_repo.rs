@@ -32,12 +32,7 @@ pub async fn init_bare_repo(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to create parent directory: {}",
-                    parent.display(),
-                )
-            })?;
+            .with_context(|| format!("failed to create parent directory: {}", parent.display(),))?;
     }
 
     let output = Command::new("git")
@@ -134,9 +129,7 @@ pub async fn remove_repo(path: &Path) -> Result<()> {
 
     tokio::fs::remove_dir_all(path)
         .await
-        .with_context(|| {
-            format!("failed to remove repo directory: {}", path.display())
-        })?;
+        .with_context(|| format!("failed to remove repo directory: {}", path.display()))?;
 
     debug!("repo directory removed");
     Ok(())

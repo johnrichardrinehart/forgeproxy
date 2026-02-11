@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use tracing::{debug, instrument, warn};
 
-use crate::AppState;
 use super::middleware::Permission;
+use crate::AppState;
 
 /// Resolve SSH fingerprint to GHE username via admin API, with KeyDB cache.
 #[instrument(skip(state), fields(fingerprint))]
@@ -117,7 +117,13 @@ pub async fn check_ssh_repo_access(
         .unwrap_or("none");
     let perm = parse_permission(perm_str);
 
-    debug!(username, owner, repo, permission = perm_str, "resolved repo permission");
+    debug!(
+        username,
+        owner,
+        repo,
+        permission = perm_str,
+        "resolved repo permission"
+    );
     crate::auth::cache::set_cached_auth(
         &state.keydb,
         &cache_key,

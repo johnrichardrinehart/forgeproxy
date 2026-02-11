@@ -84,7 +84,10 @@ pub async fn handle_bundle_list(
 
     if registry.is_empty() {
         debug!("no bundles registered for {owner}/{repo}");
-        return Ok((StatusCode::NOT_FOUND, "No bundles available for this repository.\n")
+        return Ok((
+            StatusCode::NOT_FOUND,
+            "No bundles available for this repository.\n",
+        )
             .into_response());
     }
 

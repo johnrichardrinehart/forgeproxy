@@ -386,8 +386,7 @@ fn validate_config(config: &Config) -> Result<()> {
         "high_water_mark must be greater than low_water_mark"
     );
     anyhow::ensure!(
-        config.storage.local.high_water_mark <= 1.0
-            && config.storage.local.low_water_mark >= 0.0,
+        config.storage.local.high_water_mark <= 1.0 && config.storage.local.low_water_mark >= 0.0,
         "water marks must be in range [0.0, 1.0]"
     );
     anyhow::ensure!(

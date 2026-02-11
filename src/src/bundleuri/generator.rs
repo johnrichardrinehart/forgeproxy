@@ -129,10 +129,9 @@ pub async fn generate_full_bundle(
     let current_refs = get_refs(repo_path).await?;
 
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for bundle")?;
-    let bundle_path = tmp_dir.path().join(format!(
-        "{}.full.bundle",
-        owner_repo.replace('/', "_")
-    ));
+    let bundle_path = tmp_dir
+        .path()
+        .join(format!("{}.full.bundle", owner_repo.replace('/', "_")));
 
     info!(
         owner_repo,
@@ -175,10 +174,9 @@ pub async fn generate_filtered_bundle(
     let current_refs = get_refs(repo_path).await?;
 
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for bundle")?;
-    let bundle_path = tmp_dir.path().join(format!(
-        "{}.filtered.bundle",
-        owner_repo.replace('/', "_")
-    ));
+    let bundle_path = tmp_dir
+        .path()
+        .join(format!("{}.filtered.bundle", owner_repo.replace('/', "_")));
 
     info!(
         owner_repo,

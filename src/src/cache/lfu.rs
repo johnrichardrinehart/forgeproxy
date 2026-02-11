@@ -20,10 +20,7 @@ use tracing::{debug, trace};
 /// incrementing the `clone_count` field in the repo's KeyDB hash.
 ///
 /// Key: `gheproxy:repo:{owner_repo}`, field: `clone_count`.
-pub async fn record_access(
-    keydb: &fred::clients::Pool,
-    owner_repo: &str,
-) -> Result<()> {
+pub async fn record_access(keydb: &fred::clients::Pool, owner_repo: &str) -> Result<()> {
     let key = repo_key(owner_repo);
     let _new_count: i64 = keydb
         .hincrby(&key, "clone_count", 1)
@@ -53,15 +50,9 @@ pub async fn get_eviction_candidates(
         let key = repo_key(owner_repo);
 
         // Fetch both clone_count and eviction_priority in one round-trip.
-        let clone_count: Option<i64> = keydb
-            .hget(&key, "clone_count")
-            .await
-            .unwrap_or(None);
+        let clone_count: Option<i64> = keydb.hget(&key, "clone_count").await.unwrap_or(None);
 
-        let priority: Option<String> = keydb
-            .hget(&key, "eviction_priority")
-            .await
-            .unwrap_or(None);
+        let priority: Option<String> = keydb.hget(&key, "eviction_priority").await.unwrap_or(None);
 
         // Never evict pinned repos.
         if priority.as_deref() == Some("pinned") {
@@ -105,9 +96,6 @@ mod tests {
 
     #[test]
     fn repo_key_format() {
-        assert_eq!(
-            repo_key("acme/widgets"),
-            "gheproxy:repo:acme/widgets"
-        );
+        assert_eq!(repo_key("acme/widgets"), "gheproxy:repo:acme/widgets");
     }
 }

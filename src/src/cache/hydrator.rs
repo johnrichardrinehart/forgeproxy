@@ -31,8 +31,8 @@ pub async fn hydrate_from_s3(state: &AppState, owner_repo: &str) -> Result<PathB
     let bundle_list_key = format!("{owner_repo}/bundle-list");
 
     // 2. Download bundle-list content.
-    let bundle_list_tmp = tempfile::NamedTempFile::new()
-        .context("failed to create temp file for bundle-list")?;
+    let bundle_list_tmp =
+        tempfile::NamedTempFile::new().context("failed to create temp file for bundle-list")?;
 
     s3::download_bundle(
         &state.s3_client,
@@ -47,8 +47,8 @@ pub async fn hydrate_from_s3(state: &AppState, owner_repo: &str) -> Result<PathB
         .await
         .context("failed to read bundle-list file")?;
 
-    let mut entries = parse_bundle_list(&bundle_list_content)
-        .context("failed to parse bundle-list")?;
+    let mut entries =
+        parse_bundle_list(&bundle_list_content).context("failed to parse bundle-list")?;
 
     if entries.is_empty() {
         anyhow::bail!("bundle-list for {owner_repo} contains no entries");
