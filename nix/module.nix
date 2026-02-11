@@ -2,11 +2,16 @@
 
 let
   cfg = config.services.gheproxy;
-  gheproxyPackage = self.packages.${pkgs.system}.gheproxy;
 in
 {
   options.services.gheproxy = {
     enable = lib.mkEnableOption "GHE Caching Reverse Proxy service";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = self.packages.${pkgs.system}.gheproxy;
+      description = "The gheproxy package to use.";
+    };
 
     configFile = lib.mkOption {
       type = lib.types.path;
@@ -133,7 +138,7 @@ in
         in
           "+${fetchSecretsScript}";
 
-        ExecStart = "${gheproxyPackage}/bin/gheproxy --config ${cfg.configFile}";
+        ExecStart = "${cfg.package}/bin/gheproxy --config ${cfg.configFile}";
 
         Restart = "on-failure";
         RestartSec = 5;

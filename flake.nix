@@ -24,6 +24,7 @@
     {
       packages.${system} = {
         gheproxy = pkgs.callPackage ./nix/package.nix { };
+        gheproxy-test = pkgs.callPackage ./nix/package.nix { fipsEnabled = false; };
         default = self.packages.${system}.gheproxy;
       };
 
@@ -49,6 +50,10 @@
           ./nix/hardening.nix
           ./nix/ami.nix
         ];
+      };
+
+      checks.${system} = {
+        basic = pkgs.callPackage ./nix/tests/basic.nix { inherit self; };
       };
 
       devShells.${system}.default = pkgs.mkShell {
