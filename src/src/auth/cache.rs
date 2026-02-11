@@ -41,7 +41,10 @@ pub async fn set_cached_auth(
 /// iteration instead. Returns the number of keys deleted.
 pub async fn invalidate_auth(pool: &fred::clients::Pool, pattern: &str) -> Result<u64> {
     let keys: Vec<String> = pool
-        .custom(CustomCommand::new_static("KEYS", None::<u16>, false), vec![pattern.to_string()])
+        .custom(
+            CustomCommand::new_static("KEYS", None::<u16>, false),
+            vec![pattern.to_string()],
+        )
         .await
         .unwrap_or_default();
     let count = keys.len() as u64;

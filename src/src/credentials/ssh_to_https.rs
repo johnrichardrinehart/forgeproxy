@@ -4,12 +4,7 @@ use super::upstream::CredentialMode;
 ///
 /// Produces a URL of the form:
 ///   `https://x-access-token:{pat}@{ghe_hostname}/{owner}/{repo}.git`
-pub fn translate_upstream_url(
-    ghe_hostname: &str,
-    owner: &str,
-    repo: &str,
-    pat: &str,
-) -> String {
+pub fn translate_upstream_url(ghe_hostname: &str, owner: &str, repo: &str, pat: &str) -> String {
     format!("https://x-access-token:{pat}@{ghe_hostname}/{owner}/{repo}.git")
 }
 
@@ -52,9 +47,7 @@ mod tests {
 
     #[test]
     fn test_should_translate_pat() {
-        assert!(should_translate(&CredentialMode::Pat {
-            token: "x".into()
-        }));
+        assert!(should_translate(&CredentialMode::Pat { token: "x".into() }));
     }
 
     #[test]

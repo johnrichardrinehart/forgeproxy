@@ -33,10 +33,7 @@ pub fn resolve_credential(config: &Config, owner: &str) -> Result<CredentialMode
 
     // Determine mode and keyring key name from config
     let (mode, key_name) = if let Some(org_config) = config.upstream_credentials.orgs.get(owner) {
-        (
-            org_config.mode,
-            org_config.keyring_key_name.clone(),
-        )
+        (org_config.mode, org_config.keyring_key_name.clone())
     } else {
         let default_key = match config.upstream_credentials.default_mode {
             crate::config::CredentialMode::Pat => "default-pat",
@@ -84,11 +81,7 @@ pub fn resolve_credential(config: &Config, owner: &str) -> Result<CredentialMode
 ///
 /// For PAT mode, the token is embedded in the HTTPS URL.
 /// For SSH mode, the standard git@host:owner/repo.git format is used.
-pub fn get_clone_url(
-    config: &Config,
-    owner: &str,
-    repo: &str,
-) -> Result<(String, CredentialMode)> {
+pub fn get_clone_url(config: &Config, owner: &str, repo: &str) -> Result<(String, CredentialMode)> {
     let credential = resolve_credential(config, owner)?;
     let url = match &credential {
         CredentialMode::Pat { token } => {
@@ -122,10 +115,7 @@ pub fn get_fetch_env(credential: &CredentialMode) -> Result<Vec<(String, String)
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    tmpfile.path(),
-                    std::fs::Permissions::from_mode(0o600),
-                )?;
+                std::fs::set_permissions(tmpfile.path(), std::fs::Permissions::from_mode(0o600))?;
             }
 
             let path = tmpfile.into_temp_path();
@@ -178,8 +168,9 @@ mod tests {
     #[test]
     fn test_get_fetch_env_ssh_sets_git_ssh_command() {
         let cred = CredentialMode::SshKey {
-            key_data: "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n"
-                .to_string(),
+            key_data:
+                "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----\n"
+                    .to_string(),
         };
         let env = get_fetch_env(&cred).unwrap();
         assert_eq!(env.len(), 1);

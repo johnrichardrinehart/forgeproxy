@@ -39,10 +39,7 @@ pub(crate) fn read_key_native(key_name: &str) -> Result<String> {
 
     let key = ring
         .search(key_name)
-        .map_err(|e| anyhow::anyhow!(
-            "key '{}' not found in session keyring: {e:?}",
-            key_name
-        ))?;
+        .map_err(|e| anyhow::anyhow!("key '{}' not found in session keyring: {e:?}", key_name))?;
 
     let data = key
         .read_to_vec()
@@ -112,9 +109,9 @@ mod tests {
         // (or an error that we map to false).
         let exists = key_exists("gheproxy_test_nonexistent_key_12345").await;
         // key_exists returns Ok(false) when the key is not found
-        match exists {
-            Ok(val) => assert!(!val),
-            Err(_) => {} // acceptable in environments without keyring support
+        if let Ok(val) = exists {
+            assert!(!val);
         }
+        // Err is acceptable in environments without keyring support
     }
 }

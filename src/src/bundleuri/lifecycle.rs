@@ -81,9 +81,11 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     // 2. Check if the repo is due for a fetch.
     // Use the repo info's last_fetch_ts to determine timing.
     let now = Utc::now().timestamp() as u64;
-    let repo_info = crate::coordination::registry::get_repo_info(&state.keydb, owner_repo)
-        .await?;
-    let last_fetch = repo_info.as_ref().map(|r| r.last_fetch_ts as u64).unwrap_or(0);
+    let repo_info = crate::coordination::registry::get_repo_info(&state.keydb, owner_repo).await?;
+    let last_fetch = repo_info
+        .as_ref()
+        .map(|r| r.last_fetch_ts as u64)
+        .unwrap_or(0);
     let interval = effective_interval(state, owner_repo, schedule.current_interval);
     // ^ uses the current_interval from FetchSchedule
 
@@ -98,7 +100,9 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
     // 3. Check minimum clone count threshold before investing in bundles.
     let repo_key = format!("gheproxy:repo:{owner_repo}");
-    let clone_count: Option<i64> = HashesInterface::hget(&state.keydb, &repo_key, "clone_count").await.unwrap_or(None);
+    let clone_count: Option<i64> = HashesInterface::hget(&state.keydb, &repo_key, "clone_count")
+        .await
+        .unwrap_or(None);
     let min_clones = state.config.bundles.min_clone_count_for_bundles;
     if (clone_count.unwrap_or(0) as u64) < min_clones {
         debug!(
@@ -114,13 +118,9 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     let lock_key = format!("gheproxy:lock:bundle:{owner_repo}");
     let lock_ttl = state.config.bundles.bundle_lock_ttl;
     let node_id = crate::coordination::node::node_id();
-    let lock_acquired = crate::coordination::locks::acquire_lock(
-        &state.keydb,
-        &lock_key,
-        &node_id,
-        lock_ttl,
-    )
-    .await?;
+    let lock_acquired =
+        crate::coordination::locks::acquire_lock(&state.keydb, &lock_key, &node_id, lock_ttl)
+            .await?;
 
     if !lock_acquired {
         debug!(repo = %owner_repo, "another node holds the bundle lock; skipping");
@@ -135,22 +135,14 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
     let fetch_result = if repo_path.exists() && repo_path.join("HEAD").is_file() {
         // Repo is locally cached -- do an incremental fetch.
-        let ghe_url = format!(
-            "https://{}/{}.git",
-            state.config.ghe.hostname, owner_repo,
-        );
+        let ghe_url = format!("https://{}/{}.git", state.config.ghe.hostname, owner_repo,);
         let admin_token = std::env::var(&state.config.ghe.admin_token_env).unwrap_or_default();
-        let env_vars = vec![
-            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        ];
+        let env_vars = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
         let env_with_auth: Vec<(String, String)> = if admin_token.is_empty() {
             env_vars
         } else {
             let mut v = env_vars;
-            v.push((
-                "GIT_ASKPASS".to_string(),
-                "/bin/true".to_string(),
-            ));
+            v.push(("GIT_ASKPASS".to_string(), "/bin/true".to_string()));
             v
         };
 
@@ -198,19 +190,17 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
             // 8. Generate an incremental bundle.
             // Read the previously recorded refs (if any) from KeyDB.
-            let prev_refs_json: Option<String> = HashesInterface::hget(&state.keydb, &repo_key, "prev_refs")
-                .await
-                .unwrap_or(None);
+            let prev_refs_json: Option<String> =
+                HashesInterface::hget(&state.keydb, &repo_key, "prev_refs")
+                    .await
+                    .unwrap_or(None);
 
             let prev_refs: std::collections::HashMap<String, String> = prev_refs_json
                 .and_then(|json: String| serde_json::from_str(&json).ok())
                 .unwrap_or_default();
 
             let bundle_result = crate::bundleuri::generator::generate_incremental_bundle(
-                state,
-                &repo_path,
-                owner_repo,
-                &prev_refs,
+                state, &repo_path, owner_repo, &prev_refs,
             )
             .await;
 
@@ -227,9 +217,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                     // 9. Upload bundle to S3.
                     let s3_key = format!(
                         "{}{}/bundles/{}.bundle",
-                        state.config.storage.s3.prefix,
-                        owner_repo,
-                        bundle.creation_token,
+                        state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
                     );
 
                     crate::storage::s3::upload_bundle(
@@ -257,10 +245,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                         [
                             ("prev_refs", refs_json.as_str()),
                             ("latest_bundle_s3_key", s3_key.as_str()),
-                            (
-                                "latest_bundle_token",
-                                &bundle.creation_token.to_string(),
-                            ),
+                            ("latest_bundle_token", &bundle.creation_token.to_string()),
                         ],
                     )
                     .await?;
@@ -430,12 +415,7 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
         }
 
         // Generate a new full bundle that replaces the hourly incrementals.
-        match crate::bundleuri::generator::generate_full_bundle(
-            state,
-            &repo_path,
-            owner_repo,
-        )
-        .await
+        match crate::bundleuri::generator::generate_full_bundle(state, &repo_path, owner_repo).await
         {
             Ok(bundle) => {
                 info!(
@@ -542,12 +522,7 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
         }
 
         // Generate a new base (full) bundle.
-        match crate::bundleuri::generator::generate_full_bundle(
-            state,
-            &repo_path,
-            owner_repo,
-        )
-        .await
+        match crate::bundleuri::generator::generate_full_bundle(state, &repo_path, owner_repo).await
         {
             Ok(bundle) => {
                 info!(
@@ -569,10 +544,7 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
                     &repo_key,
                     [
                         ("base_bundle_s3_key", s3_key.as_str()),
-                        (
-                            "base_bundle_token",
-                            &bundle.creation_token.to_string(),
-                        ),
+                        ("base_bundle_token", &bundle.creation_token.to_string()),
                     ],
                 )
                 .await

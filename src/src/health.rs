@@ -4,7 +4,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use fred::interfaces::ClientLike;
 use serde::Serialize;
 
 use crate::config::Config;

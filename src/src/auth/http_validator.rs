@@ -110,7 +110,11 @@ fn extract_permission(body: &serde_json::Value) -> Permission {
         None => return Permission::None,
     };
 
-    if perms.get("admin").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if perms
+        .get("admin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         Permission::Admin
     } else if perms.get("push").and_then(|v| v.as_bool()).unwrap_or(false) {
         Permission::Write

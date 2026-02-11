@@ -1,4 +1,10 @@
-{ config, lib, pkgs, modulesPath, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  modulesPath,
+  ...
+}:
 
 {
   imports = [
@@ -202,5 +208,8 @@
   hardware.bluetooth.enable = false;
 
   # Ensure nix-daemon cannot be used by arbitrary users.
-  nix.settings.allowed-users = [ "root" "@wheel" ];
+  nix.settings.allowed-users = [
+    "root"
+    "@wheel"
+  ];
 }

@@ -200,7 +200,7 @@ pub fn inject_bundle_uri(response_body: &[u8], _bundle_list_url: &str) -> Vec<u8
 
     // Rebuild the response, inserting the bundle-uri capability line just
     // before the first flush packet (end of capability advertisement).
-    let bundle_uri_line = format!("bundle-uri\n");
+    let bundle_uri_line = "bundle-uri\n".to_string();
     let bundle_uri_pkt = PktLine::Data(bundle_uri_line.into_bytes());
 
     let mut output = Vec::with_capacity(response_body.len() + 64);
@@ -319,7 +319,11 @@ mod tests {
 
         let original_len = wire.len();
         let result = inject_bundle_uri(&wire, "https://proxy.example.com/bundles/o/r/bundle-list");
-        assert_eq!(result.len(), original_len, "should not modify when already present");
+        assert_eq!(
+            result.len(),
+            original_len,
+            "should not modify when already present"
+        );
     }
 
     #[test]

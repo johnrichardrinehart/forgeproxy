@@ -3,7 +3,6 @@ ghe:
   api_url: "https://ghe.internal.example.gov/api/v3"
   admin_token_env: "GHE_ADMIN_TOKEN"
   api_rate_limit_buffer: 100
-
 upstream_credentials:
   default_mode: "pat"
   orgs:
@@ -16,43 +15,36 @@ upstream_credentials:
     "public-org":
       mode: "pat"
       keyring_key_name: "pat-public"
-
 proxy:
   ssh_listen: "0.0.0.0:2222"
   http_listen: "127.0.0.1:8080"
   bundle_uri_base_url: "https://gheproxy.internal.example.gov/bundles"
-
 keydb:
   endpoint: "keydb.internal.example.gov:6380"
   tls: true
   auth_token_env: "KEYDB_AUTH_TOKEN"
-
 auth:
   ssh_cache_ttl: 300
   http_cache_ttl: 120
   negative_cache_ttl: 60
-
 clone:
   freshness_threshold: 60
   lock_ttl: 60
   lock_wait_timeout: 120
   max_concurrent_ghe_clones: 5
   max_concurrent_ghe_fetches: 10
-
 fetch_schedule:
   default_interval: 1800
   delta_threshold: 1024
   backoff_factor: 2
   max_interval: 86400
   rolling_window: 1800
-
 bundles:
   daily_consolidation_hour: 3
   weekly_consolidation_day: 0
   min_clone_count_for_bundles: 2
   bundle_lock_ttl: 300
   generate_filtered_bundles: true
-
 storage:
   local:
     path: "/var/cache/gheproxy/repos"
@@ -66,7 +58,6 @@ storage:
     region: "us-gov-west-1"
     use_fips: true
     presigned_url_ttl: 60
-
 repo_overrides:
   "org/monorepo":
     freshness_threshold: 15
