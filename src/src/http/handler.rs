@@ -459,7 +459,12 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             AppError::Unauthorized(msg) => {
-                (StatusCode::UNAUTHORIZED, msg).into_response()
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::WWW_AUTHENTICATE, "Basic realm=\"gheproxy\"")],
+                    msg,
+                )
+                    .into_response()
             }
             AppError::Internal(err) => {
                 error!(error = %err, "internal server error");

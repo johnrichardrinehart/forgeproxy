@@ -24,6 +24,9 @@ pub async fn validate_http_auth(
     owner: &str,
     repo: &str,
 ) -> Result<()> {
+    // Normalise: callers may pass "repo.git" from the URL path.
+    let repo = repo.trim_end_matches(".git");
+
     // 1. Hash the token for the cache key (never store raw credentials).
     let token_hash = {
         let mut hasher = Sha256::new();
