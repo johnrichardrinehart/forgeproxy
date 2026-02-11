@@ -10,8 +10,8 @@ use russh::MethodSet;
 use russh_keys::key::KeyPair;
 use tracing::{info, warn};
 
-use crate::AppState;
 use super::session::SshSession;
+use crate::AppState;
 
 // ---------------------------------------------------------------------------
 // Server type
@@ -80,8 +80,7 @@ fn load_host_key_from_keyring() -> Result<KeyPair> {
         .read_to_vec()
         .map_err(|e| anyhow::anyhow!("failed to read SSH host key payload from keyring: {e:?}"))?;
 
-    let pem = std::str::from_utf8(&buf)
-        .context("SSH host key payload is not valid UTF-8")?;
+    let pem = std::str::from_utf8(&buf).context("SSH host key payload is not valid UTF-8")?;
 
     russh_keys::decode_secret_key(pem, None)
         .context("failed to decode SSH host key from keyring payload")
@@ -94,42 +93,28 @@ fn load_host_key_from_keyring() -> Result<KeyPair> {
 /// Start the SSH listener.  This function runs until the server is shut down
 /// or an unrecoverable error occurs.
 pub async fn start_ssh_server(state: Arc<AppState>) -> Result<()> {
-    let listen_addr: SocketAddr = state
-        .config
-        .proxy
-        .ssh_listen
-        .parse()
-        .with_context(|| {
-            format!(
-                "invalid SSH listen address: {:?}",
-                state.config.proxy.ssh_listen
-            )
-        })?;
+    let listen_addr: SocketAddr = state.config.proxy.ssh_listen.parse().with_context(|| {
+        format!(
+            "invalid SSH listen address: {:?}",
+            state.config.proxy.ssh_listen
+        )
+    })?;
 
     // -- Build russh server config ----------------------------------------
 
     let host_key = load_or_generate_host_key();
 
-    let mut config = server::Config::default();
-
-    // Host key(s).
-    config.keys = vec![host_key];
-
-    // Only allow public-key authentication.
-    config.methods = MethodSet::PUBLICKEY;
-
-    // Preferred algorithms -- FIPS-aligned choices where available.  The
-    // Preferred::DEFAULT already contains a reasonable set; we keep it as the
-    // base and can narrow it down further when the `fips` feature is active.
-    config.preferred = russh::Preferred::DEFAULT;
-
-    // Timing.
-    config.inactivity_timeout = Some(Duration::from_secs(600));
-    config.auth_rejection_time = Duration::from_secs(1);
-    config.auth_rejection_time_initial = Some(Duration::from_secs(0));
-    config.max_auth_attempts = 3;
-
-    let config = Arc::new(config);
+    let config = Arc::new(server::Config {
+        keys: vec![host_key],
+        methods: MethodSet::PUBLICKEY,
+        // Preferred algorithms -- FIPS-aligned choices where available.
+        preferred: russh::Preferred::DEFAULT,
+        inactivity_timeout: Some(Duration::from_secs(600)),
+        auth_rejection_time: Duration::from_secs(1),
+        auth_rejection_time_initial: Some(Duration::from_secs(0)),
+        max_auth_attempts: 3,
+        ..Default::default()
+    });
 
     // -- Start serving ----------------------------------------------------
 

@@ -5,6 +5,7 @@
 
 pub mod s3;
 
+#[allow(unused_imports)]
 pub use s3::{
     bundle_exists, delete_bundle, download_bundle, generate_presigned_url, list_bundles,
     upload_bundle, upload_bundle_list, S3Storage,

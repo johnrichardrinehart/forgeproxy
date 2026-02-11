@@ -16,8 +16,8 @@ use axum::{
 };
 use tracing::{debug, instrument, warn};
 
-use crate::AppState;
 use super::handler::AppError;
+use crate::AppState;
 
 /// Handle an archive request that missed the nginx cache.
 ///

@@ -107,6 +107,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "gheproxy-basic";
+  globalTimeout = 300;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -203,16 +204,14 @@ pkgs.testers.runNixOSTest {
         ...
       }:
       {
-        _module.args.self = self;
-
         imports = [
-          ../../nix/module.nix
-          ../../nix/nginx.nix
+          self.nixosModules.gheproxy
+          self.nixosModules.nginx
         ];
 
         services.gheproxy = {
           enable = true;
-          package = self.packages.${pkgs.system}.gheproxy-test;
+          package = pkgs.gheproxy-test;
           configFile = testConfigYaml;
           logLevel = "debug";
         };

@@ -1,4 +1,10 @@
-{ config, lib, pkgs, modulesPath, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  modulesPath,
+  ...
+}:
 
 {
   imports = [
@@ -35,7 +41,10 @@
       max-jobs = lib.mkDefault 2;
 
       # Enable the flakes feature set permanently.
-      experimental-features = [ "nix-command" "flakes" ];
+      experimental-features = [
+        "nix-command"
+        "flakes"
+      ];
 
       # Reduce Nix store disk usage by hard-linking identical files.
       auto-optimise-store = true;

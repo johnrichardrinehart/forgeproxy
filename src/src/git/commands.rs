@@ -36,11 +36,7 @@ pub struct FetchResult {
 
 /// Run `git clone --bare <url> <dest>` with the supplied environment variables.
 #[instrument(skip(env_vars), fields(%url, dest = %dest.display()))]
-pub async fn git_clone_bare(
-    url: &str,
-    dest: &Path,
-    env_vars: &[(String, String)],
-) -> Result<()> {
+pub async fn git_clone_bare(url: &str, dest: &Path, env_vars: &[(String, String)]) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("clone")
         .arg("--bare")
@@ -162,7 +158,9 @@ fn parse_bytes_received(stderr: &str) -> u64 {
             // Extract the first integer after "Total".
             if let Some(rest) = trimmed.split("Total").nth(1) {
                 for token in rest.split_whitespace() {
-                    if let Ok(n) = token.trim_matches(|c: char| !c.is_ascii_digit()).parse::<u64>()
+                    if let Ok(n) = token
+                        .trim_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<u64>()
                     {
                         return n;
                     }
@@ -182,17 +180,13 @@ fn parse_bytes_received(stderr: &str) -> u64 {
 #[instrument(fields(repo = %repo_path.display()))]
 pub async fn git_upload_pack(repo_path: &Path, input: &[u8]) -> Result<Vec<u8>> {
     let mut cmd = Command::new("git");
-    cmd.arg("upload-pack")
-        .arg("--stateless-rpc")
-        .arg(repo_path);
+    cmd.arg("upload-pack").arg("--stateless-rpc").arg(repo_path);
 
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .context("failed to spawn git upload-pack")?;
+    let mut child = cmd.spawn().context("failed to spawn git upload-pack")?;
 
     // Write input to stdin, then close it to signal EOF.
     if let Some(mut stdin) = child.stdin.take() {
@@ -233,9 +227,7 @@ pub async fn git_upload_pack(repo_path: &Path, input: &[u8]) -> Result<Vec<u8>> 
 #[instrument(fields(repo = %repo_path.display()))]
 pub async fn git_upload_pack_streamed(repo_path: &Path) -> Result<Child> {
     let mut cmd = Command::new("git");
-    cmd.arg("upload-pack")
-        .arg("--stateless-rpc")
-        .arg(repo_path);
+    cmd.arg("upload-pack").arg("--stateless-rpc").arg(repo_path);
 
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -257,10 +249,7 @@ pub async fn git_upload_pack_streamed(repo_path: &Path) -> Result<Child> {
 ///
 /// This is a convenience wrapper for the SSH upstream proxy path.
 #[instrument(fields(%remote_url))]
-pub async fn git_upload_pack_bytes(
-    remote_url: &str,
-    input: &[u8],
-) -> Result<Vec<u8>> {
+pub async fn git_upload_pack_bytes(remote_url: &str, input: &[u8]) -> Result<Vec<u8>> {
     // If input is empty, just return the ref advertisement.
     if input.is_empty() {
         let mut cmd = Command::new("git");
@@ -285,8 +274,7 @@ pub async fn git_upload_pack_bytes(
 
     // For non-empty input, create a temporary bare repo, fetch from the
     // remote, then serve upload-pack locally.
-    let tmp_dir = tempfile::tempdir()
-        .context("failed to create temp dir for upload-pack-bytes")?;
+    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for upload-pack-bytes")?;
     let tmp_repo = tmp_dir.path().join("repo.git");
 
     // Init bare repo.
@@ -346,7 +334,11 @@ pub async fn git_bundle_create(
     not_refs: Option<&[String]>,
 ) -> Result<()> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo_path).arg("bundle").arg("create").arg(output);
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("bundle")
+        .arg("create")
+        .arg(output);
 
     match refs {
         Some(ref_list) if !ref_list.is_empty() => {

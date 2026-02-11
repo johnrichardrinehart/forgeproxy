@@ -35,11 +35,7 @@ pub async fn acquire_lock(
 /// Uses a Lua script so the check-and-delete is atomic.  After deletion the
 /// script publishes a notification on `{key}:notify` so that waiters can wake
 /// up immediately.
-pub async fn release_lock(
-    pool: &fred::clients::Pool,
-    key: &str,
-    node_id: &str,
-) -> Result<()> {
+pub async fn release_lock(pool: &fred::clients::Pool, key: &str, node_id: &str) -> Result<()> {
     let script = r#"
         local val = redis.call('GET', KEYS[1])
         if val and string.find(val, ARGV[1], 1, true) == 1 then
@@ -50,11 +46,7 @@ pub async fn release_lock(
         return 0
     "#;
     let released: i64 = pool
-        .eval(
-            script,
-            vec![key.to_string()],
-            vec![node_id.to_string()],
-        )
+        .eval(script, vec![key.to_string()], vec![node_id.to_string()])
         .await
         .context("lock release script failed")?;
     if released == 1 {
@@ -68,11 +60,7 @@ pub async fn release_lock(
 /// Extend the TTL of an existing lock.
 ///
 /// Returns `true` if the key exists and its expiry was updated.
-pub async fn extend_lock(
-    pool: &fred::clients::Pool,
-    key: &str,
-    ttl_secs: u64,
-) -> Result<bool> {
+pub async fn extend_lock(pool: &fred::clients::Pool, key: &str, ttl_secs: u64) -> Result<bool> {
     let result: bool = pool.expire(key, ttl_secs as i64, None).await?;
     debug!(%key, ttl_secs, extended = result, "extend_lock");
     Ok(result)

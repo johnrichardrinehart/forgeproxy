@@ -47,16 +47,11 @@ pub enum BundleType {
 /// out-of-band insertions or manual corrections without risking collisions.
 ///
 /// Key: `gheproxy:repo:{owner_repo}`, field: `latest_creation_token`.
-pub async fn next_creation_token(
-    state: &crate::AppState,
-    owner_repo: &str,
-) -> Result<u64> {
+pub async fn next_creation_token(state: &crate::AppState, owner_repo: &str) -> Result<u64> {
     let key = format!("gheproxy:repo:{owner_repo}");
     let new_val: i64 = HashesInterface::hincrby(&state.keydb, &key, "latest_creation_token", 1000)
         .await
-        .with_context(|| {
-            format!("failed to increment creation token for {owner_repo}")
-        })?;
+        .with_context(|| format!("failed to increment creation token for {owner_repo}"))?;
     Ok(new_val as u64)
 }
 
@@ -78,18 +73,11 @@ pub async fn next_creation_token(
 ///
 /// These values are intentionally smaller than the atomic counter's step
 /// size so they can coexist in the same bundle-list without collision.
-pub fn creation_token_for_bundle_type(
-    bundle_type: BundleType,
-    timestamp: DateTime<Utc>,
-) -> u64 {
+pub fn creation_token_for_bundle_type(bundle_type: BundleType, timestamp: DateTime<Utc>) -> u64 {
     match bundle_type {
         BundleType::Base => 1000,
-        BundleType::Daily => {
-            2000 + timestamp.ordinal() as u64
-        }
-        BundleType::Hourly => {
-            3000 + (timestamp.ordinal() as u64 * 24 + timestamp.hour() as u64)
-        }
+        BundleType::Daily => 2000 + timestamp.ordinal() as u64,
+        BundleType::Hourly => 3000 + (timestamp.ordinal() as u64 * 24 + timestamp.hour() as u64),
     }
 }
 

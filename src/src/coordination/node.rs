@@ -12,9 +12,7 @@ use tracing::{debug, error, info};
 /// that every process gets a unique id even on the same host.
 pub fn node_id() -> String {
     std::env::var("EC2_INSTANCE_ID").unwrap_or_else(|_| {
-        let hostname = gethostname::gethostname()
-            .to_string_lossy()
-            .into_owned();
+        let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let suffix = &uuid::Uuid::new_v4().to_string()[..8];
         format!("{hostname}-{suffix}")
     })

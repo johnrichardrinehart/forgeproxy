@@ -1,3 +1,8 @@
+// Many modules expose pub API surfaces (e.g. coordination, bundleuri, git,
+// storage, credentials) whose functions are wired up incrementally.  Allow
+// dead_code crate-wide until the full call graph is connected.
+#![allow(dead_code)]
+
 mod auth;
 mod bundleuri;
 mod cache;
@@ -102,8 +107,8 @@ async fn build_keydb_pool(config: &Config) -> Result<Pool> {
 // ---------------------------------------------------------------------------
 
 async fn build_s3_client(config: &Config) -> Result<aws_sdk_s3::Client> {
-    let mut aws_config_loader = aws_config::from_env()
-        .region(aws_config::Region::new(config.storage.s3.region.clone()));
+    let mut aws_config_loader =
+        aws_config::from_env().region(aws_config::Region::new(config.storage.s3.region.clone()));
 
     if config.storage.s3.use_fips {
         aws_config_loader = aws_config_loader.use_fips(true);

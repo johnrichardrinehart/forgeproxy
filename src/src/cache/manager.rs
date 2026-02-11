@@ -53,7 +53,9 @@ impl CacheManager {
     pub fn repo_path(&self, owner_repo: &str) -> PathBuf {
         let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
         if parts.len() == 2 {
-            self.base_path.join(parts[0]).join(format!("{}.git", parts[1]))
+            self.base_path
+                .join(parts[0])
+                .join(format!("{}.git", parts[1]))
         } else {
             // Fallback: treat the whole string as a single component.
             self.base_path.join(format!("{}.git", owner_repo))
@@ -102,8 +104,7 @@ impl CacheManager {
         }
 
         // Ask LFU for candidates ordered by ascending clone count.
-        let candidates =
-            lfu::get_eviction_candidates(&state.keydb, &repos, repos.len()).await?;
+        let candidates = lfu::get_eviction_candidates(&state.keydb, &repos, repos.len()).await?;
 
         let mut evicted: usize = 0;
 
@@ -120,12 +121,11 @@ impl CacheManager {
             }
 
             // Safety: never evict a repo that has no S3 bundle backup.
-            let bundle_key = format!(
-                "gheproxy:repo:{owner_repo}"
-            );
-            let has_bundle: Option<String> = HashesInterface::hget(&state.keydb, &bundle_key, "bundle_list_key")
-                .await
-                .unwrap_or(None);
+            let bundle_key = format!("gheproxy:repo:{owner_repo}");
+            let has_bundle: Option<String> =
+                HashesInterface::hget(&state.keydb, &bundle_key, "bundle_list_key")
+                    .await
+                    .unwrap_or(None);
 
             if has_bundle.is_none() {
                 warn!(
@@ -138,19 +138,21 @@ impl CacheManager {
             // Remove the repo directory.
             let path = self.repo_path(owner_repo);
             if path.exists() {
-                tokio::fs::remove_dir_all(&path)
-                    .await
-                    .with_context(|| {
-                        format!("failed to remove cached repo at {}", path.display())
-                    })?;
+                tokio::fs::remove_dir_all(&path).await.with_context(|| {
+                    format!("failed to remove cached repo at {}", path.display())
+                })?;
                 debug!(repo = %owner_repo, path = %path.display(), "evicted repo from local cache");
             }
 
             // Update KeyDB registry: mark repo as not locally cached.
             let registry_key = format!("gheproxy:repo:{owner_repo}");
-            HashesInterface::hset::<(), _, _>(&state.keydb, &registry_key, [("local_cached", "false")])
-                .await
-                .unwrap_or_default();
+            HashesInterface::hset::<(), _, _>(
+                &state.keydb,
+                &registry_key,
+                [("local_cached", "false")],
+            )
+            .await
+            .unwrap_or_default();
 
             evicted += 1;
         }
@@ -169,10 +171,12 @@ impl CacheManager {
             return Ok(repos);
         }
 
-        let owners = std::fs::read_dir(&self.base_path)
-            .with_context(|| {
-                format!("failed to read cache directory: {}", self.base_path.display())
-            })?;
+        let owners = std::fs::read_dir(&self.base_path).with_context(|| {
+            format!(
+                "failed to read cache directory: {}",
+                self.base_path.display()
+            )
+        })?;
 
         for owner_entry in owners {
             let owner_entry = owner_entry?;
@@ -192,9 +196,7 @@ impl CacheManager {
                 let repo_str = repo_name.to_string_lossy();
 
                 // Strip the `.git` suffix if present.
-                let repo_clean = repo_str
-                    .strip_suffix(".git")
-                    .unwrap_or(&repo_str);
+                let repo_clean = repo_str.strip_suffix(".git").unwrap_or(&repo_str);
 
                 // Quick validity check: bare repos contain a HEAD file.
                 if repo_entry.path().join("HEAD").is_file() {
@@ -212,10 +214,7 @@ impl CacheManager {
         let path = self.repo_path(owner_repo);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create parent directory: {}",
-                    parent.display()
-                )
+                format!("failed to create parent directory: {}", parent.display())
             })?;
         }
         Ok(path)

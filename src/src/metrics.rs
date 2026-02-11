@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::encoding::text::encode;
+use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -91,11 +91,10 @@ impl Metrics {
             clone_total.clone(),
         );
 
-        let clone_duration_seconds = Family::<ProtocolLabels, Histogram>::new_with_constructor(
-            || {
+        let clone_duration_seconds =
+            Family::<ProtocolLabels, Histogram>::new_with_constructor(|| {
                 Histogram::new(exponential_buckets(0.01, 2.0, 14))
-            },
-        );
+            });
         registry.register(
             "gheproxy_clone_duration_seconds",
             "Clone request latency in seconds",
@@ -109,8 +108,7 @@ impl Metrics {
             bundle_generation_total.clone(),
         );
 
-        let bundle_generation_duration_seconds =
-            Histogram::new(exponential_buckets(1.0, 2.0, 12));
+        let bundle_generation_duration_seconds = Histogram::new(exponential_buckets(1.0, 2.0, 12));
         registry.register(
             "gheproxy_bundle_generation_duration_seconds",
             "Bundle generation latency in seconds",

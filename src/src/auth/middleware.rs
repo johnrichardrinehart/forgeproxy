@@ -8,9 +8,10 @@ pub struct AuthResult {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
+    #[default]
     None = 0,
     Read = 1,
     Write = 2,
@@ -20,12 +21,6 @@ pub enum Permission {
 impl Permission {
     pub fn has_read(&self) -> bool {
         *self >= Permission::Read
-    }
-}
-
-impl Default for Permission {
-    fn default() -> Self {
-        Permission::None
     }
 }
 
@@ -95,10 +90,22 @@ mod tests {
 
     #[test]
     fn test_permission_serde_values() {
-        assert_eq!(serde_json::to_string(&Permission::None).unwrap(), "\"none\"");
-        assert_eq!(serde_json::to_string(&Permission::Read).unwrap(), "\"read\"");
-        assert_eq!(serde_json::to_string(&Permission::Write).unwrap(), "\"write\"");
-        assert_eq!(serde_json::to_string(&Permission::Admin).unwrap(), "\"admin\"");
+        assert_eq!(
+            serde_json::to_string(&Permission::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Permission::Read).unwrap(),
+            "\"read\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Permission::Write).unwrap(),
+            "\"write\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Permission::Admin).unwrap(),
+            "\"admin\""
+        );
     }
 
     #[test]

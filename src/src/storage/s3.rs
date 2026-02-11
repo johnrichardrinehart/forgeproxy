@@ -2,9 +2,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use aws_sdk_s3::Client;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client;
 use tracing::{debug, instrument};
 
 /// High-level wrapper around an S3 bucket used for bundle storage.
@@ -18,7 +18,12 @@ pub struct S3Storage {
 impl S3Storage {
     /// Create a new `S3Storage` from an already-configured `Client` and an
     /// application-level S3 config section.
-    pub fn new(client: Client, bucket: String, prefix: String, presigned_url_ttl: Duration) -> Self {
+    pub fn new(
+        client: Client,
+        bucket: String,
+        prefix: String,
+        presigned_url_ttl: Duration,
+    ) -> Self {
         Self {
             client,
             bucket,
@@ -105,12 +110,7 @@ pub async fn upload_bundle(
 
 /// Download an S3 object to a local file.
 #[instrument(skip(client), fields(%bucket, %key))]
-pub async fn download_bundle(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-    dest: &Path,
-) -> Result<()> {
+pub async fn download_bundle(client: &Client, bucket: &str, key: &str, dest: &Path) -> Result<()> {
     let resp = client
         .get_object()
         .bucket(bucket)
@@ -193,11 +193,7 @@ pub async fn generate_presigned_url(
 
 /// Delete an object from S3.
 #[instrument(skip(client), fields(%bucket, %key))]
-pub async fn delete_bundle(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<()> {
+pub async fn delete_bundle(client: &Client, bucket: &str, key: &str) -> Result<()> {
     client
         .delete_object()
         .bucket(bucket)
@@ -214,19 +210,12 @@ pub async fn delete_bundle(
 ///
 /// Automatically paginates through all results.
 #[instrument(skip(client), fields(%bucket, %prefix))]
-pub async fn list_bundles(
-    client: &Client,
-    bucket: &str,
-    prefix: &str,
-) -> Result<Vec<String>> {
+pub async fn list_bundles(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<String>> {
     let mut keys = Vec::new();
     let mut continuation_token: Option<String> = None;
 
     loop {
-        let mut req = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(prefix);
+        let mut req = client.list_objects_v2().bucket(bucket).prefix(prefix);
 
         if let Some(ref token) = continuation_token {
             req = req.continuation_token(token);
@@ -254,18 +243,8 @@ pub async fn list_bundles(
 
 /// Check whether an object exists in S3 (HEAD request).
 #[instrument(skip(client), fields(%bucket, %key))]
-pub async fn bundle_exists(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<bool> {
-    match client
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-    {
+pub async fn bundle_exists(client: &Client, bucket: &str, key: &str) -> Result<bool> {
+    match client.head_object().bucket(bucket).key(key).send().await {
         Ok(_) => {
             debug!("bundle exists");
             Ok(true)
@@ -273,10 +252,7 @@ pub async fn bundle_exists(
         Err(err) => {
             // The SDK returns a service error with code "NotFound" (or an
             // HTTP 404) when the object does not exist.
-            if err
-                .as_service_error()
-                .map_or(false, |e| e.is_not_found())
-            {
+            if err.as_service_error().is_some_and(|e| e.is_not_found()) {
                 debug!("bundle does not exist");
                 Ok(false)
             } else {

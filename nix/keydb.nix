@@ -1,4 +1,9 @@
-{ config, lib, pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
   cfg = config.services.keydb;
@@ -216,7 +221,7 @@ in
     networking.firewall = {
       enable = true;
       allowedTCPPorts = [
-        6380   # KeyDB TLS port only; plaintext 6379 is NOT exposed
+        6380 # KeyDB TLS port only; plaintext 6379 is NOT exposed
       ];
     };
 

@@ -9,17 +9,17 @@
 //!
 //! ```ini
 //! [bundle]
-//! 	version = 1
-//! 	mode = all
-//! 	heuristic = creationToken
+//!     version = 1
+//!     mode = all
+//!     heuristic = creationToken
 //!
 //! [bundle "base-20250101"]
-//! 	uri = https://cdn.example.com/bundles/base-20250101.bundle
-//! 	creationToken = 1000
+//!     uri = https://cdn.example.com/bundles/base-20250101.bundle
+//!     creationToken = 1000
 //!
 //! [bundle "hourly-2025010112"]
-//! 	uri = https://cdn.example.com/bundles/hourly-2025010112.bundle
-//! 	creationToken = 3012
+//!     uri = https://cdn.example.com/bundles/hourly-2025010112.bundle
+//!     creationToken = 3012
 //! ```
 
 use std::fmt::Write;
@@ -102,7 +102,12 @@ pub fn parse_bundle_list(content: &str) -> Result<Vec<BundleEntry>> {
         // Section header: `[bundle]` or `[bundle "name"]`.
         if line.starts_with('[') {
             // Flush any pending entry.
-            flush_entry(&mut entries, &mut current_name, &mut current_uri, &mut current_token);
+            flush_entry(
+                &mut entries,
+                &mut current_name,
+                &mut current_uri,
+                &mut current_token,
+            );
 
             if let Some(name) = parse_bundle_section_name(line) {
                 current_name = Some(name);
@@ -118,17 +123,9 @@ pub fn parse_bundle_list(content: &str) -> Result<Vec<BundleEntry>> {
                     current_uri = Some(value.to_string());
                 }
                 "creationToken" | "creationtoken" => {
-                    current_token = Some(
-                        value
-                            .parse::<u64>()
-                            .with_context(|| {
-                                format!(
-                                    "invalid creationToken on line {}: {:?}",
-                                    line_no + 1,
-                                    value
-                                )
-                            })?,
-                    );
+                    current_token = Some(value.parse::<u64>().with_context(|| {
+                        format!("invalid creationToken on line {}: {:?}", line_no + 1, value)
+                    })?);
                 }
                 // Ignore keys we don't care about (version, mode, heuristic).
                 _ => {}
@@ -137,7 +134,12 @@ pub fn parse_bundle_list(content: &str) -> Result<Vec<BundleEntry>> {
     }
 
     // Flush the last entry.
-    flush_entry(&mut entries, &mut current_name, &mut current_uri, &mut current_token);
+    flush_entry(
+        &mut entries,
+        &mut current_name,
+        &mut current_uri,
+        &mut current_token,
+    );
 
     Ok(entries)
 }
@@ -174,10 +176,7 @@ fn parse_bundle_section_name(line: &str) -> Option<String> {
         return None;
     }
 
-    let inner = line
-        .strip_prefix("[bundle ")?
-        .strip_suffix(']')?
-        .trim();
+    let inner = line.strip_prefix("[bundle ")?.strip_suffix(']')?.trim();
 
     // Remove surrounding quotes.
     let name = inner.trim_matches('"');

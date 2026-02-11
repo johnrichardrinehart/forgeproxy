@@ -132,11 +132,7 @@ impl Handler for SshSession {
     /// We compute the key fingerprint and attempt to resolve the user through
     /// the GHE admin SSH keys API (with a KeyDB cache layer).  If resolution
     /// succeeds we accept; otherwise we reject.
-    async fn auth_publickey(
-        &mut self,
-        user: &str,
-        key: &PublicKey,
-    ) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         let fp = fingerprint_of(key);
         info!(
             peer = ?self.peer_addr,
@@ -152,9 +148,10 @@ impl Handler for SshSession {
         let cache_key = format!("gheproxy:ssh_auth:{fp}");
         let cached_user: Option<String> = {
             use fred::interfaces::HashesInterface;
-            let result: Option<String> = HashesInterface::hget(&self.state.keydb, &cache_key, "username")
-                .await
-                .unwrap_or(None);
+            let result: Option<String> =
+                HashesInterface::hget(&self.state.keydb, &cache_key, "username")
+                    .await
+                    .unwrap_or(None);
             result
         };
 
@@ -176,8 +173,7 @@ impl Handler for SshSession {
             self.state.config.ghe.api_url, fp_query,
         );
 
-        let admin_token = std::env::var(&self.state.config.ghe.admin_token_env)
-            .unwrap_or_default();
+        let admin_token = std::env::var(&self.state.config.ghe.admin_token_env).unwrap_or_default();
 
         let response = self
             .state
@@ -191,10 +187,7 @@ impl Handler for SshSession {
         match response {
             Ok(resp) if resp.status().is_success() => {
                 // Parse the response to extract the user login.
-                let body: serde_json::Value = resp
-                    .json()
-                    .await
-                    .unwrap_or(serde_json::Value::Null);
+                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
 
                 // The response is an array of key objects; each has a "user" with "login".
                 let resolved_user = body
@@ -372,10 +365,7 @@ impl Handler for SshSession {
                                     ),
                                 );
                             } else {
-                                session.data(
-                                    channel_id,
-                                    CryptoVec::from_slice(&output.stdout),
-                                );
+                                session.data(channel_id, CryptoVec::from_slice(&output.stdout));
                             }
 
                             session.close(channel_id);
@@ -471,8 +461,7 @@ mod tests {
 
     #[test]
     fn parse_double_quoted() {
-        let (cmd, repo) =
-            parse_git_command("git-upload-pack \"/my-org/my-repo.git\"").unwrap();
+        let (cmd, repo) = parse_git_command("git-upload-pack \"/my-org/my-repo.git\"").unwrap();
         assert_eq!(cmd, GitCommand::UploadPack);
         assert_eq!(repo, "my-org/my-repo");
     }

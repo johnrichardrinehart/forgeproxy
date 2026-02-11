@@ -1,11 +1,12 @@
-{ lib
-, rustPlatform
-, pkg-config
-, cmake
-, openssl
-, go
-, perl
-, fipsEnabled ? true
+{
+  lib,
+  rustPlatform,
+  pkg-config,
+  cmake,
+  openssl,
+  go,
+  perl,
+  fipsEnabled ? true,
 }:
 
 rustPlatform.buildRustPackage {
@@ -19,9 +20,10 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [
     pkg-config
     cmake
-  ] ++ lib.optionals fipsEnabled [
-    go    # required by aws-lc-fips-sys
-    perl  # required by aws-lc-fips-sys
+  ]
+  ++ lib.optionals fipsEnabled [
+    go # required by aws-lc-fips-sys
+    perl # required by aws-lc-fips-sys
   ];
 
   buildInputs = [

@@ -7,7 +7,9 @@
 pub mod bare_repo;
 pub mod commands;
 
+#[allow(unused_imports)]
 pub use bare_repo::{init_bare_repo, remove_repo, repo_size_bytes, set_remote, validate_bare_repo};
+#[allow(unused_imports)]
 pub use commands::{
     git_bundle_create, git_bundle_unbundle, git_clone_bare, git_fetch, git_for_each_ref,
     git_ls_remote, git_upload_pack, git_upload_pack_streamed, FetchResult,

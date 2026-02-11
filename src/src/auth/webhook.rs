@@ -72,8 +72,8 @@ fn verify_signature(state: &AppState, headers: &HeaderMap, body: &Bytes) -> anyh
         .strip_prefix("sha256=")
         .ok_or_else(|| anyhow::anyhow!("X-Hub-Signature-256 does not start with sha256="))?;
 
-    let sig_bytes = hex::decode(sig_hex)
-        .map_err(|e| anyhow::anyhow!("invalid hex in signature: {e}"))?;
+    let sig_bytes =
+        hex::decode(sig_hex).map_err(|e| anyhow::anyhow!("invalid hex in signature: {e}"))?;
 
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;

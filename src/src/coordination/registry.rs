@@ -61,7 +61,10 @@ fn repo_info_to_pairs(info: &RepoInfo) -> Vec<(String, String)> {
         ("s3_bundle_list_key".into(), info.s3_bundle_list_key.clone()),
         ("last_fetch_ts".into(), info.last_fetch_ts.to_string()),
         ("last_bundle_ts".into(), info.last_bundle_ts.to_string()),
-        ("latest_creation_token".into(), info.latest_creation_token.to_string()),
+        (
+            "latest_creation_token".into(),
+            info.latest_creation_token.to_string(),
+        ),
         ("refs_hash".into(), info.refs_hash.clone()),
         ("size_bytes".into(), info.size_bytes.to_string()),
         ("clone_count".into(), info.clone_count.to_string()),
@@ -107,10 +110,7 @@ pub async fn get_repo_info(
     owner_repo: &str,
 ) -> Result<Option<RepoInfo>> {
     let key = repo_key(owner_repo);
-    let map: HashMap<String, String> = pool
-        .hgetall(&key)
-        .await
-        .context("HGETALL repo info")?;
+    let map: HashMap<String, String> = pool.hgetall(&key).await.context("HGETALL repo info")?;
     if map.is_empty() {
         trace!(%owner_repo, "repo info not found");
         return Ok(None);
@@ -148,10 +148,7 @@ pub async fn update_repo_field(
 }
 
 /// Atomically increment the clone counter by 1 and return the new value.
-pub async fn increment_clone_count(
-    pool: &fred::clients::Pool,
-    owner_repo: &str,
-) -> Result<u64> {
+pub async fn increment_clone_count(pool: &fred::clients::Pool, owner_repo: &str) -> Result<u64> {
     let key = repo_key(owner_repo);
     let new_val: i64 = pool
         .hincrby(&key, "clone_count", 1)
@@ -169,10 +166,7 @@ pub async fn register_node_for_repo(
     node_id: &str,
 ) -> Result<()> {
     let key = repo_key(owner_repo);
-    let current: String = pool
-        .hget(&key, "node_ids")
-        .await
-        .unwrap_or_default();
+    let current: String = pool.hget(&key, "node_ids").await.unwrap_or_default();
     let ids: Vec<&str> = current.split(',').filter(|s| !s.is_empty()).collect();
     if ids.contains(&node_id) {
         trace!(%owner_repo, %node_id, "node already registered");
@@ -196,10 +190,7 @@ pub async fn deregister_node_for_repo(
     node_id: &str,
 ) -> Result<()> {
     let key = repo_key(owner_repo);
-    let current: String = pool
-        .hget(&key, "node_ids")
-        .await
-        .unwrap_or_default();
+    let current: String = pool.hget(&key, "node_ids").await.unwrap_or_default();
     let ids: Vec<&str> = current
         .split(',')
         .filter(|s| !s.is_empty() && *s != node_id)
@@ -219,16 +210,32 @@ pub async fn get_fetch_schedule(
     owner_repo: &str,
 ) -> Result<Option<FetchSchedule>> {
     let key = fetch_schedule_key(owner_repo);
-    let map: HashMap<String, String> = pool.hgetall(&key).await.context("HGETALL fetch_schedule")?;
+    let map: HashMap<String, String> =
+        pool.hgetall(&key).await.context("HGETALL fetch_schedule")?;
     if map.is_empty() {
         return Ok(None);
     }
     Ok(Some(FetchSchedule {
-        current_interval: map.get("current_interval").and_then(|v| v.parse().ok()).unwrap_or(0),
-        rolling_avg_delta: map.get("rolling_avg_delta").and_then(|v| v.parse().ok()).unwrap_or(0),
-        delta_threshold: map.get("delta_threshold").and_then(|v| v.parse().ok()).unwrap_or(0),
-        max_interval: map.get("max_interval").and_then(|v| v.parse().ok()).unwrap_or(0),
-        last_delta_bytes: map.get("last_delta_bytes").and_then(|v| v.parse().ok()).unwrap_or(0),
+        current_interval: map
+            .get("current_interval")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        rolling_avg_delta: map
+            .get("rolling_avg_delta")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        delta_threshold: map
+            .get("delta_threshold")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        max_interval: map
+            .get("max_interval")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        last_delta_bytes: map
+            .get("last_delta_bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
     }))
 }
 
@@ -240,13 +247,28 @@ pub async fn set_fetch_schedule(
 ) -> Result<()> {
     let key = fetch_schedule_key(owner_repo);
     let pairs: Vec<(String, String)> = vec![
-        ("current_interval".into(), schedule.current_interval.to_string()),
-        ("rolling_avg_delta".into(), schedule.rolling_avg_delta.to_string()),
-        ("delta_threshold".into(), schedule.delta_threshold.to_string()),
+        (
+            "current_interval".into(),
+            schedule.current_interval.to_string(),
+        ),
+        (
+            "rolling_avg_delta".into(),
+            schedule.rolling_avg_delta.to_string(),
+        ),
+        (
+            "delta_threshold".into(),
+            schedule.delta_threshold.to_string(),
+        ),
         ("max_interval".into(), schedule.max_interval.to_string()),
-        ("last_delta_bytes".into(), schedule.last_delta_bytes.to_string()),
+        (
+            "last_delta_bytes".into(),
+            schedule.last_delta_bytes.to_string(),
+        ),
     ];
-    let _: () = pool.hset(&key, pairs).await.context("HSET fetch_schedule")?;
+    let _: () = pool
+        .hset(&key, pairs)
+        .await
+        .context("HSET fetch_schedule")?;
     debug!(%owner_repo, "fetch schedule written");
     Ok(())
 }
@@ -254,10 +276,7 @@ pub async fn set_fetch_schedule(
 /// Check whether a repository is cached locally and still within its freshness
 /// threshold.  Returns `true` if a local clone exists AND the last fetch
 /// timestamp is within the configured (or per-repo override) window.
-pub async fn is_repo_cached_and_fresh(
-    state: &crate::AppState,
-    owner_repo: &str,
-) -> Result<bool> {
+pub async fn is_repo_cached_and_fresh(state: &crate::AppState, owner_repo: &str) -> Result<bool> {
     // Check local presence first.
     if !state.cache_manager.has_repo(owner_repo) {
         return Ok(false);
@@ -331,12 +350,14 @@ pub async fn ensure_repo_cloned(
         );
 
         // Acquire the clone semaphore to respect concurrency limits.
-        let _permit = state.clone_semaphore.acquire().await
+        let _permit = state
+            .clone_semaphore
+            .acquire()
+            .await
             .map_err(|e| anyhow::anyhow!("clone semaphore closed: {e}"))?;
 
-        let env_vars: Vec<(String, String)> = vec![
-            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        ];
+        let env_vars: Vec<(String, String)> =
+            vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
 
         crate::git::commands::git_clone_bare(&clone_url, &repo_path, &env_vars).await?;
 
@@ -368,11 +389,12 @@ pub async fn ensure_repo_cloned(
 ///
 /// Uses the `KEYS` command which is acceptable for small-to-moderate key
 /// spaces.  For very large deployments consider replacing with `SCAN`.
-pub async fn list_all_repos(
-    pool: &fred::clients::Pool,
-) -> Result<Vec<String>> {
+pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
     let keys: Vec<String> = pool
-        .custom(CustomCommand::new_static("KEYS", None::<u16>, false), vec!["gheproxy:repo:*".to_string()])
+        .custom(
+            CustomCommand::new_static("KEYS", None::<u16>, false),
+            vec!["gheproxy:repo:*".to_string()],
+        )
         .await
         .context("KEYS gheproxy:repo:*")?;
 

@@ -37,10 +37,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         // Git smart HTTP protocol endpoints
         .route("/{owner}/{repo}/info/refs", get(handle_info_refs))
-        .route(
-            "/{owner}/{repo}/git-upload-pack",
-            post(handle_upload_pack),
-        )
+        .route("/{owner}/{repo}/git-upload-pack", post(handle_upload_pack))
         .route(
             "/{owner}/{repo}/git-receive-pack",
             post(handle_receive_pack),
@@ -89,17 +86,12 @@ async fn handle_info_refs(
 ) -> Result<Response, AppError> {
     // 1. Extract and validate the Authorization header.
     let auth_header = extract_auth_header(&headers)?;
-    crate::auth::http_validator::validate_http_auth(
-        &state,
-        &auth_header,
-        &owner,
-        &repo,
-    )
-    .await
-    .map_err(|e| {
-        warn!(error = %e, "auth validation failed");
-        AppError::Unauthorized(e.to_string())
-    })?;
+    crate::auth::http_validator::validate_http_auth(&state, &auth_header, &owner, &repo)
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "auth validation failed");
+            AppError::Unauthorized(e.to_string())
+        })?;
 
     // 2. Check requested service.
     let service = query.service.unwrap_or_default();
@@ -143,7 +135,10 @@ async fn handle_info_refs(
             .await
             .unwrap_or_else(|_| String::from("<unreadable>"));
         warn!(%status, "upstream GHE returned error for info/refs");
-        return Ok((StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY), body)
+        return Ok((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        )
             .into_response());
     }
 
@@ -187,14 +182,9 @@ async fn handle_upload_pack(
 ) -> Result<Response, AppError> {
     // 1. Validate auth.
     let auth_header = extract_auth_header(&headers)?;
-    crate::auth::http_validator::validate_http_auth(
-        &state,
-        &auth_header,
-        &owner,
-        &repo,
-    )
-    .await
-    .map_err(|e| AppError::Unauthorized(e.to_string()))?;
+    crate::auth::http_validator::validate_http_auth(&state, &auth_header, &owner, &repo)
+        .await
+        .map_err(|e| AppError::Unauthorized(e.to_string()))?;
 
     // 2. Check if repo is cached locally and fresh.
     let repo_slug = format!("{}/{}", owner, repo);
@@ -282,9 +272,7 @@ async fn handle_webhook(
 }
 
 /// `GET /healthz`
-async fn handle_health(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health_state = crate::health::HealthState {
         config: Arc::clone(&state.config),
         keydb: state.keydb.clone(),
@@ -333,10 +321,7 @@ async fn serve_local_upload_pack(
     repo: &str,
     request_body: &[u8],
 ) -> Result<Response, AppError> {
-    let repo_path = format!(
-        "{}/{}/{}.git",
-        state.config.storage.local.path, owner, repo,
-    );
+    let repo_path = format!("{}/{}/{}.git", state.config.storage.local.path, owner, repo,);
 
     let mut child = Command::new("git")
         .arg("upload-pack")
@@ -379,10 +364,7 @@ async fn serve_local_upload_pack(
 
     Ok((
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "application/x-git-upload-pack-result",
-        )],
+        [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
         body,
     )
         .into_response())
@@ -421,10 +403,11 @@ async fn proxy_upload_pack_to_ghe(
             .text()
             .await
             .unwrap_or_else(|_| String::from("<unreadable>"));
-        return Ok(
-            (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY), text)
-                .into_response(),
-        );
+        return Ok((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            text,
+        )
+            .into_response());
     }
 
     // Stream the upstream body back to the client without buffering.
@@ -433,10 +416,7 @@ async fn proxy_upload_pack_to_ghe(
 
     Ok((
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "application/x-git-upload-pack-result",
-        )],
+        [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
         body,
     )
         .into_response())
@@ -458,14 +438,12 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
-            AppError::Unauthorized(msg) => {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    [(header::WWW_AUTHENTICATE, "Basic realm=\"gheproxy\"")],
-                    msg,
-                )
-                    .into_response()
-            }
+            AppError::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Basic realm=\"gheproxy\"")],
+                msg,
+            )
+                .into_response(),
             AppError::Internal(err) => {
                 error!(error = %err, "internal server error");
                 (

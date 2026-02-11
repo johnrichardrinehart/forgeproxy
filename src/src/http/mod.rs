@@ -10,4 +10,5 @@ pub mod bundle_serve;
 pub mod handler;
 pub mod protocolv2;
 
+#[allow(unused_imports)]
 pub use handler::create_router;

@@ -3,7 +3,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use fred::clients::SubscriberClient;
 use fred::interfaces::{ClientLike, EventInterface, PubsubInterface};
-use fred::types::CustomCommand;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
