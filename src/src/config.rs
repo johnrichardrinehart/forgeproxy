@@ -5,12 +5,40 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
+// Backend type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendType {
+    #[default]
+    GithubEnterprise,
+    Github,
+    Gitlab,
+    Gitea,
+    Forgejo,
+}
+
+impl BackendType {
+    /// Returns the appropriate `Accept` header value for API requests to this backend.
+    pub fn accept_header(&self) -> &'static str {
+        match self {
+            Self::GithubEnterprise | Self::Github => "application/vnd.github.v3+json",
+            Self::Gitlab | Self::Gitea | Self::Forgejo => "application/json",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    pub ghe: GheConfig,
+    #[serde(alias = "ghe")]
+    pub upstream: UpstreamConfig,
+    #[serde(default)]
+    pub backend_type: BackendType,
     pub upstream_credentials: UpstreamCredentials,
     pub proxy: ProxyConfig,
     pub keydb: KeyDbConfig,
@@ -24,16 +52,16 @@ pub struct Config {
 }
 
 // ---------------------------------------------------------------------------
-// GHE
+// Upstream
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct GheConfig {
-    /// Hostname of the GHE appliance (e.g. `ghe.corp.example.com`).
+pub struct UpstreamConfig {
+    /// Hostname of the upstream forge (e.g. `ghe.corp.example.com`).
     pub hostname: String,
-    /// Full URL to the GHE API root (e.g. `https://ghe.corp.example.com/api/v3`).
+    /// Full URL to the upstream API root (e.g. `https://ghe.corp.example.com/api/v3`).
     pub api_url: String,
-    /// Name of the environment variable that holds the GHE admin PAT.
+    /// Name of the environment variable that holds the upstream admin PAT.
     #[serde(default = "default_admin_token_env")]
     pub admin_token_env: String,
     /// Minimum number of API calls to keep in reserve before self-throttling.
@@ -42,7 +70,7 @@ pub struct GheConfig {
 }
 
 fn default_admin_token_env() -> String {
-    "GHE_ADMIN_TOKEN".to_string()
+    "FORGE_ADMIN_TOKEN".to_string()
 }
 
 fn default_api_rate_limit_buffer() -> u32 {
@@ -152,7 +180,7 @@ fn default_negative_cache_ttl() -> u64 {
 }
 
 fn default_webhook_secret_env() -> String {
-    "GHE_WEBHOOK_SECRET".to_string()
+    "FORGE_WEBHOOK_SECRET".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -171,12 +199,18 @@ pub struct CloneConfig {
     /// How long (seconds) a waiter will block for the lock before giving up.
     #[serde(default = "default_lock_wait_timeout")]
     pub lock_wait_timeout: u64,
-    /// Semaphore limit for concurrent full clones against GHE.
-    #[serde(default = "default_max_concurrent_ghe_clones")]
-    pub max_concurrent_ghe_clones: usize,
-    /// Semaphore limit for concurrent fetches against GHE.
-    #[serde(default = "default_max_concurrent_ghe_fetches")]
-    pub max_concurrent_ghe_fetches: usize,
+    /// Semaphore limit for concurrent full clones against upstream.
+    #[serde(
+        default = "default_max_concurrent_upstream_clones",
+        alias = "max_concurrent_ghe_clones"
+    )]
+    pub max_concurrent_upstream_clones: usize,
+    /// Semaphore limit for concurrent fetches against upstream.
+    #[serde(
+        default = "default_max_concurrent_upstream_fetches",
+        alias = "max_concurrent_ghe_fetches"
+    )]
+    pub max_concurrent_upstream_fetches: usize,
 }
 
 fn default_freshness_threshold() -> u64 {
@@ -191,11 +225,11 @@ fn default_lock_wait_timeout() -> u64 {
     90
 }
 
-fn default_max_concurrent_ghe_clones() -> usize {
+fn default_max_concurrent_upstream_clones() -> usize {
     4
 }
 
-fn default_max_concurrent_ghe_fetches() -> usize {
+fn default_max_concurrent_upstream_fetches() -> usize {
     8
 }
 
@@ -343,7 +377,7 @@ pub struct S3StorageConfig {
 }
 
 fn default_s3_prefix() -> String {
-    "gheproxy/".to_string()
+    "forgecache/".to_string()
 }
 
 fn default_presigned_url_ttl() -> u64 {

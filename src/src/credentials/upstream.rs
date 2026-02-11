@@ -87,11 +87,11 @@ pub fn get_clone_url(config: &Config, owner: &str, repo: &str) -> Result<(String
         CredentialMode::Pat { token } => {
             format!(
                 "https://x-access-token:{token}@{}/{owner}/{repo}.git",
-                config.ghe.hostname
+                config.upstream.hostname
             )
         }
         CredentialMode::SshKey { .. } => {
-            format!("git@{}:{owner}/{repo}.git", config.ghe.hostname)
+            format!("git@{}:{owner}/{repo}.git", config.upstream.hostname)
         }
     };
     Ok((url, credential))

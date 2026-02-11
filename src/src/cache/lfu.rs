@@ -1,7 +1,7 @@
 //! Least Frequently Used (LFU) eviction policy backed by KeyDB.
 //!
 //! Each clone/fetch increments a per-repo counter stored in the KeyDB hash
-//! `gheproxy:repo:{owner/repo}` under the `clone_count` field.  When the cache
+//! `forgecache:repo:{owner/repo}` under the `clone_count` field.  When the cache
 //! manager needs to free space, this module ranks repos by ascending clone
 //! count and returns the least-accessed ones as eviction candidates.
 //!
@@ -19,7 +19,7 @@ use tracing::{debug, trace};
 /// Record a single access (clone or fetch) for `owner_repo` by atomically
 /// incrementing the `clone_count` field in the repo's KeyDB hash.
 ///
-/// Key: `gheproxy:repo:{owner_repo}`, field: `clone_count`.
+/// Key: `forgecache:repo:{owner_repo}`, field: `clone_count`.
 pub async fn record_access(keydb: &fred::clients::Pool, owner_repo: &str) -> Result<()> {
     let key = repo_key(owner_repo);
     let _new_count: i64 = keydb
@@ -87,7 +87,7 @@ pub async fn get_eviction_candidates(
 
 /// Build the KeyDB hash key for a given `owner/repo`.
 fn repo_key(owner_repo: &str) -> String {
-    format!("gheproxy:repo:{owner_repo}")
+    format!("forgecache:repo:{owner_repo}")
 }
 
 #[cfg(test)]
@@ -96,6 +96,6 @@ mod tests {
 
     #[test]
     fn repo_key_format() {
-        assert_eq!(repo_key("acme/widgets"), "gheproxy:repo:acme/widgets");
+        assert_eq!(repo_key("acme/widgets"), "forgecache:repo:acme/widgets");
     }
 }

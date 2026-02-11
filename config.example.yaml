@@ -1,7 +1,7 @@
-ghe:
+upstream:
   hostname: "ghe.internal.example.gov"
   api_url: "https://ghe.internal.example.gov/api/v3"
-  admin_token_env: "GHE_ADMIN_TOKEN"
+  admin_token_env: "FORGE_ADMIN_TOKEN"
   api_rate_limit_buffer: 100
 upstream_credentials:
   default_mode: "pat"
@@ -18,7 +18,7 @@ upstream_credentials:
 proxy:
   ssh_listen: "0.0.0.0:2222"
   http_listen: "127.0.0.1:8080"
-  bundle_uri_base_url: "https://gheproxy.internal.example.gov/bundles"
+  bundle_uri_base_url: "https://forgecache.internal.example.gov/bundles"
 keydb:
   endpoint: "keydb.internal.example.gov:6380"
   tls: true
@@ -31,8 +31,8 @@ clone:
   freshness_threshold: 60
   lock_ttl: 60
   lock_wait_timeout: 120
-  max_concurrent_ghe_clones: 5
-  max_concurrent_ghe_fetches: 10
+  max_concurrent_upstream_clones: 5
+  max_concurrent_upstream_fetches: 10
 fetch_schedule:
   default_interval: 1800
   delta_threshold: 1024
@@ -47,13 +47,13 @@ bundles:
   generate_filtered_bundles: true
 storage:
   local:
-    path: "/var/cache/gheproxy/repos"
+    path: "/var/cache/forgecache/repos"
     max_bytes: 536870912000
     high_water_mark: 0.90
     low_water_mark: 0.75
     eviction_policy: "lfu"
   s3:
-    bucket: "gheproxy-bundles"
+    bucket: "forgecache-bundles"
     prefix: ""
     region: "us-gov-west-1"
     use_fips: true

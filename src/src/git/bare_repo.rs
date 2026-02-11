@@ -283,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_nonexistent_path() {
-        let result = validate_bare_repo(Path::new("/tmp/nonexistent_gheproxy_test_repo"))
+        let result = validate_bare_repo(Path::new("/tmp/nonexistent_forgecache_test_repo"))
             .await
             .unwrap();
         assert!(!result);
@@ -291,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn repo_size_nonexistent_is_zero() {
-        let size = repo_size_bytes(Path::new("/tmp/nonexistent_gheproxy_test_repo"))
+        let size = repo_size_bytes(Path::new("/tmp/nonexistent_forgecache_test_repo"))
             .await
             .unwrap();
         assert_eq!(size, 0);
@@ -300,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn remove_nonexistent_is_noop() {
         // Should not error.
-        remove_repo(Path::new("/tmp/nonexistent_gheproxy_test_repo"))
+        remove_repo(Path::new("/tmp/nonexistent_forgecache_test_repo"))
             .await
             .unwrap();
     }

@@ -20,7 +20,7 @@ pub fn node_id() -> String {
 
 /// Run the heartbeat loop.
 ///
-/// This writes a HASH at `gheproxy:node:{node_id}` with a 30-second TTL
+/// This writes a HASH at `forgecache:node:{node_id}` with a 30-second TTL
 /// every 10 seconds.  If the process crashes the key will expire and the
 /// node will no longer appear in the active-node list.
 ///
@@ -28,7 +28,7 @@ pub fn node_id() -> String {
 pub async fn run_heartbeat(pool: fred::clients::Pool, node_id: String) {
     info!(%node_id, "starting heartbeat loop");
     loop {
-        let key = format!("gheproxy:node:{node_id}");
+        let key = format!("forgecache:node:{node_id}");
         if let Err(e) = heartbeat_once(&pool, &key).await {
             error!(error = %e, %node_id, "heartbeat tick failed");
         }
@@ -58,7 +58,7 @@ async fn heartbeat_once(pool: &fred::clients::Pool, key: &str) -> Result<()> {
 
 /// Remove this node's heartbeat key immediately (graceful shutdown).
 pub async fn deregister_node(pool: &fred::clients::Pool, node_id: &str) -> Result<()> {
-    let key = format!("gheproxy:node:{node_id}");
+    let key = format!("forgecache:node:{node_id}");
     let _: i64 = pool.del(&key).await.context("DEL node key")?;
     info!(%node_id, "node deregistered");
     Ok(())
@@ -66,21 +66,21 @@ pub async fn deregister_node(pool: &fred::clients::Pool, node_id: &str) -> Resul
 
 /// Return the IDs of all nodes whose heartbeat key still exists.
 ///
-/// Uses the `KEYS` command with the `gheproxy:node:*` pattern.  This is
+/// Uses the `KEYS` command with the `forgecache:node:*` pattern.  This is
 /// acceptable because the number of proxy nodes is small (typically < 100).
 /// For very large fleets, replace with an incremental `SCAN`.
 pub async fn list_active_nodes(pool: &fred::clients::Pool) -> Result<Vec<String>> {
     let keys: Vec<String> = ClientLike::custom(
         pool,
         CustomCommand::new_static("KEYS", None::<u16>, false),
-        vec!["gheproxy:node:*".to_string()],
+        vec!["forgecache:node:*".to_string()],
     )
     .await
-    .context("KEYS gheproxy:node:*")?;
+    .context("KEYS forgecache:node:*")?;
 
     let nodes: Vec<String> = keys
         .into_iter()
-        .filter_map(|k: String| k.strip_prefix("gheproxy:node:").map(String::from))
+        .filter_map(|k: String| k.strip_prefix("forgecache:node:").map(String::from))
         .collect();
 
     debug!(count = nodes.len(), "listed active nodes");
@@ -90,7 +90,7 @@ pub async fn list_active_nodes(pool: &fred::clients::Pool) -> Result<Vec<String>
 /// Check whether a specific node is still alive (its key exists and has not
 /// expired).
 pub async fn is_node_alive(pool: &fred::clients::Pool, node_id: &str) -> Result<bool> {
-    let key = format!("gheproxy:node:{node_id}");
+    let key = format!("forgecache:node:{node_id}");
     let exists: bool = pool.exists(&key).await.context("EXISTS node key")?;
     Ok(exists)
 }

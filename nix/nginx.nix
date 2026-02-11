@@ -6,46 +6,50 @@
 }:
 
 let
-  cfg = config.services.gheproxy-nginx;
+  cfg = config.services.forgecache-nginx;
+  backendCfg = config.services.forgecache.backend._derived;
 in
 {
-  options.services.gheproxy-nginx = {
-    enable = lib.mkEnableOption "nginx reverse proxy for gheproxy";
+  imports = [
+    ./backend.nix
+  ];
+  options.services.forgecache-nginx = {
+    enable = lib.mkEnableOption "nginx reverse proxy for forgecache";
 
     serverName = lib.mkOption {
       type = lib.types.str;
-      default = "gheproxy.internal.example.gov";
+      default = "forgecache.internal.example.gov";
       description = "Virtual host server name for the nginx proxy.";
     };
 
     sslCertificate = lib.mkOption {
       type = lib.types.path;
-      default = "/etc/ssl/gheproxy/cert.pem";
+      default = "/etc/ssl/forgecache/cert.pem";
       description = "Path to the TLS certificate.";
     };
 
     sslCertificateKey = lib.mkOption {
       type = lib.types.path;
-      default = "/etc/ssl/gheproxy/key.pem";
+      default = "/etc/ssl/forgecache/key.pem";
       description = "Path to the TLS certificate private key.";
     };
 
     gheUpstream = lib.mkOption {
       type = lib.types.str;
       default = "ghe.internal.example.gov";
-      description = "Hostname of the upstream GitHub Enterprise server.";
+      description = "Hostname of the upstream Git forge server.";
     };
 
     gheUpstreamPort = lib.mkOption {
       type = lib.types.port;
       default = 443;
-      description = "Port of the upstream GitHub Enterprise server.";
+      description = "Port of the upstream Git forge server.";
     };
 
     backendPort = lib.mkOption {
       type = lib.types.port;
       default = 8080;
-      description = "Local port on which the gheproxy backend listens.";
+      description = "Local port on which the forgecache backend listens.";
     };
 
     resolver = lib.mkOption {
@@ -83,7 +87,7 @@ in
 
       # ── Global HTTP-level configuration ────────────────────────────
       appendHttpConfig = ''
-        # Upstream block for the GitHub Enterprise server.
+        # Upstream block for the Git forge server.
         upstream ghe-upstream {
           server ${cfg.gheUpstream}:${toString cfg.gheUpstreamPort};
           keepalive 32;
@@ -100,6 +104,24 @@ in
         # DNS resolver for dynamic upstream resolution.
         resolver ${cfg.resolver} valid=300s;
         resolver_timeout 5s;
+
+        # Map backend-specific webhook event header to normalized header.
+        map $http_${
+          lib.toLower (builtins.replaceStrings [ "-" ] [ "_" ] backendCfg.webhookEventHeader)
+        } $webhook_event {
+          default $http_${
+            lib.toLower (builtins.replaceStrings [ "-" ] [ "_" ] backendCfg.webhookEventHeader)
+          };
+        }
+
+        # Map backend-specific webhook signature header to normalized header.
+        map $http_${
+          lib.toLower (builtins.replaceStrings [ "-" ] [ "_" ] backendCfg.webhookSignatureHeader)
+        } $webhook_signature {
+          default $http_${
+            lib.toLower (builtins.replaceStrings [ "-" ] [ "_" ] backendCfg.webhookSignatureHeader)
+          };
+        }
       '';
 
       virtualHosts.${cfg.serverName} = {
@@ -183,9 +205,9 @@ in
             '';
           };
 
-          # ── GitHub API pass-through ──────────────────────────────
-          "/api/" = {
-            proxyPass = "https://ghe-upstream/api/";
+          # ── API pass-through ───────────────────────────────────
+          "${backendCfg.apiPathPrefix}/" = {
+            proxyPass = "https://ghe-upstream${backendCfg.apiPathPrefix}/";
             extraConfig = ''
               proxy_set_header Authorization $http_authorization;
               proxy_set_header Host ${cfg.gheUpstream};
@@ -204,8 +226,18 @@ in
               proxy_set_header X-Real-IP $remote_addr;
               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
               proxy_set_header X-Forwarded-Proto $scheme;
-              proxy_set_header X-GitHub-Event $http_x_github_event;
-              proxy_set_header X-Hub-Signature-256 $http_x_hub_signature_256;
+
+              # Pass through original backend-specific headers.
+              proxy_set_header ${backendCfg.webhookEventHeader} $http_${
+                lib.toLower (builtins.replaceStrings [ "-" ] [ "_" ] backendCfg.webhookEventHeader)
+              };
+              proxy_set_header ${backendCfg.webhookSignatureHeader} $http_${
+                lib.toLower (builtins.replaceStrings [ "-" ] [ "_" ] backendCfg.webhookSignatureHeader)
+              };
+
+              # Normalized headers for the Rust backend.
+              proxy_set_header X-Webhook-Event $webhook_event;
+              proxy_set_header X-Webhook-Signature $webhook_signature;
             '';
           };
         };

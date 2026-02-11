@@ -10,28 +10,28 @@ pub async fn resolve_user_by_fingerprint(
     state: &AppState,
     fingerprint: &str,
 ) -> Result<Option<String>> {
-    // 1. Check KeyDB cache: gheproxy:ssh:auth:{fingerprint}
-    let cache_key = format!("gheproxy:ssh:auth:{fingerprint}");
+    // 1. Check KeyDB cache: forgecache:ssh:auth:{fingerprint}
+    let cache_key = format!("forgecache:ssh:auth:{fingerprint}");
     if let Some(cached) = crate::auth::cache::get_cached_auth(&state.keydb, &cache_key).await? {
         debug!(fingerprint, username = %cached, "resolved user from cache");
         return Ok(Some(cached));
     }
 
     // 2. Call GHE admin API: GET /api/v3/admin/ssh-keys?fingerprint={fp}
-    let admin_token = std::env::var(&state.config.ghe.admin_token_env).unwrap_or_default();
+    let admin_token = std::env::var(&state.config.upstream.admin_token_env).unwrap_or_default();
     let url = format!(
         "{}/admin/ssh-keys?fingerprint={}",
-        state.config.ghe.api_url, fingerprint
+        state.config.upstream.api_url, fingerprint
     );
 
     let resp = state
         .http_client
         .get(&url)
         .header("Authorization", format!("Bearer {admin_token}"))
-        .header("Accept", "application/vnd.github.v3+json")
+        .header("Accept", state.config.backend_type.accept_header())
         .send()
         .await
-        .context("GHE admin API request failed")?;
+        .context("upstream admin API request failed")?;
 
     if !resp.status().is_success() {
         warn!(
@@ -79,23 +79,23 @@ pub async fn check_ssh_repo_access(
     owner: &str,
     repo: &str,
 ) -> Result<Permission> {
-    let cache_key = format!("gheproxy:ssh:access:{fingerprint}:{owner}/{repo}");
+    let cache_key = format!("forgecache:ssh:access:{fingerprint}:{owner}/{repo}");
     if let Some(cached) = crate::auth::cache::get_cached_auth(&state.keydb, &cache_key).await? {
         debug!(cache_key, permission = %cached, "repo access from cache");
         return Ok(parse_permission(&cached));
     }
 
-    let admin_token = std::env::var(&state.config.ghe.admin_token_env).unwrap_or_default();
+    let admin_token = std::env::var(&state.config.upstream.admin_token_env).unwrap_or_default();
     let url = format!(
         "{}/repos/{owner}/{repo}/collaborators/{username}/permission",
-        state.config.ghe.api_url
+        state.config.upstream.api_url
     );
 
     let resp = state
         .http_client
         .get(&url)
         .header("Authorization", format!("Bearer {admin_token}"))
-        .header("Accept", "application/vnd.github.v3+json")
+        .header("Accept", state.config.backend_type.accept_header())
         .send()
         .await?;
 
