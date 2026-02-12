@@ -132,7 +132,7 @@ pkgs.testers.runNixOSTest {
   # ---------------------------------------------------------------------------
   nodes = {
 
-    # ── Mock GitHub Enterprise (Gitea) ─────────────────────────────────
+    # ── Mock GitHub Enterprise (Gitea behind nginx TLS) ─────────────────
     ghe =
       {
         config,
@@ -146,11 +146,27 @@ pkgs.testers.runNixOSTest {
           settings = {
             server = {
               HTTP_PORT = 3000;
-              ROOT_URL = "http://ghe:3000/";
+              ROOT_URL = "https://ghe/";
               DOMAIN = "ghe";
             };
             service = {
               DISABLE_REGISTRATION = false;
+            };
+          };
+        };
+
+        services.nginx = {
+          enable = true;
+          virtualHosts."ghe" = {
+            forceSSL = true;
+            sslCertificate = "${testCerts}/ghe.crt";
+            sslCertificateKey = "${testCerts}/ghe.key";
+            locations."/" = {
+              proxyPass = "http://localhost:3000";
+              extraConfig = ''
+                proxy_buffering off;
+                client_max_body_size 0;
+              '';
             };
           };
         };
@@ -163,7 +179,11 @@ pkgs.testers.runNixOSTest {
           jq
         ];
 
-        networking.firewall.allowedTCPPorts = [ 3000 ];
+        security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
+        networking.firewall.allowedTCPPorts = [
+          443
+          3000
+        ];
         virtualisation.memorySize = 2048;
       };
 
@@ -270,6 +290,10 @@ pkgs.testers.runNixOSTest {
     with subtest("Gitea starts"):
         ghe.wait_for_unit("gitea.service")
         ghe.wait_for_open_port(3000)
+
+    with subtest("GHE nginx starts"):
+        ghe.wait_for_unit("nginx.service")
+        ghe.wait_for_open_port(443)
 
     # ── Seed Gitea with users, repos, and collaborators ──────────────────
     with subtest("Seed Gitea"):

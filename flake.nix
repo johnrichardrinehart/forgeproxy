@@ -61,6 +61,12 @@
                   nixos-vm-test-compliance = pkgs.callPackage ./nix/tests/compliance.nix { inherit self; };
                   nixos-vm-test-backend = pkgs.callPackage ./nix/tests/backend.nix { inherit self; };
                   nixos-vm-test-ssh-authz = pkgs.callPackage ./nix/tests/ssh-authz.nix { inherit self; };
+                  nixos-vm-test-keyring-creds = pkgs.callPackage ./nix/tests/keyring-creds.nix { inherit self; };
+                  nixos-vm-test-eviction-lfu = pkgs.callPackage ./nix/tests/eviction-lfu.nix { inherit self; };
+                  nixos-vm-test-eviction-lru = pkgs.callPackage ./nix/tests/eviction-lru.nix { inherit self; };
+                  nixos-vm-test-filtered-bundles = pkgs.callPackage ./nix/tests/filtered-bundles.nix {
+                    inherit self;
+                  };
                 };
 
                 # ── Formatting (consumed by git-hooks via treefmt hook) ──
