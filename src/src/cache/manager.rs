@@ -98,7 +98,11 @@ impl CacheManager {
     /// eviction -- repos without a bundle are skipped so they are not lost.
     ///
     /// Returns the number of repos evicted.
-    pub async fn run_eviction(&self, state: &AppState) -> Result<usize> {
+    pub async fn run_eviction(
+        &self,
+        state: &AppState,
+        telemetry: Option<&super::telemetry::TelemetryBuffer>,
+    ) -> Result<usize> {
         let repos = self.list_repos()?;
         if repos.is_empty() {
             return Ok(0);
@@ -115,8 +119,15 @@ impl CacheManager {
         };
 
         let mut evicted: usize = 0;
+        let mut repo_details: Vec<super::telemetry::RepoDetail> = Vec::new();
 
         for owner_repo in &candidates {
+            // Collect metadata for telemetry before we possibly evict.
+            let info = crate::coordination::registry::get_repo_info(&state.keydb, owner_repo)
+                .await
+                .ok()
+                .flatten();
+
             // Re-check whether we still need to evict.
             let fraction = self.usage_fraction()?;
             if fraction <= self.low_water {
@@ -125,6 +136,16 @@ impl CacheManager {
                     usage_fraction = fraction,
                     "eviction complete: reached low-water mark"
                 );
+                // Record remaining candidates as not-evicted.
+                if telemetry.is_some() {
+                    repo_details.push(super::telemetry::RepoDetail {
+                        name: owner_repo.clone(),
+                        clone_count: info.as_ref().map_or(0, |i| i.clone_count),
+                        last_fetch_ts: info.as_ref().map_or(0, |i| i.last_fetch_ts),
+                        size_bytes: info.as_ref().map_or(0, |i| i.size_bytes),
+                        evicted: false,
+                    });
+                }
                 break;
             }
 
@@ -140,6 +161,15 @@ impl CacheManager {
                     repo = %owner_repo,
                     "skipping eviction: no S3 bundle backup recorded in KeyDB"
                 );
+                if telemetry.is_some() {
+                    repo_details.push(super::telemetry::RepoDetail {
+                        name: owner_repo.clone(),
+                        clone_count: info.as_ref().map_or(0, |i| i.clone_count),
+                        last_fetch_ts: info.as_ref().map_or(0, |i| i.last_fetch_ts),
+                        size_bytes: info.as_ref().map_or(0, |i| i.size_bytes),
+                        evicted: false,
+                    });
+                }
                 continue;
             }
 
@@ -162,7 +192,33 @@ impl CacheManager {
             .await
             .unwrap_or_default();
 
+            if telemetry.is_some() {
+                repo_details.push(super::telemetry::RepoDetail {
+                    name: owner_repo.clone(),
+                    clone_count: info.as_ref().map_or(0, |i| i.clone_count),
+                    last_fetch_ts: info.as_ref().map_or(0, |i| i.last_fetch_ts),
+                    size_bytes: info.as_ref().map_or(0, |i| i.size_bytes),
+                    evicted: true,
+                });
+            }
+
             evicted += 1;
+        }
+
+        // Record telemetry event.
+        if let Some(buf) = telemetry {
+            let policy_name = match self.eviction_policy {
+                EvictionPolicy::Lfu => "lfu",
+                EvictionPolicy::Lru => "lru",
+            };
+            buf.record(super::telemetry::EvictionEvent {
+                ts: chrono::Utc::now().timestamp(),
+                policy: policy_name.to_string(),
+                candidates: candidates.len(),
+                evicted,
+                repos: repo_details,
+            })
+            .await;
         }
 
         info!(evicted, "eviction sweep finished");
