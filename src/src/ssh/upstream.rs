@@ -35,7 +35,7 @@ pub async fn proxy_upload_pack_to_ghe(
     let (owner, repo) = split_owner_repo(owner_repo)?;
 
     // Resolve clone URL and environment variables for credential injection.
-    let (clone_url, env_vars) = resolve_upstream_url_and_creds(&state.config, owner, repo)?;
+    let (clone_url, env_vars) = resolve_upstream_url_and_creds(&state.config, owner, repo).await?;
 
     debug!(
         clone_url = %clone_url,
@@ -79,7 +79,7 @@ pub(crate) fn split_owner_repo(slug: &str) -> Result<(&str, &str)> {
 /// the `GIT_ASKPASS` or header-based auth.  For SSH mode the URL uses the
 /// `git@host:owner/repo.git` form and the environment is empty (the SSH key
 /// is expected to be available via the agent or keyring).
-fn resolve_upstream_url_and_creds(
+async fn resolve_upstream_url_and_creds(
     config: &Config,
     owner: &str,
     repo: &str,
@@ -94,15 +94,18 @@ fn resolve_upstream_url_and_creds(
 
     match mode {
         CredentialMode::Pat => {
-            // Resolve the PAT from the environment variable.
-            let token_env = config
+            // Resolve the PAT: try the kernel keyring first, fall back to env var.
+            let key_name = config
                 .upstream_credentials
                 .orgs
                 .get(owner)
                 .map(|oc| oc.keyring_key_name.as_str())
                 .unwrap_or(&config.upstream.admin_token_env);
 
-            let token = std::env::var(token_env).unwrap_or_default();
+            let token = match crate::credentials::keyring::read_key(key_name).await {
+                Ok(val) => val,
+                Err(_) => std::env::var(key_name).unwrap_or_default(),
+            };
 
             // HTTPS clone URL with embedded token for authentication.
             let url = if token.is_empty() {
