@@ -172,7 +172,7 @@ impl ForgeBackend for GiteaBackend {
             .and_then(|p| p.as_str())
             .unwrap_or("none");
 
-        Ok(parse_permission(perm_str))
+        Ok(Permission::parse(perm_str))
     }
 
     fn verify_webhook_signature(
@@ -267,15 +267,6 @@ fn extract_permission(body: &serde_json::Value) -> Permission {
         Permission::Read
     } else {
         Permission::None
-    }
-}
-
-fn parse_permission(s: &str) -> Permission {
-    match s {
-        "admin" => Permission::Admin,
-        "write" | "push" => Permission::Write,
-        "read" | "pull" => Permission::Read,
-        _ => Permission::None,
     }
 }
 

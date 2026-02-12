@@ -145,7 +145,7 @@ impl ForgeBackend for GitHubBackend {
             .and_then(|p| p.as_str())
             .unwrap_or("none");
 
-        Ok(parse_permission(perm_str))
+        Ok(Permission::parse(perm_str))
     }
 
     fn verify_webhook_signature(
@@ -257,15 +257,6 @@ fn extract_ssh_user_login(body: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn parse_permission(s: &str) -> Permission {
-    match s {
-        "admin" => Permission::Admin,
-        "write" | "push" => Permission::Write,
-        "read" | "pull" => Permission::Read,
-        _ => Permission::None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -340,22 +331,22 @@ mod tests {
 
     #[test]
     fn parse_collaborator_permission_write() {
-        assert_eq!(parse_permission("write"), Permission::Write);
+        assert_eq!(Permission::parse("write"), Permission::Write);
     }
 
     #[test]
     fn parse_collaborator_permission_admin() {
-        assert_eq!(parse_permission("admin"), Permission::Admin);
+        assert_eq!(Permission::parse("admin"), Permission::Admin);
     }
 
     #[test]
     fn parse_collaborator_permission_read() {
-        assert_eq!(parse_permission("read"), Permission::Read);
+        assert_eq!(Permission::parse("read"), Permission::Read);
     }
 
     #[test]
     fn parse_collaborator_permission_unknown() {
-        assert_eq!(parse_permission("maintain"), Permission::None);
+        assert_eq!(Permission::parse("maintain"), Permission::None);
     }
 
     // ── HMAC verification ───────────────────────────────────────────────
