@@ -42,7 +42,7 @@ pub struct FetchSchedule {
 // Key helpers
 // ---------------------------------------------------------------------------
 
-fn repo_key(owner_repo: &str) -> String {
+pub(crate) fn repo_key(owner_repo: &str) -> String {
     format!("forgecache:repo:{owner_repo}")
 }
 
