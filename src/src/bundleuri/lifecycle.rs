@@ -99,7 +99,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     }
 
     // 3. Check minimum clone count threshold before investing in bundles.
-    let repo_key = format!("forgecache:repo:{owner_repo}");
+    let repo_key = crate::coordination::registry::repo_key(owner_repo);
     let clone_count: Option<i64> = HashesInterface::hget(&state.keydb, &repo_key, "clone_count")
         .await
         .unwrap_or(None);
@@ -427,7 +427,7 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
                 );
 
                 // Update registry with new bundle info.
-                let repo_key = format!("forgecache:repo:{owner_repo}");
+                let repo_key = crate::coordination::registry::repo_key(owner_repo);
                 let s3_key = format!(
                     "{}{}/bundles/daily-{}.bundle",
                     state.config.storage.s3.prefix,
@@ -532,7 +532,7 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
                     "weekly consolidation (base) bundle generated"
                 );
 
-                let repo_key = format!("forgecache:repo:{owner_repo}");
+                let repo_key = crate::coordination::registry::repo_key(owner_repo);
                 let s3_key = format!(
                     "{}{}/bundles/base-{}.bundle",
                     state.config.storage.s3.prefix,
