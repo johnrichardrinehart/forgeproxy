@@ -188,7 +188,7 @@ async fn handle_upload_pack(
 
     // 2. Check if repo is cached locally and fresh.
     let repo_slug = format!("{}/{}", owner, repo);
-    let cached = crate::coordination::is_repo_cached_and_fresh(&state, &repo_slug)
+    let cached = crate::coordination::registry::is_repo_cached_and_fresh(&state, &repo_slug)
         .await
         .unwrap_or(false);
 
@@ -209,7 +209,8 @@ async fn handle_upload_pack(
         let auth = auth_header.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                crate::coordination::ensure_repo_cloned(&state, &owner, &repo, &auth).await
+                crate::coordination::registry::ensure_repo_cloned(&state, &owner, &repo, &auth)
+                    .await
             {
                 warn!(
                     error = %e,

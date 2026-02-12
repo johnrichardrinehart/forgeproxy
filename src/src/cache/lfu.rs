@@ -8,27 +8,13 @@
 //! Repos that are marked as "pinned" via the `eviction_priority` field in
 //! their KeyDB hash are never returned as eviction candidates.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use fred::interfaces::HashesInterface;
-use tracing::{debug, trace};
+use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-/// Record a single access (clone or fetch) for `owner_repo` by atomically
-/// incrementing the `clone_count` field in the repo's KeyDB hash.
-///
-/// Key: `forgecache:repo:{owner_repo}`, field: `clone_count`.
-pub async fn record_access(keydb: &fred::clients::Pool, owner_repo: &str) -> Result<()> {
-    let key = repo_key(owner_repo);
-    let _new_count: i64 = keydb
-        .hincrby(&key, "clone_count", 1)
-        .await
-        .with_context(|| format!("failed to increment clone_count for {owner_repo}"))?;
-    trace!(repo = %owner_repo, "recorded LFU access");
-    Ok(())
-}
 
 /// Return up to `count` repos from `repos` ordered by ascending clone count
 /// (least frequently used first).

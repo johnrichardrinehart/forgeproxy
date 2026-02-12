@@ -1,8 +1,3 @@
-// Many modules expose pub API surfaces (e.g. coordination, bundleuri, git,
-// storage, credentials) whose functions are wired up incrementally.  Allow
-// dead_code crate-wide until the full call graph is connected.
-#![allow(dead_code)]
-
 mod auth;
 mod bundleuri;
 mod cache;

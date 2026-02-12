@@ -147,63 +147,6 @@ pub async fn update_repo_field(
     Ok(())
 }
 
-/// Atomically increment the clone counter by 1 and return the new value.
-pub async fn increment_clone_count(pool: &fred::clients::Pool, owner_repo: &str) -> Result<u64> {
-    let key = repo_key(owner_repo);
-    let new_val: i64 = pool
-        .hincrby(&key, "clone_count", 1)
-        .await
-        .context("HINCRBY clone_count")?;
-    debug!(%owner_repo, clone_count = new_val, "clone count incremented");
-    Ok(new_val as u64)
-}
-
-/// Add `node_id` to the comma-separated `node_ids` field (if not already
-/// present).
-pub async fn register_node_for_repo(
-    pool: &fred::clients::Pool,
-    owner_repo: &str,
-    node_id: &str,
-) -> Result<()> {
-    let key = repo_key(owner_repo);
-    let current: String = pool.hget(&key, "node_ids").await.unwrap_or_default();
-    let ids: Vec<&str> = current.split(',').filter(|s| !s.is_empty()).collect();
-    if ids.contains(&node_id) {
-        trace!(%owner_repo, %node_id, "node already registered");
-        return Ok(());
-    }
-    let mut new_ids = ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    new_ids.push(node_id.to_string());
-    let joined = new_ids.join(",");
-    let _: () = pool
-        .hset(&key, vec![("node_ids".to_string(), joined)])
-        .await
-        .context("HSET node_ids")?;
-    debug!(%owner_repo, %node_id, "node registered for repo");
-    Ok(())
-}
-
-/// Remove `node_id` from the comma-separated `node_ids` field.
-pub async fn deregister_node_for_repo(
-    pool: &fred::clients::Pool,
-    owner_repo: &str,
-    node_id: &str,
-) -> Result<()> {
-    let key = repo_key(owner_repo);
-    let current: String = pool.hget(&key, "node_ids").await.unwrap_or_default();
-    let ids: Vec<&str> = current
-        .split(',')
-        .filter(|s| !s.is_empty() && *s != node_id)
-        .collect();
-    let joined = ids.join(",");
-    let _: () = pool
-        .hset(&key, vec![("node_ids".to_string(), joined)])
-        .await
-        .context("HSET node_ids after deregister")?;
-    debug!(%owner_repo, %node_id, "node deregistered from repo");
-    Ok(())
-}
-
 /// Retrieve the adaptive fetch schedule for a repository.
 pub async fn get_fetch_schedule(
     pool: &fred::clients::Pool,
