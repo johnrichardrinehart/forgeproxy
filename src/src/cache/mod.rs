@@ -8,5 +8,6 @@ pub mod hydrator;
 pub mod lfu;
 pub mod lru;
 pub mod manager;
+pub mod telemetry;
 
 pub use manager::CacheManager;

@@ -289,7 +289,16 @@ async fn main() -> Result<()> {
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
     };
 
+    // ---- Telemetry buffer ----
+    let telemetry_buffer = cache::telemetry::TelemetryBuffer::new();
+
     // ---- Spawn services ----
+    let telemetry_handle = tokio::spawn({
+        let s = Arc::new(state.clone());
+        let buf = telemetry_buffer.clone();
+        async move { cache::telemetry::run_telemetry_flusher(s, buf).await }
+    });
+
     let http_handle = tokio::spawn({
         let s = state.clone();
         async move {
@@ -329,7 +338,13 @@ async fn main() -> Result<()> {
     // ---- Await shutdown ----
     // We wait for ALL tasks; when the shutdown signal fires each task will
     // see it through its own `shutdown_signal()` future and wind down.
-    let _ = tokio::try_join!(http_handle, ssh_handle, bundle_handle, heartbeat_handle);
+    let _ = tokio::try_join!(
+        http_handle,
+        ssh_handle,
+        bundle_handle,
+        heartbeat_handle,
+        telemetry_handle,
+    );
 
     tracing::info!("forgecache shut down cleanly");
     Ok(())
