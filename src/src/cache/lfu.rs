@@ -33,7 +33,7 @@ pub async fn get_eviction_candidates(
     let mut scored: Vec<(String, i64)> = Vec::with_capacity(repos.len());
 
     for owner_repo in repos {
-        let key = repo_key(owner_repo);
+        let key = crate::coordination::registry::repo_key(owner_repo);
 
         // Fetch both clone_count and eviction_priority in one round-trip.
         let clone_count: Option<i64> = keydb.hget(&key, "clone_count").await.unwrap_or(None);
@@ -71,17 +71,13 @@ pub async fn get_eviction_candidates(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build the KeyDB hash key for a given `owner/repo`.
-fn repo_key(owner_repo: &str) -> String {
-    format!("forgecache:repo:{owner_repo}")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn repo_key_format() {
-        assert_eq!(repo_key("acme/widgets"), "forgecache:repo:acme/widgets");
+        assert_eq!(
+            crate::coordination::registry::repo_key("acme/widgets"),
+            "forgecache:repo:acme/widgets",
+        );
     }
 }
