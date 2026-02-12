@@ -18,26 +18,28 @@ let
 
         # CA
         openssl req -new -x509 -nodes -days 365 \
-          -newkey rsa:2048 \
+          -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
           -keyout $out/ca.key -out $out/ca.crt \
           -subj "/CN=ForgeCache Test CA"
 
         # GHE server certificate (SAN: DNS:ghe)
-        openssl req -new -nodes -newkey rsa:2048 \
+        openssl req -new -nodes \
+          -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
           -keyout $out/ghe.key -out $out/ghe.csr \
           -subj "/CN=ghe"
         openssl x509 -req -in $out/ghe.csr \
           -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
-          -out $out/ghe.crt -days 365 \
+          -out $out/ghe.crt -days 365 -sha256 \
           -extfile <(printf "subjectAltName=DNS:ghe")
 
         # Proxy server certificate (SAN: DNS:proxy)
-        openssl req -new -nodes -newkey rsa:2048 \
+        openssl req -new -nodes \
+          -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
           -keyout $out/proxy.key -out $out/proxy.csr \
           -subj "/CN=proxy"
         openssl x509 -req -in $out/proxy.csr \
           -CA $out/ca.crt -CAkey $out/ca.key -CAcreateserial \
-          -out $out/proxy.crt -days 365 \
+          -out $out/proxy.crt -days 365 -sha256 \
           -extfile <(printf "subjectAltName=DNS:proxy")
       '';
 
@@ -132,7 +134,7 @@ pkgs.testers.runNixOSTest {
   # ---------------------------------------------------------------------------
   nodes = {
 
-    # ── Mock GitHub Enterprise (Gitea) ─────────────────────────────────
+    # ── Mock GitHub Enterprise (Gitea behind nginx TLS) ─────────────────
     ghe =
       {
         config,
@@ -146,11 +148,27 @@ pkgs.testers.runNixOSTest {
           settings = {
             server = {
               HTTP_PORT = 3000;
-              ROOT_URL = "http://ghe:3000/";
+              ROOT_URL = "https://ghe/";
               DOMAIN = "ghe";
             };
             service = {
               DISABLE_REGISTRATION = false;
+            };
+          };
+        };
+
+        services.nginx = {
+          enable = true;
+          virtualHosts."ghe" = {
+            forceSSL = true;
+            sslCertificate = "${testCerts}/ghe.crt";
+            sslCertificateKey = "${testCerts}/ghe.key";
+            locations."/" = {
+              proxyPass = "http://localhost:3000";
+              extraConfig = ''
+                proxy_buffering off;
+                client_max_body_size 0;
+              '';
             };
           };
         };
@@ -163,7 +181,11 @@ pkgs.testers.runNixOSTest {
           jq
         ];
 
-        networking.firewall.allowedTCPPorts = [ 3000 ];
+        security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
+        networking.firewall.allowedTCPPorts = [
+          443
+          3000
+        ];
         virtualisation.memorySize = 2048;
       };
 
@@ -270,6 +292,10 @@ pkgs.testers.runNixOSTest {
     with subtest("Gitea starts"):
         ghe.wait_for_unit("gitea.service")
         ghe.wait_for_open_port(3000)
+
+    with subtest("GHE nginx starts"):
+        ghe.wait_for_unit("nginx.service")
+        ghe.wait_for_open_port(443)
 
     # ── Seed Gitea with users, repos, and collaborators ──────────────────
     with subtest("Seed Gitea"):
