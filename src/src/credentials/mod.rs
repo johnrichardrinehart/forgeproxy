@@ -6,6 +6,3 @@
 pub mod keyring;
 pub mod ssh_to_https;
 pub mod upstream;
-
-#[allow(unused_imports)]
-pub use upstream::{get_clone_url, get_fetch_env, resolve_credential, CredentialMode};

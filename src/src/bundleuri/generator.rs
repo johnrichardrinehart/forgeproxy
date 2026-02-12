@@ -1,15 +1,15 @@
 //! Bundle generation utilities.
 //!
-//! Produces full, incremental, and filtered Git bundles from bare repositories
-//! using the `git bundle create` command. Bundles are written to temporary
-//! files via the `tempfile` crate so that partially-written artifacts never
-//! appear in the final storage path.
+//! Produces full and incremental Git bundles from bare repositories using the
+//! `git bundle create` command. Bundles are written to temporary files via the
+//! `tempfile` crate so that partially-written artifacts never appear in the
+//! final storage path.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use crate::git::commands;
 
@@ -26,8 +26,6 @@ pub struct BundleResult {
     pub creation_token: u64,
     /// Size of the bundle file in bytes.
     pub size_bytes: u64,
-    /// Number of refs included in the bundle.
-    pub ref_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +113,6 @@ pub async fn generate_incremental_bundle(
         bundle_path,
         creation_token,
         size_bytes: metadata.len(),
-        ref_count: new_refs.len(),
     })
 }
 
@@ -157,71 +154,6 @@ pub async fn generate_full_bundle(
         bundle_path,
         creation_token,
         size_bytes: metadata.len(),
-        ref_count: current_refs.len(),
-    })
-}
-
-/// Generate a filtered bundle (e.g. `blob:none` for blobless clones).
-///
-/// This is a placeholder for future use; the `filter` string is passed
-/// directly to `git bundle create --filter=<filter>`.
-#[instrument(fields(%owner_repo, %filter))]
-pub async fn generate_filtered_bundle(
-    repo_path: &Path,
-    owner_repo: &str,
-    filter: &str,
-) -> Result<BundleResult> {
-    let current_refs = get_refs(repo_path).await?;
-
-    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for bundle")?;
-    let bundle_path = tmp_dir
-        .path()
-        .join(format!("{}.filtered.bundle", owner_repo.replace('/', "_")));
-
-    info!(
-        owner_repo,
-        filter,
-        refs = current_refs.len(),
-        "creating filtered bundle"
-    );
-
-    // Build a custom command to include the --filter flag.
-    let status = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_path)
-        .arg("bundle")
-        .arg("create")
-        .arg(&bundle_path)
-        .arg("--all")
-        .arg(format!("--filter={filter}"))
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .status()
-        .await
-        .context("failed to spawn git bundle create")?;
-
-    if !status.success() {
-        anyhow::bail!(
-            "git bundle create --filter={filter} exited with status {status} for {owner_repo}"
-        );
-    }
-
-    let metadata = tokio::fs::metadata(&bundle_path)
-        .await
-        .context("failed to stat filtered bundle file")?;
-
-    // Filtered bundles currently get a token of 0; the caller is responsible
-    // for assigning a real token if needed.
-    warn!(
-        owner_repo,
-        "filtered bundle generated with placeholder creation_token=0"
-    );
-
-    Ok(BundleResult {
-        bundle_path,
-        creation_token: 0,
-        size_bytes: metadata.len(),
-        ref_count: current_refs.len(),
     })
 }
 

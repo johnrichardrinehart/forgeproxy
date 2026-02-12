@@ -57,15 +57,6 @@ pub async fn release_lock(pool: &fred::clients::Pool, key: &str, node_id: &str) 
     Ok(())
 }
 
-/// Extend the TTL of an existing lock.
-///
-/// Returns `true` if the key exists and its expiry was updated.
-pub async fn extend_lock(pool: &fred::clients::Pool, key: &str, ttl_secs: u64) -> Result<bool> {
-    let result: bool = pool.expire(key, ttl_secs as i64, None).await?;
-    debug!(%key, ttl_secs, extended = result, "extend_lock");
-    Ok(result)
-}
-
 /// Wait until the lock identified by `key` is released or `timeout` elapses.
 ///
 /// The function polls at a short interval and also subscribes to the

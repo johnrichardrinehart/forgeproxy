@@ -10,18 +10,3 @@ pub mod node;
 pub mod pubsub;
 pub mod redis;
 pub mod registry;
-
-#[allow(unused_imports)]
-pub use locks::{acquire_lock, extend_lock, release_lock, wait_for_lock};
-#[allow(unused_imports)]
-pub use node::{deregister_node, list_active_nodes, node_id, run_heartbeat};
-#[allow(unused_imports)]
-pub use pubsub::{publish_ready, subscribe_ready};
-#[allow(unused_imports)]
-pub use redis::create_keydb_pool;
-#[allow(unused_imports)]
-pub use registry::{
-    deregister_node_for_repo, ensure_repo_cloned, get_fetch_schedule, get_repo_info,
-    increment_clone_count, is_repo_cached_and_fresh, list_all_repos, register_node_for_repo,
-    set_fetch_schedule, set_repo_info, update_repo_field, FetchSchedule, RepoInfo,
-};

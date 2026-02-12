@@ -1,15 +1,11 @@
 use std::sync::Arc;
 
-use prometheus_client::encoding::text::encode;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
 use prometheus_client::registry::Registry;
-
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
 
 // ---------------------------------------------------------------------------
 // Label types
@@ -231,39 +227,6 @@ impl MetricsRegistry {
         Self {
             registry: Arc::new(registry),
             metrics: Arc::new(metrics),
-        }
-    }
-}
-
-impl Default for MetricsRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Axum handler
-// ---------------------------------------------------------------------------
-
-/// Axum handler that encodes the Prometheus registry into the OpenMetrics text
-/// format and returns it with the correct content-type.
-pub async fn metrics_handler(
-    axum::extract::State(mr): axum::extract::State<MetricsRegistry>,
-) -> impl IntoResponse {
-    let mut buf = String::new();
-    match encode(&mut buf, &mr.registry) {
-        Ok(()) => (
-            StatusCode::OK,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "application/openmetrics-text; version=1.0.0; charset=utf-8",
-            )],
-            buf,
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "failed to encode metrics");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
