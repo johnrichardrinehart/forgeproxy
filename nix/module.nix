@@ -73,7 +73,10 @@ in
         RUST_LOG = cfg.logLevel;
       };
 
-      path = [ pkgs.keyutils ];
+      path = [
+        pkgs.git
+        pkgs.keyutils
+      ];
 
       serviceConfig = {
         Type = "simple";

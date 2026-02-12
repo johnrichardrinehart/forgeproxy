@@ -62,7 +62,7 @@ pub async fn proxy_upload_pack_to_ghe(
 // ---------------------------------------------------------------------------
 
 /// Split an `owner/repo` slug into its two components.
-fn split_owner_repo(slug: &str) -> Result<(&str, &str)> {
+pub(crate) fn split_owner_repo(slug: &str) -> Result<(&str, &str)> {
     let mut parts = slug.splitn(2, '/');
     let owner = parts.next().context("missing owner in repo slug")?;
     let repo = parts.next().context("missing repo in repo slug")?;
