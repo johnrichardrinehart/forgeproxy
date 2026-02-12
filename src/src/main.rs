@@ -56,6 +56,8 @@ pub struct AppState {
     pub node_id: String,
     /// Forge-specific API backend (GitHub, GitLab, Gitea, etc.).
     pub forge: Arc<dyn forge::ForgeBackend>,
+    /// Upstream API rate-limit state shared across all callers.
+    pub rate_limit: forge::rate_limit::RateLimitState,
     /// Semaphore limiting concurrent full clones against upstream.
     pub clone_semaphore: Arc<Semaphore>,
     /// Semaphore limiting concurrent fetches against upstream.
@@ -269,6 +271,9 @@ async fn main() -> Result<()> {
     let forge: Arc<dyn forge::ForgeBackend> = Arc::from(forge::build_backend(&config));
     tracing::info!(backend = ?config.backend_type, "forge backend initialised");
 
+    // ---- Rate limit state ----
+    let rate_limit = forge::rate_limit::RateLimitState::new();
+
     // ---- App state ----
     let state = AppState {
         config: Arc::clone(&config),
@@ -279,6 +284,7 @@ async fn main() -> Result<()> {
         cache_manager,
         node_id,
         forge,
+        rate_limit,
         clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_clones)),
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
     };

@@ -89,6 +89,17 @@ async fn handle_info_refs(
     crate::auth::http_validator::validate_http_auth(&state, &auth_header, &owner, &repo)
         .await
         .map_err(|e| {
+            // If rate-limited, return 503 with Retry-After.
+            let remaining = state.rate_limit.remaining();
+            if remaining < state.config.upstream.api_rate_limit_buffer as u64
+                && remaining != u64::MAX
+            {
+                let retry = state.rate_limit.retry_after_secs();
+                warn!(error = %e, retry_after = retry, "auth failed due to rate limiting");
+                return AppError::RateLimited {
+                    retry_after_secs: retry,
+                };
+            }
             warn!(error = %e, "auth validation failed");
             AppError::Unauthorized(e.to_string())
         })?;
@@ -432,6 +443,8 @@ async fn proxy_upload_pack_to_ghe(
 pub enum AppError {
     /// The caller is not authenticated or not authorised.
     Unauthorized(String),
+    /// Upstream rate limit reached — include `Retry-After` header.
+    RateLimited { retry_after_secs: u64 },
     /// An unexpected internal error.
     Internal(anyhow::Error),
 }
@@ -443,6 +456,15 @@ impl IntoResponse for AppError {
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Basic realm=\"forgecache\"")],
                 msg,
+            )
+                .into_response(),
+            AppError::RateLimited { retry_after_secs } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(
+                    "Retry-After",
+                    retry_after_secs.to_string().as_str().to_owned(),
+                )],
+                "Upstream API rate limit reached. Please retry later.\n",
             )
                 .into_response(),
             AppError::Internal(err) => {

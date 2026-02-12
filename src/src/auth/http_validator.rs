@@ -47,13 +47,25 @@ pub async fn validate_http_auth(
         bail!("access denied for {owner}/{repo} (cached)");
     }
 
-    // 3. Delegate to the forge backend.
+    // 3. Self-throttle if approaching the upstream rate limit.
+    state
+        .rate_limit
+        .wait_if_needed(state.config.upstream.api_rate_limit_buffer)
+        .await;
+
+    // 4. Delegate to the forge backend.
     let perm = state
         .forge
-        .validate_http_auth(&state.http_client, auth_header, owner, repo)
+        .validate_http_auth(
+            &state.http_client,
+            auth_header,
+            owner,
+            repo,
+            &state.rate_limit,
+        )
         .await?;
 
-    // 4. Cache the result.
+    // 5. Cache the result.
     let ttl = if perm.has_read() {
         state.config.auth.http_cache_ttl
     } else {
@@ -64,7 +76,7 @@ pub async fn validate_http_auth(
         .await
         .ok();
 
-    // 5. Decide.
+    // 6. Decide.
     if perm.has_read() {
         debug!(%owner, %repo, permission = perm_str, "http auth validated (allowed)");
         Ok(())
