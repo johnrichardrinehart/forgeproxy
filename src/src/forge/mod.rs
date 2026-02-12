@@ -78,6 +78,72 @@ pub trait ForgeBackend: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Shared helpers (GitHub & Gitea use the same JSON schemas)
+// ---------------------------------------------------------------------------
+
+/// Extract the highest permission from a `{admin, push, pull}` booleans
+/// object — the format used by both GitHub and Gitea/Forgejo.
+pub(crate) fn extract_permission(body: &serde_json::Value) -> Permission {
+    let perms = match body.get("permissions") {
+        Some(p) => p,
+        None => return Permission::None,
+    };
+
+    if perms
+        .get("admin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        Permission::Admin
+    } else if perms.get("push").and_then(|v| v.as_bool()).unwrap_or(false) {
+        Permission::Write
+    } else if perms.get("pull").and_then(|v| v.as_bool()).unwrap_or(false) {
+        Permission::Read
+    } else {
+        Permission::None
+    }
+}
+
+/// Parse webhook payloads that follow the GitHub/Gitea event schema
+/// (`membership`, `team`, `organization`, `repository`).
+pub(crate) fn parse_webhook_payload_github_style(
+    event_type: &str,
+    payload: &serde_json::Value,
+) -> WebhookEvent {
+    match event_type {
+        "membership" | "team" | "organization" => {
+            let org = payload
+                .get("organization")
+                .and_then(|o| o.get("login"))
+                .and_then(|l| l.as_str())
+                .unwrap_or("");
+            if org.is_empty() {
+                WebhookEvent::NoAction
+            } else {
+                WebhookEvent::OrgChange {
+                    org: org.to_string(),
+                }
+            }
+        }
+        "repository" => {
+            let full_name = payload
+                .get("repository")
+                .and_then(|r| r.get("full_name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            if full_name.is_empty() {
+                WebhookEvent::NoAction
+            } else {
+                WebhookEvent::RepoChange {
+                    repo_full_name: full_name.to_string(),
+                }
+            }
+        }
+        _ => WebhookEvent::NoAction,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 

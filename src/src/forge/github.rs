@@ -72,7 +72,7 @@ impl ForgeBackend for GitHubBackend {
             .await
             .context("failed to parse upstream API response")?;
 
-        Ok(extract_permission(&body))
+        Ok(super::extract_permission(&body))
     }
 
     async fn resolve_ssh_user(
@@ -186,66 +186,13 @@ impl ForgeBackend for GitHubBackend {
     }
 
     fn parse_webhook_payload(&self, event_type: &str, payload: &serde_json::Value) -> WebhookEvent {
-        match event_type {
-            "membership" | "team" | "organization" => {
-                let org = payload
-                    .get("organization")
-                    .and_then(|o| o.get("login"))
-                    .and_then(|l| l.as_str())
-                    .unwrap_or("");
-                if org.is_empty() {
-                    WebhookEvent::NoAction
-                } else {
-                    WebhookEvent::OrgChange {
-                        org: org.to_string(),
-                    }
-                }
-            }
-            "repository" => {
-                let full_name = payload
-                    .get("repository")
-                    .and_then(|r| r.get("full_name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                if full_name.is_empty() {
-                    WebhookEvent::NoAction
-                } else {
-                    WebhookEvent::RepoChange {
-                        repo_full_name: full_name.to_string(),
-                    }
-                }
-            }
-            _ => WebhookEvent::NoAction,
-        }
+        super::parse_webhook_payload_github_style(event_type, payload)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Extract the highest permission from the GitHub repo response `permissions`
-/// object (`{admin, push, pull}` booleans).
-fn extract_permission(body: &serde_json::Value) -> Permission {
-    let perms = match body.get("permissions") {
-        Some(p) => p,
-        None => return Permission::None,
-    };
-
-    if perms
-        .get("admin")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        Permission::Admin
-    } else if perms.get("push").and_then(|v| v.as_bool()).unwrap_or(false) {
-        Permission::Write
-    } else if perms.get("pull").and_then(|v| v.as_bool()).unwrap_or(false) {
-        Permission::Read
-    } else {
-        Permission::None
-    }
-}
 
 /// Extract the SSH user login from the GitHub admin API response array.
 fn extract_ssh_user_login(body: &serde_json::Value) -> Option<String> {
@@ -272,7 +219,7 @@ mod tests {
         let body = serde_json::json!({
             "permissions": {"admin": true, "push": true, "pull": true}
         });
-        assert_eq!(extract_permission(&body), Permission::Admin);
+        assert_eq!(crate::forge::extract_permission(&body), Permission::Admin);
     }
 
     #[test]
@@ -280,7 +227,7 @@ mod tests {
         let body = serde_json::json!({
             "permissions": {"admin": false, "push": true, "pull": true}
         });
-        assert_eq!(extract_permission(&body), Permission::Write);
+        assert_eq!(crate::forge::extract_permission(&body), Permission::Write);
     }
 
     #[test]
@@ -288,7 +235,7 @@ mod tests {
         let body = serde_json::json!({
             "permissions": {"admin": false, "push": false, "pull": true}
         });
-        assert_eq!(extract_permission(&body), Permission::Read);
+        assert_eq!(crate::forge::extract_permission(&body), Permission::Read);
     }
 
     #[test]
@@ -296,13 +243,13 @@ mod tests {
         let body = serde_json::json!({
             "permissions": {"admin": false, "push": false, "pull": false}
         });
-        assert_eq!(extract_permission(&body), Permission::None);
+        assert_eq!(crate::forge::extract_permission(&body), Permission::None);
     }
 
     #[test]
     fn extract_permission_missing_permissions_key() {
         let body = serde_json::json!({"id": 1});
-        assert_eq!(extract_permission(&body), Permission::None);
+        assert_eq!(crate::forge::extract_permission(&body), Permission::None);
     }
 
     // ── SSH user extraction ─────────────────────────────────────────────
