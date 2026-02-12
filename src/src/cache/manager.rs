@@ -11,10 +11,10 @@ use anyhow::{Context, Result};
 use fred::interfaces::HashesInterface;
 use tracing::{debug, info, warn};
 
-use crate::config::LocalStorageConfig;
+use crate::config::{EvictionPolicy, LocalStorageConfig};
 use crate::AppState;
 
-use super::lfu;
+use super::{lfu, lru};
 
 // ---------------------------------------------------------------------------
 // CacheManager
@@ -31,8 +31,8 @@ pub struct CacheManager {
     pub high_water: f64,
     /// Eviction stops when usage fraction drops to or below this value.
     pub low_water: f64,
-    /// Name of the active eviction policy (informational).
-    pub eviction_policy: String,
+    /// Active eviction policy.
+    pub eviction_policy: EvictionPolicy,
 }
 
 impl CacheManager {
@@ -43,7 +43,7 @@ impl CacheManager {
             max_bytes: config.max_bytes,
             high_water: config.high_water_mark,
             low_water: config.low_water_mark,
-            eviction_policy: format!("{:?}", config.eviction_policy).to_lowercase(),
+            eviction_policy: config.eviction_policy,
         }
     }
 
@@ -104,8 +104,15 @@ impl CacheManager {
             return Ok(0);
         }
 
-        // Ask LFU for candidates ordered by ascending clone count.
-        let candidates = lfu::get_eviction_candidates(&state.keydb, &repos, repos.len()).await?;
+        // Select candidates using the configured eviction policy.
+        let candidates = match self.eviction_policy {
+            EvictionPolicy::Lfu => {
+                lfu::get_eviction_candidates(&state.keydb, &repos, repos.len()).await?
+            }
+            EvictionPolicy::Lru => {
+                lru::get_eviction_candidates(&state.keydb, &repos, repos.len()).await?
+            }
+        };
 
         let mut evicted: usize = 0;
 
@@ -271,7 +278,7 @@ mod tests {
             max_bytes: 100_000_000_000,
             high_water: 0.90,
             low_water: 0.75,
-            eviction_policy: "lfu".to_string(),
+            eviction_policy: EvictionPolicy::Lfu,
         };
 
         let path = mgr.repo_path("acme-corp/my-service");
@@ -288,7 +295,7 @@ mod tests {
             max_bytes: 100_000_000_000,
             high_water: 0.90,
             low_water: 0.75,
-            eviction_policy: "lfu".to_string(),
+            eviction_policy: EvictionPolicy::Lfu,
         };
 
         // With and without .git should resolve to the same path.
