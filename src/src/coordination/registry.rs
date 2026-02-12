@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use fred::interfaces::{ClientLike, HashesInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
@@ -43,11 +44,15 @@ pub struct FetchSchedule {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn repo_key(owner_repo: &str) -> String {
-    format!("forgecache:repo:{owner_repo}")
+    // Normalize: strip trailing ".git" so that "owner/repo" and
+    // "owner/repo.git" map to the same KeyDB key.
+    let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+    format!("forgecache:repo:{normalized}")
 }
 
 fn fetch_schedule_key(owner_repo: &str) -> String {
-    format!("forgecache:repo:{owner_repo}:fetch_schedule")
+    let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+    format!("forgecache:repo:{normalized}:fetch_schedule")
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +261,10 @@ pub async fn ensure_repo_cloned(
     repo: &str,
     auth_header: &str,
 ) -> Result<()> {
-    let owner_repo = format!("{owner}/{repo}");
+    // Strip trailing ".git" from repo if present to avoid double-suffixing
+    // (the URL path extractor preserves it, and we append ".git" below).
+    let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
+    let owner_repo = format!("{owner}/{repo_clean}");
     let lock_key = format!("forgecache:lock:clone:{owner_repo}");
     let node_id = crate::coordination::node::node_id();
 
@@ -281,16 +289,29 @@ pub async fn ensure_repo_cloned(
         let repo_path = state.cache_manager.ensure_repo_dir(&owner_repo)?;
 
         // Build the GHE clone URL with embedded credentials.
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .or_else(|| auth_header.strip_prefix("token "))
-            .or_else(|| auth_header.strip_prefix("Basic "))
-            .unwrap_or(auth_header);
-
-        let clone_url = format!(
-            "https://x-access-token:{token}@{}/{owner}/{repo}.git",
-            state.config.upstream.hostname,
-        );
+        // For Basic auth, decode the base64 to recover "user:pass" and embed
+        // directly in the URL.  For Bearer/token auth, use the x-access-token
+        // format understood by GitHub/Gitea.
+        let clone_url = if let Some(b64) = auth_header.strip_prefix("Basic ") {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_default();
+            format!(
+                "https://{decoded}@{}/{owner}/{repo_clean}.git",
+                state.config.upstream.hostname,
+            )
+        } else {
+            let token = auth_header
+                .strip_prefix("Bearer ")
+                .or_else(|| auth_header.strip_prefix("token "))
+                .unwrap_or(auth_header);
+            format!(
+                "https://x-access-token:{token}@{}/{owner}/{repo_clean}.git",
+                state.config.upstream.hostname,
+            )
+        };
 
         // Acquire the clone semaphore to respect concurrency limits.
         let _permit = state

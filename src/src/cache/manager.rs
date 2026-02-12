@@ -53,12 +53,13 @@ impl CacheManager {
     pub fn repo_path(&self, owner_repo: &str) -> PathBuf {
         let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
         if parts.len() == 2 {
-            self.base_path
-                .join(parts[0])
-                .join(format!("{}.git", parts[1]))
+            // Strip trailing ".git" before appending it, so callers can pass
+            // either "owner/repo" or "owner/repo.git" and get the same path.
+            let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+            self.base_path.join(parts[0]).join(format!("{repo}.git"))
         } else {
-            // Fallback: treat the whole string as a single component.
-            self.base_path.join(format!("{}.git", owner_repo))
+            let name = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+            self.base_path.join(format!("{name}.git"))
         }
     }
 
@@ -276,6 +277,26 @@ mod tests {
         let path = mgr.repo_path("acme-corp/my-service");
         assert_eq!(
             path,
+            PathBuf::from("/var/cache/forgecache/repos/acme-corp/my-service.git")
+        );
+    }
+
+    #[test]
+    fn repo_path_normalizes_git_suffix() {
+        let mgr = CacheManager {
+            base_path: PathBuf::from("/var/cache/forgecache/repos"),
+            max_bytes: 100_000_000_000,
+            high_water: 0.90,
+            low_water: 0.75,
+            eviction_policy: "lfu".to_string(),
+        };
+
+        // With and without .git should resolve to the same path.
+        let without = mgr.repo_path("acme-corp/my-service");
+        let with = mgr.repo_path("acme-corp/my-service.git");
+        assert_eq!(without, with);
+        assert_eq!(
+            without,
             PathBuf::from("/var/cache/forgecache/repos/acme-corp/my-service.git")
         );
     }
