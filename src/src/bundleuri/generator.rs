@@ -157,6 +157,44 @@ pub async fn generate_full_bundle(
     })
 }
 
+/// Generate a filtered (blobless) bundle of all refs.
+///
+/// Uses `git bundle create --filter=blob:none` which requires Git 2.40+.
+/// On failure (e.g., Git version too old), logs a warning and returns the
+/// error without panicking.
+#[instrument(skip(state), fields(%owner_repo))]
+pub async fn generate_filtered_bundle(
+    state: &crate::AppState,
+    repo_path: &Path,
+    owner_repo: &str,
+) -> Result<BundleResult> {
+    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for filtered bundle")?;
+    let bundle_path = tmp_dir
+        .path()
+        .join(format!("{}.filtered.bundle", owner_repo.replace('/', "_")));
+
+    info!(owner_repo, "creating filtered (blob:none) bundle");
+
+    commands::git_bundle_create_filtered(repo_path, &bundle_path, "blob:none")
+        .await
+        .with_context(|| format!("filtered bundle create failed for {owner_repo}"))?;
+
+    let metadata = tokio::fs::metadata(&bundle_path)
+        .await
+        .context("failed to stat filtered bundle file")?;
+
+    let creation_token =
+        crate::bundleuri::creation_token::next_creation_token(state, owner_repo).await?;
+
+    state.metrics.metrics.bundle_generation_total.inc();
+
+    Ok(BundleResult {
+        bundle_path,
+        creation_token,
+        size_bytes: metadata.len(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
