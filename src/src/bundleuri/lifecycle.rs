@@ -130,8 +130,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     // 5. Perform the fetch.
     info!(repo = %owner_repo, "starting background fetch for bundle generation");
 
-    let cache_manager = crate::cache::CacheManager::new(&state.config.storage.local);
-    let repo_path = cache_manager.repo_path(owner_repo);
+    let repo_path = state.cache_manager.repo_path(owner_repo);
 
     let fetch_result = if repo_path.exists() && repo_path.join("HEAD").is_file() {
         // Repo is locally cached -- do an incremental fetch.
@@ -409,8 +408,7 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
             }
         }
 
-        let cache_manager = crate::cache::CacheManager::new(&state.config.storage.local);
-        let repo_path = cache_manager.repo_path(owner_repo);
+        let repo_path = state.cache_manager.repo_path(owner_repo);
 
         if !repo_path.exists() || !repo_path.join("HEAD").is_file() {
             debug!(repo = %owner_repo, "repo not locally cached; skipping daily consolidation");
@@ -517,8 +515,7 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
             }
         }
 
-        let cache_manager = crate::cache::CacheManager::new(&state.config.storage.local);
-        let repo_path = cache_manager.repo_path(owner_repo);
+        let repo_path = state.cache_manager.repo_path(owner_repo);
 
         if !repo_path.exists() || !repo_path.join("HEAD").is_file() {
             continue;
