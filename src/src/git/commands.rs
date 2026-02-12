@@ -235,6 +235,50 @@ pub async fn git_bundle_create(
     Ok(())
 }
 
+/// Run `git bundle create --filter=<filter> <output> --all` inside a bare repo.
+///
+/// This generates a "filtered" bundle (e.g. `blob:none` for blobless clones).
+/// Requires Git 2.40+.  Returns an error if the `--filter` flag is not
+/// supported by the installed Git version.
+#[instrument(fields(repo = %repo_path.display(), output = %output.display(), %filter))]
+pub async fn git_bundle_create_filtered(
+    repo_path: &Path,
+    output: &Path,
+    filter: &str,
+) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("bundle")
+        .arg("create")
+        .arg(format!("--filter={filter}"))
+        .arg(output)
+        .arg("--all");
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git bundle create --filter");
+
+    let output_result = cmd
+        .output()
+        .await
+        .context("failed to spawn git bundle create --filter")?;
+
+    if !output_result.status.success() {
+        let stderr = String::from_utf8_lossy(&output_result.stderr);
+        bail!(
+            "git bundle create --filter failed (status {}): {}",
+            output_result.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git bundle create --filter succeeded");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // for-each-ref
 // ---------------------------------------------------------------------------
