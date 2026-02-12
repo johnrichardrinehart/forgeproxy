@@ -9,6 +9,7 @@ mod cache;
 mod config;
 mod coordination;
 mod credentials;
+mod forge;
 mod git;
 mod health;
 mod http;
@@ -58,9 +59,11 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub cache_manager: cache::CacheManager,
     pub node_id: String,
-    /// Semaphore limiting concurrent full clones against GHE.
+    /// Forge-specific API backend (GitHub, GitLab, Gitea, etc.).
+    pub forge: Arc<dyn forge::ForgeBackend>,
+    /// Semaphore limiting concurrent full clones against upstream.
     pub clone_semaphore: Arc<Semaphore>,
-    /// Semaphore limiting concurrent fetches against GHE.
+    /// Semaphore limiting concurrent fetches against upstream.
     pub fetch_semaphore: Arc<Semaphore>,
 }
 
@@ -267,6 +270,10 @@ async fn main() -> Result<()> {
     let node_id = coordination::node::node_id();
     tracing::info!(%node_id, "node identity established");
 
+    // ---- Forge backend ----
+    let forge: Arc<dyn forge::ForgeBackend> = Arc::from(forge::build_backend(&config));
+    tracing::info!(backend = ?config.backend_type, "forge backend initialised");
+
     // ---- App state ----
     let state = AppState {
         config: Arc::clone(&config),
@@ -276,6 +283,7 @@ async fn main() -> Result<()> {
         http_client,
         cache_manager,
         node_id,
+        forge,
         clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_clones)),
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
     };
