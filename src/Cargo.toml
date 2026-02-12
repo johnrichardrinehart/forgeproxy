@@ -75,3 +75,4 @@ clap = { version = "4", features = ["derive"] }
 hmac = "0.12"
 subtle = "2"
 gethostname = "0.5"
+zstd = "0.13"
