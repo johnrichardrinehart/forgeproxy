@@ -130,8 +130,9 @@ impl Handler for SshSession {
     /// Authenticate a client by public key.
     ///
     /// We compute the key fingerprint and attempt to resolve the user through
-    /// the GHE admin SSH keys API (with a KeyDB cache layer).  If resolution
-    /// succeeds we accept; otherwise we reject.
+    /// the upstream admin SSH keys API (delegated to [`ssh_resolver`] which
+    /// handles the KeyDB cache layer).  If resolution succeeds we accept;
+    /// otherwise we reject.
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         let fp = fingerprint_of(key);
         info!(
@@ -141,137 +142,48 @@ impl Handler for SshSession {
             "SSH public-key auth attempt"
         );
 
-        // Attempt to resolve the fingerprint to a GHE user via the admin API.
-        // We use the GHE API endpoint: GET /api/v3/admin/ssh-keys/{fingerprint}
-        // For now we accept if the upstream returns a valid user, and cache
-        // the result in KeyDB.
-        let cache_key = format!("forgecache:ssh_auth:{fp}");
-        let cached_user: Option<String> = {
-            use fred::interfaces::HashesInterface;
-            let result: Option<String> =
-                HashesInterface::hget(&self.state.keydb, &cache_key, "username")
-                    .await
-                    .unwrap_or(None);
-            result
-        };
+        // Quick cache check for metrics tracking (hit/miss counters).
+        let cache_key = format!("forgecache:ssh:auth:{fp}");
+        let is_cached = crate::auth::cache::get_cached_auth(&self.state.keydb, &cache_key)
+            .await
+            .unwrap_or(None)
+            .is_some();
 
-        if let Some(ref resolved) = cached_user {
-            debug!(fingerprint = %fp, username = %resolved, "SSH auth cache hit");
-            self.fingerprint = Some(fp);
-            self.username = Some(resolved.to_string());
+        if is_cached {
             self.state.metrics.metrics.auth_cache_hits.inc();
-            return Ok(Auth::Accept);
+        } else {
+            self.state.metrics.metrics.auth_cache_misses.inc();
         }
 
-        self.state.metrics.metrics.auth_cache_misses.inc();
-
-        // Call GHE admin API to look up the SSH key fingerprint.
-        // The fingerprint needs to have the "SHA256:" prefix stripped for the URL.
-        let fp_query = fp.strip_prefix("SHA256:").unwrap_or(&fp);
-        let api_url = format!(
-            "{}/admin/keys?fingerprint={}",
-            self.state.config.upstream.api_url, fp_query,
-        );
-
-        let admin_token =
-            std::env::var(&self.state.config.upstream.admin_token_env).unwrap_or_default();
-
-        let response = self
-            .state
-            .http_client
-            .get(&api_url)
-            .header("Authorization", format!("token {admin_token}"))
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await;
-
-        match response {
-            Ok(resp) if resp.status().is_success() => {
-                // Parse the response to extract the user login.
-                let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-
-                // The response is an array of key objects; each has a "user" with "login".
-                let resolved_user = body
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|obj| obj.get("user"))
-                    .and_then(|u| u.get("login"))
-                    .and_then(|l| l.as_str())
-                    .map(|s| s.to_string());
-
-                if let Some(ref username) = resolved_user {
-                    info!(
-                        fingerprint = %fp,
-                        username = %username,
-                        "SSH key resolved via GHE API"
-                    );
-
-                    // Cache the positive result.
-                    let ttl = self.state.config.auth.ssh_cache_ttl;
-                    {
-                        use fred::interfaces::HashesInterface;
-                        use fred::interfaces::KeysInterface;
-                        let _ = HashesInterface::hset::<(), _, _>(
-                            &self.state.keydb,
-                            &cache_key,
-                            [("username", username.as_str())],
-                        )
-                        .await;
-                        let _ = KeysInterface::expire::<bool, _>(
-                            &self.state.keydb,
-                            &cache_key,
-                            ttl as i64,
-                            None,
-                        )
-                        .await;
-                    }
-
-                    self.fingerprint = Some(fp);
-                    self.username = Some(username.clone());
-                    return Ok(Auth::Accept);
-                }
-
-                warn!(fingerprint = %fp, "SSH key not associated with any GHE user");
-            }
-            Ok(resp) => {
-                warn!(
+        // Delegate to ssh_resolver which handles cache + forge API.
+        match crate::auth::ssh_resolver::resolve_user_by_fingerprint(&self.state, &fp).await {
+            Ok(Some(username)) => {
+                info!(
                     fingerprint = %fp,
-                    status = %resp.status(),
-                    "GHE admin key lookup returned non-success"
+                    username = %username,
+                    "SSH key resolved"
                 );
+                self.fingerprint = Some(fp);
+                self.username = Some(username);
+                Ok(Auth::Accept)
+            }
+            Ok(None) => {
+                warn!(fingerprint = %fp, "SSH key not associated with any upstream user");
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                })
             }
             Err(e) => {
                 error!(
                     fingerprint = %fp,
                     error = %e,
-                    "failed to reach GHE API for SSH key lookup"
+                    "failed to resolve SSH key"
                 );
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                })
             }
         }
-
-        // Cache negative result with shorter TTL.
-        {
-            use fred::interfaces::HashesInterface;
-            use fred::interfaces::KeysInterface;
-            let neg_ttl = self.state.config.auth.negative_cache_ttl;
-            let _ = HashesInterface::hset::<(), _, _>(
-                &self.state.keydb,
-                &cache_key,
-                [("username", "__rejected__")],
-            )
-            .await;
-            let _ = KeysInterface::expire::<bool, _>(
-                &self.state.keydb,
-                &cache_key,
-                neg_ttl as i64,
-                None,
-            )
-            .await;
-        }
-
-        Ok(Auth::Reject {
-            proceed_with_methods: None,
-        })
     }
 
     /// Accept new channel-open requests for sessions.
