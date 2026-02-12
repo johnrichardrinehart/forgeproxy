@@ -336,12 +336,29 @@ fn effective_interval(state: &AppState, owner_repo: &str, schedule_secs: u64) ->
     schedule_secs
 }
 
+/// Compute an Exponential Moving Average (EMA) value.
+///
+/// `alpha` is the smoothing factor (0.0 .. 1.0).  When `prev_avg` is 0 the
+/// raw `latest` value is returned (seeding the EMA).
+fn compute_ema(latest: f64, prev_avg: f64, alpha: f64) -> f64 {
+    if prev_avg == 0.0 {
+        latest
+    } else {
+        alpha * latest + (1.0 - alpha) * prev_avg
+    }
+}
+
 /// Update the dynamic fetch schedule for a repo based on observed delta size.
 ///
-/// - If the delta exceeds the configured threshold, the interval is reset to
-///   the default (aggressive) value.
-/// - If the delta is below the threshold, the interval is multiplied by the
-///   backoff factor, up to `max_interval`.
+/// Uses an Exponential Moving Average (EMA) over the configured
+/// `rolling_window` to smooth out delta observations before comparing against
+/// the threshold.  This prevents a single large/small fetch from whipsawing
+/// the interval.
+///
+/// - If the smoothed delta exceeds the configured threshold, the interval is
+///   reset to the default (aggressive) value.
+/// - If the smoothed delta is below the threshold, the interval is multiplied
+///   by the backoff factor, up to `max_interval`.
 ///
 /// Returns the new interval duration.
 pub async fn update_fetch_schedule(
@@ -357,38 +374,51 @@ pub async fn update_fetch_schedule(
     let default_interval = state.config.fetch_schedule.default_interval;
     let backoff_factor = state.config.fetch_schedule.backoff_factor;
     let max_interval_cfg = state.config.fetch_schedule.max_interval;
+    let rolling_window = state.config.fetch_schedule.rolling_window;
 
-    let new_interval = if delta_bytes >= delta_threshold_cfg {
+    // Compute EMA of the delta bytes using the rolling window.
+    let effective_interval = if current.current_interval == 0 {
+        default_interval
+    } else {
+        current.current_interval
+    };
+
+    let alpha = if rolling_window == 0 {
+        1.0
+    } else {
+        (effective_interval as f64 / rolling_window as f64).min(1.0)
+    };
+
+    let smoothed_delta = compute_ema(delta_bytes as f64, current.rolling_avg_delta as f64, alpha);
+
+    let new_interval = if smoothed_delta >= delta_threshold_cfg as f64 {
         // Significant activity -- reset to the default (short) interval.
         debug!(
             repo = %owner_repo,
-            delta_bytes = delta_bytes,
+            delta_bytes,
+            smoothed_delta = smoothed_delta as u64,
             new_interval_secs = default_interval,
-            "large delta detected; resetting fetch interval to default"
+            "large smoothed delta; resetting fetch interval to default"
         );
         default_interval
     } else {
         // Quiet repo -- back off.
-        let current_interval = if current.current_interval == 0 {
-            default_interval
-        } else {
-            current.current_interval
-        };
-        let backed_off = (current_interval as f64 * backoff_factor) as u64;
+        let backed_off = (effective_interval as f64 * backoff_factor) as u64;
         let clamped = backed_off.min(max_interval_cfg);
         debug!(
             repo = %owner_repo,
-            delta_bytes = delta_bytes,
-            previous_interval = current_interval,
+            delta_bytes,
+            smoothed_delta = smoothed_delta as u64,
+            previous_interval = effective_interval,
             new_interval = clamped,
-            "small delta; backing off fetch interval"
+            "small smoothed delta; backing off fetch interval"
         );
         clamped
     };
 
     let new_schedule = crate::coordination::registry::FetchSchedule {
         current_interval: new_interval,
-        rolling_avg_delta: current.rolling_avg_delta,
+        rolling_avg_delta: smoothed_delta as u64,
         delta_threshold: current.delta_threshold,
         max_interval: current.max_interval,
         last_delta_bytes: delta_bytes,
@@ -640,4 +670,40 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
 
     info!("weekly bundle consolidation complete");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ema_seeds_from_zero() {
+        // When prev_avg is 0, EMA returns the raw value.
+        assert_eq!(compute_ema(100.0, 0.0, 0.5), 100.0);
+    }
+
+    #[test]
+    fn ema_blends_values() {
+        // alpha=0.5: 0.5*200 + 0.5*100 = 150
+        let result = compute_ema(200.0, 100.0, 0.5);
+        assert!((result - 150.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ema_alpha_one_returns_latest() {
+        // alpha=1.0: fully replaces previous average.
+        let result = compute_ema(300.0, 100.0, 1.0);
+        assert!((result - 300.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ema_alpha_zero_keeps_previous() {
+        // alpha=0.0: ignores new value entirely.
+        let result = compute_ema(300.0, 100.0, 0.0);
+        assert!((result - 100.0).abs() < f64::EPSILON);
+    }
 }
