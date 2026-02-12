@@ -251,6 +251,45 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                         ],
                     )
                     .await?;
+
+                    // Generate filtered (blobless) bundle variant if configured.
+                    if state.config.bundles.generate_filtered_bundles {
+                        match crate::bundleuri::generator::generate_filtered_bundle(
+                            state, &repo_path, owner_repo,
+                        )
+                        .await
+                        {
+                            Ok(filtered) => {
+                                let filtered_s3_key = format!(
+                                    "{}{}/bundles/{}.filtered.bundle",
+                                    state.config.storage.s3.prefix,
+                                    owner_repo,
+                                    filtered.creation_token,
+                                );
+                                crate::storage::s3::upload_bundle(
+                                    &state.s3_client,
+                                    &state.config.storage.s3.bucket,
+                                    &filtered_s3_key,
+                                    &filtered.bundle_path,
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
+                                    warn!(
+                                        repo = %owner_repo,
+                                        error = %e,
+                                        "failed to upload filtered bundle to S3"
+                                    );
+                                });
+                            }
+                            Err(e) => {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %e,
+                                    "filtered bundle generation failed (Git 2.40+ required)"
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -447,6 +486,45 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
                 )
                 .await
                 .unwrap_or_default();
+
+                // Generate filtered (blobless) bundle variant if configured.
+                if state.config.bundles.generate_filtered_bundles {
+                    match crate::bundleuri::generator::generate_filtered_bundle(
+                        state, &repo_path, owner_repo,
+                    )
+                    .await
+                    {
+                        Ok(filtered) => {
+                            let filtered_s3_key = format!(
+                                "{}{}/bundles/daily-{}.filtered.bundle",
+                                state.config.storage.s3.prefix,
+                                owner_repo,
+                                Utc::now().format("%Y%m%d"),
+                            );
+                            crate::storage::s3::upload_bundle(
+                                &state.s3_client,
+                                &state.config.storage.s3.bucket,
+                                &filtered_s3_key,
+                                &filtered.bundle_path,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %e,
+                                    "failed to upload filtered daily bundle to S3"
+                                );
+                            });
+                        }
+                        Err(e) => {
+                            warn!(
+                                repo = %owner_repo,
+                                error = %e,
+                                "filtered bundle generation failed during daily consolidation"
+                            );
+                        }
+                    }
+                }
             }
             Err(e) => {
                 warn!(
