@@ -226,7 +226,7 @@ impl CacheManager {
 // ---------------------------------------------------------------------------
 
 /// Recursively compute the total size of all files under `dir`.
-fn dir_size(dir: &Path) -> Result<u64> {
+pub(crate) fn dir_size(dir: &Path) -> Result<u64> {
     let mut total: u64 = 0;
 
     if !dir.exists() {
