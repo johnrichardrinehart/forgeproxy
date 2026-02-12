@@ -14,6 +14,24 @@ impl Permission {
     pub fn has_read(&self) -> bool {
         *self >= Permission::Read
     }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "admin" => Permission::Admin,
+            "write" | "push" => Permission::Write,
+            "read" | "pull" => Permission::Read,
+            _ => Permission::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Permission::Admin => "admin",
+            Permission::Write => "write",
+            Permission::Read => "read",
+            Permission::None => "none",
+        }
+    }
 }
 
 #[cfg(test)]

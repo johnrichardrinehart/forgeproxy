@@ -52,7 +52,7 @@ pub async fn check_ssh_repo_access(
     let cache_key = format!("forgecache:ssh:access:{fingerprint}:{owner}/{repo}");
     if let Some(cached) = crate::auth::cache::get_cached_auth(&state.keydb, &cache_key).await? {
         debug!(cache_key, permission = %cached, "repo access from cache");
-        return Ok(parse_permission(&cached));
+        return Ok(Permission::parse(&cached));
     }
 
     // Delegate to the forge backend.
@@ -61,7 +61,7 @@ pub async fn check_ssh_repo_access(
         .check_repo_access(&state.http_client, username, owner, repo)
         .await?;
 
-    let perm_str = permission_str(perm);
+    let perm_str = perm.as_str();
     debug!(
         username,
         owner,
@@ -80,61 +80,43 @@ pub async fn check_ssh_repo_access(
     Ok(perm)
 }
 
-fn parse_permission(s: &str) -> Permission {
-    match s {
-        "admin" => Permission::Admin,
-        "write" | "push" => Permission::Write,
-        "read" | "pull" => Permission::Read,
-        _ => Permission::None,
-    }
-}
-
-fn permission_str(p: Permission) -> &'static str {
-    match p {
-        Permission::Admin => "admin",
-        Permission::Write => "write",
-        Permission::Read => "read",
-        Permission::None => "none",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_parse_permission_admin() {
-        assert_eq!(parse_permission("admin"), Permission::Admin);
+        assert_eq!(Permission::parse("admin"), Permission::Admin);
     }
 
     #[test]
     fn test_parse_permission_write() {
-        assert_eq!(parse_permission("write"), Permission::Write);
+        assert_eq!(Permission::parse("write"), Permission::Write);
     }
 
     #[test]
     fn test_parse_permission_push() {
-        assert_eq!(parse_permission("push"), Permission::Write);
+        assert_eq!(Permission::parse("push"), Permission::Write);
     }
 
     #[test]
     fn test_parse_permission_read() {
-        assert_eq!(parse_permission("read"), Permission::Read);
+        assert_eq!(Permission::parse("read"), Permission::Read);
     }
 
     #[test]
     fn test_parse_permission_pull() {
-        assert_eq!(parse_permission("pull"), Permission::Read);
+        assert_eq!(Permission::parse("pull"), Permission::Read);
     }
 
     #[test]
     fn test_parse_permission_none() {
-        assert_eq!(parse_permission("none"), Permission::None);
+        assert_eq!(Permission::parse("none"), Permission::None);
     }
 
     #[test]
     fn test_parse_permission_unknown() {
-        assert_eq!(parse_permission("gibberish"), Permission::None);
-        assert_eq!(parse_permission(""), Permission::None);
+        assert_eq!(Permission::parse("gibberish"), Permission::None);
+        assert_eq!(Permission::parse(""), Permission::None);
     }
 }

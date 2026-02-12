@@ -38,7 +38,7 @@ pub async fn validate_http_auth(
 
     // 2. Check KeyDB cache.
     if let Some(cached) = cache::get_cached_auth(&state.keydb, &cache_key).await? {
-        let perm = parse_permission(&cached);
+        let perm = Permission::parse(&cached);
         if perm.has_read() {
             debug!(%owner, %repo, permission = %cached, "http auth cache hit (allowed)");
             return Ok(());
@@ -59,7 +59,7 @@ pub async fn validate_http_auth(
     } else {
         state.config.auth.negative_cache_ttl
     };
-    let perm_str = permission_str(perm);
+    let perm_str = perm.as_str();
     cache::set_cached_auth(&state.keydb, &cache_key, perm_str, ttl)
         .await
         .ok();
@@ -71,23 +71,5 @@ pub async fn validate_http_auth(
     } else {
         debug!(%owner, %repo, permission = perm_str, "http auth validated (denied)");
         bail!("access denied for {owner}/{repo}")
-    }
-}
-
-fn parse_permission(s: &str) -> Permission {
-    match s {
-        "admin" => Permission::Admin,
-        "write" | "push" => Permission::Write,
-        "read" | "pull" => Permission::Read,
-        _ => Permission::None,
-    }
-}
-
-fn permission_str(p: Permission) -> &'static str {
-    match p {
-        Permission::Admin => "admin",
-        Permission::Write => "write",
-        Permission::Read => "read",
-        Permission::None => "none",
     }
 }
