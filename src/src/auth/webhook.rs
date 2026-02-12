@@ -1,43 +1,39 @@
-//! GitHub webhook receiver for cache invalidation and event processing.
+//! Webhook receiver for cache invalidation and event processing.
 //!
-//! Validates the HMAC-SHA256 signature from GitHub, parses the event type,
-//! and invalidates the appropriate KeyDB auth cache entries so that
+//! Validates the webhook signature via the [`ForgeBackend`] trait, parses the
+//! event type, and invalidates the appropriate KeyDB auth cache entries so that
 //! permission changes take effect without waiting for TTL expiry.
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use tracing::{debug, info, warn};
 
 use crate::auth::cache;
+use crate::forge::WebhookEvent;
 use crate::AppState;
 
-type HmacSha256 = Hmac<Sha256>;
-
-/// Process an incoming GitHub webhook payload.
+/// Process an incoming webhook payload.
 ///
-/// 1. Verify the HMAC-SHA256 signature.
-/// 2. Parse the event type from `X-GitHub-Event`.
-/// 3. Dispatch to per-event handlers that invalidate auth cache entries.
+/// 1. Verify the signature via the forge backend.
+/// 2. Parse the event type from forge-specific headers.
+/// 3. Dispatch to cache-invalidation handlers.
 pub async fn handle_webhook_payload(
     state: &AppState,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> anyhow::Result<Response> {
-    // 1. Verify HMAC signature.
-    if let Err(e) = verify_signature(state, headers, body) {
+    // 1. Verify signature.
+    let secret = std::env::var(&state.config.auth.webhook_secret_env)
+        .map_err(|_| anyhow::anyhow!("webhook secret env var not set"))?;
+
+    if let Err(e) = state.forge.verify_webhook_signature(headers, body, &secret) {
         warn!(error = %e, "webhook signature verification failed");
         return Ok((StatusCode::UNAUTHORIZED, "invalid signature").into_response());
     }
 
-    // 2. Extract event type (prefer normalized header from nginx, fall back to GitHub-specific).
-    let event_type = headers
-        .get("X-Webhook-Event")
-        .or_else(|| headers.get("X-GitHub-Event"))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
+    // 2. Extract event type.
+    let event_type = state.forge.webhook_event_type(headers).unwrap_or_default();
 
     info!(event = %event_type, "processing webhook event");
 
@@ -45,13 +41,15 @@ pub async fn handle_webhook_payload(
     let payload: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| anyhow::anyhow!("failed to parse webhook JSON: {e}"))?;
 
-    // 4. Dispatch by event type.
-    match event_type {
-        "membership" => handle_membership(state, &payload).await,
-        "team" => handle_team(state, &payload).await,
-        "organization" => handle_organization(state, &payload).await,
-        "repository" => handle_repository(state, &payload).await,
-        _ => {
+    // 4. Dispatch by parsed event.
+    let event = state.forge.parse_webhook_payload(&event_type, &payload);
+
+    match event {
+        WebhookEvent::OrgChange { org } => invalidate_org_auth(state, &org).await,
+        WebhookEvent::RepoChange { repo_full_name } => {
+            invalidate_repo_auth(state, &repo_full_name).await
+        }
+        WebhookEvent::NoAction => {
             debug!(event = %event_type, "ignoring unhandled webhook event type");
         }
     }
@@ -59,95 +57,8 @@ pub async fn handle_webhook_payload(
     Ok(StatusCode::OK.into_response())
 }
 
-/// Verify the HMAC-SHA256 signature from the webhook signature header.
-///
-/// Checks the normalized `X-Webhook-Signature` header first (set by nginx for
-/// non-GitHub backends), then falls back to `X-Hub-Signature-256`.
-fn verify_signature(state: &AppState, headers: &HeaderMap, body: &Bytes) -> anyhow::Result<()> {
-    let secret = std::env::var(&state.config.auth.webhook_secret_env)
-        .map_err(|_| anyhow::anyhow!("webhook secret env var not set"))?;
-
-    let sig_header = headers
-        .get("X-Webhook-Signature")
-        .or_else(|| headers.get("X-Hub-Signature-256"))
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("missing webhook signature header"))?;
-
-    let sig_hex = sig_header
-        .strip_prefix("sha256=")
-        .ok_or_else(|| anyhow::anyhow!("X-Hub-Signature-256 does not start with sha256="))?;
-
-    let sig_bytes =
-        hex::decode(sig_hex).map_err(|e| anyhow::anyhow!("invalid hex in signature: {e}"))?;
-
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
-    mac.update(body);
-
-    mac.verify_slice(&sig_bytes)
-        .map_err(|_| anyhow::anyhow!("HMAC signature mismatch"))?;
-
-    Ok(())
-}
-
-/// `membership` event: a user was added to or removed from a team.
-async fn handle_membership(state: &AppState, payload: &serde_json::Value) {
-    let org = payload
-        .get("organization")
-        .and_then(|o| o.get("login"))
-        .and_then(|l| l.as_str())
-        .unwrap_or("");
-
-    if org.is_empty() {
-        return;
-    }
-
-    invalidate_org_auth(state, org).await;
-}
-
-/// `team` event: team permissions or repos changed.
-async fn handle_team(state: &AppState, payload: &serde_json::Value) {
-    let org = payload
-        .get("organization")
-        .and_then(|o| o.get("login"))
-        .and_then(|l| l.as_str())
-        .unwrap_or("");
-
-    if org.is_empty() {
-        return;
-    }
-
-    invalidate_org_auth(state, org).await;
-}
-
-/// `organization` event: member added/removed from org.
-async fn handle_organization(state: &AppState, payload: &serde_json::Value) {
-    let org = payload
-        .get("organization")
-        .and_then(|o| o.get("login"))
-        .and_then(|l| l.as_str())
-        .unwrap_or("");
-
-    if org.is_empty() {
-        return;
-    }
-
-    invalidate_org_auth(state, org).await;
-}
-
-/// `repository` event: repo visibility, transfer, or access changes.
-async fn handle_repository(state: &AppState, payload: &serde_json::Value) {
-    let full_name = payload
-        .get("repository")
-        .and_then(|r| r.get("full_name"))
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
-
-    if full_name.is_empty() {
-        return;
-    }
-
-    // Invalidate all auth entries for this specific repo.
+/// Invalidate all auth cache entries for a specific repository.
+async fn invalidate_repo_auth(state: &AppState, full_name: &str) {
     let http_pattern = format!("forgecache:http:auth:*:{full_name}");
     let ssh_pattern = format!("forgecache:ssh:access:*:{full_name}");
 

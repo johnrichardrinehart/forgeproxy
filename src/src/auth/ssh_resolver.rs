@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
-use tracing::{debug, instrument, warn};
+use anyhow::Result;
+use tracing::{debug, instrument};
 
 use super::middleware::Permission;
 use crate::AppState;
 
-/// Resolve SSH fingerprint to GHE username via admin API, with KeyDB cache.
+/// Resolve SSH fingerprint to upstream username via the forge admin API, with
+/// KeyDB cache.
 #[instrument(skip(state), fields(fingerprint))]
 pub async fn resolve_user_by_fingerprint(
     state: &AppState,
@@ -17,60 +18,29 @@ pub async fn resolve_user_by_fingerprint(
         return Ok(Some(cached));
     }
 
-    // 2. Call GHE admin API: GET /api/v3/admin/ssh-keys?fingerprint={fp}
-    let admin_token = std::env::var(&state.config.upstream.admin_token_env).unwrap_or_default();
-    let url = format!(
-        "{}/admin/ssh-keys?fingerprint={}",
-        state.config.upstream.api_url, fingerprint
-    );
+    // 2. Delegate to the forge backend.
+    let resolved = state
+        .forge
+        .resolve_ssh_user(&state.http_client, fingerprint)
+        .await?;
 
-    let resp = state
-        .http_client
-        .get(&url)
-        .header("Authorization", format!("Bearer {admin_token}"))
-        .header("Accept", state.config.backend_type.accept_header())
-        .send()
-        .await
-        .context("upstream admin API request failed")?;
-
-    if !resp.status().is_success() {
-        warn!(
-            fingerprint,
-            status = %resp.status(),
-            "GHE admin API returned non-success status"
-        );
-        return Ok(None);
+    if let Some(ref username) = resolved {
+        debug!(fingerprint, username = %username, "resolved user from upstream API");
+        crate::auth::cache::set_cached_auth(
+            &state.keydb,
+            &cache_key,
+            username,
+            state.config.auth.ssh_cache_ttl,
+        )
+        .await?;
+    } else {
+        debug!(fingerprint, "no user found for fingerprint");
     }
 
-    let body: serde_json::Value = resp.json().await?;
-
-    // Parse array, extract user.login from the first matching key
-    if let Some(arr) = body.as_array() {
-        if let Some(first) = arr.first() {
-            if let Some(login) = first
-                .get("user")
-                .and_then(|u| u.get("login"))
-                .and_then(|l| l.as_str())
-            {
-                let username = login.to_string();
-                debug!(fingerprint, username = %username, "resolved user from GHE API");
-                crate::auth::cache::set_cached_auth(
-                    &state.keydb,
-                    &cache_key,
-                    &username,
-                    state.config.auth.ssh_cache_ttl,
-                )
-                .await?;
-                return Ok(Some(username));
-            }
-        }
-    }
-
-    debug!(fingerprint, "no user found for fingerprint");
-    Ok(None)
+    Ok(resolved)
 }
 
-/// Check SSH user's permission on a repo via GHE collaborator API, with KeyDB cache.
+/// Check SSH user's permission on a repo via the forge API, with KeyDB cache.
 #[instrument(skip(state), fields(fingerprint, username, owner, repo))]
 pub async fn check_ssh_repo_access(
     state: &AppState,
@@ -85,38 +55,13 @@ pub async fn check_ssh_repo_access(
         return Ok(parse_permission(&cached));
     }
 
-    let admin_token = std::env::var(&state.config.upstream.admin_token_env).unwrap_or_default();
-    let url = format!(
-        "{}/repos/{owner}/{repo}/collaborators/{username}/permission",
-        state.config.upstream.api_url
-    );
-
-    let resp = state
-        .http_client
-        .get(&url)
-        .header("Authorization", format!("Bearer {admin_token}"))
-        .header("Accept", state.config.backend_type.accept_header())
-        .send()
+    // Delegate to the forge backend.
+    let perm = state
+        .forge
+        .check_repo_access(&state.http_client, username, owner, repo)
         .await?;
 
-    if !resp.status().is_success() {
-        warn!(
-            username,
-            owner,
-            repo,
-            status = %resp.status(),
-            "GHE collaborator permission check failed"
-        );
-        return Ok(Permission::None);
-    }
-
-    let body: serde_json::Value = resp.json().await?;
-    let perm_str = body
-        .get("permission")
-        .and_then(|p| p.as_str())
-        .unwrap_or("none");
-    let perm = parse_permission(perm_str);
-
+    let perm_str = permission_str(perm);
     debug!(
         username,
         owner,
@@ -141,6 +86,15 @@ fn parse_permission(s: &str) -> Permission {
         "write" | "push" => Permission::Write,
         "read" | "pull" => Permission::Read,
         _ => Permission::None,
+    }
+}
+
+fn permission_str(p: Permission) -> &'static str {
+    match p {
+        Permission::Admin => "admin",
+        Permission::Write => "write",
+        Permission::Read => "read",
+        Permission::None => "none",
     }
 }
 
