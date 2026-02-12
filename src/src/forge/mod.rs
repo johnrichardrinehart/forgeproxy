@@ -8,12 +8,15 @@
 pub mod gitea;
 pub mod github;
 pub mod gitlab;
+pub mod rate_limit;
 
 use anyhow::Result;
 use axum::http::HeaderMap;
 
 use crate::auth::middleware::Permission;
 use crate::config::Config;
+
+use self::rate_limit::RateLimitState;
 
 // ---------------------------------------------------------------------------
 // Webhook event
@@ -44,6 +47,7 @@ pub trait ForgeBackend: Send + Sync {
         auth_header: &str,
         owner: &str,
         repo: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Permission>;
 
     /// Resolve an SSH key fingerprint to a username via the upstream admin API.
@@ -51,6 +55,7 @@ pub trait ForgeBackend: Send + Sync {
         &self,
         http_client: &reqwest::Client,
         fingerprint: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Option<String>>;
 
     /// Check a user's permission on a repository via the upstream API.
@@ -60,6 +65,7 @@ pub trait ForgeBackend: Send + Sync {
         username: &str,
         owner: &str,
         repo: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Permission>;
 
     /// Verify a webhook signature/token.

@@ -10,6 +10,7 @@ use tracing::warn;
 use crate::auth::middleware::Permission;
 use crate::config::Config;
 
+use super::rate_limit::RateLimitState;
 use super::{ForgeBackend, WebhookEvent};
 
 // ---------------------------------------------------------------------------
@@ -42,6 +43,7 @@ impl ForgeBackend for GitLabBackend {
         auth_header: &str,
         owner: &str,
         repo: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Permission> {
         // GitLab uses URL-encoded `namespace/project` as the project id.
         let project_path = format!("{owner}%2F{repo}");
@@ -54,6 +56,8 @@ impl ForgeBackend for GitLabBackend {
             .send()
             .await
             .context("upstream API request failed")?;
+
+        rate_limit.update_from_headers(resp.headers());
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -73,6 +77,7 @@ impl ForgeBackend for GitLabBackend {
         &self,
         http_client: &reqwest::Client,
         fingerprint: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
         let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
         let url = format!("{}/keys?fingerprint={fingerprint}", self.api_url);
@@ -84,6 +89,8 @@ impl ForgeBackend for GitLabBackend {
             .send()
             .await
             .context("GitLab admin API request failed")?;
+
+        rate_limit.update_from_headers(resp.headers());
 
         if !resp.status().is_success() {
             warn!(
@@ -109,6 +116,7 @@ impl ForgeBackend for GitLabBackend {
         _username: &str,
         owner: &str,
         repo: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Permission> {
         // GitLab: fetch the project with an admin token and read the access level.
         let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
@@ -121,6 +129,8 @@ impl ForgeBackend for GitLabBackend {
             .header("Accept", "application/json")
             .send()
             .await?;
+
+        rate_limit.update_from_headers(resp.headers());
 
         if !resp.status().is_success() {
             warn!(

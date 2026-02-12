@@ -14,6 +14,7 @@ use tracing::warn;
 use crate::auth::middleware::Permission;
 use crate::config::Config;
 
+use super::rate_limit::RateLimitState;
 use super::{ForgeBackend, WebhookEvent};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -50,6 +51,7 @@ impl ForgeBackend for GitHubBackend {
         auth_header: &str,
         owner: &str,
         repo: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Permission> {
         let url = format!("{}/repos/{owner}/{repo}", self.api_url);
 
@@ -60,6 +62,8 @@ impl ForgeBackend for GitHubBackend {
             .send()
             .await
             .context("upstream API request failed")?;
+
+        rate_limit.update_from_headers(resp.headers());
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -79,6 +83,7 @@ impl ForgeBackend for GitHubBackend {
         &self,
         http_client: &reqwest::Client,
         fingerprint: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
         let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
         let url = format!(
@@ -93,6 +98,8 @@ impl ForgeBackend for GitHubBackend {
             .send()
             .await
             .context("upstream admin API request failed")?;
+
+        rate_limit.update_from_headers(resp.headers());
 
         if !resp.status().is_success() {
             warn!(
@@ -114,6 +121,7 @@ impl ForgeBackend for GitHubBackend {
         username: &str,
         owner: &str,
         repo: &str,
+        rate_limit: &RateLimitState,
     ) -> Result<Permission> {
         let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
         let url = format!(
@@ -127,6 +135,8 @@ impl ForgeBackend for GitHubBackend {
             .header("Accept", self.accept)
             .send()
             .await?;
+
+        rate_limit.update_from_headers(resp.headers());
 
         if !resp.status().is_success() {
             warn!(

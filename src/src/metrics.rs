@@ -70,6 +70,9 @@ pub struct Metrics {
     // -- upstream API --
     pub upstream_api_calls: Family<EndpointLabels, Counter>,
 
+    // -- rate limit --
+    pub upstream_api_rate_limit_remaining: Gauge,
+
     // -- gauges --
     pub active_connections: Family<ProtocolLabels, Gauge>,
     pub cache_size_bytes: Gauge,
@@ -167,6 +170,13 @@ impl Metrics {
             upstream_api_calls.clone(),
         );
 
+        let upstream_api_rate_limit_remaining: Gauge = Gauge::default();
+        registry.register(
+            "forgecache_upstream_api_rate_limit_remaining",
+            "Remaining upstream API calls before rate limit",
+            upstream_api_rate_limit_remaining.clone(),
+        );
+
         let active_connections = Family::<ProtocolLabels, Gauge>::default();
         registry.register(
             "forgecache_active_connections",
@@ -201,6 +211,7 @@ impl Metrics {
             s3_upload_bytes,
             s3_download_bytes,
             upstream_api_calls,
+            upstream_api_rate_limit_remaining,
             active_connections,
             cache_size_bytes,
             cache_repos_total,

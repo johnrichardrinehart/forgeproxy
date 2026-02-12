@@ -18,10 +18,16 @@ pub async fn resolve_user_by_fingerprint(
         return Ok(Some(cached));
     }
 
-    // 2. Delegate to the forge backend.
+    // 2. Self-throttle if approaching the upstream rate limit.
+    state
+        .rate_limit
+        .wait_if_needed(state.config.upstream.api_rate_limit_buffer)
+        .await;
+
+    // 3. Delegate to the forge backend.
     let resolved = state
         .forge
-        .resolve_ssh_user(&state.http_client, fingerprint)
+        .resolve_ssh_user(&state.http_client, fingerprint, &state.rate_limit)
         .await?;
 
     if let Some(ref username) = resolved {
@@ -55,10 +61,16 @@ pub async fn check_ssh_repo_access(
         return Ok(Permission::parse(&cached));
     }
 
+    // Self-throttle if approaching the upstream rate limit.
+    state
+        .rate_limit
+        .wait_if_needed(state.config.upstream.api_rate_limit_buffer)
+        .await;
+
     // Delegate to the forge backend.
     let perm = state
         .forge
-        .check_repo_access(&state.http_client, username, owner, repo)
+        .check_repo_access(&state.http_client, username, owner, repo, &state.rate_limit)
         .await?;
 
     let perm_str = perm.as_str();
