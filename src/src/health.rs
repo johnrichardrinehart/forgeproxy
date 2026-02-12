@@ -133,41 +133,8 @@ async fn check_disk(config: &Config) -> CheckResult {
 /// `std::fs::metadata`-based traversal for the used-bytes component and
 /// a simple `available + used` estimate from `std::fs` for the fs capacity.
 fn disk_usage(path: &str, _max_bytes: u64) -> anyhow::Result<(u64, u64)> {
-    use std::fs;
-
-    // Walk the cache directory and sum file sizes.
     let dir = std::path::Path::new(path);
-    if !dir.exists() {
-        // If the cache dir has not been created yet, report 0 usage.
-        return Ok((0, 0));
-    }
-
-    let mut used: u64 = 0;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(entry_path) = stack.pop() {
-        let entries = match fs::read_dir(&entry_path) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if meta.is_dir() {
-                stack.push(entry.path());
-            } else {
-                used += meta.len();
-            }
-        }
-    }
-
-    // For filesystem capacity we read /proc/mounts or fall back to 0.
-    // A production version would use nix::sys::statvfs; we keep it simple.
+    let used = crate::cache::manager::dir_size(dir)?;
     let capacity = fs_capacity_for(dir).unwrap_or(0);
     Ok((used, capacity))
 }
