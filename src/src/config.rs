@@ -8,14 +8,40 @@ use serde::Deserialize;
 // Backend type
 // ---------------------------------------------------------------------------
 
+/// Which upstream forge flavour to use.
+///
+/// This controls API URL construction, response parsing, webhook signature
+/// verification, and header selection.
+///
+/// # SSH key resolution and cloud/SaaS forges
+///
+/// SSH fingerprint-to-username resolution requires **instance administrator**
+/// API access.  This is only available on self-hosted deployments:
+///
+/// | Variant              | SSH key resolution | Notes                                   |
+/// |----------------------|--------------------|-----------------------------------------|
+/// | `github-enterprise`  | Supported          | Requires `site_admin` PAT scope on GHE  |
+/// | `github`             | **Not supported**  | GitHub.com has no admin key lookup API   |
+/// | `gitlab`             | Supported          | Requires self-managed instance admin     |
+/// | `gitea` / `forgejo`  | Supported          | Requires instance admin token            |
+///
+/// When SSH key resolution is unavailable, clients must authenticate via
+/// HTTP (token-based) rather than SSH key passthrough.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendType {
+    /// GitHub Enterprise Server (self-hosted).  Full admin API available.
     #[default]
     GithubEnterprise,
+    /// GitHub.com / GitHub Enterprise Cloud.  No admin SSH key endpoint.
     Github,
+    /// GitLab (self-managed or GitLab.com).  SSH key resolution requires
+    /// self-managed instance admin; on GitLab.com the `/keys` endpoint is
+    /// inaccessible to non-admin users.
     Gitlab,
+    /// Gitea (self-hosted).
     Gitea,
+    /// Forgejo (self-hosted).  Same API as Gitea with different webhook headers.
     Forgejo,
 }
 
@@ -62,6 +88,15 @@ pub struct UpstreamConfig {
     /// Full URL to the upstream API root (e.g. `https://ghe.corp.example.com/api/v3`).
     pub api_url: String,
     /// Name of the environment variable that holds the upstream admin PAT.
+    ///
+    /// This token is used for SSH fingerprint-to-username resolution and
+    /// collaborator permission checks.  It requires **instance admin** privileges
+    /// (e.g. `site_admin` scope on GitHub Enterprise Server, or an admin
+    /// `PRIVATE-TOKEN` on self-managed GitLab).
+    ///
+    /// On cloud/SaaS forges (GitHub.com, GitLab.com) admin endpoints are not
+    /// available; SSH key resolution will not work and clients must use HTTP
+    /// token authentication instead.
     #[serde(default = "default_admin_token_env")]
     pub admin_token_env: String,
     /// Minimum number of API calls to keep in reserve before self-throttling.
