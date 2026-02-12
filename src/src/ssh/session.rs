@@ -45,7 +45,7 @@ pub struct SshSession {
 impl SshSession {
     /// Create a new session for an incoming connection.
     pub fn new(state: Arc<AppState>, peer_addr: Option<SocketAddr>) -> Self {
-        let cache_manager = CacheManager::new(&state.config.storage.local);
+        let cache_manager = state.cache_manager.clone();
         Self {
             state,
             peer_addr,
