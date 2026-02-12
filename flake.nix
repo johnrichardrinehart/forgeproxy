@@ -60,6 +60,7 @@
                   nixos-vm-test-secrets-aws = pkgs.callPackage ./nix/tests/secrets-aws.nix { };
                   nixos-vm-test-compliance = pkgs.callPackage ./nix/tests/compliance.nix { inherit self; };
                   nixos-vm-test-backend = pkgs.callPackage ./nix/tests/backend.nix { inherit self; };
+                  nixos-vm-test-ssh-authz = pkgs.callPackage ./nix/tests/ssh-authz.nix { inherit self; };
                 };
 
                 # ── Formatting (consumed by git-hooks via treefmt hook) ──
