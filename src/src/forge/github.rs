@@ -86,13 +86,19 @@ impl ForgeBackend for GitHubBackend {
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
         let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
-        let url = format!(
-            "{}/admin/ssh-keys?fingerprint={}",
-            self.api_url, fingerprint
-        );
+        if admin_token.is_empty() {
+            warn!(
+                env_var = %self.admin_token_env,
+                "admin token env var is empty — SSH key resolution will fail"
+            );
+        }
+        let url = reqwest::Url::parse_with_params(
+            &format!("{}/admin/ssh-keys", self.api_url),
+            &[("fingerprint", fingerprint)],
+        )?;
 
         let resp = http_client
-            .get(&url)
+            .get(url)
             .header("Authorization", format!("Bearer {admin_token}"))
             .header("Accept", self.accept)
             .send()
@@ -124,6 +130,12 @@ impl ForgeBackend for GitHubBackend {
         rate_limit: &RateLimitState,
     ) -> Result<Permission> {
         let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
+        if admin_token.is_empty() {
+            warn!(
+                env_var = %self.admin_token_env,
+                "admin token env var is empty — collaborator permission check will fail"
+            );
+        }
         let url = format!(
             "{}/repos/{owner}/{repo}/collaborators/{username}/permission",
             self.api_url
@@ -197,6 +209,47 @@ impl ForgeBackend for GitHubBackend {
 
     fn parse_webhook_payload(&self, event_type: &str, payload: &serde_json::Value) -> WebhookEvent {
         super::parse_webhook_payload_github_style(event_type, payload)
+    }
+
+    async fn resolve_ref(
+        &self,
+        http_client: &reqwest::Client,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        auth_header: &str,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>> {
+        let url = format!("{}/repos/{owner}/{repo}/commits/{git_ref}", self.api_url);
+
+        let resp = http_client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .header("Accept", self.accept)
+            .send()
+            .await
+            .context("upstream API request failed for ref resolution")?;
+
+        rate_limit.update_from_headers(resp.headers());
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            warn!(%owner, %repo, %git_ref, %status, "upstream API returned non-success for ref resolution");
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("failed to parse ref resolution response")?;
+
+        Ok(body
+            .get("sha")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()))
     }
 }
 

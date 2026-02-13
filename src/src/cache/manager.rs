@@ -272,6 +272,70 @@ impl CacheManager {
         Ok(repos)
     }
 
+    /// Evict archived files from `{base_path}/_archives/` until disk usage
+    /// drops below the low-water mark.
+    ///
+    /// Files are sorted by modification time (oldest first) and deleted in
+    /// order.  No S3 backup check is needed because the upstream forge is
+    /// the authoritative source for archives.
+    ///
+    /// Returns the number of files evicted.
+    pub async fn run_archive_eviction(&self) -> Result<usize> {
+        let archive_dir = self.base_path.join("_archives");
+        if !archive_dir.exists() {
+            return Ok(0);
+        }
+
+        // Collect all files with their modification times.
+        let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        let mut stack = vec![archive_dir.clone()];
+        while let Some(current) = stack.pop() {
+            let entries = match std::fs::read_dir(&current) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    files.push((entry.path(), mtime));
+                }
+            }
+        }
+
+        // Sort oldest first.
+        files.sort_by_key(|(_, mtime)| *mtime);
+
+        let mut evicted: usize = 0;
+        for (path, _) in &files {
+            let fraction = self.usage_fraction()?;
+            if fraction <= self.low_water {
+                break;
+            }
+            if let Err(e) = tokio::fs::remove_file(path).await {
+                warn!(path = %path.display(), error = %e, "failed to evict archive file");
+            } else {
+                debug!(path = %path.display(), "evicted archive file");
+                evicted += 1;
+            }
+        }
+
+        if evicted > 0 {
+            info!(evicted, "archive eviction sweep finished");
+        }
+
+        Ok(evicted)
+    }
+
     /// Ensure the parent directories for a repo path exist and return the
     /// full path to the bare repo directory.
     pub fn ensure_repo_dir(&self, owner_repo: &str) -> Result<PathBuf> {

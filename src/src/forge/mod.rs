@@ -81,6 +81,21 @@ pub trait ForgeBackend: Send + Sync {
 
     /// Parse a webhook payload into a cache-invalidation action.
     fn parse_webhook_payload(&self, event_type: &str, payload: &serde_json::Value) -> WebhookEvent;
+
+    /// Resolve a Git ref (branch, tag, or SHA) to its commit SHA.
+    ///
+    /// Returns `Ok(Some(sha))` if the ref exists, `Ok(None)` if not found, or
+    /// an error on API failure.  Uses the caller's auth header (not the admin
+    /// token) so the result respects the caller's permissions.
+    async fn resolve_ref(
+        &self,
+        http_client: &reqwest::Client,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        auth_header: &str,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>>;
 }
 
 // ---------------------------------------------------------------------------

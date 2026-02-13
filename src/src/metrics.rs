@@ -63,6 +63,11 @@ pub struct Metrics {
     pub lock_waits: Counter,
     pub lock_timeouts: Counter,
 
+    // -- archive cache --
+    pub archive_cache_hits_local: Counter,
+    pub archive_cache_hits_s3: Counter,
+    pub archive_cache_misses: Counter,
+
     // -- S3 --
     pub s3_upload_bytes: Counter,
     pub s3_download_bytes: Counter,
@@ -149,6 +154,27 @@ impl Metrics {
             lock_timeouts.clone(),
         );
 
+        let archive_cache_hits_local = Counter::default();
+        registry.register(
+            "forgecache_archive_cache_hits_local_total",
+            "Archive cache hits served from local disk",
+            archive_cache_hits_local.clone(),
+        );
+
+        let archive_cache_hits_s3 = Counter::default();
+        registry.register(
+            "forgecache_archive_cache_hits_s3_total",
+            "Archive cache hits served from S3",
+            archive_cache_hits_s3.clone(),
+        );
+
+        let archive_cache_misses = Counter::default();
+        registry.register(
+            "forgecache_archive_cache_misses_total",
+            "Archive cache misses fetched from upstream",
+            archive_cache_misses.clone(),
+        );
+
         let s3_upload_bytes = Counter::default();
         registry.register(
             "forgecache_s3_upload_bytes_total",
@@ -205,6 +231,9 @@ impl Metrics {
             bundle_generation_duration_seconds,
             auth_cache_hits,
             auth_cache_misses,
+            archive_cache_hits_local,
+            archive_cache_hits_s3,
+            archive_cache_misses,
             lock_acquisitions,
             lock_waits,
             lock_timeouts,
