@@ -12,7 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
-      - uses: DeterminateSystems/magic-nix-cache-action@v13
         with:
-          use-flakehub: false
+          flakehub: false
       - run: nix flake check --print-build-logs
