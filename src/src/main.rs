@@ -21,9 +21,9 @@ use fred::interfaces::ClientLike;
 use fred::types::config::{Config as FredConfig, ReconnectPolicy, ServerConfig, TlsConnector};
 use tokio::signal;
 use tokio::sync::Semaphore;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::metrics::MetricsRegistry;
@@ -159,7 +159,7 @@ async fn run_http_server(state: AppState) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Background tasks (stubs)
+// Background tasks
 // ---------------------------------------------------------------------------
 
 async fn run_ssh_server(state: AppState) -> Result<()> {
@@ -270,6 +270,15 @@ async fn main() -> Result<()> {
     // ---- Forge backend ----
     let forge: Arc<dyn forge::ForgeBackend> = Arc::from(forge::build_backend(&config));
     tracing::info!(backend = ?config.backend_type, "forge backend initialised");
+
+    // ---- SaaS backend SSH warning ----
+    if matches!(config.backend_type, crate::config::BackendType::Github) {
+        tracing::warn!(
+            backend = ?config.backend_type,
+            "SSH key resolution is not supported with cloud/SaaS forge backends — \
+             SSH authentication will not work. Use HTTP token authentication instead."
+        );
+    }
 
     // ---- Rate limit state ----
     let rate_limit = forge::rate_limit::RateLimitState::new();

@@ -283,9 +283,11 @@ mod tests {
             is_forgejo: false,
         };
 
-        assert!(backend
-            .verify_webhook_signature(&headers, body, secret)
-            .is_ok());
+        assert!(
+            backend
+                .verify_webhook_signature(&headers, body, secret)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -305,9 +307,11 @@ mod tests {
             is_forgejo: false,
         };
 
-        assert!(backend
-            .verify_webhook_signature(&headers, b"body", "secret")
-            .is_err());
+        assert!(
+            backend
+                .verify_webhook_signature(&headers, b"body", "secret")
+                .is_err()
+        );
     }
 
     // ── Forgejo variant header ──────────────────────────────────────────
@@ -333,9 +337,11 @@ mod tests {
             is_forgejo: true,
         };
 
-        assert!(backend
-            .verify_webhook_signature(&headers, body, secret)
-            .is_ok());
+        assert!(
+            backend
+                .verify_webhook_signature(&headers, body, secret)
+                .is_ok()
+        );
     }
 
     #[test]

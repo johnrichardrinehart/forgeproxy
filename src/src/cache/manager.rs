@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use fred::interfaces::HashesInterface;
 use tracing::{debug, info, warn};
 
-use crate::config::{EvictionPolicy, LocalStorageConfig};
 use crate::AppState;
+use crate::config::{EvictionPolicy, LocalStorageConfig};
 
 use super::{lfu, lru};
 

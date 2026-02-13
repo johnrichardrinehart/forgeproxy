@@ -38,7 +38,7 @@ pub async fn acquire_lock(
 pub async fn release_lock(pool: &fred::clients::Pool, key: &str, node_id: &str) -> Result<()> {
     let script = r#"
         local val = redis.call('GET', KEYS[1])
-        if val and string.find(val, ARGV[1], 1, true) == 1 then
+        if val and string.find(val, ARGV[1] .. ":", 1, true) == 1 then
             redis.call('DEL', KEYS[1])
             redis.call('PUBLISH', KEYS[1] .. ':notify', 'released')
             return 1
