@@ -76,7 +76,7 @@
                     nixfmt.enable = true;
                     rustfmt = {
                       enable = true;
-                      edition = (builtins.fromTOML (builtins.readFile ./src/Cargo.toml)).package.edition;
+                      edition = (builtins.fromTOML (builtins.readFile ./rust/Cargo.toml)).package.edition;
                     };
                     yamlfmt.enable = true;
                   };
@@ -99,7 +99,7 @@
                       in
                       toString (
                         pkgs.writeShellScript "clippy-hook" ''
-                          cd src && ${rust}/bin/cargo clippy --all-targets -- -D warnings
+                          cd rust && ${rust}/bin/cargo clippy --all-targets -- -D warnings
                         ''
                       );
                     files = "\\.rs$";
@@ -114,7 +114,7 @@
                       in
                       toString (
                         pkgs.writeShellScript "cargo-check-hook" ''
-                          cd src && ${rust}/bin/cargo check --all-targets
+                          cd rust && ${rust}/bin/cargo check --all-targets
                         ''
                       );
                     files = "\\.rs$";

@@ -13,9 +13,9 @@ rustPlatform.buildRustPackage {
   pname = "forgecache";
   version = "0.1.0";
 
-  src = ../src;
+  src = ../rust;
 
-  cargoLock.lockFile = ../src/Cargo.lock;
+  cargoLock.lockFile = ../rust/Cargo.lock;
 
   nativeBuildInputs = [
     pkg-config
