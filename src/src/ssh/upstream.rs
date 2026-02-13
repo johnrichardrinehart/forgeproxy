@@ -1,24 +1,23 @@
-//! SSH upstream proxy to GHE.
+//! SSH upstream proxy.
 //!
 //! When a requested repository is not available in the local bare-repo cache,
-//! this module proxies the `git-upload-pack` exchange to the upstream GHE
-//! appliance.  It resolves the appropriate credential (PAT or SSH key) from
-//! the application configuration and shells out to `git` for the actual
-//! transport.
+//! this module proxies the `git-upload-pack` exchange to the upstream forge.
+//! It resolves the appropriate credential (PAT or SSH key) from the application
+//! configuration and shells out to `git` for the actual transport.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, info, instrument, warn};
 
-use crate::config::{Config, CredentialMode};
 use crate::AppState;
+use crate::config::{Config, CredentialMode};
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Proxy a `git-upload-pack` request to the upstream GHE appliance.
+/// Proxy a `git-upload-pack` request to the upstream forge.
 ///
 /// The function resolves the upstream clone URL and credential for the given
 /// `owner_repo` slug (`"owner/repo"`) and then runs a local
@@ -27,7 +26,7 @@ use crate::AppState;
 ///
 /// Returns the raw bytes produced by the upstream `git-upload-pack`.
 #[instrument(skip(state, input), fields(%owner_repo))]
-pub async fn proxy_upload_pack_to_ghe(
+pub async fn proxy_upload_pack_upstream(
     state: &AppState,
     owner_repo: &str,
     input: &[u8],
@@ -39,7 +38,7 @@ pub async fn proxy_upload_pack_to_ghe(
 
     debug!(
         clone_url = %clone_url,
-        "proxying git-upload-pack to upstream GHE"
+        "proxying git-upload-pack to upstream forge"
     );
 
     // Use `git-upload-pack` in stateless-rpc mode against the remote URL

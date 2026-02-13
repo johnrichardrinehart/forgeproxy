@@ -4,8 +4,8 @@
 //! `RateLimit-Remaining` / `RateLimit-Reset`) from forge API responses and
 //! decides whether to self-throttle before hitting the limit.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, info};
 

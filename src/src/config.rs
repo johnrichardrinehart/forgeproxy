@@ -442,7 +442,7 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
     let path = path.as_ref();
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
-    let config: Config = serde_yaml::from_str(&contents)
+    let config: Config = serde_yml::from_str(&contents)
         .with_context(|| format!("failed to parse config file: {}", path.display()))?;
     validate_config(&config)?;
     Ok(config)

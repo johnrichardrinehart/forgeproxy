@@ -288,7 +288,7 @@ pub async fn ensure_repo_cloned(
     let result = async {
         let repo_path = state.cache_manager.ensure_repo_dir(&owner_repo)?;
 
-        // Build the GHE clone URL with embedded credentials.
+        // Build the upstream clone URL with embedded credentials.
         // For Basic auth, decode the base64 to recover "user:pass" and embed
         // directly in the URL.  For Bearer/token auth, use the x-access-token
         // format understood by GitHub/Gitea.

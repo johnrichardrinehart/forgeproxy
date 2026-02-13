@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
 use axum::{
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use fred::interfaces::{HashesInterface, SortedSetsInterface};

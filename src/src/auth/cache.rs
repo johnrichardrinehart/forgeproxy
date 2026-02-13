@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
-use fred::interfaces::{ClientLike, KeysInterface};
-use fred::types::CustomCommand;
+use fred::interfaces::KeysInterface;
 use tracing::trace;
 
 /// Retrieve a cached auth value from KeyDB by key.
@@ -36,21 +35,29 @@ pub async fn set_cached_auth(
 
 /// Invalidate all auth cache keys matching a glob pattern.
 ///
-/// Uses the KEYS command to find matching keys, then DELetes each one.
-/// For production workloads with very large keyspaces, consider SCAN-based
-/// iteration instead. Returns the number of keys deleted.
+/// Uses SCAN-based iteration to avoid blocking the KeyDB server, then
+/// DELetes each matching key.  Returns the number of keys deleted.
 pub async fn invalidate_auth(pool: &fred::clients::Pool, pattern: &str) -> Result<u64> {
-    let keys: Vec<String> = pool
-        .custom(
-            CustomCommand::new_static("KEYS", None::<u16>, false),
-            vec![pattern.to_string()],
-        )
-        .await
-        .unwrap_or_default();
-    let count = keys.len() as u64;
-    for key in &keys {
-        let _: () = pool.del(key).await.unwrap_or_default();
+    let mut count: u64 = 0;
+    let mut cursor = String::from("0");
+
+    loop {
+        let (next_cursor, keys): (String, Vec<String>) = pool
+            .scan_page(&cursor, pattern, Some(100), None)
+            .await
+            .context("KeyDB SCAN failed")?;
+
+        for key in &keys {
+            let _: () = pool.del(key).await.unwrap_or_default();
+            count += 1;
+        }
+
+        if next_cursor == "0" {
+            break;
+        }
+        cursor = next_cursor;
     }
+
     if count > 0 {
         trace!(pattern, count, "auth cache invalidated");
     }

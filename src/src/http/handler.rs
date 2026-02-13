@@ -1,4 +1,4 @@
-//! Main axum router and HTTP request handlers for the GHE caching proxy.
+//! Main axum router and HTTP request handlers for the caching proxy.
 //!
 //! Routes:
 //! - `GET  /:owner/:repo/info/refs`       - Smart HTTP info/refs (upload-pack only)
@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::{
+    Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
 };
 use bytes::Bytes;
 use serde::Deserialize;
@@ -75,7 +75,7 @@ struct InfoRefsQuery {
 /// `GET /:owner/:repo/info/refs?service=git-upload-pack`
 ///
 /// Validates authentication, rejects pushes, and proxies info/refs from the
-/// upstream GHE server.  For `git-upload-pack` requests the response is
+/// upstream forge.  For `git-upload-pack` requests the response is
 /// intercepted so that we can inject the `bundle-uri` protocol-v2 capability.
 #[instrument(skip(state, headers), fields(%owner, %repo))]
 async fn handle_info_refs(
@@ -84,7 +84,11 @@ async fn handle_info_refs(
     Query(query): Query<InfoRefsQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    // 1. Extract and validate the Authorization header.
+    // 1. Validate path segments.
+    validate_path_segment(&owner, "owner")?;
+    validate_path_segment(&repo, "repo")?;
+
+    // 2. Extract and validate the Authorization header.
     let auth_header = extract_auth_header(&headers)?;
     crate::auth::http_validator::validate_http_auth(&state, &auth_header, &owner, &repo)
         .await
@@ -104,7 +108,6 @@ async fn handle_info_refs(
             AppError::Unauthorized(e.to_string())
         })?;
 
-    // 2. Check requested service.
     let service = query.service.unwrap_or_default();
     if service == "git-receive-pack" {
         return Ok((
@@ -122,22 +125,22 @@ async fn handle_info_refs(
             .into_response());
     }
 
-    // 3. Proxy the info/refs request to upstream GHE.
-    let ghe_url = format!(
+    // Proxy the info/refs request to the upstream forge.
+    let upstream_url = format!(
         "https://{}/{}/{}/info/refs?service=git-upload-pack",
         state.config.upstream.hostname, owner, repo,
     );
 
-    debug!(%ghe_url, "proxying info/refs to GHE");
+    debug!(%upstream_url, "proxying info/refs to upstream forge");
 
     let upstream_resp = state
         .http_client
-        .get(&ghe_url)
+        .get(&upstream_url)
         .header(header::AUTHORIZATION, &auth_header)
         .header("Git-Protocol", "version=2")
         .send()
         .await
-        .context("failed to reach upstream GHE")?;
+        .context("failed to reach upstream forge")?;
 
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status();
@@ -145,7 +148,7 @@ async fn handle_info_refs(
             .text()
             .await
             .unwrap_or_else(|_| String::from("<unreadable>"));
-        warn!(%status, "upstream GHE returned error for info/refs");
+        warn!(%status, "upstream forge returned error for info/refs");
         return Ok((
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             body,
@@ -182,7 +185,7 @@ async fn handle_info_refs(
 /// `POST /:owner/:repo/git-upload-pack`
 ///
 /// If the repository is cached locally and fresh, runs a local `git upload-pack`
-/// process.  Otherwise proxies the request to upstream GHE and spawns a
+/// process.  Otherwise proxies the request to the upstream forge and spawns a
 /// background task to clone the repo for future requests.
 #[instrument(skip(state, headers, body), fields(%owner, %repo))]
 async fn handle_upload_pack(
@@ -191,13 +194,17 @@ async fn handle_upload_pack(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    // 1. Validate auth.
+    // 1. Validate path segments.
+    validate_path_segment(&owner, "owner")?;
+    validate_path_segment(&repo, "repo")?;
+
+    // 2. Validate auth.
     let auth_header = extract_auth_header(&headers)?;
     crate::auth::http_validator::validate_http_auth(&state, &auth_header, &owner, &repo)
         .await
         .map_err(|e| AppError::Unauthorized(e.to_string()))?;
 
-    // 2. Check if repo is cached locally and fresh.
+    // Check if repo is cached locally and fresh.
     let repo_slug = format!("{}/{}", owner, repo);
     let cached = crate::coordination::registry::is_repo_cached_and_fresh(&state, &repo_slug)
         .await
@@ -208,9 +215,9 @@ async fn handle_upload_pack(
         return serve_local_upload_pack(&state, &owner, &repo, &body).await;
     }
 
-    // 3. Proxy to upstream GHE.
-    info!("proxying upload-pack to upstream GHE");
-    let response = proxy_upload_pack_to_ghe(&state, &owner, &repo, &auth_header, body).await?;
+    // Proxy to upstream forge.
+    info!("proxying upload-pack to upstream forge");
+    let response = proxy_upload_pack_to_upstream(&state, &owner, &repo, &auth_header, body).await?;
 
     // 4. Spawn background clone so future requests can be served locally.
     {
@@ -244,11 +251,17 @@ async fn handle_receive_pack(
     Path((owner, repo)): Path<(String, String)>,
     _headers: HeaderMap,
 ) -> Response {
+    if validate_path_segment(&owner, "owner").is_err()
+        || validate_path_segment(&repo, "repo").is_err()
+    {
+        return (StatusCode::UNAUTHORIZED, "invalid owner or repo").into_response();
+    }
+
     warn!(%owner, %repo, "rejected git-receive-pack (push)");
     (
         StatusCode::FORBIDDEN,
         "Push (git-receive-pack) is not supported through the caching proxy.\n\
-         Please push directly to the GHE appliance.",
+         Please push directly to the upstream forge.",
     )
         .into_response()
 }
@@ -262,6 +275,9 @@ async fn handle_bundle_list(
     Path((owner, repo)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    validate_path_segment(&owner, "owner")?;
+    validate_path_segment(&repo, "repo")?;
+
     let auth_header = extract_auth_header(&headers)?;
     crate::http::bundle_serve::handle_bundle_list(&state, &owner, &repo, &auth_header)
         .await
@@ -316,8 +332,30 @@ async fn handle_metrics(State(state): State<Arc<AppState>>) -> Result<Response, 
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Validate that an owner or repo path segment is safe (no path traversal).
+///
+/// Rejects segments containing `..`, `/`, `\`, null bytes, or that are empty.
+pub(crate) fn validate_path_segment(segment: &str, label: &str) -> Result<(), AppError> {
+    if segment.is_empty() {
+        return Err(AppError::Unauthorized(format!("{label} must not be empty")));
+    }
+    if segment.contains('/')
+        || segment.contains('\\')
+        || segment.contains('\0')
+        || segment == ".."
+        || segment.starts_with("../")
+        || segment.ends_with("/..")
+        || segment.contains("/../")
+    {
+        return Err(AppError::Unauthorized(format!(
+            "invalid {label}: {segment:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Extract the `Authorization` header value, returning an error if absent.
-fn extract_auth_header(headers: &HeaderMap) -> Result<String, AppError> {
+pub(crate) fn extract_auth_header(headers: &HeaderMap) -> Result<String, AppError> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -333,7 +371,7 @@ async fn serve_local_upload_pack(
     repo: &str,
     request_body: &[u8],
 ) -> Result<Response, AppError> {
-    let repo_path = format!("{}/{}/{}.git", state.config.storage.local.path, owner, repo,);
+    let repo_path = state.cache_manager.repo_path(&format!("{owner}/{repo}"));
 
     let mut child = Command::new("git")
         .arg("upload-pack")
@@ -382,22 +420,22 @@ async fn serve_local_upload_pack(
         .into_response())
 }
 
-/// Proxy a `git-upload-pack` POST to upstream GHE and stream the response.
-async fn proxy_upload_pack_to_ghe(
+/// Proxy a `git-upload-pack` POST to the upstream forge and stream the response.
+async fn proxy_upload_pack_to_upstream(
     state: &AppState,
     owner: &str,
     repo: &str,
     auth_header: &str,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let ghe_url = format!(
+    let upstream_url = format!(
         "https://{}/{}/{}/git-upload-pack",
         state.config.upstream.hostname, owner, repo,
     );
 
     let upstream_resp = state
         .http_client
-        .post(&ghe_url)
+        .post(&upstream_url)
         .header(header::AUTHORIZATION, auth_header)
         .header(
             header::CONTENT_TYPE,
@@ -407,7 +445,7 @@ async fn proxy_upload_pack_to_ghe(
         .body(body)
         .send()
         .await
-        .context("failed to reach upstream GHE for upload-pack")?;
+        .context("failed to reach upstream forge for upload-pack")?;
 
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status();
@@ -469,11 +507,7 @@ impl IntoResponse for AppError {
                 .into_response(),
             AppError::Internal(err) => {
                 error!(error = %err, "internal server error");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Internal server error: {err:#}"),
-                )
-                    .into_response()
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error\n").into_response()
             }
         }
     }
@@ -482,5 +516,69 @@ impl IntoResponse for AppError {
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         AppError::Internal(err)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_path_segment_rejects_empty() {
+        assert!(validate_path_segment("", "owner").is_err());
+    }
+
+    #[test]
+    fn validate_path_segment_rejects_dotdot() {
+        assert!(validate_path_segment("..", "owner").is_err());
+    }
+
+    #[test]
+    fn validate_path_segment_rejects_dotdot_prefix() {
+        assert!(validate_path_segment("../etc", "owner").is_err());
+    }
+
+    #[test]
+    fn validate_path_segment_rejects_dotdot_suffix() {
+        assert!(validate_path_segment("foo/..", "owner").is_err());
+    }
+
+    #[test]
+    fn validate_path_segment_rejects_dotdot_middle() {
+        assert!(validate_path_segment("foo/../bar", "owner").is_err());
+    }
+
+    #[test]
+    fn validate_path_segment_rejects_slash() {
+        assert!(validate_path_segment("foo/bar", "owner").is_err());
+    }
+
+    #[test]
+    fn validate_path_segment_rejects_backslash() {
+        assert!(validate_path_segment("foo\\bar", "owner").is_err());
+    }
+
+    #[test]
+    fn validate_path_segment_rejects_null_byte() {
+        assert!(validate_path_segment("foo\0bar", "owner").is_err());
+    }
+
+    #[test]
+    fn validate_path_segment_accepts_normal_names() {
+        assert!(validate_path_segment("acme-corp", "owner").is_ok());
+        assert!(validate_path_segment("my_repo.v2", "repo").is_ok());
+        assert!(validate_path_segment("123", "owner").is_ok());
+        assert!(validate_path_segment("a", "owner").is_ok());
+    }
+
+    #[test]
+    fn validate_path_segment_accepts_dots_that_are_not_traversal() {
+        assert!(validate_path_segment(".", "owner").is_ok());
+        assert!(validate_path_segment(".hidden", "owner").is_ok());
+        assert!(validate_path_segment("name.git", "repo").is_ok());
     }
 }

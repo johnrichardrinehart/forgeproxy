@@ -1,4 +1,4 @@
-//! Bundle-URI subsystem for the GHE Caching Reverse Proxy.
+//! Bundle-URI subsystem for the Caching Reverse Proxy.
 //!
 //! This module implements the Git bundle-URI protocol: pre-computing bundles
 //! on a schedule, managing their lifecycle (hourly -> daily -> weekly

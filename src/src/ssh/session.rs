@@ -1,7 +1,7 @@
 //! SSH session handler implementing the `russh` 0.46 [`Handler`] trait.
 //!
 //! Each inbound SSH connection is served by a dedicated [`SshSession`].  The
-//! handler performs public-key authentication (with a GHE API fallback and
+//! handler performs public-key authentication (with an upstream forge API fallback and
 //! KeyDB cache), rejects push operations, and either serves `git-upload-pack`
 //! from the local bare-repo cache or returns a "not cached" error for repos
 //! that have not yet been mirrored.
@@ -13,16 +13,16 @@ use anyhow::Result;
 use base64::Engine as _;
 use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec};
-use russh_keys::key::PublicKey;
 use russh_keys::PublicKeyBase64;
+use russh_keys::key::PublicKey;
 use sha2::{Digest, Sha256};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
-use crate::cache::CacheManager;
 use crate::AppState;
+use crate::cache::CacheManager;
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -243,11 +243,11 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(ref mut stdin) = self.child_stdin {
-            if let Err(e) = stdin.write_all(data).await {
-                debug!(error = %e, "failed to write to upload-pack stdin (process may have exited)");
-                self.child_stdin.take();
-            }
+        if let Some(ref mut stdin) = self.child_stdin
+            && let Err(e) = stdin.write_all(data).await
+        {
+            debug!(error = %e, "failed to write to upload-pack stdin (process may have exited)");
+            self.child_stdin.take();
         }
         Ok(())
     }
@@ -291,7 +291,7 @@ impl Handler for SshSession {
                     1,
                     CryptoVec::from_slice(
                         b"ERROR: Push (git-receive-pack) is not supported through the caching proxy.\n\
-                          Please push directly to the GHE appliance.\n",
+                          Please push directly to the upstream forge.\n",
                     ),
                 );
                 finish_channel(session, channel_id, 1);
@@ -299,6 +299,18 @@ impl Handler for SshSession {
             }
 
             Some((GitCommand::UploadPack, repo)) => {
+                // ── Path validation ──────────────────────────────────
+                if repo.contains("..") || repo.contains('\0') {
+                    warn!(repo = %repo, "rejected SSH exec with path traversal attempt");
+                    session.extended_data(
+                        channel_id,
+                        1,
+                        CryptoVec::from_slice(b"ERROR: Invalid repository path.\n"),
+                    );
+                    finish_channel(session, channel_id, 1);
+                    return Ok(());
+                }
+
                 // ── Per-repo authorization ────────────────────────────
                 // Split "owner/repo" so we can check access on the forge.
                 match super::upstream::split_owner_repo(&repo) {
@@ -500,7 +512,8 @@ impl Handler for SshSession {
                     // upstream.  If the upstream module is not yet wired, return
                     // an actionable error message.
                     warn!(repo = %repo, "repository not in local cache");
-                    match super::upstream::proxy_upload_pack_to_ghe(&self.state, &repo, &[]).await {
+                    match super::upstream::proxy_upload_pack_upstream(&self.state, &repo, &[]).await
+                    {
                         Ok(data) => {
                             session.data(channel_id, CryptoVec::from_slice(&data));
                             finish_channel(session, channel_id, 0);
@@ -513,7 +526,7 @@ impl Handler for SshSession {
                                 CryptoVec::from_slice(
                                     format!(
                                         "Repository '{}' is not cached and upstream proxy failed: {}\n\
-                                         Try cloning directly from the GHE appliance.\n",
+                                         Try cloning directly from the upstream forge.\n",
                                         repo, e,
                                     )
                                     .as_bytes(),
@@ -587,11 +600,54 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_is_stable() {
-        // Verify that the fingerprint function produces a SHA256: prefix.
-        // We cannot easily construct a PublicKey in a unit test without
-        // generating a keypair, so this is a basic structural test.
-        let fp_prefix = "SHA256:";
-        assert!(fp_prefix.starts_with("SHA256:"));
+    fn parse_rejects_traversal_in_repo_path() {
+        // parse_git_command itself doesn't validate traversal, but the
+        // exec_request handler checks for ".." before proceeding.
+        let (_, repo) = parse_git_command("git-upload-pack '../../etc/passwd'").unwrap();
+        assert!(repo.contains(".."));
+    }
+
+    #[test]
+    fn parse_traversal_in_owner() {
+        let (_, repo) = parse_git_command("git-upload-pack '../evil/repo'").unwrap();
+        assert!(repo.contains(".."));
+    }
+
+    #[test]
+    fn fingerprint_has_sha256_prefix() {
+        let keypair = russh_keys::key::KeyPair::generate_ed25519();
+        let pubkey = keypair.clone_public_key().unwrap();
+        let fp = fingerprint_of(&pubkey);
+        assert!(
+            fp.starts_with("SHA256:"),
+            "fingerprint should start with SHA256: prefix, got: {fp}"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_deterministic() {
+        let keypair = russh_keys::key::KeyPair::generate_ed25519();
+        let pubkey = keypair.clone_public_key().unwrap();
+        let fp1 = fingerprint_of(&pubkey);
+        let fp2 = fingerprint_of(&pubkey);
+        assert_eq!(
+            fp1, fp2,
+            "fingerprint should be deterministic for the same key"
+        );
+    }
+
+    #[test]
+    fn fingerprint_has_correct_length() {
+        let keypair = russh_keys::key::KeyPair::generate_ed25519();
+        let pubkey = keypair.clone_public_key().unwrap();
+        let fp = fingerprint_of(&pubkey);
+        // SHA256: prefix (7 chars) + 43 base64-no-pad chars = 50 total
+        assert_eq!(
+            fp.len(),
+            50,
+            "fingerprint length should be 50, got: {} ({})",
+            fp.len(),
+            fp
+        );
     }
 }

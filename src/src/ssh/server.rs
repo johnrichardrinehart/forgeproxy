@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use russh::server::{self, Server};
 use russh::MethodSet;
+use russh::server::{self, Server};
 use russh_keys::key::KeyPair;
 use tracing::{info, warn};
 
