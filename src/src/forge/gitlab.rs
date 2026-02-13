@@ -80,10 +80,19 @@ impl ForgeBackend for GitLabBackend {
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
         let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
-        let url = format!("{}/keys?fingerprint={fingerprint}", self.api_url);
+        if admin_token.is_empty() {
+            warn!(
+                env_var = %self.admin_token_env,
+                "admin token env var is empty — SSH key resolution will fail"
+            );
+        }
+        let url = reqwest::Url::parse_with_params(
+            &format!("{}/keys", self.api_url),
+            &[("fingerprint", fingerprint)],
+        )?;
 
         let resp = http_client
-            .get(&url)
+            .get(url)
             .header("PRIVATE-TOKEN", &admin_token)
             .header("Accept", "application/json")
             .send()
@@ -120,6 +129,12 @@ impl ForgeBackend for GitLabBackend {
     ) -> Result<Permission> {
         // GitLab: fetch the project with an admin token and read the access level.
         let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
+        if admin_token.is_empty() {
+            warn!(
+                env_var = %self.admin_token_env,
+                "admin token env var is empty — project access check will fail"
+            );
+        }
         let project_path = format!("{owner}%2F{repo}");
         let url = format!("{}/projects/{project_path}", self.api_url);
 
@@ -174,6 +189,51 @@ impl ForgeBackend for GitLabBackend {
             .or_else(|| headers.get("X-Gitlab-Event"))
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
+    }
+
+    async fn resolve_ref(
+        &self,
+        http_client: &reqwest::Client,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+        auth_header: &str,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>> {
+        let project_path = format!("{owner}%2F{repo}");
+        let url = format!(
+            "{}/projects/{project_path}/repository/commits/{git_ref}",
+            self.api_url
+        );
+
+        let resp = http_client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("upstream API request failed for ref resolution")?;
+
+        rate_limit.update_from_headers(resp.headers());
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            warn!(%owner, %repo, %git_ref, %status, "GitLab API returned non-success for ref resolution");
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("failed to parse GitLab ref resolution response")?;
+
+        Ok(body
+            .get("id")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string()))
     }
 
     fn parse_webhook_payload(&self, event_type: &str, payload: &serde_json::Value) -> WebhookEvent {
