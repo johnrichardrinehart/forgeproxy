@@ -5,13 +5,13 @@
 //! The cache key is derived from a SHA-256 hash of the token so that raw
 //! credentials are never stored.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
+use crate::AppState;
 use crate::auth::cache;
 use crate::auth::middleware::Permission;
-use crate::AppState;
 
 /// Validate an HTTP `Authorization` header value by forwarding it to the
 /// upstream forge API and caching the result in KeyDB.

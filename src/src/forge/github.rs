@@ -331,9 +331,11 @@ mod tests {
             accept: "application/json",
         };
 
-        assert!(backend
-            .verify_webhook_signature(&headers, body, secret)
-            .is_ok());
+        assert!(
+            backend
+                .verify_webhook_signature(&headers, body, secret)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -352,9 +354,11 @@ mod tests {
             accept: "application/json",
         };
 
-        assert!(backend
-            .verify_webhook_signature(&headers, b"body", "secret")
-            .is_err());
+        assert!(
+            backend
+                .verify_webhook_signature(&headers, b"body", "secret")
+                .is_err()
+        );
     }
 
     // ── Webhook event dispatch ──────────────────────────────────────────

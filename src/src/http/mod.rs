@@ -1,4 +1,4 @@
-//! HTTP layer for the GHE Caching Reverse Proxy.
+//! HTTP layer for the Caching Reverse Proxy.
 //!
 //! This module provides the axum-based HTTP server that intercepts Git smart
 //! HTTP protocol requests, validates authentication, injects bundle-uri

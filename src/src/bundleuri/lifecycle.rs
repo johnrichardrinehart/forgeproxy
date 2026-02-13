@@ -2,7 +2,7 @@
 //!
 //! Runs background tasks on a periodic schedule to:
 //!
-//! 1. Scan the repo registry for repos that need a background fetch from GHE.
+//! 1. Scan the repo registry for repos that need a background fetch from the upstream forge.
 //! 2. Generate incremental bundles after each fetch.
 //! 3. Upload bundles to S3 and update the KeyDB registry.
 //! 4. Consolidate hourly bundles into daily bundles.
@@ -134,7 +134,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
     let fetch_result = if repo_path.exists() && repo_path.join("HEAD").is_file() {
         // Repo is locally cached -- do an incremental fetch.
-        let ghe_url = format!(
+        let upstream_url = format!(
             "https://{}/{}.git",
             state.config.upstream.hostname, owner_repo,
         );
@@ -149,7 +149,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
         };
 
         let url_with_token = if admin_token.is_empty() {
-            ghe_url
+            upstream_url
         } else {
             format!(
                 "https://x-access-token:{admin_token}@{}/{}.git",
@@ -323,10 +323,10 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 /// per-repo overrides from the configuration.
 fn effective_interval(state: &AppState, owner_repo: &str, schedule_secs: u64) -> u64 {
     // Check for a per-repo override.
-    if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo) {
-        if let Some(interval) = override_cfg.fetch_interval {
-            return interval;
-        }
+    if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo)
+        && let Some(interval) = override_cfg.fetch_interval
+    {
+        return interval;
     }
 
     if schedule_secs == 0 {
@@ -470,11 +470,11 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
 
     for owner_repo in &repos {
         // Check if bundles are disabled for this repo.
-        if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo.as_str()) {
-            if override_cfg.disable_bundles == Some(true) {
-                debug!(repo = %owner_repo, "bundles disabled for repo; skipping consolidation");
-                continue;
-            }
+        if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo.as_str())
+            && override_cfg.disable_bundles == Some(true)
+        {
+            debug!(repo = %owner_repo, "bundles disabled for repo; skipping consolidation");
+            continue;
         }
 
         let repo_path = state.cache_manager.repo_path(owner_repo);
@@ -617,10 +617,10 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
     let repos = crate::coordination::registry::list_all_repos(&state.keydb).await?;
 
     for owner_repo in &repos {
-        if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo.as_str()) {
-            if override_cfg.disable_bundles == Some(true) {
-                continue;
-            }
+        if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo.as_str())
+            && override_cfg.disable_bundles == Some(true)
+        {
+            continue;
         }
 
         let repo_path = state.cache_manager.repo_path(owner_repo);

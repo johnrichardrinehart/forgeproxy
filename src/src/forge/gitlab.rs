@@ -335,9 +335,11 @@ mod tests {
         };
         let mut headers = HeaderMap::new();
         headers.insert("X-Gitlab-Token", "my-secret".parse().unwrap());
-        assert!(backend
-            .verify_webhook_signature(&headers, b"body", "my-secret")
-            .is_ok());
+        assert!(
+            backend
+                .verify_webhook_signature(&headers, b"body", "my-secret")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -348,9 +350,11 @@ mod tests {
         };
         let mut headers = HeaderMap::new();
         headers.insert("X-Gitlab-Token", "wrong-secret".parse().unwrap());
-        assert!(backend
-            .verify_webhook_signature(&headers, b"body", "my-secret")
-            .is_err());
+        assert!(
+            backend
+                .verify_webhook_signature(&headers, b"body", "my-secret")
+                .is_err()
+        );
     }
 
     // ── Webhook event parsing ───────────────────────────────────────────
