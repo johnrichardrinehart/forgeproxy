@@ -76,7 +76,7 @@
                     nixfmt.enable = true;
                     rustfmt = {
                       enable = true;
-                      edition = "2021";
+                      edition = (builtins.fromTOML (builtins.readFile ./src/Cargo.toml)).package.edition;
                     };
                     yamlfmt.enable = true;
                   };
