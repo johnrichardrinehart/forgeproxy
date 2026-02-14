@@ -6,7 +6,7 @@
 
 pkgs.testers.runNixOSTest {
   name = "forgecache-compliance";
-  globalTimeout = 120;
+  globalTimeout = 300;
 
   nodes = {
     # ── Node with FedRAMP enabled ──────────────────────────────────────

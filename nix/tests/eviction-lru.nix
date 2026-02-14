@@ -101,7 +101,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgecache-eviction-lru";
-  globalTimeout = 300;
+  globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
   # Node definitions

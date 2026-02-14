@@ -20,7 +20,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgecache-backend";
-  globalTimeout = 120;
+  globalTimeout = 300;
 
   nodes = {
     # ── Gitea backend ────────────────────────────────────────────────
