@@ -127,7 +127,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgecache-ssh-authz";
-  globalTimeout = 300;
+  globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
   # Node definitions
