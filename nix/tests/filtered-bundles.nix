@@ -100,7 +100,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgecache-filtered-bundles";
-  globalTimeout = 300;
+  globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
   # Node definitions

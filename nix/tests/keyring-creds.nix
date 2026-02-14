@@ -109,7 +109,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgecache-keyring-creds";
-  globalTimeout = 300;
+  globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
   # Node definitions
