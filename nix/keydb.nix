@@ -30,6 +30,8 @@ let
       openssl
       jemalloc
       systemd
+      libuuid
+      curl
     ];
 
     makeFlags = [
@@ -69,15 +71,17 @@ let
     # ── Threading ──────────────────────────────────────────────────────
     server-threads 2
 
-    # ── TLS ────────────────────────────────────────────────────────────
-    tls-port 6380
-    tls-cert-file ${cfg.tlsCert}
-    tls-key-file ${cfg.tlsKey}
-    tls-ca-cert-file ${cfg.tlsCaCert}
-    tls-protocols "TLSv1.2 TLSv1.3"
-    tls-ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
-    tls-ciphersuites "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256"
-    tls-prefer-server-ciphers yes
+    ${lib.optionalString cfg.tls.enable ''
+      # ── TLS ────────────────────────────────────────────────────────────
+      tls-port 6380
+      tls-cert-file ${cfg.tls.certFile}
+      tls-key-file ${cfg.tls.keyFile}
+      tls-ca-cert-file ${cfg.tls.caFile}
+      tls-protocols "TLSv1.2 TLSv1.3"
+      tls-ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
+      tls-ciphersuites "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256"
+      tls-prefer-server-ciphers yes
+    ''}
 
     # ── Authentication ─────────────────────────────────────────────────
     requirepass ${cfg.requirePass}
@@ -106,22 +110,30 @@ in
   options.services.keydb = {
     enable = lib.mkEnableOption "KeyDB server";
 
-    tlsCert = lib.mkOption {
-      type = lib.types.path;
-      default = "/etc/ssl/keydb/cert.pem";
-      description = "Path to the TLS certificate for KeyDB.";
-    };
+    tls = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Enable TLS for KeyDB.";
+      };
 
-    tlsKey = lib.mkOption {
-      type = lib.types.path;
-      default = "/etc/ssl/keydb/key.pem";
-      description = "Path to the TLS private key for KeyDB.";
-    };
+      certFile = lib.mkOption {
+        type = lib.types.path;
+        default = "/var/lib/keydb/tls/cert.pem";
+        description = "Path to the TLS certificate for KeyDB.";
+      };
 
-    tlsCaCert = lib.mkOption {
-      type = lib.types.path;
-      default = "/etc/ssl/keydb/ca.pem";
-      description = "Path to the TLS CA certificate for KeyDB.";
+      keyFile = lib.mkOption {
+        type = lib.types.path;
+        default = "/var/lib/keydb/tls/key.pem";
+        description = "Path to the TLS private key for KeyDB.";
+      };
+
+      caFile = lib.mkOption {
+        type = lib.types.path;
+        default = "/var/lib/keydb/tls/ca.pem";
+        description = "Path to the TLS CA certificate for KeyDB.";
+      };
     };
 
     requirePass = lib.mkOption {
@@ -143,6 +155,15 @@ in
       type = lib.types.path;
       default = "/var/lib/keydb";
       description = "Directory for KeyDB data files (RDB snapshots).";
+    };
+
+    extraConfFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Optional second configuration file to pass to keydb-server.
+        This allows runtime configuration overrides (e.g., requirepass).
+      '';
     };
 
     user = lib.mkOption {
@@ -190,12 +211,15 @@ in
         User = cfg.user;
         Group = cfg.group;
 
-        ExecStart = "${keydb}/bin/keydb-server /etc/keydb/keydb.conf";
+        ExecStart =
+          "${keydb}/bin/keydb-server /etc/keydb/keydb.conf"
+          + lib.optionalString (cfg.extraConfFile != null) " ${cfg.extraConfFile}";
 
         Restart = "on-failure";
         RestartSec = 5;
 
         StateDirectory = "keydb";
+        RuntimeDirectory = "keydb";
 
         # ── Hardening ──────────────────────────────────────────────
         ProtectSystem = "strict";
@@ -213,16 +237,22 @@ in
         ReadWritePaths = [
           cfg.dataDir
           "/var/log/keydb"
+        ]
+        ++ lib.optionals cfg.tls.enable [
+          "/var/lib/keydb/tls"
         ];
       };
     };
 
-    # ── Firewall (only TLS port exposed) ───────────────────────────────
+    # ── Firewall ───────────────────────────────────────────────────────
     networking.firewall = {
       enable = true;
-      allowedTCPPorts = [
-        6380 # KeyDB TLS port only; plaintext 6379 is NOT exposed
-      ];
+      allowedTCPPorts =
+        if cfg.tls.enable then
+          [ 6380 ] # TLS port
+        else
+          [ 6379 ] # plaintext port (use only in private subnets with SG protection)
+      ;
     };
 
     # ── Log directory via tmpfiles ─────────────────────────────────────
