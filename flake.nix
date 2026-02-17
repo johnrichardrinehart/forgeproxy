@@ -79,6 +79,7 @@
                       edition = (builtins.fromTOML (builtins.readFile ./rust/Cargo.toml)).package.edition;
                     };
                     yamlfmt.enable = true;
+                    terraform.enable = true;
                   };
                 };
 
@@ -136,6 +137,7 @@
                     openssl
                     git
                     keyutils
+                    terraform
                   ];
                   OPENSSL_DIR = "${pkgs.openssl.dev}";
                   OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
@@ -161,6 +163,11 @@
               inputs.rust-overlay.overlays.default
               self.overlays.default
             ];
+            config.allowUnfreePredicate =
+              pkg:
+              builtins.elem (pkg.pname or "") [
+                "terraform"
+              ];
           };
 
           packages = {
@@ -201,6 +208,100 @@
             self.nixosModules.ami
             # FedRAMP compliance is opt-in:
             # { services.forgecache.compliance.fedramp.enable = true; }
+
+            # ── AWS provider configuration ──────────────────────────────────────
+            (
+              {
+                config,
+                pkgs,
+                lib,
+                ...
+              }:
+              let
+                awsForgeProxyProvider = pkgs.writeShellScript "forgecache-aws-provider" ''
+                  set -euo pipefail
+
+                  # ── Write config.yaml from Secrets Manager ────────────────────────
+                  mkdir -p /etc/forgecache
+                  ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                    --secret-id forgecache/service-config \
+                    --query 'SecretString' --output text > /etc/forgecache/config.yaml
+
+                  # ── Load per-org credentials into the kernel keyring ──────────────
+                  # Discovers all secrets under forgecache/creds/ dynamically — no
+                  # hardcoded org list. Adding an org requires creating a new SM secret,
+                  # not rebuilding the AMI.
+                  CRED_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
+                    --filters Key=name,Values=forgecache/creds/ \
+                    --query 'SecretList[].Name' --output text)
+                  for SECRET_NAME in $CRED_SECRETS; do
+                    SECRET_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                      --secret-id "$SECRET_NAME" --query 'SecretString' --output text)
+                    KEY_DESC="''${SECRET_NAME//\//-}"
+                    echo -n "$SECRET_VALUE" | keyctl padd user "$KEY_DESC" @s >/dev/null || true
+                  done
+
+                  # ── Load fixed secrets into keyring ───────────────────────────────
+                  for SECRET_NAME in \
+                    forgecache/forge-admin-token \
+                    forgecache/keydb-auth-token \
+                    forgecache/webhook-secret; do
+                    SECRET_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                      --secret-id "$SECRET_NAME" --query 'SecretString' --output text) || true
+                    if [ -n "''${SECRET_VALUE}" ]; then
+                      KEY_DESC="''${SECRET_NAME//\//-}"
+                      echo -n "$SECRET_VALUE" | keyctl padd user "$KEY_DESC" @s >/dev/null || true
+                    fi
+                  done
+                '';
+
+                awsNginxProvider = pkgs.writeShellScript "forgecache-nginx-provider" ''
+                                  set -euo pipefail
+                                  UPSTREAM=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                                    --secret-id forgecache/nginx-upstream-hostname \
+                                    --query 'SecretString' --output text)
+                                  UPSTREAM_PORT=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                                    --secret-id forgecache/nginx-upstream-port \
+                                    --query 'SecretString' --output text)
+
+                                  mkdir -p /etc/ssl/forgecache /etc/nginx/conf.d
+
+                                  # TLS material for nginx
+                                  ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                                    --secret-id forgecache/nginx-tls-cert --query 'SecretString' --output text \
+                                    > /etc/ssl/forgecache/cert.pem
+                                  ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                                    --secret-id forgecache/nginx-tls-key --query 'SecretString' --output text \
+                                    > /etc/ssl/forgecache/key.pem
+                                  chmod 640 /etc/ssl/forgecache/key.pem
+                                  chown root:nginx /etc/ssl/forgecache/key.pem
+
+                                  # Upstream block (http-level include)
+                                  cat > /etc/nginx/conf.d/forgecache-upstream.conf <<EOF
+                  upstream forge-upstream {
+                    server $UPSTREAM:$UPSTREAM_PORT;
+                    keepalive 32;
+                  }
+                  EOF
+
+                                  # Server-level variable (server-level include)
+                                  cat > /etc/nginx/conf.d/forgecache-server.conf <<EOF
+                  set \$forge_upstream_host "$UPSTREAM";
+                  EOF
+                '';
+              in
+              {
+                services.forgecache-secrets = lib.mkDefault {
+                  enable = true;
+                  providerScript = awsForgeProxyProvider;
+                };
+
+                services.forgecache-nginx-runtime = lib.mkDefault {
+                  enable = true;
+                  providerScript = awsNginxProvider;
+                };
+              }
+            )
           ];
         };
 
@@ -211,6 +312,47 @@
             inputs.sops-nix.nixosModules.sops
             self.nixosModules.keydb-host
             self.nixosModules.ami
+
+            # ── AWS provider configuration ──────────────────────────────────────
+            (
+              {
+                config,
+                pkgs,
+                lib,
+                ...
+              }:
+              let
+                awsKeydbProvider = pkgs.writeShellScript "keydb-aws-provider" ''
+                  set -euo pipefail
+                  fetch() {
+                    ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                      --secret-id "$1" --query 'SecretString' --output text
+                  }
+                  # Write TLS material to paths configured in services.keydb.tls.{certFile,keyFile,caFile}
+                  # (defaults: /var/lib/keydb/tls/{cert,key,ca}.pem — writable under ProtectSystem=strict)
+                  mkdir -p /var/lib/keydb/tls
+                  fetch forgecache/keydb-tls-cert > /var/lib/keydb/tls/cert.pem
+                  fetch forgecache/keydb-tls-key  > /var/lib/keydb/tls/key.pem
+                  fetch forgecache/keydb-tls-ca   > /var/lib/keydb/tls/ca.pem
+                  chmod 600 /var/lib/keydb/tls/key.pem
+                  chown -R keydb:keydb /var/lib/keydb/tls
+
+                  # Write runtime conf (second keydb-server arg, overrides requirepass from main conf)
+                  # Path matches services.keydb.extraConfFile (default: /run/keydb/runtime.conf)
+                  printf 'requirepass %s\n' "$(fetch forgecache/keydb-auth-token)" \
+                    > /run/keydb/runtime.conf
+                  chmod 600 /run/keydb/runtime.conf
+                '';
+              in
+              {
+                services.keydb.tls.enable = lib.mkDefault false;
+
+                services.keydb-secrets = lib.mkDefault {
+                  enable = false;
+                  providerScript = awsKeydbProvider;
+                };
+              }
+            )
           ];
         };
       };
