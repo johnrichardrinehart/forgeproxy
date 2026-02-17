@@ -79,7 +79,10 @@
                       edition = (builtins.fromTOML (builtins.readFile ./rust/Cargo.toml)).package.edition;
                     };
                     yamlfmt.enable = true;
-                    terraform.enable = true;
+                    terraform = {
+                      enable = true;
+                      package = pkgs.terraform;
+                    };
                   };
                 };
 
@@ -120,6 +123,20 @@
                       );
                     files = "\\.rs$";
                     pass_filenames = false;
+                  };
+
+                  terraform-validate = {
+                    enable = true;
+                    entry = toString (
+                      pkgs.writeShellScript "terraform-validate-hook" ''
+                        for arg in "$@"; do
+                          dirname "$arg"
+                        done | sort | uniq | while read dir; do
+                          ${pkgs.terraform}/bin/terraform -chdir="$dir" init
+                          ${pkgs.terraform}/bin/terraform -chdir="$dir" validate
+                        done
+                      ''
+                    );
                   };
                 };
 
