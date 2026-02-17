@@ -1,0 +1,70 @@
+# AWS Configuration
+aws_region = "us-east-1"
+
+# Resource naming
+name_prefix = "forgecache"
+
+# Upstream forge configuration
+upstream_hostname  = "ghe.example.com"
+upstream_port      = 443
+upstream_api_url   = "https://ghe.example.com/api/v3"
+backend_type       = "github-enterprise"
+
+# Proxy configuration
+proxy_fqdn = "cache.example.com"
+
+# S3 bundle bucket name (MUST be globally unique)
+bundle_bucket_name = "my-org-forgecache-bundles-12345"
+
+# Instance types and counts
+forgeproxy_instance_type = "t3.large"
+forgeproxy_count         = 1
+keydb_instance_type      = "r6i.large"
+
+# Volume sizes (GB)
+forgeproxy_root_volume_gb = 50
+keydb_root_volume_gb      = 50
+
+# KeyDB configuration
+keydb_max_memory = "2gb"
+
+# Network configuration
+vpc_cidr           = "10.0.0.0/16"
+public_subnet_cidr = "10.0.1.0/24"
+private_subnet_cidr = "10.0.2.0/24"
+
+# Network Load Balancer configuration
+nlb_internal = true  # Set to false to expose NLB via public EIP (corporate internal traffic only)
+
+# Access control
+allowed_client_cidrs = ["0.0.0.0/0"]  # Restrict this in production
+metrics_scrape_cidrs = []              # Add CIDRs for Prometheus scraping
+
+# EC2 key pair (optional, SSM access always available)
+ec2_key_pair_name = ""
+
+# Cache configuration
+local_cache_max_bytes = 53687091200  # 50 GiB
+eviction_policy       = "lfu"         # or "lru"
+
+# S3 storage configuration
+s3_bundle_prefix     = "forgecache/"
+s3_presigned_url_ttl = 3600
+
+# Logging
+log_level = "info"  # trace, debug, info, warn, error
+
+# Organization credentials configuration
+org_creds = [
+  {
+    name = "example-org"
+    mode = "pat"
+  },
+  {
+    name = "another-org"
+    mode = "pat"
+  },
+]
+
+# OpenTelemetry configuration (optional)
+otlp_endpoint = ""  # Leave empty to disable OTLP
