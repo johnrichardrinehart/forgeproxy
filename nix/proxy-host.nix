@@ -3,6 +3,7 @@
   imports = [
     ./module.nix
     ./nginx.nix
+    ./nginx-runtime.nix
     ./hardening.nix
     ./secrets.nix
     ./backend.nix
