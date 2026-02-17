@@ -34,13 +34,13 @@ in
       description = "Path to the TLS certificate private key.";
     };
 
-    gheUpstream = lib.mkOption {
+    upstreamHostname = lib.mkOption {
       type = lib.types.str;
       default = "ghe.internal.example.gov";
       description = "Hostname of the upstream Git forge server.";
     };
 
-    gheUpstreamPort = lib.mkOption {
+    upstreamPort = lib.mkOption {
       type = lib.types.port;
       default = 443;
       description = "Port of the upstream Git forge server.";
@@ -87,11 +87,8 @@ in
 
       # ── Global HTTP-level configuration ────────────────────────────
       appendHttpConfig = ''
-        # Upstream block for the Git forge server.
-        upstream ghe-upstream {
-          server ${cfg.gheUpstream}:${toString cfg.gheUpstreamPort};
-          keepalive 32;
-        }
+        # Runtime-configured upstream block (written by nginx-runtime provider at boot).
+        include /run/nginx/forgecache-upstream.conf;
 
         # Proxy cache for archive / tarball responses.
         proxy_cache_path ${cfg.archiveCachePath}
@@ -128,6 +125,11 @@ in
         forceSSL = true;
         sslCertificate = cfg.sslCertificate;
         sslCertificateKey = cfg.sslCertificateKey;
+
+        extraConfig = ''
+          # Runtime-configured upstream hostname variable (written by nginx-runtime provider at boot).
+          include /run/nginx/forgecache-server.conf;
+        '';
 
         locations = {
           # ── Git smart HTTP: info/refs ────────────────────────────
@@ -187,10 +189,10 @@ in
 
           # ── Archive / tarball downloads (cached) ─────────────────
           "~ ^/(.+)/(archive|tarball|zipball)/" = {
-            proxyPass = "https://ghe-upstream";
+            proxyPass = "https://forge-upstream";
             extraConfig = ''
               proxy_set_header Authorization $http_authorization;
-              proxy_set_header Host ${cfg.gheUpstream};
+              proxy_set_header Host $forge_upstream_host;
               proxy_set_header X-Real-IP $remote_addr;
               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
               proxy_set_header X-Forwarded-Proto $scheme;
@@ -207,10 +209,10 @@ in
 
           # ── API pass-through ───────────────────────────────────
           "${backendCfg.apiPathPrefix}/" = {
-            proxyPass = "https://ghe-upstream${backendCfg.apiPathPrefix}/";
+            proxyPass = "https://forge-upstream${backendCfg.apiPathPrefix}/";
             extraConfig = ''
               proxy_set_header Authorization $http_authorization;
-              proxy_set_header Host ${cfg.gheUpstream};
+              proxy_set_header Host $forge_upstream_host;
               proxy_set_header X-Real-IP $remote_addr;
               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
               proxy_set_header X-Forwarded-Proto $scheme;

@@ -48,9 +48,24 @@ pkgs.testers.runNixOSTest {
           serverName = "gitea-proxy";
           sslCertificate = "${testCerts}/cert.pem";
           sslCertificateKey = "${testCerts}/key.pem";
-          gheUpstream = "upstream.local";
+          upstreamHostname = "upstream.local";
           resolver = "127.0.0.53";
         };
+
+        # Create nginx runtime config includes before nginx starts (normally written by the provider script)
+        systemd.services.nginx.serviceConfig.ExecStartPre = lib.mkBefore [
+          "${pkgs.writeShellScript "nginx-runtime-config" ''
+                        cat > /run/nginx/forgecache-upstream.conf <<'EOFCONF'
+            upstream forge-upstream {
+              server upstream.local:443;
+              keepalive 32;
+            }
+            EOFCONF
+                        cat > /run/nginx/forgecache-server.conf <<'EOFCONF'
+            set $forge_upstream_host "upstream.local";
+            EOFCONF
+          ''}"
+        ];
 
         virtualisation.memorySize = 1024;
       };
@@ -79,9 +94,24 @@ pkgs.testers.runNixOSTest {
           serverName = "gitlab-proxy";
           sslCertificate = "${testCerts}/cert.pem";
           sslCertificateKey = "${testCerts}/key.pem";
-          gheUpstream = "upstream.local";
+          upstreamHostname = "upstream.local";
           resolver = "127.0.0.53";
         };
+
+        # Create nginx runtime config includes before nginx starts (normally written by the provider script)
+        systemd.services.nginx.serviceConfig.ExecStartPre = lib.mkBefore [
+          "${pkgs.writeShellScript "nginx-runtime-config" ''
+                        cat > /run/nginx/forgecache-upstream.conf <<'EOFCONF'
+            upstream forge-upstream {
+              server upstream.local:443;
+              keepalive 32;
+            }
+            EOFCONF
+                        cat > /run/nginx/forgecache-server.conf <<'EOFCONF'
+            set $forge_upstream_host "upstream.local";
+            EOFCONF
+          ''}"
+        ];
 
         virtualisation.memorySize = 1024;
       };

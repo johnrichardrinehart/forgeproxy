@@ -221,9 +221,24 @@ pkgs.testers.runNixOSTest {
           serverName = "proxy";
           sslCertificate = "${testCerts}/proxy.crt";
           sslCertificateKey = "${testCerts}/proxy.key";
-          gheUpstream = "ghe";
+          upstreamHostname = "ghe";
           resolver = "127.0.0.53";
         };
+
+        # Create nginx runtime config includes before nginx starts (normally written by the provider script)
+        systemd.services.nginx.serviceConfig.ExecStartPre = lib.mkBefore [
+          "${pkgs.writeShellScript "nginx-runtime-config" ''
+                        cat > /run/nginx/forgecache-upstream.conf <<'EOFCONF'
+            upstream forge-upstream {
+              server ghe:443;
+              keepalive 32;
+            }
+            EOFCONF
+                        cat > /run/nginx/forgecache-server.conf <<'EOFCONF'
+            set $forge_upstream_host "ghe";
+            EOFCONF
+          ''}"
+        ];
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
         systemd.services.forgecache.environment = {
