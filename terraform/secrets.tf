@@ -184,6 +184,8 @@ resource "aws_secretsmanager_secret_version" "nginx_tls_key" {
 
 # ── KeyDB TLS Certificate Secret ──────────────────────────────────────────
 resource "aws_secretsmanager_secret" "keydb_tls_cert" {
+  count = var.keydb_enable_tls ? 1 : 0
+
   name_prefix = "${var.name_prefix}/keydb-tls-cert-"
   description = "KeyDB TLS certificate (public part)"
 
@@ -193,13 +195,17 @@ resource "aws_secretsmanager_secret" "keydb_tls_cert" {
 }
 
 resource "aws_secretsmanager_secret_version" "keydb_tls_cert" {
-  secret_id = aws_secretsmanager_secret.keydb_tls_cert.id
+  count = var.keydb_enable_tls ? 1 : 0
 
-  secret_string = tls_locally_signed_cert.keydb.cert_pem
+  secret_id = aws_secretsmanager_secret.keydb_tls_cert[0].id
+
+  secret_string = tls_locally_signed_cert.keydb[0].cert_pem
 }
 
 # ── KeyDB TLS Key Secret ──────────────────────────────────────────────────
 resource "aws_secretsmanager_secret" "keydb_tls_key" {
+  count = var.keydb_enable_tls ? 1 : 0
+
   name_prefix = "${var.name_prefix}/keydb-tls-key-"
   description = "KeyDB TLS private key"
 
@@ -209,13 +215,17 @@ resource "aws_secretsmanager_secret" "keydb_tls_key" {
 }
 
 resource "aws_secretsmanager_secret_version" "keydb_tls_key" {
-  secret_id = aws_secretsmanager_secret.keydb_tls_key.id
+  count = var.keydb_enable_tls ? 1 : 0
 
-  secret_string = tls_private_key.keydb.private_key_pem
+  secret_id = aws_secretsmanager_secret.keydb_tls_key[0].id
+
+  secret_string = tls_private_key.keydb[0].private_key_pem
 }
 
 # ── KeyDB TLS CA Certificate Secret ───────────────────────────────────────
 resource "aws_secretsmanager_secret" "keydb_tls_ca" {
+  count = var.keydb_enable_tls ? 1 : 0
+
   name_prefix = "${var.name_prefix}/keydb-tls-ca-"
   description = "KeyDB TLS CA certificate"
 
@@ -225,7 +235,9 @@ resource "aws_secretsmanager_secret" "keydb_tls_ca" {
 }
 
 resource "aws_secretsmanager_secret_version" "keydb_tls_ca" {
-  secret_id = aws_secretsmanager_secret.keydb_tls_ca.id
+  count = var.keydb_enable_tls ? 1 : 0
+
+  secret_id = aws_secretsmanager_secret.keydb_tls_ca[0].id
 
   secret_string = tls_self_signed_cert.ca.cert_pem
 }

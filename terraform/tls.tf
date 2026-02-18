@@ -26,12 +26,16 @@ resource "tls_self_signed_cert" "ca" {
 
 # ── TLS: KeyDB Server Certificate ───────────────────────────────────────────
 resource "tls_private_key" "keydb" {
+  count = var.keydb_enable_tls ? 1 : 0
+
   algorithm = "RSA"
   rsa_bits  = 2048
 }
 
 resource "tls_cert_request" "keydb" {
-  private_key_pem = tls_private_key.keydb.private_key_pem
+  count = var.keydb_enable_tls ? 1 : 0
+
+  private_key_pem = tls_private_key.keydb[0].private_key_pem
 
   subject {
     common_name         = "keydb"
@@ -53,7 +57,9 @@ resource "tls_cert_request" "keydb" {
 }
 
 resource "tls_locally_signed_cert" "keydb" {
-  cert_request_pem   = tls_cert_request.keydb.cert_request_pem
+  count = var.keydb_enable_tls ? 1 : 0
+
+  cert_request_pem   = tls_cert_request.keydb[0].cert_request_pem
   ca_private_key_pem = tls_private_key.ca.private_key_pem
   ca_cert_pem        = tls_self_signed_cert.ca.cert_pem
 

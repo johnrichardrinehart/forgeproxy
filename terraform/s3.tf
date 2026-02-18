@@ -50,8 +50,12 @@ resource "aws_s3_bucket_policy" "ami_staging" {
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject",
+          "s3:ListBucket",
         ]
-        Resource = "${aws_s3_bucket.ami_staging.arn}/*"
+        Resource = [
+          aws_s3_bucket.ami_staging.arn,
+          "${aws_s3_bucket.ami_staging.arn}/*"
+        ]
       }
     ]
   })
