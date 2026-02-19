@@ -5,6 +5,7 @@
     ./keydb-secrets.nix
     ./hardening.nix
     ./compliance/default.nix
+    ./local-vm.nix
   ];
 
   config = {

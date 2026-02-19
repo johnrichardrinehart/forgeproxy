@@ -214,6 +214,7 @@
           compliance = ./nix/compliance/default.nix;
           proxy-host = ./nix/proxy-host.nix;
           keydb-host = ./nix/keydb-host.nix;
+          dev = ./nix/dev.nix;
         };
 
         nixosConfigurations.forgecache = inputs.nixpkgs.lib.nixosSystem {
@@ -371,6 +372,14 @@
               }
             )
           ];
+        };
+
+        nixosConfigurations.forgecache-dev = self.nixosConfigurations.forgecache.extendModules {
+          modules = [ self.nixosModules.dev ];
+        };
+
+        nixosConfigurations.keydb-dev = self.nixosConfigurations.keydb.extendModules {
+          modules = [ self.nixosModules.dev ];
         };
       };
     };

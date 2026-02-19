@@ -1,7 +1,14 @@
+# ── Map closure_variant to nixosConfiguration names ───────────────────────────
+locals {
+  forgecache_config = var.closure_variant == "dev" ? "forgecache-dev" : "forgecache"
+  keydb_config      = var.closure_variant == "dev" ? "keydb-dev" : "keydb"
+  variant_suffix    = var.closure_variant == "dev" ? "-dev" : ""
+}
+
 # ── Evaluate Nix outPaths at plan time (fast, no build) ──────────────────────
 data "external" "forgecache_image_hash" {
   program = ["bash", "-c", <<-EOT
-    OUTPATH=$(nix eval --raw '${var.flake_ref}#nixosConfigurations.forgecache.config.system.build.images.amazon.outPath')
+    OUTPATH=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.system.build.images.amazon.outPath')
     HASH=$(basename "$OUTPATH" | cut -d- -f1)
     printf '{"hash":"%s"}\n' "$HASH"
   EOT
@@ -10,7 +17,7 @@ data "external" "forgecache_image_hash" {
 
 data "external" "keydb_image_hash" {
   program = ["bash", "-c", <<-EOT
-    OUTPATH=$(nix eval --raw '${var.flake_ref}#nixosConfigurations.keydb.config.system.build.images.amazon.outPath')
+    OUTPATH=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.system.build.images.amazon.outPath')
     HASH=$(basename "$OUTPATH" | cut -d- -f1)
     printf '{"hash":"%s"}\n' "$HASH"
   EOT
@@ -28,8 +35,8 @@ resource "null_resource" "build_forgecache_ami" {
       set -euo pipefail
 
       HASH="${data.external.forgecache_image_hash.result.hash}"
-      AMI_NAME="${var.name_prefix}-forgecache-$HASH"
-      S3_KEY="forgecache-$HASH.vhd"
+      AMI_NAME="${var.name_prefix}-forgecache${local.variant_suffix}-$HASH"
+      S3_KEY="forgecache${local.variant_suffix}-$HASH.vhd"
 
       # If an AMI with this hash already exists, nothing to do
       EXISTING_AMI=$(aws ec2 describe-images \
@@ -42,7 +49,7 @@ resource "null_resource" "build_forgecache_ami" {
       fi
 
       # Build the NixOS image (only reached when AMI doesn't exist yet)
-      nix build '${var.flake_ref}#nixosConfigurations.forgecache.config.system.build.images.amazon'
+      nix build --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.system.build.images.amazon'
 
       # Upload only if this exact image isn't already in the bucket
       if ! aws s3api head-object --bucket "${aws_s3_bucket.ami_staging.id}" --key "$S3_KEY" 2>/dev/null; then
@@ -107,7 +114,7 @@ data "aws_ami" "forgecache" {
 
   filter {
     name   = "name"
-    values = ["${var.name_prefix}-forgecache-${data.external.forgecache_image_hash.result.hash}"]
+    values = ["${var.name_prefix}-forgecache${local.variant_suffix}-${data.external.forgecache_image_hash.result.hash}"]
   }
 
   depends_on = [null_resource.build_forgecache_ami]
@@ -124,8 +131,8 @@ resource "null_resource" "build_keydb_ami" {
       set -euo pipefail
 
       HASH="${data.external.keydb_image_hash.result.hash}"
-      AMI_NAME="${var.name_prefix}-keydb-$HASH"
-      S3_KEY="keydb-$HASH.vhd"
+      AMI_NAME="${var.name_prefix}-keydb${local.variant_suffix}-$HASH"
+      S3_KEY="keydb${local.variant_suffix}-$HASH.vhd"
 
       # If an AMI with this hash already exists, nothing to do
       EXISTING_AMI=$(aws ec2 describe-images \
@@ -138,7 +145,7 @@ resource "null_resource" "build_keydb_ami" {
       fi
 
       # Build the NixOS image (only reached when AMI doesn't exist yet)
-      nix build '${var.flake_ref}#nixosConfigurations.keydb.config.system.build.images.amazon'
+      nix build --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.system.build.images.amazon'
 
       # Upload only if this exact image isn't already in the bucket
       if ! aws s3api head-object --bucket "${aws_s3_bucket.ami_staging.id}" --key "$S3_KEY" 2>/dev/null; then
@@ -203,7 +210,7 @@ data "aws_ami" "keydb" {
 
   filter {
     name   = "name"
-    values = ["${var.name_prefix}-keydb-${data.external.keydb_image_hash.result.hash}"]
+    values = ["${var.name_prefix}-keydb${local.variant_suffix}-${data.external.keydb_image_hash.result.hash}"]
   }
 
   depends_on = [null_resource.build_keydb_ami]

@@ -8,6 +8,7 @@
     ./secrets.nix
     ./backend.nix
     ./compliance/default.nix
+    ./local-vm.nix
   ];
 
   config = {

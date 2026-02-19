@@ -220,6 +220,14 @@ in
             '';
           };
 
+          # ── Health check (proxied to backend) ────────────────────
+          "/healthz" = {
+            proxyPass = "http://127.0.0.1:${toString cfg.backendPort}/healthz";
+            extraConfig = ''
+              proxy_set_header Host $host;
+            '';
+          };
+
           # ── Webhook receiver ─────────────────────────────────────
           "/webhook" = {
             proxyPass = "http://127.0.0.1:${toString cfg.backendPort}/webhook";

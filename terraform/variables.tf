@@ -1,3 +1,14 @@
+variable "closure_variant" {
+  type        = string
+  default     = "prod"
+  description = "NixOS closure variant: 'prod' (hardened) or 'dev' (root SSH + console logs)."
+
+  validation {
+    condition     = contains(["prod", "dev"], var.closure_variant)
+    error_message = "closure_variant must be 'prod' or 'dev'."
+  }
+}
+
 variable "flake_ref" {
   type        = string
   default     = "github:johnrichardrinehart/forgeproxy"

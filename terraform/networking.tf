@@ -304,8 +304,8 @@ resource "aws_lb_target_group" "https" {
     unhealthy_threshold = 3
     timeout             = 10
     interval            = 30
-    port                = "8080"
-    protocol            = "HTTP"
+    port                = "443"
+    protocol            = "HTTPS"
     path                = "/healthz"
     matcher             = "200-299"
   }
@@ -329,8 +329,8 @@ resource "aws_lb_target_group" "ssh" {
     unhealthy_threshold = 3
     timeout             = 10
     interval            = 30
-    port                = "8080"
-    protocol            = "HTTP"
+    port                = "443"
+    protocol            = "HTTPS"
     path                = "/healthz"
     matcher             = "200-299"
   }
