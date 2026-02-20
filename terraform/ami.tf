@@ -93,6 +93,7 @@ resource "null_resource" "build_forgecache_ami" {
         --architecture x86_64 \
         --root-device-name /dev/xvda \
         --virtualization-type hvm \
+        --boot-mode uefi \
         --ena-support \
         --block-device-mappings \
           "DeviceName=/dev/xvda,Ebs={SnapshotId=$SNAP_ID,VolumeSize=${var.forgeproxy_root_volume_gb},VolumeType=gp3,DeleteOnTermination=true}" \
@@ -189,6 +190,7 @@ resource "null_resource" "build_keydb_ami" {
         --architecture x86_64 \
         --root-device-name /dev/xvda \
         --virtualization-type hvm \
+        --boot-mode uefi \
         --ena-support \
         --block-device-mappings \
           "DeviceName=/dev/xvda,Ebs={SnapshotId=$SNAP_ID,VolumeSize=${var.keydb_root_volume_gb},VolumeType=gp3,DeleteOnTermination=true}" \
