@@ -328,8 +328,7 @@
                                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                                     --secret-id "$(resolve nginx-tls-key)" --query 'SecretString' --output text \
                                     > /run/nginx/ssl/key.pem
-                                  chmod 640 /run/nginx/ssl/key.pem
-                                  chown root:nginx /run/nginx/ssl/key.pem
+                                  chmod 600 /run/nginx/ssl/key.pem
 
                                   # Upstream block (http-level include)
                                   cat > /run/nginx/forgecache-upstream.conf <<EOF
