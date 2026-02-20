@@ -22,7 +22,6 @@ module "forgecache" {
 
   keydb_instance_type  = var.keydb_instance_type
   keydb_root_volume_gb = var.keydb_root_volume_gb
-  keydb_max_memory     = var.keydb_max_memory
   vpc_cidr             = var.vpc_cidr
   public_subnet_cidr   = var.public_subnet_cidr
   private_subnet_cidr  = var.private_subnet_cidr

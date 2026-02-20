@@ -78,12 +78,6 @@ variable "keydb_root_volume_gb" {
   description = "Root volume size (GB) for KeyDB instance"
 }
 
-variable "keydb_max_memory" {
-  type        = string
-  default     = "2gb"
-  description = "Maximum memory for KeyDB"
-}
-
 
 variable "vpc_cidr" {
   type        = string

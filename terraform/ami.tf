@@ -4,8 +4,10 @@ locals {
   keydb_config      = var.closure_variant == "dev" ? "keydb-dev" : "keydb"
   variant_suffix    = var.closure_variant == "dev" ? "-dev" : ""
 
-  # Derive keydb TLS setting from the Nix configuration (single source of truth).
-  keydb_tls_enable = data.external.keydb_tls.result.enable == "true"
+  # ── Values derived from the Nix configuration (single source of truth) ──
+  keydb_tls_enable = data.external.nix_config.result.keydb_tls_enable == "true"
+  backend_port     = tonumber(data.external.nix_config.result.backend_port)
+  keydb_max_memory = data.external.nix_config.result.keydb_max_memory
 }
 
 # ── Evaluate Nix outPaths at plan time (fast, no build) ──────────────────────
@@ -27,12 +29,16 @@ data "external" "keydb_image_hash" {
   ]
 }
 
-# Derive keydb TLS setting from the Nix configuration so the Terraform-generated
-# config.yaml (port, tls flag) and secrets (TLS certs) stay in sync with the AMI.
-data "external" "keydb_tls" {
+# ── Extract configuration values from Nix (single source of truth) ────────────
+# These values are baked into the AMIs. Terraform must use the same values for
+# infrastructure (SG rules, NLB target groups) and runtime config (Secrets Manager).
+data "external" "nix_config" {
   program = ["bash", "-c", <<-EOT
-    VAL=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.services.keydb.tls.enable')
-    printf '{"enable":"%s"}\n' "$VAL"
+    KEYDB_TLS=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.services.keydb.tls.enable')
+    BACKEND_PORT=$(nix eval --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.services.forgecache-nginx.backendPort')
+    KEYDB_MAX_MEM=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.services.keydb.maxMemory')
+    printf '{"keydb_tls_enable":"%s","backend_port":"%s","keydb_max_memory":"%s"}\n' \
+      "$KEYDB_TLS" "$BACKEND_PORT" "$KEYDB_MAX_MEM"
   EOT
   ]
 }

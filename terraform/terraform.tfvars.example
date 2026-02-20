@@ -25,9 +25,6 @@ keydb_instance_type      = "r6i.large"
 forgeproxy_root_volume_gb = 50
 keydb_root_volume_gb      = 50
 
-# KeyDB configuration
-keydb_max_memory = "2gb"
-
 # Network configuration
 vpc_cidr           = "10.0.0.0/16"
 public_subnet_cidr = "10.0.1.0/24"
