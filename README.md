@@ -73,14 +73,14 @@ nix build .#forgecache-fips     # FIPS 140 TLS build
 Copy and edit the example configuration:
 
 ```bash
-cp config.example.yaml /etc/forgecache/config.yaml
+cp config.example.yaml /run/forgecache/config.yaml
 # edit upstream hostname, API URL, KeyDB endpoint, S3 bucket, etc.
 ```
 
 Run:
 
 ```bash
-forgecache --config /etc/forgecache/config.yaml
+forgecache --config /run/forgecache/config.yaml
 ```
 
 ## Configuration
@@ -119,7 +119,7 @@ The flake exports a NixOS module for declarative deployment:
         {
           services.forgecache = {
             enable = true;
-            configFile = "/etc/forgecache/config.yaml";
+            configFile = "/run/forgecache/config.yaml";
             logLevel = "info";
           };
         }

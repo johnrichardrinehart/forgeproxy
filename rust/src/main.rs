@@ -36,7 +36,7 @@ use crate::metrics::MetricsRegistry;
 #[command(name = "forgecache", about = "Git Caching Reverse Proxy")]
 struct Cli {
     /// Path to the YAML configuration file.
-    #[arg(short, long, default_value = "/etc/forgecache/config.yaml")]
+    #[arg(short, long, default_value = "/run/forgecache/config.yaml")]
     config: String,
 }
 
