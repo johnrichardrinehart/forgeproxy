@@ -254,6 +254,10 @@ in
       };
     };
 
+    # The NixOS nginx module enables MemoryDenyWriteExecute by default, but
+    # the preStart provider runs awscli2 (Python/libffi) which requires W|X memory.
+    systemd.services.nginx.serviceConfig.MemoryDenyWriteExecute = lib.mkForce false;
+
     # Ensure the cache directory exists with correct ownership.
     systemd.tmpfiles.rules = [
       "d ${cfg.archiveCachePath} 0750 nginx nginx -"
