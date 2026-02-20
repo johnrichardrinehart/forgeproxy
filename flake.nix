@@ -239,19 +239,28 @@
                 awsForgeProxyProvider = pkgs.writeShellScript "forgecache-aws-provider" ''
                   set -euo pipefail
 
+                  # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
+                  ALL_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
+                    --filters "Key=name,Values=''${SM_PREFIX}/" \
+                    --query 'SecretList[].Name' --output json)
+
+                  resolve() {
+                    echo "$ALL_SECRETS" | ${pkgs.jq}/bin/jq -r --arg p "''${SM_PREFIX}/$1" \
+                      '[.[] | select(startswith($p))][0]'
+                  }
+
                   # ── Write config.yaml from Secrets Manager ────────────────────────
                   mkdir -p /etc/forgecache
                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                    --secret-id forgecache/service-config \
+                    --secret-id "$(resolve service-config)" \
                     --query 'SecretString' --output text > /etc/forgecache/config.yaml
 
                   # ── Load per-org credentials into the kernel keyring ──────────────
-                  # Discovers all secrets under forgecache/creds/ dynamically — no
+                  # Discovers all secrets under ''${SM_PREFIX}/creds/ dynamically — no
                   # hardcoded org list. Adding an org requires creating a new SM secret,
                   # not rebuilding the AMI.
-                  CRED_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
-                    --filters Key=name,Values=forgecache/creds/ \
-                    --query 'SecretList[].Name' --output text)
+                  CRED_SECRETS=$(echo "$ALL_SECRETS" | ${pkgs.jq}/bin/jq -r \
+                    --arg p "''${SM_PREFIX}/creds/" '.[] | select(startswith($p))')
                   for SECRET_NAME in $CRED_SECRETS; do
                     SECRET_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$SECRET_NAME" --query 'SecretString' --output text)
@@ -260,10 +269,11 @@
                   done
 
                   # ── Load fixed secrets into keyring ───────────────────────────────
-                  for SECRET_NAME in \
-                    forgecache/forge-admin-token \
-                    forgecache/keydb-auth-token \
-                    forgecache/webhook-secret; do
+                  for SUFFIX in \
+                    forge-admin-token \
+                    keydb-auth-token \
+                    webhook-secret; do
+                    SECRET_NAME=$(resolve "$SUFFIX")
                     SECRET_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$SECRET_NAME" --query 'SecretString' --output text) || true
                     if [ -n "''${SECRET_VALUE}" ]; then
@@ -275,21 +285,32 @@
 
                 awsNginxProvider = pkgs.writeShellScript "forgecache-nginx-provider" ''
                                   set -euo pipefail
+
+                                  # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
+                                  ALL_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
+                                    --filters "Key=name,Values=''${SM_PREFIX}/" \
+                                    --query 'SecretList[].Name' --output json)
+
+                                  resolve() {
+                                    echo "$ALL_SECRETS" | ${pkgs.jq}/bin/jq -r --arg p "''${SM_PREFIX}/$1" \
+                                      '[.[] | select(startswith($p))][0]'
+                                  }
+
                                   UPSTREAM=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                                    --secret-id forgecache/nginx-upstream-hostname \
+                                    --secret-id "$(resolve nginx-upstream-hostname)" \
                                     --query 'SecretString' --output text)
                                   UPSTREAM_PORT=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                                    --secret-id forgecache/nginx-upstream-port \
+                                    --secret-id "$(resolve nginx-upstream-port)" \
                                     --query 'SecretString' --output text)
 
                                   mkdir -p /etc/ssl/forgecache /run/nginx
 
                                   # TLS material for nginx
                                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                                    --secret-id forgecache/nginx-tls-cert --query 'SecretString' --output text \
+                                    --secret-id "$(resolve nginx-tls-cert)" --query 'SecretString' --output text \
                                     > /etc/ssl/forgecache/cert.pem
                                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                                    --secret-id forgecache/nginx-tls-key --query 'SecretString' --output text \
+                                    --secret-id "$(resolve nginx-tls-key)" --query 'SecretString' --output text \
                                     > /etc/ssl/forgecache/key.pem
                                   chmod 640 /etc/ssl/forgecache/key.pem
                                   chown root:nginx /etc/ssl/forgecache/key.pem
@@ -312,11 +333,13 @@
                 services.forgecache-secrets = lib.mkDefault {
                   enable = true;
                   providerScript = awsForgeProxyProvider;
+                  environment.SM_PREFIX = "forgecache";
                 };
 
                 services.forgecache-nginx-runtime = lib.mkDefault {
                   enable = true;
                   providerScript = awsNginxProvider;
+                  environment.SM_PREFIX = "forgecache";
                 };
               }
             )
@@ -342,22 +365,33 @@
               let
                 awsKeydbProvider = pkgs.writeShellScript "keydb-aws-provider" ''
                   set -euo pipefail
+
+                  # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
+                  ALL_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
+                    --filters "Key=name,Values=''${SM_PREFIX}/" \
+                    --query 'SecretList[].Name' --output json)
+
+                  resolve() {
+                    echo "$ALL_SECRETS" | ${pkgs.jq}/bin/jq -r --arg p "''${SM_PREFIX}/$1" \
+                      '[.[] | select(startswith($p))][0]'
+                  }
+
                   fetch() {
                     ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                      --secret-id "$1" --query 'SecretString' --output text
+                      --secret-id "$(resolve "$1")" --query 'SecretString' --output text
                   }
                   # Write TLS material to paths configured in services.keydb.tls.{certFile,keyFile,caFile}
                   # (defaults: /var/lib/keydb/tls/{cert,key,ca}.pem — writable under ProtectSystem=strict)
                   mkdir -p /var/lib/keydb/tls
-                  fetch forgecache/keydb-tls-cert > /var/lib/keydb/tls/cert.pem
-                  fetch forgecache/keydb-tls-key  > /var/lib/keydb/tls/key.pem
-                  fetch forgecache/keydb-tls-ca   > /var/lib/keydb/tls/ca.pem
+                  fetch keydb-tls-cert > /var/lib/keydb/tls/cert.pem
+                  fetch keydb-tls-key  > /var/lib/keydb/tls/key.pem
+                  fetch keydb-tls-ca   > /var/lib/keydb/tls/ca.pem
                   chmod 600 /var/lib/keydb/tls/key.pem
                   chown -R keydb:keydb /var/lib/keydb/tls
 
                   # Write runtime conf (second keydb-server arg, overrides requirepass from main conf)
                   # Path matches services.keydb.extraConfFile (default: /run/keydb/runtime.conf)
-                  printf 'requirepass %s\n' "$(fetch forgecache/keydb-auth-token)" \
+                  printf 'requirepass %s\n' "$(fetch keydb-auth-token)" \
                     > /run/keydb/runtime.conf
                   chmod 600 /run/keydb/runtime.conf
                 '';
@@ -368,6 +402,7 @@
                 services.keydb-secrets = lib.mkDefault {
                   enable = false;
                   providerScript = awsKeydbProvider;
+                  environment.SM_PREFIX = "forgecache";
                 };
               }
             )
