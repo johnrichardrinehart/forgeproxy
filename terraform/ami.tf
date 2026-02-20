@@ -54,7 +54,10 @@ resource "null_resource" "build_forgecache_ami" {
       # Upload only if this exact image isn't already in the bucket
       if ! aws s3api head-object --bucket "${aws_s3_bucket.ami_staging.id}" --key "$S3_KEY" 2>/dev/null; then
         OUT_PATH=$(readlink -f result)
-        aws s3 cp "$OUT_PATH"/*.vhd \
+        AWS_MAX_ATTEMPTS=5 aws s3 cp \
+          --cli-read-timeout 300 \
+          --cli-connect-timeout 60 \
+          "$OUT_PATH"/*.vhd \
           "s3://${aws_s3_bucket.ami_staging.id}/$S3_KEY"
       fi
 
@@ -151,7 +154,10 @@ resource "null_resource" "build_keydb_ami" {
       # Upload only if this exact image isn't already in the bucket
       if ! aws s3api head-object --bucket "${aws_s3_bucket.ami_staging.id}" --key "$S3_KEY" 2>/dev/null; then
         OUT_PATH=$(readlink -f result)
-        aws s3 cp "$OUT_PATH"/*.vhd \
+        AWS_MAX_ATTEMPTS=5 aws s3 cp \
+          --cli-read-timeout 300 \
+          --cli-connect-timeout 60 \
+          "$OUT_PATH"/*.vhd \
           "s3://${aws_s3_bucket.ami_staging.id}/$S3_KEY"
       fi
 
