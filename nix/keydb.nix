@@ -212,6 +212,7 @@ in
 
       serviceConfig = {
         Type = "simple";
+        SyslogIdentifier = "keydb-server";
         User = cfg.user;
         Group = cfg.group;
 
