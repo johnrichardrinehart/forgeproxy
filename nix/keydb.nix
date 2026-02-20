@@ -262,6 +262,9 @@ in
     # ── Log directory via tmpfiles ─────────────────────────────────────
     systemd.tmpfiles.rules = [
       "d /var/log/keydb 0750 ${cfg.user} ${cfg.group} -"
+    ]
+    ++ lib.optionals cfg.tls.enable [
+      "d /var/lib/keydb/tls 0750 ${cfg.user} ${cfg.group} -"
     ];
   };
 }
