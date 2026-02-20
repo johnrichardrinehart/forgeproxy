@@ -28,6 +28,10 @@ resource "aws_instance" "keydb" {
     null_resource.build_keydb_ami,
     aws_secretsmanager_secret_version.keydb_auth_token,
   ]
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # ── forgeproxy Instances (count) ───────────────────────────────────────────
@@ -70,6 +74,11 @@ resource "aws_instance" "forgeproxy" {
     aws_secretsmanager_secret_version.nginx_tls_cert,
     aws_secretsmanager_secret_version.nginx_tls_key,
   ]
+
+  lifecycle {
+    create_before_destroy = true
+    replace_triggered_by  = [aws_instance.keydb.id]
+  }
 }
 
 # ── NLB Target Group Attachments: HTTPS ────────────────────────────────────
@@ -78,6 +87,10 @@ resource "aws_lb_target_group_attachment" "forgeproxy_https" {
   target_group_arn = aws_lb_target_group.https.arn
   target_id        = aws_instance.forgeproxy[count.index].id
   port             = 443
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # ── NLB Target Group Attachments: SSH Git ─────────────────────────────────
@@ -86,4 +99,8 @@ resource "aws_lb_target_group_attachment" "forgeproxy_ssh" {
   target_group_arn = aws_lb_target_group.ssh.arn
   target_id        = aws_instance.forgeproxy[count.index].id
   port             = 2222
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }

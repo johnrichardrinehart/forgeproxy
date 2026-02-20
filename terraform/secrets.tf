@@ -36,10 +36,6 @@ resource "aws_secretsmanager_secret_version" "forgecache_config" {
     log_level             = var.log_level
     org_creds             = var.org_creds
   })
-
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
 }
 
 # ── Forge Admin Token Secret ──────────────────────────────────────────────
