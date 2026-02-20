@@ -101,7 +101,7 @@ in
             "-w /etc/cron.d -p wa -k cron"
 
             # Monitor TLS certificate stores used by forgecache and KeyDB.
-            "-w /etc/ssl/forgecache/ -p wa -k tls_certs"
+            "-w /run/ssl/forgecache/ -p wa -k tls_certs"
             "-w /etc/ssl/keydb/ -p wa -k tls_certs"
 
             # Make audit configuration immutable until next boot (-e 2).

@@ -317,17 +317,17 @@
                                     --secret-id "$(resolve nginx-upstream-port)" \
                                     --query 'SecretString' --output text)
 
-                                  mkdir -p /etc/ssl/forgecache /run/nginx
+                                  mkdir -p /run/ssl/forgecache /run/nginx
 
                                   # TLS material for nginx
                                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                                     --secret-id "$(resolve nginx-tls-cert)" --query 'SecretString' --output text \
-                                    > /etc/ssl/forgecache/cert.pem
+                                    > /run/ssl/forgecache/cert.pem
                                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                                     --secret-id "$(resolve nginx-tls-key)" --query 'SecretString' --output text \
-                                    > /etc/ssl/forgecache/key.pem
-                                  chmod 640 /etc/ssl/forgecache/key.pem
-                                  chown root:nginx /etc/ssl/forgecache/key.pem
+                                    > /run/ssl/forgecache/key.pem
+                                  chmod 640 /run/ssl/forgecache/key.pem
+                                  chown root:nginx /run/ssl/forgecache/key.pem
 
                                   # Upstream block (http-level include)
                                   cat > /run/nginx/forgecache-upstream.conf <<EOF
