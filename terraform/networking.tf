@@ -188,12 +188,15 @@ resource "aws_security_group" "forgeproxy" {
   }
 
   # Prometheus metrics from allowed scrapers
-  ingress {
-    from_port   = 9090
-    to_port     = 9090
-    protocol    = "tcp"
-    cidr_blocks = var.metrics_scrape_cidrs
-    description = "Prometheus metrics from allowed scrapers"
+  dynamic "ingress" {
+    for_each = length(var.metrics_scrape_cidrs) > 0 ? [1] : []
+    content {
+      from_port   = 9090
+      to_port     = 9090
+      protocol    = "tcp"
+      cidr_blocks = var.metrics_scrape_cidrs
+      description = "Prometheus metrics from allowed scrapers"
+    }
   }
 
   # All outbound

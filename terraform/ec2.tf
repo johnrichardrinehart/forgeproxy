@@ -6,6 +6,7 @@ resource "aws_instance" "keydb" {
   associate_public_ip_address = false
   iam_instance_profile        = aws_iam_instance_profile.keydb.name
   vpc_security_group_ids      = [local.keydb_security_group_id]
+  user_data                   = var.name_prefix
 
   root_block_device {
     volume_type           = "gp3"
@@ -44,6 +45,7 @@ resource "aws_instance" "forgeproxy" {
   iam_instance_profile        = aws_iam_instance_profile.forgeproxy.name
   vpc_security_group_ids      = [local.forgeproxy_security_group_id]
   key_name                    = var.ec2_key_pair_name != "" ? var.ec2_key_pair_name : null
+  user_data                   = var.name_prefix
 
   root_block_device {
     volume_type           = "gp3"
