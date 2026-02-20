@@ -15,6 +15,9 @@
   # EC2 instance configuration
   # ══════════════════════════════════════════════════════════════════════
 
+  # Build a UEFI-bootable image (GRUB EFI + ESP partition).
+  ec2.efi = true;
+
   # EBS root volume: GP3, 50 GiB, KMS-encrypted, delete-on-termination.
   # Configured via the EC2 launch template / `amazon-image.nix` defaults,
   # not NixOS options (no `ec2.ebs` option exists).
