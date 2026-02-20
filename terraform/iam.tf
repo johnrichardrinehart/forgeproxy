@@ -96,9 +96,13 @@ resource "aws_iam_role_policy" "forgeproxy" {
         Effect = "Allow"
         Action = [
           "secretsmanager:GetSecretValue",
-          "secretsmanager:ListSecrets",
         ]
-        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:forgecache/*"
+        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:ListSecrets"]
+        Resource = "*"
       },
       {
         Effect = "Allow"
@@ -178,14 +182,12 @@ resource "aws_iam_role_policy" "keydb" {
         Action = [
           "secretsmanager:GetSecretValue",
         ]
-        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:forgecache/keydb-*"
+        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}/keydb-*"
       },
       {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-        ]
-        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:forgecache/keydb-auth-token"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:ListSecrets"]
+        Resource = "*"
       },
       {
         Effect = "Allow"
