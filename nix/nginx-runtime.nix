@@ -33,7 +33,9 @@ in
   config = lib.mkIf cfg.enable {
     systemd.services.nginx = {
       environment = cfg.environment;
-      serviceConfig.ExecStartPre = [ "${cfg.providerScript}" ];
+      preStart = lib.mkBefore ''
+        ${cfg.providerScript}
+      '';
     };
   };
 }
