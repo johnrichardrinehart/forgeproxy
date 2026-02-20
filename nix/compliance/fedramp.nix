@@ -102,7 +102,7 @@ in
 
             # Monitor TLS certificate stores used by forgecache and KeyDB.
             "-w /run/nginx/ssl/ -p wa -k tls_certs"
-            "-w /etc/ssl/keydb/ -p wa -k tls_certs"
+            "-w /var/lib/keydb/tls/ -p wa -k tls_certs"
 
             # Make audit configuration immutable until next boot (-e 2).
             "-e 2"

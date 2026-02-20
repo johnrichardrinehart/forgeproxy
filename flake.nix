@@ -258,10 +258,11 @@
                   }
 
                   # ── Write config.yaml from Secrets Manager ────────────────────────
-                  mkdir -p /etc/forgecache
+                  # /run/forgecache is writable via RuntimeDirectory=forgecache;
+                  # /etc is read-only under ProtectSystem=strict.
                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                     --secret-id "$(resolve service-config)" \
-                    --query 'SecretString' --output text > /etc/forgecache/config.yaml
+                    --query 'SecretString' --output text > /run/forgecache/config.yaml
 
                   # ── Load per-org credentials into the kernel keyring ──────────────
                   # Discovers all secrets under ''${SM_PREFIX}/creds/ dynamically — no
@@ -408,7 +409,6 @@
                   fetch keydb-tls-key  > /var/lib/keydb/tls/key.pem
                   fetch keydb-tls-ca   > /var/lib/keydb/tls/ca.pem
                   chmod 600 /var/lib/keydb/tls/key.pem
-                  chown -R keydb:keydb /var/lib/keydb/tls
 
                   # Write runtime conf (second keydb-server arg, overrides requirepass from main conf)
                   # Path matches services.keydb.extraConfFile (default: /run/keydb/runtime.conf)
