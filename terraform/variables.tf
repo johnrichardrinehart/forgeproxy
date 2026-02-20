@@ -105,11 +105,6 @@ variable "keydb_max_memory" {
   description = "Maximum memory for KeyDB"
 }
 
-variable "keydb_enable_tls" {
-  type        = bool
-  default     = false
-  description = "Enable TLS for KeyDB (server cert + client verification). Set to true for production with in-transit encryption. KeyDB is protected by security groups in private subnet."
-}
 
 variable "vpc_id" {
   type        = string

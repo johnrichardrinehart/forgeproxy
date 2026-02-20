@@ -24,6 +24,7 @@ resource "aws_secretsmanager_secret_version" "forgecache_config" {
     backend_type          = var.backend_type
     proxy_fqdn            = var.proxy_fqdn
     keydb_private_ip      = aws_instance.keydb.private_ip
+    keydb_enable_tls      = local.keydb_tls_enable
     bundle_bucket         = aws_s3_bucket.bundle.id
     s3_bundle_prefix      = var.s3_bundle_prefix
     aws_region            = var.aws_region
@@ -180,7 +181,7 @@ resource "aws_secretsmanager_secret_version" "nginx_tls_key" {
 
 # ── KeyDB TLS Certificate Secret ──────────────────────────────────────────
 resource "aws_secretsmanager_secret" "keydb_tls_cert" {
-  count = var.keydb_enable_tls ? 1 : 0
+  count = local.keydb_tls_enable ? 1 : 0
 
   name_prefix = "${var.name_prefix}/keydb-tls-cert-"
   description = "KeyDB TLS certificate (public part)"
@@ -191,7 +192,7 @@ resource "aws_secretsmanager_secret" "keydb_tls_cert" {
 }
 
 resource "aws_secretsmanager_secret_version" "keydb_tls_cert" {
-  count = var.keydb_enable_tls ? 1 : 0
+  count = local.keydb_tls_enable ? 1 : 0
 
   secret_id = aws_secretsmanager_secret.keydb_tls_cert[0].id
 
@@ -200,7 +201,7 @@ resource "aws_secretsmanager_secret_version" "keydb_tls_cert" {
 
 # ── KeyDB TLS Key Secret ──────────────────────────────────────────────────
 resource "aws_secretsmanager_secret" "keydb_tls_key" {
-  count = var.keydb_enable_tls ? 1 : 0
+  count = local.keydb_tls_enable ? 1 : 0
 
   name_prefix = "${var.name_prefix}/keydb-tls-key-"
   description = "KeyDB TLS private key"
@@ -211,7 +212,7 @@ resource "aws_secretsmanager_secret" "keydb_tls_key" {
 }
 
 resource "aws_secretsmanager_secret_version" "keydb_tls_key" {
-  count = var.keydb_enable_tls ? 1 : 0
+  count = local.keydb_tls_enable ? 1 : 0
 
   secret_id = aws_secretsmanager_secret.keydb_tls_key[0].id
 
@@ -220,7 +221,7 @@ resource "aws_secretsmanager_secret_version" "keydb_tls_key" {
 
 # ── KeyDB TLS CA Certificate Secret ───────────────────────────────────────
 resource "aws_secretsmanager_secret" "keydb_tls_ca" {
-  count = var.keydb_enable_tls ? 1 : 0
+  count = local.keydb_tls_enable ? 1 : 0
 
   name_prefix = "${var.name_prefix}/keydb-tls-ca-"
   description = "KeyDB TLS CA certificate"
@@ -231,7 +232,7 @@ resource "aws_secretsmanager_secret" "keydb_tls_ca" {
 }
 
 resource "aws_secretsmanager_secret_version" "keydb_tls_ca" {
-  count = var.keydb_enable_tls ? 1 : 0
+  count = local.keydb_tls_enable ? 1 : 0
 
   secret_id = aws_secretsmanager_secret.keydb_tls_ca[0].id
 

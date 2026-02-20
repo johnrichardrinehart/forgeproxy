@@ -418,7 +418,7 @@
                 '';
               in
               {
-                services.keydb.tls.enable = lib.mkDefault false;
+                services.keydb.tls.enable = lib.mkDefault true;
 
                 services.keydb-secrets = lib.mkDefault {
                   enable = false;

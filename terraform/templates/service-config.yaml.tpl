@@ -22,8 +22,8 @@ proxy:
   bundle_uri_base_url: "https://${proxy_fqdn}/bundles"
 
 keydb:
-  endpoint: "${keydb_private_ip}:6380"
-  tls: true
+  endpoint: "${keydb_private_ip}:${keydb_enable_tls ? "6380" : "6379"}"
+  tls: ${keydb_enable_tls}
   auth_token_env: "KEYDB_AUTH_TOKEN"
 
 auth:

@@ -84,11 +84,6 @@ variable "keydb_max_memory" {
   description = "Maximum memory for KeyDB"
 }
 
-variable "keydb_enable_tls" {
-  type        = bool
-  default     = false
-  description = "Enable TLS for KeyDB"
-}
 
 variable "vpc_cidr" {
   type        = string
