@@ -20,7 +20,7 @@ in
 
     configFile = lib.mkOption {
       type = lib.types.path;
-      default = "/etc/forgecache/config.yaml";
+      default = "/run/forgecache/config.yaml";
       description = "Path to the forgecache configuration file.";
     };
 
