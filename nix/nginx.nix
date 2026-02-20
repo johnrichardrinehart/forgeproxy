@@ -24,13 +24,13 @@ in
 
     sslCertificate = lib.mkOption {
       type = lib.types.path;
-      default = "/etc/ssl/forgecache/cert.pem";
+      default = "/run/ssl/forgecache/cert.pem";
       description = "Path to the TLS certificate.";
     };
 
     sslCertificateKey = lib.mkOption {
       type = lib.types.path;
-      default = "/etc/ssl/forgecache/key.pem";
+      default = "/run/ssl/forgecache/key.pem";
       description = "Path to the TLS certificate private key.";
     };
 
