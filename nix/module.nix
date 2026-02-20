@@ -104,7 +104,9 @@ in
         ProtectControlGroups = true;
         RestrictNamespaces = true;
         LockPersonality = true;
-        MemoryDenyWriteExecute = true;
+        # Note: MemoryDenyWriteExecute is intentionally omitted here.
+        # ExecStartPre runs the AWS provider (awscli2/Python/libffi) under the
+        # same seccomp filter as the main process, and Python requires W|X memory.
         RestrictRealtime = true;
 
         ReadWritePaths = [
