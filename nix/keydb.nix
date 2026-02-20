@@ -206,6 +206,10 @@ in
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
+      # Disable the scudo allocator (set globally by profiles/hardened.nix) for
+      # KeyDB so its compiled-in jemalloc can handle allocations without conflict.
+      environment.LD_PRELOAD = lib.mkForce "";
+
       serviceConfig = {
         Type = "simple";
         User = cfg.user;
