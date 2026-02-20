@@ -68,9 +68,13 @@ pub struct Config {
     pub upstream_credentials: UpstreamCredentials,
     pub proxy: ProxyConfig,
     pub keydb: KeyDbConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
     pub clone: CloneConfig,
+    #[serde(default)]
     pub fetch_schedule: FetchScheduleConfig,
+    #[serde(default)]
     pub bundles: BundleConfig,
     pub storage: StorageConfig,
     #[serde(default)]
@@ -202,6 +206,17 @@ pub struct AuthConfig {
     pub webhook_secret_env: String,
 }
 
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            ssh_cache_ttl: default_ssh_cache_ttl(),
+            http_cache_ttl: default_http_cache_ttl(),
+            negative_cache_ttl: default_negative_cache_ttl(),
+            webhook_secret_env: default_webhook_secret_env(),
+        }
+    }
+}
+
 fn default_ssh_cache_ttl() -> u64 {
     300
 }
@@ -248,6 +263,18 @@ pub struct CloneConfig {
     pub max_concurrent_upstream_fetches: usize,
 }
 
+impl Default for CloneConfig {
+    fn default() -> Self {
+        Self {
+            freshness_threshold: default_freshness_threshold(),
+            lock_ttl: default_lock_ttl(),
+            lock_wait_timeout: default_lock_wait_timeout(),
+            max_concurrent_upstream_clones: default_max_concurrent_upstream_clones(),
+            max_concurrent_upstream_fetches: default_max_concurrent_upstream_fetches(),
+        }
+    }
+}
+
 fn default_freshness_threshold() -> u64 {
     600
 }
@@ -289,6 +316,18 @@ pub struct FetchScheduleConfig {
     /// Rolling window (seconds) for evaluating clone frequency.
     #[serde(default = "default_rolling_window")]
     pub rolling_window: u64,
+}
+
+impl Default for FetchScheduleConfig {
+    fn default() -> Self {
+        Self {
+            default_interval: default_fetch_interval(),
+            delta_threshold: default_delta_threshold(),
+            backoff_factor: default_backoff_factor(),
+            max_interval: default_max_interval(),
+            rolling_window: default_rolling_window(),
+        }
+    }
 }
 
 fn default_fetch_interval() -> u64 {
@@ -333,6 +372,18 @@ pub struct BundleConfig {
     /// Whether to produce filtered (blobless / treeless) bundle variants.
     #[serde(default)]
     pub generate_filtered_bundles: bool,
+}
+
+impl Default for BundleConfig {
+    fn default() -> Self {
+        Self {
+            daily_consolidation_hour: default_daily_hour(),
+            weekly_consolidation_day: default_weekly_day(),
+            min_clone_count_for_bundles: default_min_clone_count(),
+            bundle_lock_ttl: default_bundle_lock_ttl(),
+            generate_filtered_bundles: false,
+        }
+    }
 }
 
 fn default_daily_hour() -> u8 {
