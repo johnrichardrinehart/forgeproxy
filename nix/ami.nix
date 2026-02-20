@@ -18,6 +18,11 @@
   # Build a UEFI-bootable image (GRUB EFI + ESP partition).
   ec2.efi = true;
 
+  # The default 4 GiB image is too small with EFI (256 MiB ESP + closure).
+  # The EBS volume on EC2 is resized at launch via the Terraform block
+  # device mapping, so this only affects the build-time image.
+  virtualisation.diskSize = 5 * 1024;
+
   # EBS root volume: GP3, 50 GiB, KMS-encrypted, delete-on-termination.
   # Configured via the EC2 launch template / `amazon-image.nix` defaults,
   # not NixOS options (no `ec2.ebs` option exists).
