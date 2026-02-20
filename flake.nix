@@ -239,11 +239,12 @@
                 awsForgeProxyProvider = pkgs.writeShellScript "forgecache-aws-provider" ''
                   set -euo pipefail
 
-                  # ── Override SM_PREFIX from EC2 user_data (Terraform-driven) ──
-                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
-                  if [ -n "$_IMDS_TOKEN" ]; then
-                    _UD=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
-                    [ -n "$_UD" ] && SM_PREFIX="$_UD"
+                  # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
+                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                  if [ -z "$SM_PREFIX" ]; then
+                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                    exit 1
                   fi
 
                   # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
@@ -293,11 +294,12 @@
                 awsNginxProvider = pkgs.writeShellScript "forgecache-nginx-provider" ''
                                   set -euo pipefail
 
-                                  # ── Override SM_PREFIX from EC2 user_data (Terraform-driven) ──
-                                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
-                                  if [ -n "$_IMDS_TOKEN" ]; then
-                                    _UD=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
-                                    [ -n "$_UD" ] && SM_PREFIX="$_UD"
+                                  # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
+                                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                                  if [ -z "$SM_PREFIX" ]; then
+                                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                                    exit 1
                                   fi
 
                                   # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
@@ -347,13 +349,11 @@
                 services.forgecache-secrets = lib.mkDefault {
                   enable = true;
                   providerScript = awsForgeProxyProvider;
-                  environment.SM_PREFIX = "forgecache";
                 };
 
                 services.forgecache-nginx-runtime = lib.mkDefault {
                   enable = true;
                   providerScript = awsNginxProvider;
-                  environment.SM_PREFIX = "forgecache";
                 };
               }
             )
@@ -380,11 +380,12 @@
                 awsKeydbProvider = pkgs.writeShellScript "keydb-aws-provider" ''
                   set -euo pipefail
 
-                  # ── Override SM_PREFIX from EC2 user_data (Terraform-driven) ──
-                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
-                  if [ -n "$_IMDS_TOKEN" ]; then
-                    _UD=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
-                    [ -n "$_UD" ] && SM_PREFIX="$_UD"
+                  # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
+                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                  if [ -z "$SM_PREFIX" ]; then
+                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                    exit 1
                   fi
 
                   # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
@@ -423,7 +424,6 @@
                 services.keydb-secrets = lib.mkDefault {
                   enable = false;
                   providerScript = awsKeydbProvider;
-                  environment.SM_PREFIX = "forgecache";
                 };
               }
             )
