@@ -282,7 +282,7 @@
                                     --secret-id forgecache/nginx-upstream-port \
                                     --query 'SecretString' --output text)
 
-                                  mkdir -p /etc/ssl/forgecache /etc/nginx/conf.d
+                                  mkdir -p /etc/ssl/forgecache /run/nginx
 
                                   # TLS material for nginx
                                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
@@ -295,7 +295,7 @@
                                   chown root:nginx /etc/ssl/forgecache/key.pem
 
                                   # Upstream block (http-level include)
-                                  cat > /etc/nginx/conf.d/forgecache-upstream.conf <<EOF
+                                  cat > /run/nginx/forgecache-upstream.conf <<EOF
                   upstream forge-upstream {
                     server $UPSTREAM:$UPSTREAM_PORT;
                     keepalive 32;
@@ -303,7 +303,7 @@
                   EOF
 
                                   # Server-level variable (server-level include)
-                                  cat > /etc/nginx/conf.d/forgecache-server.conf <<EOF
+                                  cat > /run/nginx/forgecache-server.conf <<EOF
                   set \$forge_upstream_host "$UPSTREAM";
                   EOF
                 '';
