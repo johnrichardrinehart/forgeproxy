@@ -27,7 +27,8 @@ data "external" "keydb_image_hash" {
 # ── Build forgecache AMI ──────────────────────────────────────────────────
 resource "null_resource" "build_forgecache_ami" {
   triggers = {
-    image_hash = data.external.forgecache_image_hash.result.hash
+    image_hash  = data.external.forgecache_image_hash.result.hash
+    name_prefix = var.name_prefix
   }
 
   provisioner "local-exec" {
@@ -127,7 +128,8 @@ data "aws_ami" "forgecache" {
 # ── Build keydb AMI ────────────────────────────────────────────────────────
 resource "null_resource" "build_keydb_ami" {
   triggers = {
-    image_hash = data.external.keydb_image_hash.result.hash
+    image_hash  = data.external.keydb_image_hash.result.hash
+    name_prefix = var.name_prefix
   }
 
   provisioner "local-exec" {

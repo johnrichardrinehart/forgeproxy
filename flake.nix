@@ -239,6 +239,13 @@
                 awsForgeProxyProvider = pkgs.writeShellScript "forgecache-aws-provider" ''
                   set -euo pipefail
 
+                  # ── Override SM_PREFIX from EC2 user_data (Terraform-driven) ──
+                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
+                  if [ -n "$_IMDS_TOKEN" ]; then
+                    _UD=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                    [ -n "$_UD" ] && SM_PREFIX="$_UD"
+                  fi
+
                   # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
                   ALL_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
                     --filters "Key=name,Values=''${SM_PREFIX}/" \
@@ -285,6 +292,13 @@
 
                 awsNginxProvider = pkgs.writeShellScript "forgecache-nginx-provider" ''
                                   set -euo pipefail
+
+                                  # ── Override SM_PREFIX from EC2 user_data (Terraform-driven) ──
+                                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
+                                  if [ -n "$_IMDS_TOKEN" ]; then
+                                    _UD=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                                    [ -n "$_UD" ] && SM_PREFIX="$_UD"
+                                  fi
 
                                   # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
                                   ALL_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
@@ -365,6 +379,13 @@
               let
                 awsKeydbProvider = pkgs.writeShellScript "keydb-aws-provider" ''
                   set -euo pipefail
+
+                  # ── Override SM_PREFIX from EC2 user_data (Terraform-driven) ──
+                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
+                  if [ -n "$_IMDS_TOKEN" ]; then
+                    _UD=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                    [ -n "$_UD" ] && SM_PREFIX="$_UD"
+                  fi
 
                   # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
                   ALL_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
