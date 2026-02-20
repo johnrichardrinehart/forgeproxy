@@ -87,6 +87,9 @@ in
 
       # ── Global HTTP-level configuration ────────────────────────────
       appendHttpConfig = ''
+        proxy_headers_hash_max_size 1024;
+        proxy_headers_hash_bucket_size 128;
+
         # Runtime-configured upstream block (written by nginx-runtime provider at boot).
         include /run/nginx/forgecache-upstream.conf;
 
