@@ -12,6 +12,5 @@ bundle_bucket_name = "my-forgecache-bundles"
 # forgeproxy_instance_type = "t3.large"
 # forgeproxy_count         = 1
 # keydb_instance_type      = "r6i.large"
-# keydb_enable_tls         = false
 # nlb_internal             = true
 # log_level                = "info"

@@ -3,6 +3,9 @@ locals {
   forgecache_config = var.closure_variant == "dev" ? "forgecache-dev" : "forgecache"
   keydb_config      = var.closure_variant == "dev" ? "keydb-dev" : "keydb"
   variant_suffix    = var.closure_variant == "dev" ? "-dev" : ""
+
+  # Derive keydb TLS setting from the Nix configuration (single source of truth).
+  keydb_tls_enable = data.external.keydb_tls.result.enable == "true"
 }
 
 # ── Evaluate Nix outPaths at plan time (fast, no build) ──────────────────────
@@ -20,6 +23,16 @@ data "external" "keydb_image_hash" {
     OUTPATH=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.system.build.images.amazon.outPath')
     HASH=$(basename "$OUTPATH" | cut -d- -f1)
     printf '{"hash":"%s"}\n' "$HASH"
+  EOT
+  ]
+}
+
+# Derive keydb TLS setting from the Nix configuration so the Terraform-generated
+# config.yaml (port, tls flag) and secrets (TLS certs) stay in sync with the AMI.
+data "external" "keydb_tls" {
+  program = ["bash", "-c", <<-EOT
+    VAL=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.services.keydb.tls.enable')
+    printf '{"enable":"%s"}\n' "$VAL"
   EOT
   ]
 }
