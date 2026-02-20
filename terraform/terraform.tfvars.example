@@ -27,7 +27,6 @@ keydb_root_volume_gb      = 50
 
 # KeyDB configuration
 keydb_max_memory = "2gb"
-keydb_enable_tls = false  # Set to true for production with in-transit encryption; KeyDB is protected by security groups in private subnet
 
 # Network configuration
 vpc_cidr           = "10.0.0.0/16"
