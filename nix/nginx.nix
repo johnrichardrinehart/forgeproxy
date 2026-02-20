@@ -258,5 +258,19 @@ in
     systemd.tmpfiles.rules = [
       "d ${cfg.archiveCachePath} 0750 nginx nginx -"
     ];
+
+    # Create stub runtime config files so nginx can start even if the
+    # provider hasn't run yet.  The runtime provider overwrites these.
+    systemd.services.nginx.preStart = lib.mkBefore ''
+      mkdir -p /run/nginx
+      if [ ! -f /run/nginx/forgecache-upstream.conf ]; then
+        echo 'upstream forge-upstream { server 127.0.0.1:443; }' \
+          > /run/nginx/forgecache-upstream.conf
+      fi
+      if [ ! -f /run/nginx/forgecache-server.conf ]; then
+        printf 'set $%s "%s";\n' forge_upstream_host localhost \
+          > /run/nginx/forgecache-server.conf
+      fi
+    '';
   };
 }

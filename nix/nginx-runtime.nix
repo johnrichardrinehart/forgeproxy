@@ -16,7 +16,7 @@ in
       description = ''
         Derivation containing a script that fetches nginx configuration from
         a secrets manager and writes the upstream hostname, port, and TLS material
-        to /etc/nginx/conf.d/forgecache-*.conf files at boot.
+        to /run/nginx/forgecache-*.conf files at boot.
         Users provide this derivation; see flake.nix awsNginxProvider for reference.
       '';
     };
