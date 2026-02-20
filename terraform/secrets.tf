@@ -25,6 +25,7 @@ resource "aws_secretsmanager_secret_version" "forgecache_config" {
     proxy_fqdn            = var.proxy_fqdn
     keydb_private_ip      = aws_instance.keydb.private_ip
     keydb_enable_tls      = local.keydb_tls_enable
+    backend_port          = local.backend_port
     bundle_bucket         = aws_s3_bucket.bundle.id
     s3_bundle_prefix      = var.s3_bundle_prefix
     aws_region            = var.aws_region

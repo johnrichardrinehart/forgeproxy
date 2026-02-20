@@ -18,7 +18,7 @@ upstream_credentials:
 
 proxy:
   ssh_listen: "0.0.0.0:2222"
-  http_listen: "127.0.0.1:8080"
+  http_listen: "127.0.0.1:${backend_port}"
   bundle_uri_base_url: "https://${proxy_fqdn}/bundles"
 
 keydb:
