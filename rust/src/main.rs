@@ -223,6 +223,11 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ---- TLS crypto provider (must be installed before any rustls usage) ----
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls CryptoProvider");
+
     // ---- CLI ----
     let cli = Cli::parse();
 
