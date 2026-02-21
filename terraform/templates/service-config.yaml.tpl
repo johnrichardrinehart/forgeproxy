@@ -24,6 +24,9 @@ proxy:
 keydb:
   endpoint: "${keydb_private_ip}:${keydb_enable_tls ? "6380" : "6379"}"
   tls: ${keydb_enable_tls}
+%{ if keydb_enable_tls ~}
+  ca_cert_file: "/run/forgecache/keydb-ca.pem"
+%{ endif ~}
   auth_token_env: "KEYDB_AUTH_TOKEN"
 
 auth:

@@ -85,7 +85,31 @@ async fn build_keydb_pool(config: &Config) -> Result<Pool> {
     };
 
     if config.keydb.tls {
-        fred_config.tls = Some(TlsConnector::default_rustls()?.into());
+        let mut root_store = rustls::RootCertStore::empty();
+
+        // Load native system root certificates.
+        for cert in rustls_native_certs::load_native_certs().certs {
+            root_store.add(cert).ok();
+        }
+
+        // Load an additional CA cert (e.g. self-signed KeyDB CA) if configured.
+        if let Some(ref path) = config.keydb.ca_cert_file {
+            let pem = std::fs::read(path)
+                .with_context(|| format!("failed to read CA cert file: {path}"))?;
+            let certs = rustls_pemfile::certs(&mut pem.as_slice())
+                .collect::<Result<Vec<_>, _>>()
+                .with_context(|| format!("failed to parse PEM certs from: {path}"))?;
+            for cert in certs {
+                root_store
+                    .add(cert)
+                    .with_context(|| format!("failed to add CA cert from: {path}"))?;
+            }
+        }
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        fred_config.tls = Some(TlsConnector::from(tls_config).into());
     }
 
     if let Some(ref token) = auth_token {

@@ -44,6 +44,8 @@ aws-credential-types = "1"
 
 # TLS
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
