@@ -24,8 +24,9 @@ pub async fn handle_webhook_payload(
     body: &Bytes,
 ) -> anyhow::Result<Response> {
     // 1. Verify signature.
-    let secret = std::env::var(&state.config.auth.webhook_secret_env)
-        .map_err(|_| anyhow::anyhow!("webhook secret env var not set"))?;
+    let secret = crate::credentials::keyring::resolve_secret(&state.config.auth.webhook_secret_env)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("webhook secret not found in keyring or env"))?;
 
     if let Err(e) = state.forge.verify_webhook_signature(headers, body, &secret) {
         warn!(error = %e, "webhook signature verification failed");

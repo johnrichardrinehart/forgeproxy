@@ -79,7 +79,9 @@ impl ForgeBackend for GitLabBackend {
         fingerprint: &str,
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
-        let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
+        let admin_token = crate::credentials::keyring::resolve_secret(&self.admin_token_env)
+            .await
+            .unwrap_or_default();
         if admin_token.is_empty() {
             warn!(
                 env_var = %self.admin_token_env,
@@ -128,7 +130,9 @@ impl ForgeBackend for GitLabBackend {
         rate_limit: &RateLimitState,
     ) -> Result<Permission> {
         // GitLab: fetch the project with an admin token and read the access level.
-        let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
+        let admin_token = crate::credentials::keyring::resolve_secret(&self.admin_token_env)
+            .await
+            .unwrap_or_default();
         if admin_token.is_empty() {
             warn!(
                 env_var = %self.admin_token_env,

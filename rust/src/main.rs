@@ -69,7 +69,8 @@ pub struct AppState {
 // ---------------------------------------------------------------------------
 
 async fn build_keydb_pool(config: &Config) -> Result<Pool> {
-    let auth_token = std::env::var(&config.keydb.auth_token_env).ok();
+    let auth_token =
+        crate::credentials::keyring::resolve_secret(&config.keydb.auth_token_env).await;
 
     let endpoint = config
         .keydb

@@ -27,6 +27,18 @@ pub async fn read_key(key_name: &str) -> Result<String> {
     }
 }
 
+/// Resolve a secret by name: try the kernel keyring first, then fall back to
+/// an environment variable with the same name.  Returns `None` if neither source
+/// has a non-empty value.
+pub async fn resolve_secret(name: &str) -> Option<String> {
+    if let Ok(val) = read_key(name).await
+        && !val.is_empty()
+    {
+        return Some(val);
+    }
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
 /// Read a key from the session keyring using the `linux-keyutils` crate (direct syscall).
 pub(crate) fn read_key_native(key_name: &str) -> Result<String> {
     use linux_keyutils::{KeyRing, KeyRingIdentifier};
