@@ -283,12 +283,12 @@
                     SECRET_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$SECRET_NAME" --query 'SecretString' --output text)
                     KEY_DESC="''${SECRET_NAME//\//-}"
-                    echo -n "$SECRET_VALUE" | keyctl padd user "$KEY_DESC" @s >/dev/null || true
+                    echo -n "$SECRET_VALUE" | keyctl padd user "$KEY_DESC" @u >/dev/null || true
                   done
 
                   # ── Load fixed secrets into keyring ───────────────────────────────
                   # Stored under their env-var names so the Rust binary can look them
-                  # up from the session keyring (same pattern as org credentials).
+                  # up from the user keyring (same pattern as org credentials).
                   declare -A SUFFIX_TO_ENV=(
                     [forge-admin-token]=FORGE_ADMIN_TOKEN
                     [keydb-auth-token]=KEYDB_AUTH_TOKEN
@@ -300,7 +300,7 @@
                     SECRET_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$SECRET_NAME" --query 'SecretString' --output text) || true
                     if [ -n "''${SECRET_VALUE}" ]; then
-                      echo -n "$SECRET_VALUE" | keyctl padd user "''${SUFFIX_TO_ENV[$SUFFIX]}" @s >/dev/null || true
+                      echo -n "$SECRET_VALUE" | keyctl padd user "''${SUFFIX_TO_ENV[$SUFFIX]}" @u >/dev/null || true
                     fi
                   done
                 '';
