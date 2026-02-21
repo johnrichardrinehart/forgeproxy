@@ -11,7 +11,7 @@ upstream_credentials:
 %{ for org in org_creds ~}
     "${org.name}":
       mode: "${org.mode}"
-      keyring_key_name: "forgecache-creds-${replace(org.name, "/", "-")}"
+      keyring_key_name: "${name_prefix}-creds-${replace(org.name, "/", "-")}"
 %{ endfor ~}
   # To add an org without a Terraform re-apply: update this secret directly and
   # create a forgecache/creds/<keyring-key> secret; then restart forgecache.
