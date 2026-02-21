@@ -15,8 +15,8 @@ in
     providerScript = lib.mkOption {
       type = lib.types.package;
       description = ''
-        Script (derivation) that loads secrets into the session keyring
-        via `keyctl padd user <key> @s`.  keyutils is always on PATH.
+        Script (derivation) that loads secrets into the user keyring
+        via `keyctl padd user <key> @u`.  keyutils is always on PATH.
       '';
     };
 
@@ -28,8 +28,8 @@ in
   };
 
   # Inject the provider as ExecStartPre into forgecache.service.
-  # Keys land in forgecache's own private session keyring — no cross-service
-  # keyring sharing required.
+  # Keys land in the dynamic user's keyring (@u) — DynamicUser=true scopes
+  # the keyring to this service unit.
   config = lib.mkIf (cfg.enable && (config.services.forgecache.enable or false)) {
     systemd.services.forgecache = {
       path = [ pkgs.keyutils ];

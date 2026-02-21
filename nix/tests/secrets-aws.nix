@@ -14,7 +14,7 @@ let
         --secret-id "$SECRET_NAME" \
         --query 'SecretString' --output text)
       KEY_DESC="''${SECRET_NAME//\//-}"
-      echo -n "$SECRET_VALUE" | keyctl padd user "$KEY_DESC" @s >/dev/null
+      echo -n "$SECRET_VALUE" | keyctl padd user "$KEY_DESC" @u >/dev/null
     done
   '';
 
@@ -120,15 +120,18 @@ pkgs.testers.runNixOSTest {
             " SECRETS='forgecache/default-pat forgecache/webhook-secret'"
             " && ${awsProvider}"
         )
+        # Link the user keyring into the session keyring so the test
+        # process "possesses" the keys (mirrors KeyringMode=shared).
+        proxy.succeed("keyctl link @u @s")
 
     with subtest("default-pat secret is in the keyring"):
-        key_id = proxy.succeed("keyctl search @s user forgecache-default-pat").strip()
+        key_id = proxy.succeed("keyctl search @u user forgecache-default-pat").strip()
         assert key_id, "keyctl search returned empty key ID"
         value = proxy.succeed(f"keyctl pipe {key_id}").strip()
         assert value == "ghp_AWSTEST1234567890abcdef", f"unexpected value: {value}"
 
     with subtest("webhook-secret is in the keyring"):
-        key_id = proxy.succeed("keyctl search @s user forgecache-webhook-secret").strip()
+        key_id = proxy.succeed("keyctl search @u user forgecache-webhook-secret").strip()
         assert key_id, "keyctl search returned empty key ID"
         value = proxy.succeed(f"keyctl pipe {key_id}").strip()
         assert value == "whsec_awstest456", f"unexpected value: {value}"
