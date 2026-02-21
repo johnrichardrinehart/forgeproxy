@@ -74,14 +74,36 @@ resource "null_resource" "build_forgecache_ami" {
       # Build the NixOS image (only reached when AMI doesn't exist yet)
       nix build --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.system.build.images.amazon'
 
-      # Upload only if this exact image isn't already in the bucket
+      # Upload only if this exact image isn't already in the bucket.
+      # Uses aggressive retry/timeout settings for large uploads over
+      # slow or unstable home connections: adaptive retry, 64 MiB chunks
+      # (fewer parts = fewer failure points), and a retry loop around
+      # the entire upload.
       if ! aws s3api head-object --bucket "${aws_s3_bucket.ami_staging.id}" --key "$S3_KEY" 2>/dev/null; then
         OUT_PATH=$(readlink -f result)
-        AWS_MAX_ATTEMPTS=5 aws s3 cp \
-          --cli-read-timeout 300 \
-          --cli-connect-timeout 60 \
-          "$OUT_PATH"/*.vhd \
-          "s3://${aws_s3_bucket.ami_staging.id}/$S3_KEY"
+        export AWS_MAX_ATTEMPTS=10
+        export AWS_RETRY_MODE=adaptive
+        # Configure S3 multipart settings in a temp copy of the user's config
+        S3_CFG=$(mktemp)
+        trap 'rm -f "$S3_CFG"' EXIT
+        cp "$HOME/.aws/config" "$S3_CFG"
+        AWS_CONFIG_FILE="$S3_CFG" aws configure set default.s3.multipart_chunksize 64MB
+        AWS_CONFIG_FILE="$S3_CFG" aws configure set default.s3.max_concurrent_requests 2
+        for attempt in 1 2 3; do
+          echo "S3 upload attempt $attempt/3 ..."
+          if AWS_CONFIG_FILE="$S3_CFG" aws s3 cp \
+            --cli-read-timeout 600 \
+            --cli-connect-timeout 120 \
+            "$OUT_PATH"/*.vhd \
+            "s3://${aws_s3_bucket.ami_staging.id}/$S3_KEY"; then
+            break
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            echo "S3 upload failed after 3 attempts" >&2; exit 1
+          fi
+          echo "Upload failed, retrying in 10s ..."
+          sleep 10
+        done
       fi
 
       # Import snapshot from S3
@@ -175,14 +197,36 @@ resource "null_resource" "build_keydb_ami" {
       # Build the NixOS image (only reached when AMI doesn't exist yet)
       nix build --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.system.build.images.amazon'
 
-      # Upload only if this exact image isn't already in the bucket
+      # Upload only if this exact image isn't already in the bucket.
+      # Uses aggressive retry/timeout settings for large uploads over
+      # slow or unstable home connections: adaptive retry, 64 MiB chunks
+      # (fewer parts = fewer failure points), and a retry loop around
+      # the entire upload.
       if ! aws s3api head-object --bucket "${aws_s3_bucket.ami_staging.id}" --key "$S3_KEY" 2>/dev/null; then
         OUT_PATH=$(readlink -f result)
-        AWS_MAX_ATTEMPTS=5 aws s3 cp \
-          --cli-read-timeout 300 \
-          --cli-connect-timeout 60 \
-          "$OUT_PATH"/*.vhd \
-          "s3://${aws_s3_bucket.ami_staging.id}/$S3_KEY"
+        export AWS_MAX_ATTEMPTS=10
+        export AWS_RETRY_MODE=adaptive
+        # Configure S3 multipart settings in a temp copy of the user's config
+        S3_CFG=$(mktemp)
+        trap 'rm -f "$S3_CFG"' EXIT
+        cp "$HOME/.aws/config" "$S3_CFG"
+        AWS_CONFIG_FILE="$S3_CFG" aws configure set default.s3.multipart_chunksize 64MB
+        AWS_CONFIG_FILE="$S3_CFG" aws configure set default.s3.max_concurrent_requests 2
+        for attempt in 1 2 3; do
+          echo "S3 upload attempt $attempt/3 ..."
+          if AWS_CONFIG_FILE="$S3_CFG" aws s3 cp \
+            --cli-read-timeout 600 \
+            --cli-connect-timeout 120 \
+            "$OUT_PATH"/*.vhd \
+            "s3://${aws_s3_bucket.ami_staging.id}/$S3_KEY"; then
+            break
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            echo "S3 upload failed after 3 attempts" >&2; exit 1
+          fi
+          echo "Upload failed, retrying in 10s ..."
+          sleep 10
+        done
       fi
 
       # Import snapshot from S3
