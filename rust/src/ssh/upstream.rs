@@ -101,10 +101,9 @@ async fn resolve_upstream_url_and_creds(
                 .map(|oc| oc.keyring_key_name.as_str())
                 .unwrap_or(&config.upstream.admin_token_env);
 
-            let token = match crate::credentials::keyring::read_key(key_name).await {
-                Ok(val) => val,
-                Err(_) => std::env::var(key_name).unwrap_or_default(),
-            };
+            let token = crate::credentials::keyring::resolve_secret(key_name)
+                .await
+                .unwrap_or_default();
 
             // HTTPS clone URL with embedded token for authentication.
             let url = if token.is_empty() {

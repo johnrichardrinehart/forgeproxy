@@ -138,7 +138,10 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             "https://{}/{}.git",
             state.config.upstream.hostname, owner_repo,
         );
-        let admin_token = std::env::var(&state.config.upstream.admin_token_env).unwrap_or_default();
+        let admin_token =
+            crate::credentials::keyring::resolve_secret(&state.config.upstream.admin_token_env)
+                .await
+                .unwrap_or_default();
         let env_vars = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
         let env_with_auth: Vec<(String, String)> = if admin_token.is_empty() {
             env_vars
