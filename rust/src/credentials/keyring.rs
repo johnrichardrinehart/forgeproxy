@@ -1,12 +1,12 @@
 //! Linux kernel keyring integration.
 //!
-//! Reads secrets from the session keyring via the `linux-keyutils` crate
+//! Reads secrets from the user keyring via the `linux-keyutils` crate
 //! (direct syscall) or the `keyctl` CLI tool as fallback.
 
 use anyhow::{Context, Result};
 use tracing::{debug, warn};
 
-/// Read a key from the Linux kernel session keyring by name.
+/// Read a key from the Linux kernel user keyring by name.
 ///
 /// Tries the `linux-keyutils` crate first for direct syscall access,
 /// then falls back to shelling out to the `keyctl` CLI tool.
@@ -39,16 +39,16 @@ pub async fn resolve_secret(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-/// Read a key from the session keyring using the `linux-keyutils` crate (direct syscall).
+/// Read a key from the user keyring using the `linux-keyutils` crate (direct syscall).
 pub(crate) fn read_key_native(key_name: &str) -> Result<String> {
     use linux_keyutils::{KeyRing, KeyRingIdentifier};
 
-    let ring = KeyRing::from_special_id(KeyRingIdentifier::Session, false)
-        .map_err(|e| anyhow::anyhow!("failed to open session keyring: {e:?}"))?;
+    let ring = KeyRing::from_special_id(KeyRingIdentifier::User, false)
+        .map_err(|e| anyhow::anyhow!("failed to open user keyring: {e:?}"))?;
 
     let key = ring
         .search(key_name)
-        .map_err(|e| anyhow::anyhow!("key '{}' not found in session keyring: {e:?}", key_name))?;
+        .map_err(|e| anyhow::anyhow!("key '{}' not found in user keyring: {e:?}", key_name))?;
 
     let data = key
         .read_to_vec()
@@ -57,11 +57,11 @@ pub(crate) fn read_key_native(key_name: &str) -> Result<String> {
     String::from_utf8(data).context("key payload is not valid UTF-8")
 }
 
-/// Read a key from the session keyring by shelling out to the `keyctl` CLI.
+/// Read a key from the user keyring by shelling out to the `keyctl` CLI.
 async fn read_key_cli(key_name: &str) -> Result<String> {
-    // First, search for the key ID in the session keyring (@s)
+    // First, search for the key ID in the user keyring (@u)
     let search = tokio::process::Command::new("keyctl")
-        .args(["search", "@s", "user", key_name])
+        .args(["search", "@u", "user", key_name])
         .output()
         .await
         .context("keyctl search failed to execute")?;

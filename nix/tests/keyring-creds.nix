@@ -38,7 +38,7 @@ let
   # Key difference from basic.nix: credentials are resolved from the Linux
   # kernel keyring rather than environment variables.  The per-org entry
   # under `upstream_credentials.orgs.octocat` sets `keyring_key_name` so
-  # that the proxy reads the Gitea admin PAT from the session keyring.
+  # that the proxy reads the Gitea admin PAT from the user keyring.
   # ---------------------------------------------------------------------------
   testConfigYaml = pkgs.writeText "keyring-creds-test-config.yaml" ''
     upstream:
@@ -348,7 +348,7 @@ pkgs.testers.runNixOSTest {
             f"cat > /run/systemd/system/forgecache.service.d/keyring.conf <<'UNIT'\n"
             f"[Service]\n"
             f"Environment=FORGE_ADMIN_TOKEN={TOKEN}\n"
-            f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user forgecache:octocat_pat @s'\n"
+            f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user forgecache:octocat_pat @u'\n"
             f"UNIT"
         )
         proxy.succeed("systemctl daemon-reload")
@@ -361,7 +361,7 @@ pkgs.testers.runNixOSTest {
     # -- Verify keyring key is accessible from the service session -------------
     with subtest("Keyring key is loaded"):
         # The ExecStartPre ran in the same session as the service.  Verify
-        # the key exists by searching the forgecache user's session keyring
+        # the key exists by searching the forgecache user's user keyring
         # from the test harness side.  We check via the service journal
         # instead, since the keyring is per-session.  A successful proxy
         # start with debug logging confirms the key was loaded.

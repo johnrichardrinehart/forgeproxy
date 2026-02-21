@@ -24,18 +24,6 @@ in
       description = "Path to the forgecache configuration file.";
     };
 
-    user = lib.mkOption {
-      type = lib.types.str;
-      default = "forgecache";
-      description = "System user to run the forgecache service.";
-    };
-
-    group = lib.mkOption {
-      type = lib.types.str;
-      default = "forgecache";
-      description = "System group for the forgecache service.";
-    };
-
     cacheDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/cache/forgecache";
@@ -51,17 +39,6 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    # ── System user and group ──────────────────────────────────────────
-    users.users.${cfg.user} = {
-      isSystemUser = true;
-      group = cfg.group;
-      home = cfg.cacheDir;
-      createHome = true;
-      description = "Git Caching Reverse Proxy service user";
-    };
-
-    users.groups.${cfg.group} = { };
-
     # ── systemd service ────────────────────────────────────────────────
     systemd.services.forgecache = {
       description = "Git Caching Reverse Proxy";
@@ -80,17 +57,22 @@ in
 
       serviceConfig = {
         Type = "simple";
-        User = cfg.user;
-        Group = cfg.group;
+
+        # DynamicUser allocates an ephemeral UID for this service invocation.
+        # Secrets in the user keyring (@u) are scoped to this UID, so only
+        # processes inside forgecache.service can access them.
+        DynamicUser = true;
+
+        # Links the user keyring (@u) into each process's session keyring.
+        # Without this, keys in @u are addressable but not "possessed" by
+        # the process, so reads fail with EACCES (default key permissions
+        # only grant possessor access).
+        KeyringMode = "shared";
 
         ExecStart = "${cfg.package}/bin/forgecache --config ${cfg.configFile}";
 
         Restart = "on-failure";
         RestartSec = 5;
-
-        # Share the session keyring between ExecStartPre (provider) and
-        # ExecStart so secrets loaded via keyctl persist to the main process.
-        KeyringMode = "shared";
 
         # Directories managed by systemd (created automatically).
         StateDirectory = "forgecache";
@@ -98,11 +80,9 @@ in
         RuntimeDirectory = "forgecache";
 
         # ── Hardening ────────────────────────────────────────────────
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        NoNewPrivileges = true;
-        RestrictSUIDSGID = true;
+        # DynamicUser=true already implies: ProtectSystem=strict,
+        # ProtectHome=read-only, PrivateTmp, NoNewPrivileges,
+        # RestrictSUIDSGID, RemoveIPC.
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         ProtectControlGroups = true;
@@ -112,10 +92,6 @@ in
         # ExecStartPre runs the AWS provider (awscli2/Python/libffi) under the
         # same seccomp filter as the main process, and Python requires W|X memory.
         RestrictRealtime = true;
-
-        ReadWritePaths = [
-          cfg.cacheDir
-        ];
       };
     };
 

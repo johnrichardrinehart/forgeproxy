@@ -64,13 +64,13 @@ fn load_or_generate_host_key() -> KeyPair {
     }
 }
 
-/// Try to read a PEM-encoded private key stored in the session keyring under
+/// Try to read a PEM-encoded private key stored in the user keyring under
 /// the well-known description `forgecache:ssh_host_key`.
 fn load_host_key_from_keyring() -> Result<KeyPair> {
     use linux_keyutils::{KeyRing, KeyRingIdentifier};
 
-    let ring = KeyRing::from_special_id(KeyRingIdentifier::Session, false)
-        .map_err(|e| anyhow::anyhow!("failed to open session keyring: {e:?}"))?;
+    let ring = KeyRing::from_special_id(KeyRingIdentifier::User, false)
+        .map_err(|e| anyhow::anyhow!("failed to open user keyring: {e:?}"))?;
 
     let key = ring
         .search("forgecache:ssh_host_key")

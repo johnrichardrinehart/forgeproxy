@@ -39,7 +39,7 @@ let
     for secret_file in /run/secrets/*; do
       [ -f "$secret_file" ] || continue
       key_name="''${secret_file##*/}"
-      keyctl padd user "$key_name" @s < "$secret_file" >/dev/null
+      keyctl padd user "$key_name" @u < "$secret_file" >/dev/null
     done
   '';
 in
@@ -82,15 +82,18 @@ pkgs.testers.runNixOSTest {
 
     with subtest("provider loads secrets into keyring"):
         proxy.succeed("${sopsProvider}")
+        # Link the user keyring into the session keyring so the test
+        # process "possesses" the keys (mirrors KeyringMode=shared).
+        proxy.succeed("keyctl link @u @s")
 
     with subtest("default-pat secret is in the keyring"):
-        key_id = proxy.succeed("keyctl search @s user default-pat").strip()
+        key_id = proxy.succeed("keyctl search @u user default-pat").strip()
         assert key_id, "keyctl search returned empty key ID"
         value = proxy.succeed(f"keyctl pipe {key_id}").strip()
         assert value == "ghp_TESTSECRET1234567890abcdef", f"unexpected value: {value}"
 
     with subtest("webhook-secret is in the keyring"):
-        key_id = proxy.succeed("keyctl search @s user webhook-secret").strip()
+        key_id = proxy.succeed("keyctl search @u user webhook-secret").strip()
         assert key_id, "keyctl search returned empty key ID"
         value = proxy.succeed(f"keyctl pipe {key_id}").strip()
         assert value == "whsec_testabc123", f"unexpected value: {value}"

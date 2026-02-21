@@ -415,26 +415,18 @@ pkgs.testers.runNixOSTest {
             f"redis-cli -h keydb SET 'forgecache:ssh:auth:{bob_fp}' 'bob' EX 3600"
         )
 
-    # ── Populate cache for repo-cached only ──────────────────────────────
-    with subtest("Populate local cache for repo-cached"):
-        proxy.succeed(
-            "mkdir -p /var/cache/forgecache/repos/octocat"
-        )
-        proxy.succeed(
-            "git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git"
-            " /var/cache/forgecache/repos/octocat/repo-cached.git"
-        )
-        proxy.succeed(
-            "chown -R forgecache:forgecache /var/cache/forgecache/repos"
-        )
-
     # ── Start forgecache with admin token ────────────────────────────────
+    # The ExecStartPre also pre-seeds the local cache for repo-cached so
+    # the authz tests can distinguish cached vs uncached paths.  This must
+    # run inside the service namespace because DynamicUser=true makes the
+    # CacheDirectory only visible to the service's own processes.
     with subtest("Start forgecache with admin token"):
         proxy.succeed(
             f"mkdir -p /run/systemd/system/forgecache.service.d && "
-            f"cat > /run/systemd/system/forgecache.service.d/token.conf <<UNIT\n"
+            f"cat > /run/systemd/system/forgecache.service.d/token.conf <<'UNIT'\n"
             f"[Service]\n"
             f"Environment=FORGE_ADMIN_TOKEN={TOKEN}\n"
+            f"ExecStartPre=/bin/sh -c 'mkdir -p /var/cache/forgecache/repos/octocat && git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git /var/cache/forgecache/repos/octocat/repo-cached.git'\n"
             f"UNIT"
         )
         proxy.succeed("systemctl daemon-reload")
