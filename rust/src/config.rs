@@ -173,6 +173,8 @@ pub struct KeyDbConfig {
     /// Enable TLS for the KeyDB connection.
     #[serde(default = "bool_true")]
     pub tls: bool,
+    /// Path to an additional CA certificate to trust (e.g. self-signed KeyDB CA).
+    pub ca_cert_file: Option<String>,
     /// Name of the environment variable that holds the KeyDB auth token.
     #[serde(default = "default_keydb_auth_env")]
     pub auth_token_env: String,
