@@ -274,15 +274,19 @@
                   fi
 
                   # ── Load per-org credentials into the kernel keyring ──────────────
-                  # Discovers all secrets under ''${SM_PREFIX}/creds/ dynamically — no
-                  # hardcoded org list. Adding an org requires creating a new SM secret,
-                  # not rebuilding the AMI.
+                  # Discovers all secrets under ''${SM_PREFIX}/creds-<org> dynamically —
+                  # no hardcoded org list.  Adding an org requires creating a new SM
+                  # secret, not rebuilding the AMI.
                   CRED_SECRETS=$(echo "$ALL_SECRETS" | ${pkgs.jq}/bin/jq -r \
-                    --arg p "''${SM_PREFIX}/creds/" '.[] | select(startswith($p))')
+                    --arg p "''${SM_PREFIX}/creds-" '.[] | select(startswith($p))')
                   for SECRET_NAME in $CRED_SECRETS; do
                     SECRET_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$SECRET_NAME" --query 'SecretString' --output text)
-                    KEY_DESC="''${SECRET_NAME//\//-}"
+                    # Extract org name: strip SM_PREFIX/creds- prefix and Terraform's
+                    # random suffix (26-char unique ID starting with a digit).
+                    REMAINDER="''${SECRET_NAME#''${SM_PREFIX}/creds-}"
+                    ORG_NAME="''${REMAINDER%-[0-9]*}"
+                    KEY_DESC="''${SM_PREFIX//\//-}-creds-''${ORG_NAME}"
                     echo -n "$SECRET_VALUE" | keyctl padd user "$KEY_DESC" @u >/dev/null || true
                   done
 

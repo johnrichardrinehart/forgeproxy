@@ -36,6 +36,7 @@ resource "aws_secretsmanager_secret_version" "forgecache_config" {
     otlp_enabled          = var.otlp_endpoint != "" ? true : false
     otlp_endpoint         = var.otlp_endpoint != "" ? var.otlp_endpoint : ""
     log_level             = var.log_level
+    name_prefix           = var.name_prefix
     org_creds             = var.org_creds
   })
 }
