@@ -88,6 +88,10 @@ in
         Restart = "on-failure";
         RestartSec = 5;
 
+        # Share the session keyring between ExecStartPre (provider) and
+        # ExecStart so secrets loaded via keyctl persist to the main process.
+        KeyringMode = "shared";
+
         # Directories managed by systemd (created automatically).
         StateDirectory = "forgecache";
         CacheDirectory = "forgecache";
