@@ -265,6 +265,14 @@
                     --secret-id "$(resolve service-config)" \
                     --query 'SecretString' --output text > /run/forgecache/config.yaml
 
+                  # ── Write KeyDB CA cert (for TLS verification) ─────────────────────
+                  KEYDB_CA_SECRET=$(resolve keydb-tls-ca)
+                  if [ "$KEYDB_CA_SECRET" != "null" ]; then
+                    ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                      --secret-id "$KEYDB_CA_SECRET" \
+                      --query 'SecretString' --output text > /run/forgecache/keydb-ca.pem
+                  fi
+
                   # ── Load per-org credentials into the kernel keyring ──────────────
                   # Discovers all secrets under ''${SM_PREFIX}/creds/ dynamically — no
                   # hardcoded org list. Adding an org requires creating a new SM secret,
