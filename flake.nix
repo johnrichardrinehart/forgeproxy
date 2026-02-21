@@ -287,16 +287,20 @@
                   done
 
                   # ── Load fixed secrets into keyring ───────────────────────────────
-                  for SUFFIX in \
-                    forge-admin-token \
-                    keydb-auth-token \
-                    webhook-secret; do
+                  # Stored under their env-var names so the Rust binary can look them
+                  # up from the session keyring (same pattern as org credentials).
+                  declare -A SUFFIX_TO_ENV=(
+                    [forge-admin-token]=FORGE_ADMIN_TOKEN
+                    [keydb-auth-token]=KEYDB_AUTH_TOKEN
+                    [webhook-secret]=FORGE_WEBHOOK_SECRET
+                  )
+
+                  for SUFFIX in "''${!SUFFIX_TO_ENV[@]}"; do
                     SECRET_NAME=$(resolve "$SUFFIX")
                     SECRET_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$SECRET_NAME" --query 'SecretString' --output text) || true
                     if [ -n "''${SECRET_VALUE}" ]; then
-                      KEY_DESC="''${SECRET_NAME//\//-}"
-                      echo -n "$SECRET_VALUE" | keyctl padd user "$KEY_DESC" @s >/dev/null || true
+                      echo -n "$SECRET_VALUE" | keyctl padd user "''${SUFFIX_TO_ENV[$SUFFIX]}" @s >/dev/null || true
                     fi
                   done
                 '';

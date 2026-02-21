@@ -105,7 +105,9 @@ impl ForgeBackend for GiteaBackend {
         fingerprint: &str,
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
-        let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
+        let admin_token = crate::credentials::keyring::resolve_secret(&self.admin_token_env)
+            .await
+            .unwrap_or_default();
         if admin_token.is_empty() {
             warn!(
                 env_var = %self.admin_token_env,
@@ -156,7 +158,9 @@ impl ForgeBackend for GiteaBackend {
         repo: &str,
         rate_limit: &RateLimitState,
     ) -> Result<Permission> {
-        let admin_token = std::env::var(&self.admin_token_env).unwrap_or_default();
+        let admin_token = crate::credentials::keyring::resolve_secret(&self.admin_token_env)
+            .await
+            .unwrap_or_default();
         if admin_token.is_empty() {
             warn!(
                 env_var = %self.admin_token_env,
