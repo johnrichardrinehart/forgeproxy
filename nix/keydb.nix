@@ -104,6 +104,11 @@ let
     rename-command FLUSHALL ""
     rename-command FLUSHDB ""
     rename-command DEBUG ""
+
+    ${lib.optionalString (cfg.extraConfFile != null) ''
+      # ── Runtime overrides (e.g., requirepass from Secrets Manager) ──
+      include ${cfg.extraConfFile}
+    ''}
   '';
 in
 {
@@ -215,9 +220,7 @@ in
         User = cfg.user;
         Group = cfg.group;
 
-        ExecStart =
-          "${keydb}/bin/keydb-server /etc/keydb/keydb.conf"
-          + lib.optionalString (cfg.extraConfFile != null) " ${cfg.extraConfFile}";
+        ExecStart = "${keydb}/bin/keydb-server /etc/keydb/keydb.conf";
 
         Restart = "on-failure";
         RestartSec = 5;
