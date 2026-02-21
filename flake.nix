@@ -206,6 +206,7 @@
         nixosModules = {
           forgecache = ./nix/module.nix;
           keydb = ./nix/keydb.nix;
+          keydb-tls = ./nix/keydb-tls.nix;
           nginx = ./nix/nginx.nix;
           hardening = ./nix/hardening.nix;
           secrets = ./nix/secrets.nix;
@@ -377,7 +378,7 @@
                 ...
               }:
               let
-                awsKeydbProvider = pkgs.writeShellScript "keydb-aws-provider" ''
+                awsKeydbAuthProvider = pkgs.writeShellScript "keydb-aws-auth-provider" ''
                   set -euo pipefail
 
                   # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
@@ -402,13 +403,6 @@
                     ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$(resolve "$1")" --query 'SecretString' --output text
                   }
-                  # Write TLS material to paths configured in services.keydb.tls.{certFile,keyFile,caFile}
-                  # (defaults: /var/lib/keydb/tls/{cert,key,ca}.pem — writable under ProtectSystem=strict)
-                  mkdir -p /var/lib/keydb/tls
-                  fetch keydb-tls-cert > /var/lib/keydb/tls/cert.pem
-                  fetch keydb-tls-key  > /var/lib/keydb/tls/key.pem
-                  fetch keydb-tls-ca   > /var/lib/keydb/tls/ca.pem
-                  chmod 600 /var/lib/keydb/tls/key.pem
 
                   # Write runtime conf (second keydb-server arg, overrides requirepass from main conf)
                   # Path matches services.keydb.extraConfFile (default: /run/keydb/runtime.conf)
@@ -416,13 +410,53 @@
                     > /run/keydb/runtime.conf
                   chmod 600 /run/keydb/runtime.conf
                 '';
+
+                awsKeydbTlsProvider = pkgs.writeShellScript "keydb-aws-tls-provider" ''
+                  set -euo pipefail
+
+                  # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
+                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                  if [ -z "$SM_PREFIX" ]; then
+                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                    exit 1
+                  fi
+
+                  # ── Resolve secret names under SM_PREFIX (handles name_prefix random suffix) ──
+                  ALL_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
+                    --filters "Key=name,Values=''${SM_PREFIX}/" \
+                    --query 'SecretList[].Name' --output json)
+
+                  resolve() {
+                    echo "$ALL_SECRETS" | ${pkgs.jq}/bin/jq -r --arg p "''${SM_PREFIX}/$1" \
+                      '[.[] | select(startswith($p))][0]'
+                  }
+
+                  fetch() {
+                    ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                      --secret-id "$(resolve "$1")" --query 'SecretString' --output text
+                  }
+
+                  # Write TLS material to paths configured in services.keydb.tls.{certFile,keyFile,caFile}
+                  # (defaults: /var/lib/keydb/tls/{cert,key,ca}.pem — writable under ProtectSystem=strict)
+                  mkdir -p /var/lib/keydb/tls
+                  fetch keydb-tls-cert > /var/lib/keydb/tls/cert.pem
+                  fetch keydb-tls-key  > /var/lib/keydb/tls/key.pem
+                  fetch keydb-tls-ca   > /var/lib/keydb/tls/ca.pem
+                  chmod 600 /var/lib/keydb/tls/key.pem
+                '';
               in
               {
                 services.keydb.tls.enable = lib.mkDefault true;
 
                 services.keydb-secrets = lib.mkDefault {
-                  enable = false;
-                  providerScript = awsKeydbProvider;
+                  enable = true;
+                  providerScript = awsKeydbAuthProvider;
+                };
+
+                services.keydb-tls = {
+                  enable = lib.mkDefault config.services.keydb.tls.enable;
+                  providerScript = awsKeydbTlsProvider;
                 };
               }
             )
