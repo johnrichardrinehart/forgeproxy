@@ -80,6 +80,7 @@ let
       tls-protocols "TLSv1.2 TLSv1.3"
       tls-ciphers "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
       tls-ciphersuites "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256"
+      tls-auth-clients no
       tls-prefer-server-ciphers yes
     ''}
 
