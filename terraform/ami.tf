@@ -13,6 +13,7 @@ locals {
 # ── Evaluate Nix outPaths at plan time (fast, no build) ──────────────────────
 data "external" "forgecache_image_hash" {
   program = ["bash", "-c", <<-EOT
+    set -euo pipefail
     OUTPATH=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.system.build.images.amazon.outPath')
     HASH=$(basename "$OUTPATH" | cut -d- -f1)
     printf '{"hash":"%s"}\n' "$HASH"
@@ -22,6 +23,7 @@ data "external" "forgecache_image_hash" {
 
 data "external" "keydb_image_hash" {
   program = ["bash", "-c", <<-EOT
+    set -euo pipefail
     OUTPATH=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.system.build.images.amazon.outPath')
     HASH=$(basename "$OUTPATH" | cut -d- -f1)
     printf '{"hash":"%s"}\n' "$HASH"
@@ -34,6 +36,7 @@ data "external" "keydb_image_hash" {
 # infrastructure (SG rules, NLB target groups) and runtime config (Secrets Manager).
 data "external" "nix_config" {
   program = ["bash", "-c", <<-EOT
+    set -euo pipefail
     KEYDB_TLS=$(nix eval --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.services.keydb.tls.enable')
     BACKEND_PORT=$(nix eval --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.services.forgecache-nginx.backendPort')
     KEYDB_MAX_MEM=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.services.keydb.maxMemory')
