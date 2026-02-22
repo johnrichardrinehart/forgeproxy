@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn local_path_construction() {
         let path = archive_local_path(
-            Path::new("/var/cache/forgecache/repos"),
+            Path::new("/var/cache/forgeproxy/repos"),
             "acme",
             "widgets",
             "main",
@@ -333,7 +333,7 @@ mod tests {
         assert_eq!(
             path,
             PathBuf::from(
-                "/var/cache/forgecache/repos/_archives/acme/widgets/main-a1b2c3d4e5f6.tar.gz"
+                "/var/cache/forgeproxy/repos/_archives/acme/widgets/main-a1b2c3d4e5f6.tar.gz"
             )
         );
     }
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn s3_key_construction() {
         let key = archive_s3_key(
-            "forgecache/",
+            "forgeproxy/",
             "acme",
             "widgets",
             "main",
@@ -352,7 +352,7 @@ mod tests {
         );
         assert_eq!(
             key,
-            "forgecache/archives/acme/widgets/main-a1b2c3d4e5f6.tar.gz"
+            "forgeproxy/archives/acme/widgets/main-a1b2c3d4e5f6.tar.gz"
         );
     }
 

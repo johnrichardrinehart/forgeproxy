@@ -30,9 +30,9 @@ use fred::interfaces::HashesInterface;
 /// by 1000 and returns the new value.  The step of 1000 leaves room for
 /// out-of-band insertions or manual corrections without risking collisions.
 ///
-/// Key: `forgecache:repo:{owner_repo}`, field: `latest_creation_token`.
+/// Key: `forgeproxy:repo:{owner_repo}`, field: `latest_creation_token`.
 pub async fn next_creation_token(state: &crate::AppState, owner_repo: &str) -> Result<u64> {
-    let key = format!("forgecache:repo:{owner_repo}");
+    let key = format!("forgeproxy:repo:{owner_repo}");
     let new_val: i64 = HashesInterface::hincrby(&state.keydb, &key, "latest_creation_token", 1000)
         .await
         .with_context(|| format!("failed to increment creation token for {owner_repo}"))?;

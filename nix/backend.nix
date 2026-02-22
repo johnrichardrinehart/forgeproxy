@@ -5,7 +5,7 @@
 }:
 
 let
-  cfg = config.services.forgecache.backend;
+  cfg = config.services.forgeproxy.backend;
 
   # Per-backend derived values consumed by nginx.nix and the Rust binary.
   derivedValues = {
@@ -42,7 +42,7 @@ let
   };
 in
 {
-  options.services.forgecache.backend = {
+  options.services.forgeproxy.backend = {
     type = lib.mkOption {
       type = lib.types.enum [
         "github-enterprise"

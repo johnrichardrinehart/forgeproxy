@@ -2,7 +2,7 @@
 aws_region = "us-east-1"
 
 # Resource naming
-name_prefix = "forgecache"
+name_prefix = "forgeproxy"
 
 # Upstream forge configuration
 upstream_hostname  = "ghe.example.com"
@@ -14,7 +14,7 @@ backend_type       = "github-enterprise"
 proxy_fqdn = "cache.example.com"
 
 # S3 bundle bucket name (MUST be globally unique)
-bundle_bucket_name = "my-org-forgecache-bundles-12345"
+bundle_bucket_name = "my-org-forgeproxy-bundles-12345"
 
 # Instance types and counts
 forgeproxy_instance_type = "t3.large"
@@ -45,7 +45,7 @@ local_cache_max_bytes = 53687091200  # 50 GiB
 eviction_policy       = "lfu"         # or "lru"
 
 # S3 storage configuration
-s3_bundle_prefix     = "forgecache/"
+s3_bundle_prefix     = "forgeproxy/"
 s3_presigned_url_ttl = 3600
 
 # Logging

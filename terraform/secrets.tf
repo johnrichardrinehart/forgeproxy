@@ -5,18 +5,18 @@ resource "random_password" "keydb_auth" {
 }
 
 # ── Service Configuration Secret ───────────────────────────────────────────
-# The complete forgecache config.yaml
-resource "aws_secretsmanager_secret" "forgecache_config" {
+# The complete forgeproxy config.yaml
+resource "aws_secretsmanager_secret" "forgeproxy_config" {
   name_prefix = "${var.name_prefix}/service-config-"
-  description = "Forgecache service configuration (config.yaml)"
+  description = "Forgeproxy service configuration (config.yaml)"
 
   tags = {
     Name = "${var.name_prefix}-service-config"
   }
 }
 
-resource "aws_secretsmanager_secret_version" "forgecache_config" {
-  secret_id = aws_secretsmanager_secret.forgecache_config.id
+resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
+  secret_id = aws_secretsmanager_secret.forgeproxy_config.id
 
   secret_string = templatefile("${path.module}/templates/service-config.yaml.tpl", {
     upstream_hostname     = var.upstream_hostname

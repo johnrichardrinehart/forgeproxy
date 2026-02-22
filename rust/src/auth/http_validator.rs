@@ -34,7 +34,7 @@ pub async fn validate_http_auth(
         hex::encode(hasher.finalize())
     };
 
-    let cache_key = format!("forgecache:http:auth:{token_hash}:{owner}/{repo}");
+    let cache_key = format!("forgeproxy:http:auth:{token_hash}:{owner}/{repo}");
 
     // 2. Check KeyDB cache.
     if let Some(cached) = cache::get_cached_auth(&state.keydb, &cache_key).await? {

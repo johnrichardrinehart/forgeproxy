@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_read_key_native_missing_key() {
         // Attempting to read a non-existent key should return an error.
-        let result = read_key_native("forgecache_test_nonexistent_key_12345");
+        let result = read_key_native("forgeproxy_test_nonexistent_key_12345");
         assert!(result.is_err());
     }
 }

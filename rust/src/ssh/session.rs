@@ -165,7 +165,7 @@ impl Handler for SshSession {
         );
 
         // Quick cache check for metrics tracking (hit/miss counters).
-        let cache_key = format!("forgecache:ssh:auth:{fp}");
+        let cache_key = format!("forgeproxy:ssh:auth:{fp}");
         let is_cached = crate::auth::cache::get_cached_auth(&self.state.keydb, &cache_key)
             .await
             .unwrap_or(None)

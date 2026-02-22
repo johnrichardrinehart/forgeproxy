@@ -20,7 +20,7 @@ let
         openssl req -new -x509 -nodes -days 365 \
           -newkey rsa:2048 \
           -keyout $out/ca.key -out $out/ca.crt \
-          -subj "/CN=ForgeCache Test CA"
+          -subj "/CN=ForgeProxy Test CA"
 
         # GHE server certificate (SAN: DNS:ghe)
         openssl req -new -nodes -newkey rsa:2048 \
@@ -58,7 +58,7 @@ let
       '';
 
   # ---------------------------------------------------------------------------
-  # forgecache configuration YAML for the test environment
+  # forgeproxy configuration YAML for the test environment
   # ---------------------------------------------------------------------------
   testConfigYaml = pkgs.writeText "ssh-authz-test-config.yaml" ''
     upstream:
@@ -109,7 +109,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgecache/repos"
+        path: "/var/cache/forgeproxy/repos"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75
@@ -124,7 +124,7 @@ let
 
 in
 pkgs.testers.runNixOSTest {
-  name = "forgecache-ssh-authz";
+  name = "forgeproxy-ssh-authz";
   globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
@@ -208,7 +208,7 @@ pkgs.testers.runNixOSTest {
         networking.firewall.allowedTCPPorts = [ 6379 ];
       };
 
-    # ── forgecache (SSH only — no nginx needed) ──────────────────────────
+    # ── forgeproxy (SSH only — no nginx needed) ──────────────────────────
     proxy =
       {
         config,
@@ -218,21 +218,21 @@ pkgs.testers.runNixOSTest {
       }:
       {
         imports = [
-          self.nixosModules.forgecache
+          self.nixosModules.forgeproxy
         ];
 
-        services.forgecache = {
+        services.forgeproxy = {
           enable = true;
-          package = pkgs.forgecache;
+          package = pkgs.forgeproxy;
           configFile = testConfigYaml;
           logLevel = "debug";
         };
 
         # Prevent auto-start so we can inject the Gitea admin token first
-        systemd.services.forgecache.wantedBy = lib.mkForce [ ];
+        systemd.services.forgeproxy.wantedBy = lib.mkForce [ ];
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
-        systemd.services.forgecache.environment = {
+        systemd.services.forgeproxy.environment = {
           AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
           AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
           AWS_DEFAULT_REGION = "us-east-1";
@@ -249,7 +249,7 @@ pkgs.testers.runNixOSTest {
           jq
         ];
 
-        # Trust the test CA so forgecache (reqwest) validates the mock GHE cert
+        # Trust the test CA so forgeproxy (reqwest) validates the mock GHE cert
         security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
 
         networking.firewall.allowedTCPPorts = [
@@ -409,28 +409,28 @@ pkgs.testers.runNixOSTest {
         bob_fp = proxy.succeed("cat ${testSshKeys}/bob.fp").strip()
 
         proxy.succeed(
-            f"redis-cli -h keydb SET 'forgecache:ssh:auth:{alice_fp}' 'alice' EX 3600"
+            f"redis-cli -h keydb SET 'forgeproxy:ssh:auth:{alice_fp}' 'alice' EX 3600"
         )
         proxy.succeed(
-            f"redis-cli -h keydb SET 'forgecache:ssh:auth:{bob_fp}' 'bob' EX 3600"
+            f"redis-cli -h keydb SET 'forgeproxy:ssh:auth:{bob_fp}' 'bob' EX 3600"
         )
 
-    # ── Start forgecache with admin token ────────────────────────────────
+    # ── Start forgeproxy with admin token ────────────────────────────────
     # The ExecStartPre also pre-seeds the local cache for repo-cached so
     # the authz tests can distinguish cached vs uncached paths.  This must
     # run inside the service namespace because DynamicUser=true makes the
     # CacheDirectory only visible to the service's own processes.
-    with subtest("Start forgecache with admin token"):
+    with subtest("Start forgeproxy with admin token"):
         proxy.succeed(
-            f"mkdir -p /run/systemd/system/forgecache.service.d && "
-            f"cat > /run/systemd/system/forgecache.service.d/token.conf <<'UNIT'\n"
+            f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
+            f"cat > /run/systemd/system/forgeproxy.service.d/token.conf <<'UNIT'\n"
             f"[Service]\n"
             f"Environment=FORGE_ADMIN_TOKEN={TOKEN}\n"
-            f"ExecStartPre=/bin/sh -c 'mkdir -p /var/cache/forgecache/repos/octocat && git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git /var/cache/forgecache/repos/octocat/repo-cached.git'\n"
+            f"ExecStartPre=/bin/sh -c 'mkdir -p /var/cache/forgeproxy/repos/octocat && git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git /var/cache/forgeproxy/repos/octocat/repo-cached.git'\n"
             f"UNIT"
         )
         proxy.succeed("systemctl daemon-reload")
-        proxy.succeed("systemctl start forgecache")
+        proxy.succeed("systemctl start forgeproxy")
         proxy.wait_for_open_port(2222)
 
     # ── Prepare client SSH keys ──────────────────────────────────────────

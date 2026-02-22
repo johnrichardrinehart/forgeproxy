@@ -10,7 +10,7 @@
 }:
 
 rustPlatform.buildRustPackage {
-  pname = "forgecache";
+  pname = "forgeproxy";
   version = "0.1.0";
 
   src = ../rust;
@@ -39,6 +39,6 @@ rustPlatform.buildRustPackage {
     description = "Git Caching Reverse Proxy";
     license = licenses.mit;
     platforms = platforms.linux;
-    mainProgram = "forgecache";
+    mainProgram = "forgeproxy";
   };
 }

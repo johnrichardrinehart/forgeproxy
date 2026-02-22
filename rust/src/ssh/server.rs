@@ -65,7 +65,7 @@ fn load_or_generate_host_key() -> KeyPair {
 }
 
 /// Try to read a PEM-encoded private key stored in the user keyring under
-/// the well-known description `forgecache:ssh_host_key`.
+/// the well-known description `forgeproxy:ssh_host_key`.
 fn load_host_key_from_keyring() -> Result<KeyPair> {
     use linux_keyutils::{KeyRing, KeyRingIdentifier};
 
@@ -73,7 +73,7 @@ fn load_host_key_from_keyring() -> Result<KeyPair> {
         .map_err(|e| anyhow::anyhow!("failed to open user keyring: {e:?}"))?;
 
     let key = ring
-        .search("forgecache:ssh_host_key")
+        .search("forgeproxy:ssh_host_key")
         .map_err(|e| anyhow::anyhow!("SSH host key not found in kernel keyring: {e:?}"))?;
 
     let buf = key

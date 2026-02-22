@@ -465,7 +465,7 @@ pub struct S3StorageConfig {
 }
 
 fn default_s3_prefix() -> String {
-    "forgecache/".to_string()
+    "forgeproxy/".to_string()
 }
 
 fn default_presigned_url_ttl() -> u64 {

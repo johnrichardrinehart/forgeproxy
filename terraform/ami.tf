@@ -1,6 +1,6 @@
 # ── Map closure_variant to nixosConfiguration names ───────────────────────────
 locals {
-  forgecache_config = var.closure_variant == "dev" ? "forgecache-dev" : "forgecache"
+  forgeproxy_config = var.closure_variant == "dev" ? "forgeproxy-dev" : "forgeproxy"
   keydb_config      = var.closure_variant == "dev" ? "keydb-dev" : "keydb"
   variant_suffix    = var.closure_variant == "dev" ? "-dev" : ""
 
@@ -11,10 +11,10 @@ locals {
 }
 
 # ── Evaluate Nix outPaths at plan time (fast, no build) ──────────────────────
-data "external" "forgecache_image_hash" {
+data "external" "forgeproxy_image_hash" {
   program = ["bash", "-c", <<-EOT
     set -euo pipefail
-    OUTPATH=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.system.build.images.amazon.outPath')
+    OUTPATH=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.forgeproxy_config}.config.system.build.images.amazon.outPath')
     HASH=$(basename "$OUTPATH" | cut -d- -f1)
     printf '{"hash":"%s"}\n' "$HASH"
   EOT
@@ -38,7 +38,7 @@ data "external" "nix_config" {
   program = ["bash", "-c", <<-EOT
     set -euo pipefail
     KEYDB_TLS=$(nix eval --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.services.keydb.tls.enable')
-    BACKEND_PORT=$(nix eval --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.services.forgecache-nginx.backendPort')
+    BACKEND_PORT=$(nix eval --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.forgeproxy_config}.config.services.forgeproxy-nginx.backendPort')
     KEYDB_MAX_MEM=$(nix eval --tarball-ttl 0 --raw '${var.flake_ref}#nixosConfigurations.${local.keydb_config}.config.services.keydb.maxMemory')
     printf '{"keydb_tls_enable":"%s","backend_port":"%s","keydb_max_memory":"%s"}\n' \
       "$KEYDB_TLS" "$BACKEND_PORT" "$KEYDB_MAX_MEM"
@@ -46,10 +46,10 @@ data "external" "nix_config" {
   ]
 }
 
-# ── Build forgecache AMI ──────────────────────────────────────────────────
-resource "null_resource" "build_forgecache_ami" {
+# ── Build forgeproxy AMI ──────────────────────────────────────────────────
+resource "null_resource" "build_forgeproxy_ami" {
   triggers = {
-    image_hash  = data.external.forgecache_image_hash.result.hash
+    image_hash  = data.external.forgeproxy_image_hash.result.hash
     name_prefix = var.name_prefix
   }
 
@@ -57,9 +57,9 @@ resource "null_resource" "build_forgecache_ami" {
     command = <<-EOT
       set -euo pipefail
 
-      HASH="${data.external.forgecache_image_hash.result.hash}"
-      AMI_NAME="${var.name_prefix}-forgecache${local.variant_suffix}-$HASH"
-      S3_KEY="forgecache${local.variant_suffix}-$HASH.vhd"
+      HASH="${data.external.forgeproxy_image_hash.result.hash}"
+      AMI_NAME="${var.name_prefix}-forgeproxy${local.variant_suffix}-$HASH"
+      S3_KEY="forgeproxy${local.variant_suffix}-$HASH.vhd"
 
       # If an AMI with this hash already exists, nothing to do
       EXISTING_AMI=$(aws ec2 describe-images \
@@ -72,7 +72,7 @@ resource "null_resource" "build_forgecache_ami" {
       fi
 
       # Build the NixOS image (only reached when AMI doesn't exist yet)
-      nix build --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.forgecache_config}.config.system.build.images.amazon'
+      nix build --tarball-ttl 0 '${var.flake_ref}#nixosConfigurations.${local.forgeproxy_config}.config.system.build.images.amazon'
 
       # Upload only if this exact image isn't already in the bucket.
       # Uses aggressive retry/timeout settings for large uploads over
@@ -108,7 +108,7 @@ resource "null_resource" "build_forgecache_ami" {
 
       # Import snapshot from S3
       SNAPSHOT_ID=$(aws ec2 import-snapshot \
-        --description "forgecache NixOS image ($HASH)" \
+        --description "forgeproxy NixOS image ($HASH)" \
         --disk-container "Format=VHD,UserBucket={S3Bucket=${aws_s3_bucket.ami_staging.id},S3Key=$S3_KEY}" \
         --role-name "${aws_iam_role.vmimport.name}" \
         --region "${var.aws_region}" \
@@ -137,7 +137,7 @@ resource "null_resource" "build_forgecache_ami" {
       # Register AMI
       aws ec2 register-image \
         --name "$AMI_NAME" \
-        --description "forgecache NixOS AMI (Terraform-managed)" \
+        --description "forgeproxy NixOS AMI (Terraform-managed)" \
         --architecture x86_64 \
         --root-device-name /dev/xvda \
         --virtualization-type hvm \
@@ -156,17 +156,17 @@ resource "null_resource" "build_forgecache_ami" {
   ]
 }
 
-# Look up the forgecache AMI by its deterministic name
-data "aws_ami" "forgecache" {
+# Look up the forgeproxy AMI by its deterministic name
+data "aws_ami" "forgeproxy" {
   most_recent = true
   owners      = ["self"]
 
   filter {
     name   = "name"
-    values = ["${var.name_prefix}-forgecache${local.variant_suffix}-${data.external.forgecache_image_hash.result.hash}"]
+    values = ["${var.name_prefix}-forgeproxy${local.variant_suffix}-${data.external.forgeproxy_image_hash.result.hash}"]
   }
 
-  depends_on = [null_resource.build_forgecache_ami]
+  depends_on = [null_resource.build_forgeproxy_ami]
 }
 
 # ── Build keydb AMI ────────────────────────────────────────────────────────

@@ -70,7 +70,7 @@ mod tests {
     fn repo_key_format() {
         assert_eq!(
             crate::coordination::registry::repo_key("acme/widgets"),
-            "forgecache:repo:acme/widgets",
+            "forgeproxy:repo:acme/widgets",
         );
     }
 }

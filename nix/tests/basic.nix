@@ -9,7 +9,7 @@ let
   # Test TLS certificates (generated at Nix eval time)
   # ---------------------------------------------------------------------------
   testCerts =
-    pkgs.runCommand "forgecache-test-certs"
+    pkgs.runCommand "forgeproxy-test-certs"
       {
         nativeBuildInputs = [ pkgs.openssl ];
       }
@@ -20,7 +20,7 @@ let
         openssl req -new -x509 -nodes -days 365 \
           -newkey rsa:2048 \
           -keyout $out/ca.key -out $out/ca.crt \
-          -subj "/CN=ForgeCache Test CA"
+          -subj "/CN=ForgeProxy Test CA"
 
         # GHE server certificate (SAN: DNS:ghe)
         openssl req -new -nodes -newkey rsa:2048 \
@@ -42,9 +42,9 @@ let
       '';
 
   # ---------------------------------------------------------------------------
-  # forgecache configuration YAML for the test environment
+  # forgeproxy configuration YAML for the test environment
   # ---------------------------------------------------------------------------
-  testConfigYaml = pkgs.writeText "forgecache-test-config.yaml" ''
+  testConfigYaml = pkgs.writeText "forgeproxy-test-config.yaml" ''
     upstream:
       hostname: "ghe"
       api_url: "http://ghe:3000/api/v1"
@@ -91,7 +91,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgecache/repos"
+        path: "/var/cache/forgeproxy/repos"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75
@@ -106,7 +106,7 @@ let
 
 in
 pkgs.testers.runNixOSTest {
-  name = "forgecache-basic";
+  name = "forgeproxy-basic";
   globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
@@ -195,7 +195,7 @@ pkgs.testers.runNixOSTest {
         networking.firewall.allowedTCPPorts = [ 6379 ];
       };
 
-    # ── forgecache + nginx TLS termination ────────────────────────────────
+    # ── forgeproxy + nginx TLS termination ────────────────────────────────
     proxy =
       {
         config,
@@ -205,18 +205,18 @@ pkgs.testers.runNixOSTest {
       }:
       {
         imports = [
-          self.nixosModules.forgecache
+          self.nixosModules.forgeproxy
           self.nixosModules.nginx
         ];
 
-        services.forgecache = {
+        services.forgeproxy = {
           enable = true;
-          package = pkgs.forgecache;
+          package = pkgs.forgeproxy;
           configFile = testConfigYaml;
           logLevel = "debug";
         };
 
-        services.forgecache-nginx = {
+        services.forgeproxy-nginx = {
           enable = true;
           serverName = "proxy";
           sslCertificate = "${testCerts}/proxy.crt";
@@ -228,20 +228,20 @@ pkgs.testers.runNixOSTest {
         # Create nginx runtime config includes before nginx starts (normally written by the provider script)
         systemd.services.nginx.serviceConfig.ExecStartPre = lib.mkBefore [
           "${pkgs.writeShellScript "nginx-runtime-config" ''
-                        cat > /run/nginx/forgecache-upstream.conf <<'EOFCONF'
+                        cat > /run/nginx/forgeproxy-upstream.conf <<'EOFCONF'
             upstream forge-upstream {
               server ghe:443;
               keepalive 32;
             }
             EOFCONF
-                        cat > /run/nginx/forgecache-server.conf <<'EOFCONF'
+                        cat > /run/nginx/forgeproxy-server.conf <<'EOFCONF'
             set $forge_upstream_host "ghe";
             EOFCONF
           ''}"
         ];
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
-        systemd.services.forgecache.environment = {
+        systemd.services.forgeproxy.environment = {
           AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
           AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
           AWS_DEFAULT_REGION = "us-east-1";
@@ -256,7 +256,7 @@ pkgs.testers.runNixOSTest {
           jq
         ];
 
-        # Trust the test CA so forgecache (reqwest) validates the mock GHE cert
+        # Trust the test CA so forgeproxy (reqwest) validates the mock GHE cert
         security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
 
         networking.firewall.allowedTCPPorts = [
@@ -350,8 +350,8 @@ pkgs.testers.runNixOSTest {
         )
 
     # ── Proxy services come up ────────────────────────────────────────────
-    with subtest("forgecache service starts"):
-        proxy.wait_for_unit("forgecache.service")
+    with subtest("forgeproxy service starts"):
+        proxy.wait_for_unit("forgeproxy.service")
         proxy.wait_for_open_port(8080)
 
     with subtest("Proxy nginx starts"):
@@ -368,7 +368,7 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Metrics endpoint responds"):
         result = proxy.succeed("curl -sf http://localhost:8080/metrics")
-        assert "# EOF" in result or "forgecache" in result.lower() or "process" in result.lower(), \
+        assert "# EOF" in result or "forgeproxy" in result.lower() or "process" in result.lower(), \
             f"Metrics endpoint did not return expected content: {result[:200]}"
 
     # ── Push rejection ────────────────────────────────────────────────────

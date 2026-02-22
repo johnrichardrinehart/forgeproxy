@@ -1,5 +1,5 @@
 [package]
-name = "forgecache"
+name = "forgeproxy"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
@@ -10,7 +10,7 @@ default = []
 fips = ["rustls/fips"]
 
 [[bin]]
-name = "forgecache"
+name = "forgeproxy"
 path = "src/main.rs"
 
 [dependencies]

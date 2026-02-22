@@ -6,7 +6,7 @@ provider "aws" {
       Name        = var.name_prefix
       Environment = "production"
       ManagedBy   = "Terraform"
-      Project     = "forgecache"
+      Project     = "forgeproxy"
     }
   }
 }

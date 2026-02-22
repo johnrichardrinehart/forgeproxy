@@ -33,10 +33,10 @@ use crate::metrics::MetricsRegistry;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "forgecache", about = "Git Caching Reverse Proxy")]
+#[command(name = "forgeproxy", about = "Git Caching Reverse Proxy")]
 struct Cli {
     /// Path to the YAML configuration file.
-    #[arg(short, long, default_value = "/run/forgecache/config.yaml")]
+    #[arg(short, long, default_value = "/run/forgeproxy/config.yaml")]
     config: String,
 }
 
@@ -266,7 +266,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
-    tracing::info!(config_path = %cli.config, "starting forgecache");
+    tracing::info!(config_path = %cli.config, "starting forgeproxy");
 
     // ---- Ensure local cache directory exists ----
     tokio::fs::create_dir_all(&config.storage.local.path)
@@ -283,7 +283,7 @@ async fn main() -> Result<()> {
     let s3 = build_s3_client(&config).await?;
 
     let http_client = reqwest::Client::builder()
-        .user_agent("forgecache/0.1")
+        .user_agent("forgeproxy/0.1")
         .build()
         .context("failed to build reqwest client")?;
 
@@ -385,6 +385,6 @@ async fn main() -> Result<()> {
         telemetry_handle,
     );
 
-    tracing::info!("forgecache shut down cleanly");
+    tracing::info!("forgeproxy shut down cleanly");
     Ok(())
 }

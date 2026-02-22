@@ -7,11 +7,11 @@
 }:
 
 let
-  cfg = config.services.forgecache.compliance.fedramp;
-  forgecacheModuleLoaded = options.services ? forgecache && options.services.forgecache ? package;
+  cfg = config.services.forgeproxy.compliance.fedramp;
+  forgeproxyModuleLoaded = options.services ? forgeproxy && options.services.forgeproxy ? package;
 in
 {
-  options.services.forgecache.compliance.fedramp = {
+  options.services.forgeproxy.compliance.fedramp = {
     enable = lib.mkEnableOption "FedRAMP compliance controls (FIPS SSH, AU-2/AU-12 audit rules, FIPS build)";
   };
 
@@ -100,7 +100,7 @@ in
             "-w /etc/crontab -p wa -k cron"
             "-w /etc/cron.d -p wa -k cron"
 
-            # Monitor TLS certificate stores used by forgecache and KeyDB.
+            # Monitor TLS certificate stores used by forgeproxy and KeyDB.
             "-w /run/nginx/ssl/ -p wa -k tls_certs"
             "-w /var/lib/keydb/tls/ -p wa -k tls_certs"
 
@@ -111,14 +111,14 @@ in
       })
 
     ]
-    ++ lib.optionals forgecacheModuleLoaded [
+    ++ lib.optionals forgeproxyModuleLoaded [
       # ══════════════════════════════════════════════════════════════════════
       # FIPS package override -- when the proxy service is enabled and the
-      # forgecache module is loaded, replace the default package with the
+      # forgeproxy module is loaded, replace the default package with the
       # FIPS-enabled build.
       # ══════════════════════════════════════════════════════════════════════
-      (lib.mkIf (cfg.enable && (config.services.forgecache.enable or false)) {
-        services.forgecache.package = lib.mkDefault (pkgs.forgecache.override { fipsEnabled = true; });
+      (lib.mkIf (cfg.enable && (config.services.forgeproxy.enable or false)) {
+        services.forgeproxy.package = lib.mkDefault (pkgs.forgeproxy.override { fipsEnabled = true; });
       })
     ]
   );

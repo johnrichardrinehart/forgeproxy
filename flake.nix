@@ -188,9 +188,9 @@
           };
 
           packages = {
-            forgecache = pkgs.callPackage ./nix/package.nix { };
-            forgecache-fips = pkgs.callPackage ./nix/package.nix { fipsEnabled = true; };
-            default = config.packages.forgecache;
+            forgeproxy = pkgs.callPackage ./nix/package.nix { };
+            forgeproxy-fips = pkgs.callPackage ./nix/package.nix { fipsEnabled = true; };
+            default = config.packages.forgeproxy;
           };
         };
 
@@ -199,12 +199,12 @@
       # ────────────────────────────────────────────────────────────────────
       flake = {
         overlays.default = final: prev: {
-          forgecache = final.callPackage ./nix/package.nix { };
-          forgecache-fips = final.callPackage ./nix/package.nix { fipsEnabled = true; };
+          forgeproxy = final.callPackage ./nix/package.nix { };
+          forgeproxy-fips = final.callPackage ./nix/package.nix { fipsEnabled = true; };
         };
 
         nixosModules = {
-          forgecache = ./nix/module.nix;
+          forgeproxy = ./nix/module.nix;
           keydb = ./nix/keydb.nix;
           keydb-tls = ./nix/keydb-tls.nix;
           nginx = ./nix/nginx.nix;
@@ -218,7 +218,7 @@
           dev = ./nix/dev.nix;
         };
 
-        nixosConfigurations.forgecache = inputs.nixpkgs.lib.nixosSystem {
+        nixosConfigurations.forgeproxy = inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
           modules = [
             { nixpkgs.overlays = [ self.overlays.default ]; }
@@ -226,7 +226,7 @@
             self.nixosModules.proxy-host
             self.nixosModules.ami
             # FedRAMP compliance is opt-in:
-            # { services.forgecache.compliance.fedramp.enable = true; }
+            # { services.forgeproxy.compliance.fedramp.enable = true; }
 
             # ── AWS provider configuration ──────────────────────────────────────
             (
@@ -237,7 +237,7 @@
                 ...
               }:
               let
-                awsForgeProxyProvider = pkgs.writeShellScript "forgecache-aws-provider" ''
+                awsForgeProxyProvider = pkgs.writeShellScript "forgeproxy-aws-provider" ''
                   set -euo pipefail
 
                   # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
@@ -259,18 +259,18 @@
                   }
 
                   # ── Write config.yaml from Secrets Manager ────────────────────────
-                  # /run/forgecache is writable via RuntimeDirectory=forgecache;
+                  # /run/forgeproxy is writable via RuntimeDirectory=forgeproxy;
                   # /etc is read-only under ProtectSystem=strict.
                   ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                     --secret-id "$(resolve service-config)" \
-                    --query 'SecretString' --output text > /run/forgecache/config.yaml
+                    --query 'SecretString' --output text > /run/forgeproxy/config.yaml
 
                   # ── Write KeyDB CA cert (for TLS verification) ─────────────────────
                   KEYDB_CA_SECRET=$(resolve keydb-tls-ca)
                   if [ "$KEYDB_CA_SECRET" != "null" ]; then
                     ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$KEYDB_CA_SECRET" \
-                      --query 'SecretString' --output text > /run/forgecache/keydb-ca.pem
+                      --query 'SecretString' --output text > /run/forgeproxy/keydb-ca.pem
                   fi
 
                   # ── Load per-org credentials into the kernel keyring ──────────────
@@ -309,7 +309,7 @@
                   done
                 '';
 
-                awsNginxProvider = pkgs.writeShellScript "forgecache-nginx-provider" ''
+                awsNginxProvider = pkgs.writeShellScript "forgeproxy-nginx-provider" ''
                                   set -euo pipefail
 
                                   # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
@@ -349,7 +349,7 @@
                                   chmod 600 /run/nginx/ssl/key.pem
 
                                   # Upstream block (http-level include)
-                                  cat > /run/nginx/forgecache-upstream.conf <<EOF
+                                  cat > /run/nginx/forgeproxy-upstream.conf <<EOF
                   upstream forge-upstream {
                     server $UPSTREAM:$UPSTREAM_PORT;
                     keepalive 32;
@@ -357,18 +357,18 @@
                   EOF
 
                                   # Server-level variable (server-level include)
-                                  cat > /run/nginx/forgecache-server.conf <<EOF
+                                  cat > /run/nginx/forgeproxy-server.conf <<EOF
                   set \$forge_upstream_host "$UPSTREAM";
                   EOF
                 '';
               in
               {
-                services.forgecache-secrets = lib.mkDefault {
+                services.forgeproxy-secrets = lib.mkDefault {
                   enable = true;
                   providerScript = awsForgeProxyProvider;
                 };
 
-                services.forgecache-nginx-runtime = lib.mkDefault {
+                services.forgeproxy-nginx-runtime = lib.mkDefault {
                   enable = true;
                   providerScript = awsNginxProvider;
                 };
@@ -479,7 +479,7 @@
           ];
         };
 
-        nixosConfigurations.forgecache-dev = self.nixosConfigurations.forgecache.extendModules {
+        nixosConfigurations.forgeproxy-dev = self.nixosConfigurations.forgeproxy.extendModules {
           modules = [ self.nixosModules.dev ];
         };
 

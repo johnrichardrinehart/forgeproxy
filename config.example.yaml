@@ -18,7 +18,7 @@ upstream_credentials:
 proxy:
   ssh_listen: "0.0.0.0:2222"
   http_listen: "127.0.0.1:8080"
-  bundle_uri_base_url: "https://forgecache.internal.example.gov/bundles"
+  bundle_uri_base_url: "https://forgeproxy.internal.example.gov/bundles"
 keydb:
   endpoint: "keydb.internal.example.gov:6380"
   tls: true
@@ -47,13 +47,13 @@ bundles:
   generate_filtered_bundles: true
 storage:
   local:
-    path: "/var/cache/forgecache/repos"
+    path: "/var/cache/forgeproxy/repos"
     max_bytes: 536870912000
     high_water_mark: 0.90
     low_water_mark: 0.75
     eviction_policy: "lfu"
   s3:
-    bucket: "forgecache-bundles"
+    bucket: "forgeproxy-bundles"
     prefix: ""
     region: "us-gov-west-1"
     use_fips: true

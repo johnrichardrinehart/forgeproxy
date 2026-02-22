@@ -5,18 +5,18 @@
 }:
 
 let
-  cfg = config.services.forgecache-nginx-runtime;
+  cfg = config.services.forgeproxy-nginx-runtime;
 in
 {
-  options.services.forgecache-nginx-runtime = {
-    enable = lib.mkEnableOption "runtime nginx config provider for forgecache";
+  options.services.forgeproxy-nginx-runtime = {
+    enable = lib.mkEnableOption "runtime nginx config provider for forgeproxy";
 
     providerScript = lib.mkOption {
       type = lib.types.package;
       description = ''
         Derivation containing a script that fetches nginx configuration from
         a secrets manager and writes the upstream hostname, port, and TLS material
-        to /run/nginx/forgecache-*.conf files at boot.
+        to /run/nginx/forgeproxy-*.conf files at boot.
         Users provide this derivation; see flake.nix awsNginxProvider for reference.
       '';
     };

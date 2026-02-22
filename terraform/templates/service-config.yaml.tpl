@@ -14,7 +14,7 @@ upstream_credentials:
       keyring_key_name: "${name_prefix}-creds-${replace(org.name, "/", "-")}"
 %{ endfor ~}
   # To add an org without a Terraform re-apply: update this secret directly and
-  # create a forgecache/creds/<keyring-key> secret; then restart forgecache.
+  # create a forgeproxy/creds/<keyring-key> secret; then restart forgeproxy.
 
 proxy:
   ssh_listen: "0.0.0.0:2222"
@@ -25,7 +25,7 @@ keydb:
   endpoint: "${keydb_private_ip}:${keydb_enable_tls ? "6380" : "6379"}"
   tls: ${keydb_enable_tls}
 %{ if keydb_enable_tls ~}
-  ca_cert_file: "/run/forgecache/keydb-ca.pem"
+  ca_cert_file: "/run/forgeproxy/keydb-ca.pem"
 %{ endif ~}
   auth_token_env: "KEYDB_AUTH_TOKEN"
 
@@ -34,7 +34,7 @@ auth:
 
 storage:
   local:
-    path: "/var/cache/forgecache/repos"
+    path: "/var/cache/forgeproxy/repos"
     max_bytes: ${local_cache_max_bytes}
     eviction_policy: "${eviction_policy}"
   s3:

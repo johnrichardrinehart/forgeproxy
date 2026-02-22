@@ -1,6 +1,6 @@
 # To consume from git instead of a local path, use:
 #   source = "git::https://github.com/johnrichardrinehart/forgeproxy.git//terraform?ref=main"
-module "forgecache" {
+module "forgeproxy" {
   source = "../../"
 
   flake_ref = var.flake_ref

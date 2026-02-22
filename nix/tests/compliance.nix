@@ -5,7 +5,7 @@
 }:
 
 pkgs.testers.runNixOSTest {
-  name = "forgecache-compliance";
+  name = "forgeproxy-compliance";
   globalTimeout = 300;
 
   nodes = {
@@ -22,12 +22,12 @@ pkgs.testers.runNixOSTest {
           self.nixosModules.proxy-host
         ];
 
-        services.forgecache.enable = lib.mkForce true;
-        services.forgecache.package = pkgs.forgecache;
-        services.forgecache-nginx.enable = lib.mkForce false;
+        services.forgeproxy.enable = lib.mkForce true;
+        services.forgeproxy.package = pkgs.forgeproxy;
+        services.forgeproxy-nginx.enable = lib.mkForce false;
         services.amazon-ssm-agent.enable = lib.mkForce false;
 
-        services.forgecache.compliance.fedramp.enable = true;
+        services.forgeproxy.compliance.fedramp.enable = true;
 
         virtualisation.memorySize = 1024;
       };
@@ -45,9 +45,9 @@ pkgs.testers.runNixOSTest {
           self.nixosModules.proxy-host
         ];
 
-        services.forgecache.enable = lib.mkForce true;
-        services.forgecache.package = pkgs.forgecache;
-        services.forgecache-nginx.enable = lib.mkForce false;
+        services.forgeproxy.enable = lib.mkForce true;
+        services.forgeproxy.package = pkgs.forgeproxy;
+        services.forgeproxy-nginx.enable = lib.mkForce false;
         services.amazon-ssm-agent.enable = lib.mkForce false;
 
         virtualisation.memorySize = 1024;

@@ -1,10 +1,10 @@
-# forgecache
+# forgeproxy
 
 Git caching reverse proxy with [bundle-uri](https://git-scm.com/docs/bundle-uri) support.
 
 ## Overview
 
-forgecache sits between Git clients and an upstream forge (GitHub Enterprise,
+forgeproxy sits between Git clients and an upstream forge (GitHub Enterprise,
 GitHub.com, GitLab, Gitea, or Forgejo). It maintains bare-repo caches on local
 disk, serves clones and fetches from cache, and generates Git bundles that
 clients can download over HTTP before negotiating a pack — dramatically reducing
@@ -34,7 +34,7 @@ load on the upstream forge and speeding up clones.
 ```
   ┌───────────┐       SSH (2222)       ┌──────────────┐        SSH / HTTPS        ┌───────────┐
   │           │ ────────────────────▶  │              │ ──────────────────────▶   │           │
-  │  Git      │       HTTPS (8080)     │  forgecache  │                           │  Upstream │
+  │  Git      │       HTTPS (8080)     │  forgeproxy  │                           │  Upstream │
   │  Clients  │ ────────────────────▶  │              │ ◀── push webhook ───────  │  Forge    │
   │           │ ◀── bundle-uri ──────  │              │                           │           │
   └───────────┘                        └──────┬───────┘                           └───────────┘
@@ -66,21 +66,21 @@ token rather than SSH key passthrough.
 Build with Nix:
 
 ```bash
-nix build .#forgecache          # standard build
-nix build .#forgecache-fips     # FIPS 140 TLS build
+nix build .#forgeproxy          # standard build
+nix build .#forgeproxy-fips     # FIPS 140 TLS build
 ```
 
 Copy and edit the example configuration:
 
 ```bash
-cp config.example.yaml /run/forgecache/config.yaml
+cp config.example.yaml /run/forgeproxy/config.yaml
 # edit upstream hostname, API URL, KeyDB endpoint, S3 bucket, etc.
 ```
 
 Run:
 
 ```bash
-forgecache --config /run/forgecache/config.yaml
+forgeproxy --config /run/forgeproxy/config.yaml
 ```
 
 ## Configuration
@@ -108,18 +108,18 @@ The flake exports a NixOS module for declarative deployment:
 
 ```nix
 {
-  inputs.forgecache.url = "github:your-org/forgecache";
+  inputs.forgeproxy.url = "github:your-org/forgeproxy";
 
-  outputs = { self, nixpkgs, forgecache, ... }: {
+  outputs = { self, nixpkgs, forgeproxy, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
-        { nixpkgs.overlays = [ forgecache.overlays.default ]; }
-        forgecache.nixosModules.forgecache
+        { nixpkgs.overlays = [ forgeproxy.overlays.default ]; }
+        forgeproxy.nixosModules.forgeproxy
         {
-          services.forgecache = {
+          services.forgeproxy = {
             enable = true;
-            configFile = "/run/forgecache/config.yaml";
+            configFile = "/run/forgeproxy/config.yaml";
             logLevel = "info";
           };
         }
@@ -131,11 +131,11 @@ The flake exports a NixOS module for declarative deployment:
 
 Additional NixOS modules are available for companion services:
 
-- `forgecache.nixosModules.keydb` — KeyDB instance
-- `forgecache.nixosModules.nginx` — nginx TLS termination
-- `forgecache.nixosModules.hardening` — extra systemd hardening
-- `forgecache.nixosModules.secrets` — sops-nix secrets integration
-- `forgecache.nixosModules.compliance` — FedRAMP compliance profile
+- `forgeproxy.nixosModules.keydb` — KeyDB instance
+- `forgeproxy.nixosModules.nginx` — nginx TLS termination
+- `forgeproxy.nixosModules.hardening` — extra systemd hardening
+- `forgeproxy.nixosModules.secrets` — sops-nix secrets integration
+- `forgeproxy.nixosModules.compliance` — FedRAMP compliance profile
 
 ## Metrics
 

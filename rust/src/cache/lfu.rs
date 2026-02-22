@@ -1,7 +1,7 @@
 //! Least Frequently Used (LFU) eviction policy backed by KeyDB.
 //!
 //! Each clone/fetch increments a per-repo counter stored in the KeyDB hash
-//! `forgecache:repo:{owner/repo}` under the `clone_count` field.  When the cache
+//! `forgeproxy:repo:{owner/repo}` under the `clone_count` field.  When the cache
 //! manager needs to free space, this module ranks repos by ascending clone
 //! count and returns the least-accessed ones as eviction candidates.
 //!
@@ -77,7 +77,7 @@ mod tests {
     fn repo_key_format() {
         assert_eq!(
             crate::coordination::registry::repo_key("acme/widgets"),
-            "forgecache:repo:acme/widgets",
+            "forgeproxy:repo:acme/widgets",
         );
     }
 }
