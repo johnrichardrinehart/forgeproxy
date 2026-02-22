@@ -6,19 +6,19 @@
 }:
 
 let
-  cfg = config.services.forgecache-nginx;
-  backendCfg = config.services.forgecache.backend._derived;
+  cfg = config.services.forgeproxy-nginx;
+  backendCfg = config.services.forgeproxy.backend._derived;
 in
 {
   imports = [
     ./backend.nix
   ];
-  options.services.forgecache-nginx = {
-    enable = lib.mkEnableOption "nginx reverse proxy for forgecache";
+  options.services.forgeproxy-nginx = {
+    enable = lib.mkEnableOption "nginx reverse proxy for forgeproxy";
 
     serverName = lib.mkOption {
       type = lib.types.str;
-      default = "forgecache.internal.example.gov";
+      default = "forgeproxy.internal.example.gov";
       description = "Virtual host server name for the nginx proxy.";
     };
 
@@ -49,7 +49,7 @@ in
     backendPort = lib.mkOption {
       type = lib.types.port;
       default = 8080;
-      description = "Local port on which the forgecache backend listens.";
+      description = "Local port on which the forgeproxy backend listens.";
     };
 
     resolver = lib.mkOption {
@@ -91,7 +91,7 @@ in
         proxy_headers_hash_bucket_size 128;
 
         # Runtime-configured upstream block (written by nginx-runtime provider at boot).
-        include /run/nginx/forgecache-upstream.conf;
+        include /run/nginx/forgeproxy-upstream.conf;
 
         # Proxy cache for archive / tarball responses.
         proxy_cache_path ${cfg.archiveCachePath}
@@ -131,7 +131,7 @@ in
 
         extraConfig = ''
           # Runtime-configured upstream hostname variable (written by nginx-runtime provider at boot).
-          include /run/nginx/forgecache-server.conf;
+          include /run/nginx/forgeproxy-server.conf;
         '';
 
         locations = {
@@ -270,13 +270,13 @@ in
     # provider hasn't run yet.  The runtime provider overwrites these.
     systemd.services.nginx.preStart = lib.mkBefore ''
       mkdir -p /run/nginx
-      if [ ! -f /run/nginx/forgecache-upstream.conf ]; then
+      if [ ! -f /run/nginx/forgeproxy-upstream.conf ]; then
         echo 'upstream forge-upstream { server 127.0.0.1:443; }' \
-          > /run/nginx/forgecache-upstream.conf
+          > /run/nginx/forgeproxy-upstream.conf
       fi
-      if [ ! -f /run/nginx/forgecache-server.conf ]; then
+      if [ ! -f /run/nginx/forgeproxy-server.conf ]; then
         printf 'set $%s "%s";\n' forge_upstream_host localhost \
-          > /run/nginx/forgecache-server.conf
+          > /run/nginx/forgeproxy-server.conf
       fi
     '';
   };

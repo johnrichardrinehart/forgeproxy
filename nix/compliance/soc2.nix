@@ -5,13 +5,13 @@
 }:
 
 let
-  cfg = config.services.forgecache.compliance.soc2;
+  cfg = config.services.forgeproxy.compliance.soc2;
   keydbEnabled = config.services.keydb.enable or false;
   nginxEnabled = config.services.nginx.enable or false;
   firewallPorts = config.networking.firewall.allowedTCPPorts or [ ];
 in
 {
-  options.services.forgecache.compliance.soc2 = {
+  options.services.forgeproxy.compliance.soc2 = {
     enable = lib.mkEnableOption "SOC2 compliance validation and gap-filling defaults";
   };
 

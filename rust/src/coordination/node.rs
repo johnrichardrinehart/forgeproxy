@@ -19,7 +19,7 @@ pub fn node_id() -> String {
 
 /// Run the heartbeat loop.
 ///
-/// This writes a HASH at `forgecache:node:{node_id}` with a 30-second TTL
+/// This writes a HASH at `forgeproxy:node:{node_id}` with a 30-second TTL
 /// every 10 seconds.  If the process crashes the key will expire and the
 /// node will no longer appear in the active-node list.
 ///
@@ -27,7 +27,7 @@ pub fn node_id() -> String {
 pub async fn run_heartbeat(pool: fred::clients::Pool, node_id: String) {
     info!(%node_id, "starting heartbeat loop");
     loop {
-        let key = format!("forgecache:node:{node_id}");
+        let key = format!("forgeproxy:node:{node_id}");
         if let Err(e) = heartbeat_once(&pool, &key).await {
             error!(error = %e, %node_id, "heartbeat tick failed");
         }

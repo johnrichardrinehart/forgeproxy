@@ -78,7 +78,7 @@ impl TelemetryBuffer {
 
 const RETENTION_SECS: i64 = 365 * 24 * 3600; // 1 year
 const FLUSH_INTERVAL_SECS: u64 = 600; // 10 minutes
-const TELEMETRY_LOCK_KEY: &str = "forgecache:lock:telemetry";
+const TELEMETRY_LOCK_KEY: &str = "forgeproxy:lock:telemetry";
 const TELEMETRY_LOCK_TTL: u64 = 60;
 
 fn telemetry_s3_key(prefix: &str) -> String {

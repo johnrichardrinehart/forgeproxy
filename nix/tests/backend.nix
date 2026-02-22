@@ -19,7 +19,7 @@ let
       '';
 in
 pkgs.testers.runNixOSTest {
-  name = "forgecache-backend";
+  name = "forgeproxy-backend";
   globalTimeout = 300;
 
   nodes = {
@@ -33,17 +33,17 @@ pkgs.testers.runNixOSTest {
       }:
       {
         imports = [
-          self.nixosModules.forgecache
+          self.nixosModules.forgeproxy
           self.nixosModules.nginx
           self.nixosModules.backend
         ];
 
         # We only need nginx config; disable the proxy service itself.
-        services.forgecache.enable = lib.mkForce false;
+        services.forgeproxy.enable = lib.mkForce false;
 
-        services.forgecache.backend.type = "gitea";
+        services.forgeproxy.backend.type = "gitea";
 
-        services.forgecache-nginx = {
+        services.forgeproxy-nginx = {
           enable = true;
           serverName = "gitea-proxy";
           sslCertificate = "${testCerts}/cert.pem";
@@ -55,13 +55,13 @@ pkgs.testers.runNixOSTest {
         # Create nginx runtime config includes before nginx starts (normally written by the provider script)
         systemd.services.nginx.serviceConfig.ExecStartPre = lib.mkBefore [
           "${pkgs.writeShellScript "nginx-runtime-config" ''
-                        cat > /run/nginx/forgecache-upstream.conf <<'EOFCONF'
+                        cat > /run/nginx/forgeproxy-upstream.conf <<'EOFCONF'
             upstream forge-upstream {
               server upstream.local:443;
               keepalive 32;
             }
             EOFCONF
-                        cat > /run/nginx/forgecache-server.conf <<'EOFCONF'
+                        cat > /run/nginx/forgeproxy-server.conf <<'EOFCONF'
             set $forge_upstream_host "upstream.local";
             EOFCONF
           ''}"
@@ -80,16 +80,16 @@ pkgs.testers.runNixOSTest {
       }:
       {
         imports = [
-          self.nixosModules.forgecache
+          self.nixosModules.forgeproxy
           self.nixosModules.nginx
           self.nixosModules.backend
         ];
 
-        services.forgecache.enable = lib.mkForce false;
+        services.forgeproxy.enable = lib.mkForce false;
 
-        services.forgecache.backend.type = "gitlab";
+        services.forgeproxy.backend.type = "gitlab";
 
-        services.forgecache-nginx = {
+        services.forgeproxy-nginx = {
           enable = true;
           serverName = "gitlab-proxy";
           sslCertificate = "${testCerts}/cert.pem";
@@ -101,13 +101,13 @@ pkgs.testers.runNixOSTest {
         # Create nginx runtime config includes before nginx starts (normally written by the provider script)
         systemd.services.nginx.serviceConfig.ExecStartPre = lib.mkBefore [
           "${pkgs.writeShellScript "nginx-runtime-config" ''
-                        cat > /run/nginx/forgecache-upstream.conf <<'EOFCONF'
+                        cat > /run/nginx/forgeproxy-upstream.conf <<'EOFCONF'
             upstream forge-upstream {
               server upstream.local:443;
               keepalive 32;
             }
             EOFCONF
-                        cat > /run/nginx/forgecache-server.conf <<'EOFCONF'
+                        cat > /run/nginx/forgeproxy-server.conf <<'EOFCONF'
             set $forge_upstream_host "upstream.local";
             EOFCONF
           ''}"

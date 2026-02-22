@@ -492,7 +492,7 @@ impl IntoResponse for AppError {
         match self {
             AppError::Unauthorized(msg) => (
                 StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Basic realm=\"forgecache\"")],
+                [(header::WWW_AUTHENTICATE, "Basic realm=\"forgeproxy\"")],
                 msg,
             )
                 .into_response(),

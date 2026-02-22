@@ -1,6 +1,6 @@
-# Terraform Reference Deployment for forgecache
+# Terraform Reference Deployment for forgeproxy
 
-This directory contains Terraform infrastructure-as-code for a fully dynamic, runtime-configured deployment of forgecache with:
+This directory contains Terraform infrastructure-as-code for a fully dynamic, runtime-configured deployment of forgeproxy with:
 - Network Load Balancer for multi-instance support (TCP passthrough on ports 443/2222)
 - Scalable forgeproxy instances (count-based)
 - KeyDB instance for distributed caching
@@ -20,7 +20,7 @@ vim terraform.tfvars  # Edit with your values
 **Required variables:**
 - `upstream_hostname` - Git forge hostname (e.g., `ghe.example.com`)
 - `upstream_api_url` - Forge API endpoint (e.g., `https://ghe.example.com/api/v3`)
-- `proxy_fqdn` - Fully-qualified domain name for the forgecache proxy
+- `proxy_fqdn` - Fully-qualified domain name for the forgeproxy proxy
 - `bundle_bucket_name` - Globally unique S3 bucket name for bundles
 
 ### 2. Initialize Terraform
@@ -36,7 +36,7 @@ terraform plan
 ```
 
 This will:
-1. Build NixOS AMIs for forgecache and keydb
+1. Build NixOS AMIs for forgeproxy and keydb
 2. Create VPC, subnets, Internet Gateway, NAT Gateway
 3. Create security groups and NLB
 4. Generate self-signed TLS certificates
@@ -58,18 +58,18 @@ After `terraform apply` completes, populate these Secrets Manager secrets with a
 
 ```bash
 aws secretsmanager put-secret-value \
-  --secret-id forgecache/forge-admin-token \
+  --secret-id forgeproxy/forge-admin-token \
   --secret-string "your-forge-admin-pat"
 
 aws secretsmanager put-secret-value \
-  --secret-id forgecache/webhook-secret \
+  --secret-id forgeproxy/webhook-secret \
   --secret-string "your-webhook-hmac-secret"
 ```
 
 For each organization in `org_creds`, populate:
 ```bash
 aws secretsmanager put-secret-value \
-  --secret-id forgecache/creds/example-org \
+  --secret-id forgeproxy/creds/example-org \
   --secret-string "org-specific-credentials-or-pat"
 ```
 
@@ -87,7 +87,7 @@ curl -k https://$(terraform output -raw nlb_eip)/healthz
 aws ssm start-session --target $(terraform output -raw forgeproxy_instance_ids | jq -r '.[0]')
 
 # Check logs
-sudo journalctl -u forgecache -f
+sudo journalctl -u forgeproxy -f
 sudo journalctl -u nginx -f
 ```
 
@@ -110,13 +110,13 @@ terraform/
 ├── ami.tf                         # NixOS AMI build and registration
 ├── ec2.tf                         # EC2 instances and NLB attachments
 └── templates/
-    └── service-config.yaml.tpl    # forgecache config.yaml template
+    └── service-config.yaml.tpl    # forgeproxy config.yaml template
 ```
 
 ## Key Design Decisions
 
 ### 1. Provider Pattern
-All secrets and runtime configuration come from AWS Secrets Manager. The forgecache and keydb AMIs are completely generic:
+All secrets and runtime configuration come from AWS Secrets Manager. The forgeproxy and keydb AMIs are completely generic:
 - No hardcoded hostnames
 - No hardcoded credentials
 - No organization lists
@@ -124,13 +124,13 @@ All secrets and runtime configuration come from AWS Secrets Manager. The forgeca
 Configuration is fetched at boot time via `ExecStartPre` scripts in systemd services. To change config, update the secret and restart the service — no AMI rebuild needed.
 
 ### 2. Upstream and Credentials
-- **Upstream hostname/port**: Stored in `forgecache/nginx-upstream-hostname` and `forgecache/nginx-upstream-port`
+- **Upstream hostname/port**: Stored in `forgeproxy/nginx-upstream-hostname` and `forgeproxy/nginx-upstream-port`
   - Changes require restarting nginx: `systemctl restart nginx`
-- **Service config**: Complete `config.yaml` in `forgecache/service-config`
-  - Changes require restarting forgecache: `systemctl restart forgecache`
-- **Organization credentials**: One secret per org under `forgecache/creds/<org-name>`
+- **Service config**: Complete `config.yaml` in `forgeproxy/service-config`
+  - Changes require restarting forgeproxy: `systemctl restart forgeproxy`
+- **Organization credentials**: One secret per org under `forgeproxy/creds/<org-name>`
   - Dynamic discovery at startup; no hardcoded org list
-  - Add org: create SM secret, update config, restart forgecache
+  - Add org: create SM secret, update config, restart forgeproxy
 
 ### 3. TLS Configuration
 - **nginx**: Uses self-signed cert from Terraform; suitable for internal deployments
@@ -161,11 +161,11 @@ No AMI rebuild; existing instances unaffected.
 ### Change upstream Git forge
 ```bash
 aws secretsmanager put-secret-value \
-  --secret-id forgecache/nginx-upstream-hostname \
+  --secret-id forgeproxy/nginx-upstream-hostname \
   --secret-string "new-ghe.example.com"
 
 aws secretsmanager put-secret-value \
-  --secret-id forgecache/nginx-upstream-port \
+  --secret-id forgeproxy/nginx-upstream-port \
   --secret-string "443"
 
 # Restart nginx on all instances (via SSM)
@@ -179,20 +179,20 @@ aws ssm send-command \
 1. Create the Secrets Manager secret:
    ```bash
    aws secretsmanager create-secret \
-     --name forgecache/creds/new-org \
+     --name forgeproxy/creds/new-org \
      --secret-string "org-pat-token"
    ```
 
-2. Update the forgecache config secret to add the org:
+2. Update the forgeproxy config secret to add the org:
    ```bash
    # (manually via AWS console or aws cli put-secret-value)
    ```
 
-3. Restart forgecache:
+3. Restart forgeproxy:
    ```bash
    aws ssm send-command \
      --document-name "AWS-RunShellScript" \
-     --parameters 'commands=["systemctl restart forgecache"]' \
+     --parameters 'commands=["systemctl restart forgeproxy"]' \
      --targets "Key=tag:Role,Values=forgeproxy"
    ```
 
@@ -203,14 +203,14 @@ NEW_PASS=$(openssl rand -base64 32)
 
 # Update the secret
 aws secretsmanager put-secret-value \
-  --secret-id forgecache/keydb-auth-token \
+  --secret-id forgeproxy/keydb-auth-token \
   --secret-string "$NEW_PASS"
 
-# Restart keydb and forgecache
+# Restart keydb and forgeproxy
 aws ssm send-command \
   --document-name "AWS-RunShellScript" \
-  --parameters 'commands=["systemctl restart keydb && systemctl restart forgecache"]' \
-  --targets "Key=tag:Name,Values=forgecache-keydb"
+  --parameters 'commands=["systemctl restart keydb && systemctl restart forgeproxy"]' \
+  --targets "Key=tag:Name,Values=forgeproxy-keydb"
 ```
 
 ## Multi-Partition Support
@@ -264,14 +264,14 @@ Check the nix flake and ensure:
 ### Secrets Manager secrets not found
 Verify the secrets exist and the IAM roles have `secretsmanager:GetSecretValue` permission:
 ```bash
-aws secretsmanager list-secrets --filters Key=name,Values=forgecache/
+aws secretsmanager list-secrets --filters Key=name,Values=forgeproxy/
 ```
 
 ### Instances fail to start
 Check systemd logs on the instance:
 ```bash
 aws ssm start-session --target <instance-id>
-sudo journalctl -u forgecache -n 50
+sudo journalctl -u forgeproxy -n 50
 sudo journalctl -u nginx -n 50
 sudo journalctl -u keydb -n 50
 ```
@@ -291,7 +291,7 @@ curl -k http://127.0.0.1:8080/healthz
 
 2. **TLS for production**: Replace self-signed certificates with real certs
    - Update `terraform/tls.tf` or
-   - Update Secrets Manager secrets `forgecache/nginx-tls-cert` and `forgecache/nginx-tls-key`
+   - Update Secrets Manager secrets `forgeproxy/nginx-tls-cert` and `forgeproxy/nginx-tls-key`
 
 3. **Monitoring**: Set up Prometheus scraping
    - Forgeproxy metrics: `http://<instance-ip>:9090/metrics`
@@ -302,7 +302,7 @@ curl -k http://127.0.0.1:8080/healthz
 
 ## Support and Documentation
 
-- Forgecache docs: See the main repository README
+- Forgeproxy docs: See the main repository README
 - Terraform docs: https://www.terraform.io/docs
 - AWS Secrets Manager: https://docs.aws.amazon.com/secretsmanager/
 - NixOS: https://nixos.org/manual/

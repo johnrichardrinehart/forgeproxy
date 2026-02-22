@@ -20,7 +20,7 @@ let
         openssl req -new -x509 -nodes -days 365 \
           -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
           -keyout $out/ca.key -out $out/ca.crt \
-          -subj "/CN=ForgeCache Test CA"
+          -subj "/CN=ForgeProxy Test CA"
 
         # GHE server certificate (SAN: DNS:ghe)
         openssl req -new -nodes \
@@ -34,7 +34,7 @@ let
       '';
 
   # ---------------------------------------------------------------------------
-  # forgecache configuration YAML for the test environment
+  # forgeproxy configuration YAML for the test environment
   #
   # Key difference from basic.nix: credentials are resolved from the Linux
   # kernel keyring rather than environment variables.  The per-org entry
@@ -54,7 +54,7 @@ let
       orgs:
         octocat:
           mode: "pat"
-          keyring_key_name: "forgecache:octocat_pat"
+          keyring_key_name: "forgeproxy:octocat_pat"
 
     proxy:
       ssh_listen: "0.0.0.0:2222"
@@ -94,7 +94,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgecache/repos"
+        path: "/var/cache/forgeproxy/repos"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75
@@ -109,7 +109,7 @@ let
 
 in
 pkgs.testers.runNixOSTest {
-  name = "forgecache-keyring-creds";
+  name = "forgeproxy-keyring-creds";
   globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ pkgs.testers.runNixOSTest {
         networking.firewall.allowedTCPPorts = [ 6379 ];
       };
 
-    # -- forgecache proxy (keyring credentials, no TLS) -----------------------
+    # -- forgeproxy proxy (keyring credentials, no TLS) -----------------------
     proxy =
       {
         config,
@@ -203,22 +203,22 @@ pkgs.testers.runNixOSTest {
       }:
       {
         imports = [
-          self.nixosModules.forgecache
+          self.nixosModules.forgeproxy
         ];
 
-        services.forgecache = {
+        services.forgeproxy = {
           enable = true;
-          package = pkgs.forgecache;
+          package = pkgs.forgeproxy;
           configFile = testConfigYaml;
           logLevel = "debug";
         };
 
         # Prevent auto-start so we can inject the token into the keyring
         # via an ExecStartPre *after* Gitea has been seeded.
-        systemd.services.forgecache.wantedBy = lib.mkForce [ ];
+        systemd.services.forgeproxy.wantedBy = lib.mkForce [ ];
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
-        systemd.services.forgecache.environment = {
+        systemd.services.forgeproxy.environment = {
           AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
           AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
           AWS_DEFAULT_REGION = "us-east-1";
@@ -235,7 +235,7 @@ pkgs.testers.runNixOSTest {
           keyutils
         ];
 
-        # Trust the test CA so forgecache (reqwest) validates the mock GHE cert
+        # Trust the test CA so forgeproxy (reqwest) validates the mock GHE cert
         security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
 
         networking.firewall.allowedTCPPorts = [
@@ -339,36 +339,36 @@ pkgs.testers.runNixOSTest {
             " | jq -e '.permissions.pull == true'"
         )
 
-    # -- Load PAT into kernel keyring and start forgecache ---------------------
-    with subtest("Load PAT into keyring and start forgecache"):
-        # Inject the Gitea admin token into the forgecache service via a
+    # -- Load PAT into kernel keyring and start forgeproxy ---------------------
+    with subtest("Load PAT into keyring and start forgeproxy"):
+        # Inject the Gitea admin token into the forgeproxy service via a
         # systemd drop-in that sets FORGE_ADMIN_TOKEN (needed for permission
         # checks) and loads the PAT into the kernel keyring via ExecStartPre.
         proxy.succeed(
-            f"mkdir -p /run/systemd/system/forgecache.service.d && "
-            f"cat > /run/systemd/system/forgecache.service.d/keyring.conf <<'UNIT'\n"
+            f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
+            f"cat > /run/systemd/system/forgeproxy.service.d/keyring.conf <<'UNIT'\n"
             f"[Service]\n"
             f"Environment=FORGE_ADMIN_TOKEN={TOKEN}\n"
-            f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user forgecache:octocat_pat @u'\n"
+            f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user forgeproxy:octocat_pat @u'\n"
             f"UNIT"
         )
         proxy.succeed("systemctl daemon-reload")
-        proxy.succeed("systemctl start forgecache")
+        proxy.succeed("systemctl start forgeproxy")
 
-    with subtest("forgecache service starts"):
-        proxy.wait_for_unit("forgecache.service")
+    with subtest("forgeproxy service starts"):
+        proxy.wait_for_unit("forgeproxy.service")
         proxy.wait_for_open_port(8080)
 
     # -- Verify keyring key is accessible from the service session -------------
     with subtest("Keyring key is loaded"):
         # The ExecStartPre ran in the same session as the service.  Verify
-        # the key exists by searching the forgecache user's user keyring
+        # the key exists by searching the forgeproxy user's user keyring
         # from the test harness side.  We check via the service journal
         # instead, since the keyring is per-session.  A successful proxy
         # start with debug logging confirms the key was loaded.
         proxy.succeed(
-            "journalctl -u forgecache --no-pager"
-            " | grep -q 'forgecache' || true"
+            "journalctl -u forgeproxy --no-pager"
+            " | grep -q 'forgeproxy' || true"
         )
 
     # -- Health endpoint responds ----------------------------------------------

@@ -15,7 +15,7 @@ pub async fn publish_ready(
     owner_repo: &str,
     node_id: &str,
 ) -> Result<()> {
-    let channel = format!("forgecache:notify:repo:{owner_repo}");
+    let channel = format!("forgeproxy:notify:repo:{owner_repo}");
     let message = format!("ready:{node_id}");
     let _: () = pool
         .next()

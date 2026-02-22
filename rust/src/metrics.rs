@@ -90,7 +90,7 @@ impl Metrics {
     pub fn new(registry: &mut Registry) -> Self {
         let clone_total = Family::<CloneLabels, Counter>::default();
         registry.register(
-            "forgecache_clone_total",
+            "forgeproxy_clone_total",
             "Total clone requests by protocol and cache status",
             clone_total.clone(),
         );
@@ -100,126 +100,126 @@ impl Metrics {
                 Histogram::new(exponential_buckets(0.01, 2.0, 14))
             });
         registry.register(
-            "forgecache_clone_duration_seconds",
+            "forgeproxy_clone_duration_seconds",
             "Clone request latency in seconds",
             clone_duration_seconds.clone(),
         );
 
         let bundle_generation_total = Counter::default();
         registry.register(
-            "forgecache_bundle_generation_total",
+            "forgeproxy_bundle_generation_total",
             "Total bundle generation operations",
             bundle_generation_total.clone(),
         );
 
         let bundle_generation_duration_seconds = Histogram::new(exponential_buckets(1.0, 2.0, 12));
         registry.register(
-            "forgecache_bundle_generation_duration_seconds",
+            "forgeproxy_bundle_generation_duration_seconds",
             "Bundle generation latency in seconds",
             bundle_generation_duration_seconds.clone(),
         );
 
         let auth_cache_hits = Counter::default();
         registry.register(
-            "forgecache_auth_cache_hits_total",
+            "forgeproxy_auth_cache_hits_total",
             "Auth cache hits",
             auth_cache_hits.clone(),
         );
 
         let auth_cache_misses = Counter::default();
         registry.register(
-            "forgecache_auth_cache_misses_total",
+            "forgeproxy_auth_cache_misses_total",
             "Auth cache misses",
             auth_cache_misses.clone(),
         );
 
         let lock_acquisitions = Counter::default();
         registry.register(
-            "forgecache_lock_acquisitions_total",
+            "forgeproxy_lock_acquisitions_total",
             "Distributed lock acquisitions",
             lock_acquisitions.clone(),
         );
 
         let lock_waits = Counter::default();
         registry.register(
-            "forgecache_lock_waits_total",
+            "forgeproxy_lock_waits_total",
             "Distributed lock wait events",
             lock_waits.clone(),
         );
 
         let lock_timeouts = Counter::default();
         registry.register(
-            "forgecache_lock_timeouts_total",
+            "forgeproxy_lock_timeouts_total",
             "Distributed lock timeout events",
             lock_timeouts.clone(),
         );
 
         let archive_cache_hits_local = Counter::default();
         registry.register(
-            "forgecache_archive_cache_hits_local_total",
+            "forgeproxy_archive_cache_hits_local_total",
             "Archive cache hits served from local disk",
             archive_cache_hits_local.clone(),
         );
 
         let archive_cache_hits_s3 = Counter::default();
         registry.register(
-            "forgecache_archive_cache_hits_s3_total",
+            "forgeproxy_archive_cache_hits_s3_total",
             "Archive cache hits served from S3",
             archive_cache_hits_s3.clone(),
         );
 
         let archive_cache_misses = Counter::default();
         registry.register(
-            "forgecache_archive_cache_misses_total",
+            "forgeproxy_archive_cache_misses_total",
             "Archive cache misses fetched from upstream",
             archive_cache_misses.clone(),
         );
 
         let s3_upload_bytes = Counter::default();
         registry.register(
-            "forgecache_s3_upload_bytes_total",
+            "forgeproxy_s3_upload_bytes_total",
             "Total bytes uploaded to S3",
             s3_upload_bytes.clone(),
         );
 
         let s3_download_bytes = Counter::default();
         registry.register(
-            "forgecache_s3_download_bytes_total",
+            "forgeproxy_s3_download_bytes_total",
             "Total bytes downloaded from S3",
             s3_download_bytes.clone(),
         );
 
         let upstream_api_calls = Family::<EndpointLabels, Counter>::default();
         registry.register(
-            "forgecache_ghe_api_calls_total",
+            "forgeproxy_ghe_api_calls_total",
             "upstream API call count by endpoint",
             upstream_api_calls.clone(),
         );
 
         let upstream_api_rate_limit_remaining: Gauge = Gauge::default();
         registry.register(
-            "forgecache_upstream_api_rate_limit_remaining",
+            "forgeproxy_upstream_api_rate_limit_remaining",
             "Remaining upstream API calls before rate limit",
             upstream_api_rate_limit_remaining.clone(),
         );
 
         let active_connections = Family::<ProtocolLabels, Gauge>::default();
         registry.register(
-            "forgecache_active_connections",
+            "forgeproxy_active_connections",
             "Currently active connections by protocol",
             active_connections.clone(),
         );
 
         let cache_size_bytes: Gauge = Gauge::default();
         registry.register(
-            "forgecache_cache_size_bytes",
+            "forgeproxy_cache_size_bytes",
             "Current local cache disk usage in bytes",
             cache_size_bytes.clone(),
         );
 
         let cache_repos_total: Gauge = Gauge::default();
         registry.register(
-            "forgecache_cache_repos_total",
+            "forgeproxy_cache_repos_total",
             "Number of repos currently cached locally",
             cache_repos_total.clone(),
         );

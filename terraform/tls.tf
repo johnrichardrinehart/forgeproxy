@@ -8,8 +8,8 @@ resource "tls_self_signed_cert" "ca" {
   private_key_pem = tls_private_key.ca.private_key_pem
 
   subject {
-    common_name         = "forgecache-ca"
-    organization        = "Forgecache Internal CA"
+    common_name         = "forgeproxy-ca"
+    organization        = "Forgeproxy Internal CA"
     organizational_unit = "Engineering"
     country             = "US"
   }
@@ -39,7 +39,7 @@ resource "tls_cert_request" "keydb" {
 
   subject {
     common_name         = "keydb"
-    organization        = "Forgecache"
+    organization        = "Forgeproxy"
     organizational_unit = "Engineering"
     country             = "US"
   }
@@ -83,7 +83,7 @@ resource "tls_self_signed_cert" "nginx" {
 
   subject {
     common_name         = var.proxy_fqdn
-    organization        = "Forgecache"
+    organization        = "Forgeproxy"
     organizational_unit = "Engineering"
     country             = "US"
   }

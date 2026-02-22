@@ -6,11 +6,11 @@
 }:
 
 let
-  cfg = config.services.forgecache-secrets;
+  cfg = config.services.forgeproxy-secrets;
 in
 {
-  options.services.forgecache-secrets = {
-    enable = lib.mkEnableOption "kernel keyring secrets loader for forgecache";
+  options.services.forgeproxy-secrets = {
+    enable = lib.mkEnableOption "kernel keyring secrets loader for forgeproxy";
 
     providerScript = lib.mkOption {
       type = lib.types.package;
@@ -27,11 +27,11 @@ in
     };
   };
 
-  # Inject the provider as ExecStartPre into forgecache.service.
+  # Inject the provider as ExecStartPre into forgeproxy.service.
   # Keys land in the dynamic user's keyring (@u) — DynamicUser=true scopes
   # the keyring to this service unit.
-  config = lib.mkIf (cfg.enable && (config.services.forgecache.enable or false)) {
-    systemd.services.forgecache = {
+  config = lib.mkIf (cfg.enable && (config.services.forgeproxy.enable or false)) {
+    systemd.services.forgeproxy = {
       path = [ pkgs.keyutils ];
       environment = cfg.environment;
       serviceConfig.ExecStartPre = [ "${cfg.providerScript}" ];

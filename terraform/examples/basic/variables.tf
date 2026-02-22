@@ -12,7 +12,7 @@ variable "aws_region" {
 
 variable "name_prefix" {
   type        = string
-  default     = "forgecache"
+  default     = "forgeproxy"
   description = "Prefix for resource names"
 }
 
@@ -135,7 +135,7 @@ variable "eviction_policy" {
 
 variable "s3_bundle_prefix" {
   type        = string
-  default     = "forgecache/"
+  default     = "forgeproxy/"
   description = "S3 prefix for bundle storage"
 }
 
@@ -154,7 +154,7 @@ variable "s3_presigned_url_ttl" {
 variable "log_level" {
   type        = string
   default     = "info"
-  description = "Log level for forgecache (RUST_LOG)"
+  description = "Log level for forgeproxy (RUST_LOG)"
 }
 
 variable "org_creds" {

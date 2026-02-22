@@ -20,7 +20,7 @@ let
         openssl req -new -x509 -nodes -days 365 \
           -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
           -keyout $out/ca.key -out $out/ca.crt \
-          -subj "/CN=ForgeCache Test CA"
+          -subj "/CN=ForgeProxy Test CA"
 
         # GHE server certificate (SAN: DNS:ghe)
         openssl req -new -nodes \
@@ -34,9 +34,9 @@ let
       '';
 
   # ---------------------------------------------------------------------------
-  # forgecache configuration YAML – filtered bundles enabled
+  # forgeproxy configuration YAML – filtered bundles enabled
   # ---------------------------------------------------------------------------
-  testConfigYaml = pkgs.writeText "forgecache-filtered-bundles-config.yaml" ''
+  testConfigYaml = pkgs.writeText "forgeproxy-filtered-bundles-config.yaml" ''
     backend_type: "gitea"
 
     upstream:
@@ -85,7 +85,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgecache/repos"
+        path: "/var/cache/forgeproxy/repos"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75
@@ -100,7 +100,7 @@ let
 
 in
 pkgs.testers.runNixOSTest {
-  name = "forgecache-filtered-bundles";
+  name = "forgeproxy-filtered-bundles";
   globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ pkgs.testers.runNixOSTest {
         networking.firewall.allowedTCPPorts = [ 6379 ];
       };
 
-    # -- forgecache proxy (no TLS, direct HTTP) --------------------------------
+    # -- forgeproxy proxy (no TLS, direct HTTP) --------------------------------
     proxy =
       {
         config,
@@ -193,18 +193,18 @@ pkgs.testers.runNixOSTest {
       }:
       {
         imports = [
-          self.nixosModules.forgecache
+          self.nixosModules.forgeproxy
         ];
 
-        services.forgecache = {
+        services.forgeproxy = {
           enable = true;
-          package = pkgs.forgecache;
+          package = pkgs.forgeproxy;
           configFile = testConfigYaml;
           logLevel = "debug";
         };
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
-        systemd.services.forgecache.environment = {
+        systemd.services.forgeproxy.environment = {
           AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
           AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
           AWS_DEFAULT_REGION = "us-east-1";
@@ -218,7 +218,7 @@ pkgs.testers.runNixOSTest {
           jq
         ];
 
-        # Trust the test CA so forgecache (reqwest) validates the mock GHE cert
+        # Trust the test CA so forgeproxy (reqwest) validates the mock GHE cert
         security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
 
         networking.firewall.allowedTCPPorts = [
@@ -307,8 +307,8 @@ pkgs.testers.runNixOSTest {
         )
 
     # -- Proxy comes up with filtered-bundle config ----------------------------
-    with subtest("forgecache service starts with generate_filtered_bundles enabled"):
-        proxy.wait_for_unit("forgecache.service")
+    with subtest("forgeproxy service starts with generate_filtered_bundles enabled"):
+        proxy.wait_for_unit("forgeproxy.service")
         proxy.wait_for_open_port(8080)
 
     with subtest("Health endpoint responds"):
@@ -329,7 +329,7 @@ pkgs.testers.runNixOSTest {
     with subtest("Proxy remains healthy after clone"):
         proxy.succeed("curl -sf http://localhost:8080/healthz")
         proxy.succeed(
-            "systemctl is-active forgecache.service"
+            "systemctl is-active forgeproxy.service"
         )
   '';
 }
