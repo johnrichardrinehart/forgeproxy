@@ -7,14 +7,14 @@
 }:
 
 let
-  cfg = config.services.forgecache-hardening;
+  cfg = config.services.forgeproxy-hardening;
 in
 {
   imports = [
     "${modulesPath}/profiles/hardened.nix"
   ];
 
-  options.services.forgecache-hardening = {
+  options.services.forgeproxy-hardening = {
     allowSMT = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -160,7 +160,7 @@ in
       security.allowSimultaneousMultithreading = lib.mkForce true;
 
       warnings = [
-        "forgecache-hardening: SMT is enabled (allowSMT = true). This doubles vCPU count but exposes the system to CPU side-channel attacks (MDS, L1TF). Ensure this trade-off is acceptable for your threat model."
+        "forgeproxy-hardening: SMT is enabled (allowSMT = true). This doubles vCPU count but exposes the system to CPU side-channel attacks (MDS, L1TF). Ensure this trade-off is acceptable for your threat model."
       ];
     })
   ];

@@ -29,8 +29,8 @@ output "bundle_bucket_name" {
 }
 
 output "forgeproxy_ami_id" {
-  value       = data.aws_ami.forgecache.id
-  description = "AMI ID of the forgecache image"
+  value       = data.aws_ami.forgeproxy.id
+  description = "AMI ID of the forgeproxy image"
 }
 
 output "keydb_ami_id" {
@@ -40,16 +40,16 @@ output "keydb_ami_id" {
 
 output "secrets_to_populate" {
   value = concat([
-    "forgecache/forge-admin-token",
-    "forgecache/webhook-secret",
-    "forgecache/otlp-config",
-  ], [for org in var.org_creds : "forgecache/creds/${org.name}"])
+    "forgeproxy/forge-admin-token",
+    "forgeproxy/webhook-secret",
+    "forgeproxy/otlp-config",
+  ], [for org in var.org_creds : "forgeproxy/creds/${org.name}"])
   description = "List of Secrets Manager secrets that must be populated before first use"
 }
 
 output "connection_string" {
   value       = "https://${var.proxy_fqdn}/"
-  description = "Connection string for the forgecache proxy"
+  description = "Connection string for the forgeproxy proxy"
 }
 
 output "ssh_connection_string" {

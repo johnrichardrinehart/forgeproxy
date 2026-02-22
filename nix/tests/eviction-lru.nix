@@ -20,7 +20,7 @@ let
         openssl req -new -x509 -nodes -days 365 \
           -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
           -keyout $out/ca.key -out $out/ca.crt \
-          -subj "/CN=ForgeCache Test CA"
+          -subj "/CN=ForgeProxy Test CA"
 
         # GHE server certificate (SAN: DNS:ghe)
         openssl req -new -nodes \
@@ -34,7 +34,7 @@ let
       '';
 
   # ---------------------------------------------------------------------------
-  # forgecache configuration YAML — LRU eviction policy
+  # forgeproxy configuration YAML — LRU eviction policy
   # ---------------------------------------------------------------------------
   testConfigYaml = pkgs.writeText "eviction-lru-test-config.yaml" ''
     upstream:
@@ -85,7 +85,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgecache/repos"
+        path: "/var/cache/forgeproxy/repos"
         max_bytes: 1024
         high_water_mark: 0.50
         low_water_mark: 0.25
@@ -100,7 +100,7 @@ let
 
 in
 pkgs.testers.runNixOSTest {
-  name = "forgecache-eviction-lru";
+  name = "forgeproxy-eviction-lru";
   globalTimeout = 600;
 
   # ---------------------------------------------------------------------------
@@ -187,7 +187,7 @@ pkgs.testers.runNixOSTest {
         networking.firewall.allowedTCPPorts = [ 6379 ];
       };
 
-    # ── forgecache proxy (HTTP only — no TLS) ────────────────────────────
+    # ── forgeproxy proxy (HTTP only — no TLS) ────────────────────────────
     proxy =
       {
         config,
@@ -197,21 +197,21 @@ pkgs.testers.runNixOSTest {
       }:
       {
         imports = [
-          self.nixosModules.forgecache
+          self.nixosModules.forgeproxy
         ];
 
-        services.forgecache = {
+        services.forgeproxy = {
           enable = true;
-          package = pkgs.forgecache;
+          package = pkgs.forgeproxy;
           configFile = testConfigYaml;
           logLevel = "debug";
         };
 
         # Prevent auto-start so we can inject the Gitea admin token first
-        systemd.services.forgecache.wantedBy = lib.mkForce [ ];
+        systemd.services.forgeproxy.wantedBy = lib.mkForce [ ];
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
-        systemd.services.forgecache.environment = {
+        systemd.services.forgeproxy.environment = {
           AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
           AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
           AWS_DEFAULT_REGION = "us-east-1";
@@ -227,7 +227,7 @@ pkgs.testers.runNixOSTest {
           jq
         ];
 
-        # Trust the test CA so forgecache (reqwest) validates the mock GHE cert
+        # Trust the test CA so forgeproxy (reqwest) validates the mock GHE cert
         security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
 
         networking.firewall.allowedTCPPorts = [
@@ -323,17 +323,17 @@ pkgs.testers.runNixOSTest {
                 f"git push -u origin main"
             )
 
-    # ── Start forgecache with admin token ────────────────────────────────
-    with subtest("Start forgecache with admin token"):
+    # ── Start forgeproxy with admin token ────────────────────────────────
+    with subtest("Start forgeproxy with admin token"):
         proxy.succeed(
-            f"mkdir -p /run/systemd/system/forgecache.service.d && "
-            f"cat > /run/systemd/system/forgecache.service.d/token.conf <<UNIT\n"
+            f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
+            f"cat > /run/systemd/system/forgeproxy.service.d/token.conf <<UNIT\n"
             f"[Service]\n"
             f"Environment=FORGE_ADMIN_TOKEN={TOKEN}\n"
             f"UNIT"
         )
         proxy.succeed("systemctl daemon-reload")
-        proxy.succeed("systemctl start forgecache")
+        proxy.succeed("systemctl start forgeproxy")
         proxy.wait_for_open_port(8080)
 
     # ── Health endpoint responds ─────────────────────────────────────────
@@ -357,7 +357,7 @@ pkgs.testers.runNixOSTest {
     with subtest("All repos present in local cache"):
         for repo in ["repo-a", "repo-b", "repo-c"]:
             proxy.succeed(
-                f"test -d /var/cache/forgecache/repos/octocat/{repo}.git"
+                f"test -d /var/cache/forgeproxy/repos/octocat/{repo}.git"
             )
 
     # ── Seed Valkey with LRU-relevant metadata ────────────────────────────
@@ -373,37 +373,37 @@ pkgs.testers.runNixOSTest {
 
         # repo-a: fetched long ago (least recently used)
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgecache:repo:octocat/repo-a'"
+            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-a'"
             " last_fetch_ts 1000000"
         )
         # repo-b: fetched recently
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgecache:repo:octocat/repo-b'"
+            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-b'"
             " last_fetch_ts 1700000000"
         )
         # repo-c: fetched very recently (most recently used)
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgecache:repo:octocat/repo-c'"
+            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-c'"
             " last_fetch_ts 1700000999"
         )
 
         # Set bundle_list_key for all repos (required for eviction eligibility)
         for repo in ["repo-a", "repo-b", "repo-c"]:
             proxy.succeed(
-                f"redis-cli -h keydb HSET 'forgecache:repo:octocat/{repo}'"
+                f"redis-cli -h keydb HSET 'forgeproxy:repo:octocat/{repo}'"
                 f" bundle_list_key 's3://test-bucket/octocat/{repo}/bundle-list'"
             )
 
     # ── Verify KeyDB state is correct ─────────────────────────────────────
     with subtest("Verify KeyDB last_fetch_ts values are set correctly"):
         ts_a = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgecache:repo:octocat/repo-a' last_fetch_ts"
+            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-a' last_fetch_ts"
         ).strip()
         ts_b = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgecache:repo:octocat/repo-b' last_fetch_ts"
+            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-b' last_fetch_ts"
         ).strip()
         ts_c = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgecache:repo:octocat/repo-c' last_fetch_ts"
+            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-c' last_fetch_ts"
         ).strip()
 
         assert ts_a == "1000000", f"Expected repo-a last_fetch_ts=1000000, got {ts_a}"
@@ -421,8 +421,8 @@ pkgs.testers.runNixOSTest {
         assert health["status"] in ("ok", "degraded"), \
             f"Unexpected health status: {health['status']}"
 
-    # ── Verify the forgecache service is running with LRU config ──────────
-    with subtest("forgecache service is active with LRU eviction policy"):
-        proxy.succeed("systemctl is-active forgecache.service")
+    # ── Verify the forgeproxy service is running with LRU config ──────────
+    with subtest("forgeproxy service is active with LRU eviction policy"):
+        proxy.succeed("systemctl is-active forgeproxy.service")
   '';
 }

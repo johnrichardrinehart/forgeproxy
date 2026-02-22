@@ -115,7 +115,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     }
 
     // 4. Attempt to acquire the distributed fetch/bundle lock.
-    let lock_key = format!("forgecache:lock:bundle:{owner_repo}");
+    let lock_key = format!("forgeproxy:lock:bundle:{owner_repo}");
     let lock_ttl = state.config.bundles.bundle_lock_ttl;
     let node_id = crate::coordination::node::node_id();
     let lock_acquired =

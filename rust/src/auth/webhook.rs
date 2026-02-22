@@ -60,8 +60,8 @@ pub async fn handle_webhook_payload(
 
 /// Invalidate all auth cache entries for a specific repository.
 async fn invalidate_repo_auth(state: &AppState, full_name: &str) {
-    let http_pattern = format!("forgecache:http:auth:*:{full_name}");
-    let ssh_pattern = format!("forgecache:ssh:access:*:{full_name}");
+    let http_pattern = format!("forgeproxy:http:auth:*:{full_name}");
+    let ssh_pattern = format!("forgeproxy:ssh:access:*:{full_name}");
 
     let http_count = cache::invalidate_auth(&state.keydb, &http_pattern)
         .await
@@ -80,8 +80,8 @@ async fn invalidate_repo_auth(state: &AppState, full_name: &str) {
 
 /// Invalidate all auth cache entries for an entire organization.
 async fn invalidate_org_auth(state: &AppState, org: &str) {
-    let http_pattern = format!("forgecache:http:auth:*:{org}/*");
-    let ssh_pattern = format!("forgecache:ssh:access:*:{org}/*");
+    let http_pattern = format!("forgeproxy:http:auth:*:{org}/*");
+    let ssh_pattern = format!("forgeproxy:ssh:access:*:{org}/*");
 
     let http_count = cache::invalidate_auth(&state.keydb, &http_pattern)
         .await

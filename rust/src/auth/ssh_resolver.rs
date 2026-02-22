@@ -11,8 +11,8 @@ pub async fn resolve_user_by_fingerprint(
     state: &AppState,
     fingerprint: &str,
 ) -> Result<Option<String>> {
-    // 1. Check KeyDB cache: forgecache:ssh:auth:{fingerprint}
-    let cache_key = format!("forgecache:ssh:auth:{fingerprint}");
+    // 1. Check KeyDB cache: forgeproxy:ssh:auth:{fingerprint}
+    let cache_key = format!("forgeproxy:ssh:auth:{fingerprint}");
     if let Some(cached) = crate::auth::cache::get_cached_auth(&state.keydb, &cache_key).await? {
         debug!(fingerprint, username = %cached, "resolved user from cache");
         return Ok(Some(cached));
@@ -55,7 +55,7 @@ pub async fn check_ssh_repo_access(
     owner: &str,
     repo: &str,
 ) -> Result<Permission> {
-    let cache_key = format!("forgecache:ssh:access:{fingerprint}:{owner}/{repo}");
+    let cache_key = format!("forgeproxy:ssh:access:{fingerprint}:{owner}/{repo}");
     if let Some(cached) = crate::auth::cache::get_cached_auth(&state.keydb, &cache_key).await? {
         debug!(cache_key, permission = %cached, "repo access from cache");
         return Ok(Permission::parse(&cached));

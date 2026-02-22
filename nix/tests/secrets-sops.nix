@@ -44,7 +44,7 @@ let
   '';
 in
 pkgs.testers.runNixOSTest {
-  name = "forgecache-secrets-sops";
+  name = "forgeproxy-secrets-sops";
   globalTimeout = 300;
 
   nodes.proxy =

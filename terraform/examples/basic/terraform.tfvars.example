@@ -2,12 +2,12 @@
 
 upstream_hostname  = "ghe.example.com"
 upstream_api_url   = "https://ghe.example.com/api/v3"
-proxy_fqdn         = "forgecache.example.com"
-bundle_bucket_name = "my-forgecache-bundles"
+proxy_fqdn         = "forgeproxy.example.com"
+bundle_bucket_name = "my-forgeproxy-bundles"
 
 # Optional overrides (uncomment to customise):
 # aws_region               = "us-east-1"
-# name_prefix              = "forgecache"
+# name_prefix              = "forgeproxy"
 # flake_ref                = "github:johnrichardrinehart/forgeproxy"
 # forgeproxy_instance_type = "t3.large"
 # forgeproxy_count         = 1

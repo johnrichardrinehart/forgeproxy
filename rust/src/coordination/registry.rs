@@ -47,12 +47,12 @@ pub(crate) fn repo_key(owner_repo: &str) -> String {
     // Normalize: strip trailing ".git" so that "owner/repo" and
     // "owner/repo.git" map to the same KeyDB key.
     let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
-    format!("forgecache:repo:{normalized}")
+    format!("forgeproxy:repo:{normalized}")
 }
 
 fn fetch_schedule_key(owner_repo: &str) -> String {
     let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
-    format!("forgecache:repo:{normalized}:fetch_schedule")
+    format!("forgeproxy:repo:{normalized}:fetch_schedule")
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +265,7 @@ pub async fn ensure_repo_cloned(
     // (the URL path extractor preserves it, and we append ".git" below).
     let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
     let owner_repo = format!("{owner}/{repo_clean}");
-    let lock_key = format!("forgecache:lock:clone:{owner_repo}");
+    let lock_key = format!("forgeproxy:lock:clone:{owner_repo}");
     let node_id = crate::coordination::node::node_id();
 
     // Try to acquire the distributed clone lock.
@@ -348,7 +348,7 @@ pub async fn ensure_repo_cloned(
     result
 }
 
-/// List all tracked repository names by scanning for `forgecache:repo:*` keys
+/// List all tracked repository names by scanning for `forgeproxy:repo:*` keys
 /// (excluding `:fetch_schedule` sub-keys).
 ///
 /// Uses the `KEYS` command which is acceptable for small-to-moderate key
@@ -357,16 +357,16 @@ pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
     let keys: Vec<String> = pool
         .custom(
             CustomCommand::new_static("KEYS", None::<u16>, false),
-            vec!["forgecache:repo:*".to_string()],
+            vec!["forgeproxy:repo:*".to_string()],
         )
         .await
-        .context("KEYS forgecache:repo:*")?;
+        .context("KEYS forgeproxy:repo:*")?;
 
     let repos: Vec<String> = keys
         .into_iter()
         .filter_map(|k| {
-            // Skip sub-keys like forgecache:repo:owner/name:fetch_schedule
-            let stripped = k.strip_prefix("forgecache:repo:")?;
+            // Skip sub-keys like forgeproxy:repo:owner/name:fetch_schedule
+            let stripped = k.strip_prefix("forgeproxy:repo:")?;
             // A valid owner/repo has exactly one '/' and no trailing sub-key
             if stripped.matches(':').count() > 0 {
                 return None;

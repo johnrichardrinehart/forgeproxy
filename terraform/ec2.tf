@@ -38,7 +38,7 @@ resource "aws_instance" "keydb" {
 # ── forgeproxy Instances (count) ───────────────────────────────────────────
 resource "aws_instance" "forgeproxy" {
   count                       = var.forgeproxy_count
-  ami                         = data.aws_ami.forgecache.id
+  ami                         = data.aws_ami.forgeproxy.id
   instance_type               = var.forgeproxy_instance_type
   subnet_id                   = local.private_subnet_id
   associate_public_ip_address = false
@@ -65,9 +65,9 @@ resource "aws_instance" "forgeproxy" {
   }
 
   depends_on = [
-    null_resource.build_forgecache_ami,
+    null_resource.build_forgeproxy_ami,
     aws_instance.keydb,
-    aws_secretsmanager_secret_version.forgecache_config,
+    aws_secretsmanager_secret_version.forgeproxy_config,
     aws_secretsmanager_secret_version.forge_admin_token,
     aws_secretsmanager_secret_version.keydb_auth_token,
     aws_secretsmanager_secret_version.webhook_secret,

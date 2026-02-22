@@ -26,7 +26,7 @@ let
   };
 in
 pkgs.testers.runNixOSTest {
-  name = "forgecache-secrets-aws";
+  name = "forgeproxy-secrets-aws";
   globalTimeout = 300;
 
   nodes = {
@@ -85,10 +85,10 @@ pkgs.testers.runNixOSTest {
             ExecStart = pkgs.writeShellScript "seed-moto-secrets" ''
               set -euo pipefail
               aws secretsmanager create-secret \
-                --name forgecache/default-pat \
+                --name forgeproxy/default-pat \
                 --secret-string "ghp_AWSTEST1234567890abcdef"
               aws secretsmanager create-secret \
-                --name forgecache/webhook-secret \
+                --name forgeproxy/webhook-secret \
                 --secret-string "whsec_awstest456"
             '';
           };
@@ -117,7 +117,7 @@ pkgs.testers.runNixOSTest {
             " AWS_SECRET_ACCESS_KEY=testing"
             " AWS_DEFAULT_REGION=us-east-1"
             " AWS_ENDPOINT_URL=http://mock-aws:5000"
-            " SECRETS='forgecache/default-pat forgecache/webhook-secret'"
+            " SECRETS='forgeproxy/default-pat forgeproxy/webhook-secret'"
             " && ${awsProvider}"
         )
         # Link the user keyring into the session keyring so the test
@@ -125,13 +125,13 @@ pkgs.testers.runNixOSTest {
         proxy.succeed("keyctl link @u @s")
 
     with subtest("default-pat secret is in the keyring"):
-        key_id = proxy.succeed("keyctl search @u user forgecache-default-pat").strip()
+        key_id = proxy.succeed("keyctl search @u user forgeproxy-default-pat").strip()
         assert key_id, "keyctl search returned empty key ID"
         value = proxy.succeed(f"keyctl pipe {key_id}").strip()
         assert value == "ghp_AWSTEST1234567890abcdef", f"unexpected value: {value}"
 
     with subtest("webhook-secret is in the keyring"):
-        key_id = proxy.succeed("keyctl search @u user forgecache-webhook-secret").strip()
+        key_id = proxy.succeed("keyctl search @u user forgeproxy-webhook-secret").strip()
         assert key_id, "keyctl search returned empty key ID"
         value = proxy.succeed(f"keyctl pipe {key_id}").strip()
         assert value == "whsec_awstest456", f"unexpected value: {value}"

@@ -6,41 +6,41 @@
 }:
 
 let
-  cfg = config.services.forgecache;
+  cfg = config.services.forgeproxy;
 in
 {
-  options.services.forgecache = {
+  options.services.forgeproxy = {
     enable = lib.mkEnableOption "Git Caching Reverse Proxy service";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.forgecache;
-      description = "The forgecache package to use.";
+      default = pkgs.forgeproxy;
+      description = "The forgeproxy package to use.";
     };
 
     configFile = lib.mkOption {
       type = lib.types.path;
-      default = "/run/forgecache/config.yaml";
-      description = "Path to the forgecache configuration file.";
+      default = "/run/forgeproxy/config.yaml";
+      description = "Path to the forgeproxy configuration file.";
     };
 
     cacheDir = lib.mkOption {
       type = lib.types.path;
-      default = "/var/cache/forgecache";
-      description = "Directory used for forgecache cache data.";
+      default = "/var/cache/forgeproxy";
+      description = "Directory used for forgeproxy cache data.";
     };
 
     logLevel = lib.mkOption {
       type = lib.types.str;
       default = "info";
       example = "debug";
-      description = "Log verbosity level for the forgecache binary.";
+      description = "Log verbosity level for the forgeproxy binary.";
     };
   };
 
   config = lib.mkIf cfg.enable {
     # ── systemd service ────────────────────────────────────────────────
-    systemd.services.forgecache = {
+    systemd.services.forgeproxy = {
       description = "Git Caching Reverse Proxy";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -60,7 +60,7 @@ in
 
         # DynamicUser allocates an ephemeral UID for this service invocation.
         # Secrets in the user keyring (@u) are scoped to this UID, so only
-        # processes inside forgecache.service can access them.
+        # processes inside forgeproxy.service can access them.
         DynamicUser = true;
 
         # Links the user keyring (@u) into each process's session keyring.
@@ -69,15 +69,15 @@ in
         # only grant possessor access).
         KeyringMode = "shared";
 
-        ExecStart = "${cfg.package}/bin/forgecache --config ${cfg.configFile}";
+        ExecStart = "${cfg.package}/bin/forgeproxy --config ${cfg.configFile}";
 
         Restart = "on-failure";
         RestartSec = 5;
 
         # Directories managed by systemd (created automatically).
-        StateDirectory = "forgecache";
-        CacheDirectory = "forgecache";
-        RuntimeDirectory = "forgecache";
+        StateDirectory = "forgeproxy";
+        CacheDirectory = "forgeproxy";
+        RuntimeDirectory = "forgeproxy";
 
         # ── Hardening ────────────────────────────────────────────────
         # DynamicUser=true already implies: ProtectSystem=strict,
