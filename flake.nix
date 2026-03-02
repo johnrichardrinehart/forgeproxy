@@ -191,6 +191,8 @@
             forgeproxy = pkgs.callPackage ./nix/package.nix { };
             forgeproxy-fips = pkgs.callPackage ./nix/package.nix { fipsEnabled = true; };
             default = config.packages.forgeproxy;
+            ghe-key-lookup = pkgs.callPackage ./nix/ghe-key-lookup/package.nix { };
+            ghe-key-lookup-oci = pkgs.callPackage ./nix/ghe-key-lookup/oci.nix { };
           };
         };
 
@@ -201,6 +203,7 @@
         overlays.default = final: prev: {
           forgeproxy = final.callPackage ./nix/package.nix { };
           forgeproxy-fips = final.callPackage ./nix/package.nix { fipsEnabled = true; };
+          ghe-key-lookup = final.callPackage ./nix/ghe-key-lookup/package.nix { };
         };
 
         nixosModules = {
@@ -216,6 +219,8 @@
           proxy-host = ./nix/proxy-host.nix;
           keydb-host = ./nix/keydb-host.nix;
           dev = ./nix/dev.nix;
+          ghe-key-lookup = ./nix/ghe-key-lookup/module.nix;
+          ghe-key-lookup-host = ./nix/ghe-key-lookup/host.nix;
         };
 
         nixosConfigurations.forgeproxy = inputs.nixpkgs.lib.nixosSystem {
@@ -484,6 +489,29 @@
         };
 
         nixosConfigurations.keydb-dev = self.nixosConfigurations.keydb.extendModules {
+          modules = [ self.nixosModules.dev ];
+        };
+
+        nixosConfigurations.ghe-key-lookup = inputs.nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [
+            { nixpkgs.overlays = [ self.overlays.default ]; }
+            self.nixosModules.ghe-key-lookup-host
+            (
+              { lib, ... }:
+              {
+                services.ghe-key-lookup = {
+                  sshTargetEndpoint = lib.mkDefault "ghe.internal.example.com";
+                  identityFile = lib.mkDefault "/run/ghe-key-lookup/admin-key";
+                  # gheUrl defaults to https://<sshTargetEndpoint>; set explicitly
+                  # only when the HTTPS hostname differs from the SSH endpoint.
+                };
+              }
+            )
+          ];
+        };
+
+        nixosConfigurations.ghe-key-lookup-dev = self.nixosConfigurations.ghe-key-lookup.extendModules {
           modules = [ self.nixosModules.dev ];
         };
       };
