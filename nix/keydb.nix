@@ -8,68 +8,11 @@
 let
   cfg = config.services.keydb;
 
-  keydbSrc = pkgs.fetchFromGitHub {
-    owner = "Snapchat";
-    repo = "KeyDB";
-    rev = "v6.3.4";
-    sha256 = "sha256-j6qgK6P3Fv+b6k9jwKQ5zW7XLkKbXXcmHKBCQYvwEIU=";
-  };
-
-  keydb = pkgs.stdenv.mkDerivation {
-    pname = "keydb";
-    version = "6.3.4";
-
-    src = keydbSrc;
-
-    nativeBuildInputs = with pkgs; [
-      pkg-config
-      which
-    ];
-
-    buildInputs = with pkgs; [
-      openssl
-      jemalloc
-      systemd
-      libuuid
-      curl
-    ];
-
-    makeFlags = [
-      "BUILD_TLS=yes"
-      "USE_SYSTEMD=yes"
-      "MALLOC=jemalloc"
-      "PREFIX=$(out)"
-    ];
-
-    enableParallelBuilding = true;
-
-    installPhase = ''
-      runHook preInstall
-      mkdir -p $out/bin
-      cp src/keydb-server $out/bin/
-      cp src/keydb-cli $out/bin/
-      cp src/keydb-benchmark $out/bin/
-      cp src/keydb-check-aof $out/bin/
-      cp src/keydb-check-rdb $out/bin/
-      runHook postInstall
-    '';
-
-    meta = with lib; {
-      description = "KeyDB - A Multithreaded Fork of Redis";
-      homepage = "https://keydb.dev";
-      license = licenses.bsd3;
-      platforms = platforms.linux;
-    };
-  };
-
   keydbConfig = pkgs.writeText "keydb.conf" ''
     # ── Network ────────────────────────────────────────────────────────
     bind 0.0.0.0
     port 6379
     protected-mode yes
-
-    # ── Threading ──────────────────────────────────────────────────────
-    server-threads 2
 
     ${lib.optionalString cfg.tls.enable ''
       # ── TLS ────────────────────────────────────────────────────────────
@@ -114,7 +57,7 @@ let
 in
 {
   options.services.keydb = {
-    enable = lib.mkEnableOption "KeyDB server";
+    enable = lib.mkEnableOption "Valkey server (Redis-compatible)";
 
     tls = {
       enable = lib.mkOption {
@@ -192,7 +135,7 @@ in
       group = cfg.group;
       home = cfg.dataDir;
       createHome = true;
-      description = "KeyDB database server user";
+      description = "Valkey database server user";
     };
 
     users.groups.${cfg.group} = { };
@@ -207,21 +150,17 @@ in
 
     # ── systemd service ────────────────────────────────────────────────
     systemd.services.keydb = {
-      description = "KeyDB Server";
+      description = "Valkey Server";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-
-      # Disable the scudo allocator (set globally by profiles/hardened.nix) for
-      # KeyDB so its compiled-in jemalloc can handle allocations without conflict.
-      environment.LD_PRELOAD = lib.mkForce "";
 
       serviceConfig = {
         Type = "simple";
         User = cfg.user;
         Group = cfg.group;
 
-        ExecStart = "${keydb}/bin/keydb-server /etc/keydb/keydb.conf";
+        ExecStart = "${pkgs.valkey}/bin/valkey-server /etc/keydb/keydb.conf";
 
         Restart = "on-failure";
         RestartSec = 5;
