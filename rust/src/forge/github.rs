@@ -27,6 +27,9 @@ pub struct GitHubBackend {
     api_url: String,
     admin_token_env: String,
     accept: &'static str,
+    /// When `Some`, SSH fingerprint resolution calls this sidecar instead of
+    /// the built-in GHE admin endpoint.
+    key_lookup_url: Option<String>,
 }
 
 impl GitHubBackend {
@@ -35,6 +38,7 @@ impl GitHubBackend {
             api_url: config.upstream.api_url.clone(),
             admin_token_env: config.upstream.admin_token_env.clone(),
             accept: config.backend_type.accept_header(),
+            key_lookup_url: config.upstream.key_lookup_url.clone(),
         }
     }
 }
@@ -83,44 +87,43 @@ impl ForgeBackend for GitHubBackend {
         &self,
         http_client: &reqwest::Client,
         fingerprint: &str,
-        rate_limit: &RateLimitState,
+        _rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
-        let admin_token = crate::credentials::keyring::resolve_secret(&self.admin_token_env)
-            .await
-            .unwrap_or_default();
-        if admin_token.is_empty() {
+        // Neither GitHub.com nor GitHub Enterprise Server expose a usable HTTP
+        // API for fingerprint-to-username resolution.  Without a ghe-key-lookup
+        // sidecar we cannot identify the connecting user; return None so the
+        // caller falls back to an anonymous (unauthenticated) upstream clone.
+        let Some(base_url) = self.key_lookup_url.as_deref() else {
             warn!(
-                env_var = %self.admin_token_env,
-                "admin token env var is empty — SSH key resolution will fail"
+                fingerprint,
+                "no ghe-key-lookup sidecar configured; SSH key resolution unavailable, \
+                 proceeding as anonymous"
             );
-        }
+            return Ok(None);
+        };
+
         let url = reqwest::Url::parse_with_params(
-            &format!("{}/admin/ssh-keys", self.api_url),
+            &format!("{}/api/v3/users/keys/lookup", base_url),
             &[("fingerprint", fingerprint)],
         )?;
 
         let resp = http_client
             .get(url)
-            .header("Authorization", format!("Bearer {admin_token}"))
-            .header("Accept", self.accept)
             .send()
             .await
-            .context("upstream admin API request failed")?;
-
-        rate_limit.update_from_headers(resp.headers());
+            .context("ghe-key-lookup sidecar request failed")?;
 
         if !resp.status().is_success() {
             warn!(
                 fingerprint,
                 status = %resp.status(),
-                "upstream admin API returned non-success status"
+                "ghe-key-lookup sidecar returned non-success status"
             );
             return Ok(None);
         }
 
         let body: serde_json::Value = resp.json().await?;
-
-        Ok(extract_ssh_user_login(&body))
+        Ok(extract_key_lookup_login(&body))
     }
 
     async fn check_repo_access(
@@ -261,11 +264,12 @@ impl ForgeBackend for GitHubBackend {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the SSH user login from the GitHub admin API response array.
-fn extract_ssh_user_login(body: &serde_json::Value) -> Option<String> {
+/// Extract the SSH user login from a `ghe-key-lookup` sidecar response array.
+///
+/// Sidecar format: `[{"login": "<name>", ...}]` — no nested `user` object.
+fn extract_key_lookup_login(body: &serde_json::Value) -> Option<String> {
     body.as_array()?
         .first()?
-        .get("user")?
         .get("login")?
         .as_str()
         .map(|s| s.to_string())
@@ -319,26 +323,26 @@ mod tests {
         assert_eq!(crate::forge::extract_permission(&body), Permission::None);
     }
 
-    // ── SSH user extraction ─────────────────────────────────────────────
+    // ── ghe-key-lookup sidecar login extraction ─────────────────────────
 
     #[test]
-    fn extract_ssh_user_from_array() {
+    fn extract_key_lookup_login_found() {
         let body = serde_json::json!([
-            {"id": 1, "user": {"login": "alice", "id": 42}}
+            {"id": 1, "login": "alice", "key": "ssh-ed25519 AAAA..."}
         ]);
-        assert_eq!(extract_ssh_user_login(&body), Some("alice".to_string()));
+        assert_eq!(extract_key_lookup_login(&body), Some("alice".to_string()));
     }
 
     #[test]
-    fn extract_ssh_user_empty_array() {
+    fn extract_key_lookup_login_empty_array() {
         let body = serde_json::json!([]);
-        assert_eq!(extract_ssh_user_login(&body), None);
+        assert_eq!(extract_key_lookup_login(&body), None);
     }
 
     #[test]
-    fn extract_ssh_user_missing_login() {
-        let body = serde_json::json!([{"id": 1, "user": {}}]);
-        assert_eq!(extract_ssh_user_login(&body), None);
+    fn extract_key_lookup_login_missing_field() {
+        let body = serde_json::json!([{"id": 1}]);
+        assert_eq!(extract_key_lookup_login(&body), None);
     }
 
     // ── Collaborator permission parsing ─────────────────────────────────
@@ -386,6 +390,7 @@ mod tests {
             api_url: String::new(),
             admin_token_env: String::new(),
             accept: "application/json",
+            key_lookup_url: None,
         };
 
         assert!(
@@ -409,6 +414,7 @@ mod tests {
             api_url: String::new(),
             admin_token_env: String::new(),
             accept: "application/json",
+            key_lookup_url: None,
         };
 
         assert!(
@@ -426,6 +432,7 @@ mod tests {
             api_url: String::new(),
             admin_token_env: String::new(),
             accept: "application/json",
+            key_lookup_url: None,
         };
         let payload = serde_json::json!({
             "organization": {"login": "acme"}
@@ -444,6 +451,7 @@ mod tests {
             api_url: String::new(),
             admin_token_env: String::new(),
             accept: "application/json",
+            key_lookup_url: None,
         };
         let payload = serde_json::json!({
             "organization": {"login": "acme"}
@@ -462,6 +470,7 @@ mod tests {
             api_url: String::new(),
             admin_token_env: String::new(),
             accept: "application/json",
+            key_lookup_url: None,
         };
         let payload = serde_json::json!({
             "repository": {"full_name": "acme/widgets"}
@@ -480,6 +489,7 @@ mod tests {
             api_url: String::new(),
             admin_token_env: String::new(),
             accept: "application/json",
+            key_lookup_url: None,
         };
         let payload = serde_json::json!({});
         assert_eq!(
@@ -494,6 +504,7 @@ mod tests {
             api_url: String::new(),
             admin_token_env: String::new(),
             accept: "application/json",
+            key_lookup_url: None,
         };
         let mut headers = HeaderMap::new();
         headers.insert("X-GitHub-Event", "push".parse().unwrap());
@@ -509,6 +520,7 @@ mod tests {
             api_url: String::new(),
             admin_token_env: String::new(),
             accept: "application/json",
+            key_lookup_url: None,
         };
         let mut headers = HeaderMap::new();
         headers.insert("X-Webhook-Event", "push".parse().unwrap());
