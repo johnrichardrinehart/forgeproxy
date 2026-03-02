@@ -18,15 +18,16 @@ use serde::Deserialize;
 /// SSH fingerprint-to-username resolution requires **instance administrator**
 /// API access.  This is only available on self-hosted deployments:
 ///
-/// | Variant              | SSH key resolution | Notes                                   |
-/// |----------------------|--------------------|-----------------------------------------|
-/// | `github-enterprise`  | Supported          | Requires `site_admin` PAT scope on GHE  |
-/// | `github`             | **Not supported**  | GitHub.com has no admin key lookup API   |
-/// | `gitlab`             | Supported          | Requires self-managed instance admin     |
-/// | `gitea` / `forgejo`  | Supported          | Requires instance admin token            |
+/// | Variant              | SSH key resolution | Notes                                                              |
+/// |----------------------|--------------------|--------------------------------------------------------------------|
+/// | `github-enterprise`  | Via sidecar        | No usable HTTP API; set `upstream.key_lookup_url` (ghe-key-lookup) |
+/// | `github`             | Via sidecar        | No admin key lookup API; set `upstream.key_lookup_url`             |
+/// | `gitlab`             | Supported          | Requires self-managed instance admin                               |
+/// | `gitea` / `forgejo`  | Supported          | Requires instance admin token                                      |
 ///
-/// When SSH key resolution is unavailable, clients must authenticate via
-/// HTTP (token-based) rather than SSH key passthrough.
+/// For GitHub and GitHub Enterprise, SSH key resolution requires a
+/// `ghe-key-lookup` sidecar reachable at `upstream.key_lookup_url`.
+/// Without it, SSH authentication will be rejected with a configuration error.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendType {
@@ -106,6 +107,16 @@ pub struct UpstreamConfig {
     /// Minimum number of API calls to keep in reserve before self-throttling.
     #[serde(default = "default_api_rate_limit_buffer")]
     pub api_rate_limit_buffer: u32,
+    /// Base URL of a `ghe-key-lookup` sidecar for SSH fingerprint → username
+    /// resolution (e.g. `http://ghe-key-lookup:3000`).
+    ///
+    /// When set, `resolve_ssh_user` calls
+    /// `{key_lookup_url}/api/v3/users/keys/lookup?fingerprint=<fp>` instead of
+    /// the built-in GHE admin SSH-keys endpoint.  The sidecar response omits
+    /// the nested `user` object: the login is at `[0]["login"]` rather than
+    /// `[0]["user"]["login"]`.
+    #[serde(default)]
+    pub key_lookup_url: Option<String>,
 }
 
 fn default_admin_token_env() -> String {

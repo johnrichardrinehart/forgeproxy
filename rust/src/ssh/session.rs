@@ -151,10 +151,12 @@ impl Handler for SshSession {
 
     /// Authenticate a client by public key.
     ///
-    /// We compute the key fingerprint and attempt to resolve the user through
-    /// the upstream admin SSH keys API (delegated to [`ssh_resolver`] which
-    /// handles the KeyDB cache layer).  If resolution succeeds we accept;
-    /// otherwise we reject.
+    /// We compute the key fingerprint and attempt to resolve the upstream
+    /// username (via the ghe-key-lookup sidecar if configured).  If resolution
+    /// succeeds the connection is accepted as that user.  If resolution returns
+    /// `None` (sidecar not configured or fingerprint unknown) the connection is
+    /// still accepted but treated as anonymous — downstream repo access is
+    /// delegated entirely to the upstream forge via unauthenticated HTTPS.
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         let fp = fingerprint_of(key);
         info!(
@@ -190,10 +192,13 @@ impl Handler for SshSession {
                 Ok(Auth::Accept)
             }
             Ok(None) => {
-                warn!(fingerprint = %fp, "SSH key not associated with any upstream user");
-                Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                })
+                // Username could not be resolved (sidecar not configured or
+                // fingerprint unknown).  Accept the connection as anonymous;
+                // per-repo access will be enforced by the upstream forge when
+                // the unauthenticated HTTPS clone is attempted.
+                info!(fingerprint = %fp, "SSH key unresolved; accepting as anonymous");
+                self.fingerprint = Some(fp);
+                Ok(Auth::Accept)
             }
             Err(e) => {
                 error!(
@@ -313,61 +318,64 @@ impl Handler for SshSession {
 
                 // ── Per-repo authorization ────────────────────────────
                 // Split "owner/repo" so we can check access on the forge.
+                // Anonymous sessions (no resolved username) skip this check:
+                // repo visibility is enforced by the upstream forge when the
+                // unauthenticated HTTPS clone is attempted.
                 match super::upstream::split_owner_repo(&repo) {
                     Ok((owner, repo_name)) => {
-                        let fingerprint = self.fingerprint.as_deref().unwrap_or("");
-                        let username = self.username.as_deref().unwrap_or("");
-
-                        match crate::auth::ssh_resolver::check_ssh_repo_access(
-                            &self.state,
-                            fingerprint,
-                            username,
-                            owner,
-                            repo_name,
-                        )
-                        .await
-                        {
-                            Ok(perm) if !perm.has_read() => {
-                                warn!(
-                                    username = username,
-                                    repo = %repo,
-                                    "SSH repo access denied"
-                                );
-                                session.extended_data(
-                                    channel_id,
-                                    1,
-                                    CryptoVec::from_slice(
-                                        format!(
-                                            "ERROR: Access denied to repository {owner}/{repo_name}\n"
-                                        )
-                                        .as_bytes(),
-                                    ),
-                                );
-                                finish_channel(session, channel_id, 1);
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                error!(
-                                    username = username,
-                                    repo = %repo,
-                                    error = %e,
-                                    "SSH repo access check failed"
-                                );
-                                session.extended_data(
-                                    channel_id,
-                                    1,
-                                    CryptoVec::from_slice(
-                                        format!(
-                                            "ERROR: Failed to verify access to repository {owner}/{repo_name}: {e}\n"
-                                        )
-                                        .as_bytes(),
-                                    ),
-                                );
-                                finish_channel(session, channel_id, 1);
-                                return Ok(());
-                            }
-                            Ok(_) => {
-                                // Permission granted — fall through to cache/upstream logic.
+                        if let Some(username) = self.username.as_deref() {
+                            let fingerprint = self.fingerprint.as_deref().unwrap_or("");
+                            match crate::auth::ssh_resolver::check_ssh_repo_access(
+                                &self.state,
+                                fingerprint,
+                                username,
+                                owner,
+                                repo_name,
+                            )
+                            .await
+                            {
+                                Ok(perm) if !perm.has_read() => {
+                                    warn!(
+                                        username,
+                                        repo = %repo,
+                                        "SSH repo access denied"
+                                    );
+                                    session.extended_data(
+                                        channel_id,
+                                        1,
+                                        CryptoVec::from_slice(
+                                            format!(
+                                                "ERROR: Access denied to repository {owner}/{repo_name}\n"
+                                            )
+                                            .as_bytes(),
+                                        ),
+                                    );
+                                    finish_channel(session, channel_id, 1);
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    error!(
+                                        username,
+                                        repo = %repo,
+                                        error = %e,
+                                        "SSH repo access check failed"
+                                    );
+                                    session.extended_data(
+                                        channel_id,
+                                        1,
+                                        CryptoVec::from_slice(
+                                            format!(
+                                                "ERROR: Failed to verify access to repository {owner}/{repo_name}: {e}\n"
+                                            )
+                                            .as_bytes(),
+                                        ),
+                                    );
+                                    finish_channel(session, channel_id, 1);
+                                    return Ok(());
+                                }
+                                Ok(_) => {
+                                    // Permission granted — fall through to cache/upstream logic.
+                                }
                             }
                         }
                     }
