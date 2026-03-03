@@ -2,7 +2,7 @@
 //!
 //! Each inbound SSH connection is served by a dedicated [`SshSession`].  The
 //! handler performs public-key authentication (with an upstream forge API fallback and
-//! KeyDB cache), rejects push operations, and either serves `git-upload-pack`
+//! Valkey cache), rejects push operations, and either serves `git-upload-pack`
 //! from the local bare-repo cache or returns a "not cached" error for repos
 //! that have not yet been mirrored.
 
@@ -168,7 +168,7 @@ impl Handler for SshSession {
 
         // Quick cache check for metrics tracking (hit/miss counters).
         let cache_key = format!("forgeproxy:ssh:auth:{fp}");
-        let is_cached = crate::auth::cache::get_cached_auth(&self.state.keydb, &cache_key)
+        let is_cached = crate::auth::cache::get_cached_auth(&self.state.valkey, &cache_key)
             .await
             .unwrap_or(None)
             .is_some();

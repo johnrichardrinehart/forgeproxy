@@ -66,10 +66,10 @@ variable "forgeproxy_count" {
   description = "Number of forgeproxy instances"
 }
 
-variable "keydb_instance_type" {
+variable "valkey_instance_type" {
   type        = string
   default     = "r6i.large"
-  description = "EC2 instance type for KeyDB instance"
+  description = "EC2 instance type for Valkey instance"
 }
 
 variable "forgeproxy_root_volume_gb" {
@@ -78,10 +78,10 @@ variable "forgeproxy_root_volume_gb" {
   description = "Root volume size (GB) for forgeproxy instances"
 }
 
-variable "keydb_root_volume_gb" {
+variable "valkey_root_volume_gb" {
   type        = number
   default     = 50
-  description = "Root volume size (GB) for KeyDB instance"
+  description = "Root volume size (GB) for Valkey instance"
 }
 
 

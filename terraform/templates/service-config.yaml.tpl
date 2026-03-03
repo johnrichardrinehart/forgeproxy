@@ -22,13 +22,13 @@ proxy:
   http_listen: "127.0.0.1:${backend_port}"
   bundle_uri_base_url: "https://${proxy_fqdn}/bundles"
 
-keydb:
-  endpoint: "${keydb_private_ip}:${keydb_enable_tls ? "6380" : "6379"}"
-  tls: ${keydb_enable_tls}
-%{ if keydb_enable_tls ~}
-  ca_cert_file: "/run/forgeproxy/keydb-ca.pem"
+valkey:
+  endpoint: "${valkey_private_ip}:${valkey_enable_tls ? "6380" : "6379"}"
+  tls: ${valkey_enable_tls}
+%{ if valkey_enable_tls ~}
+  ca_cert_file: "/run/forgeproxy/valkey-ca.pem"
 %{ endif ~}
-  auth_token_env: "KEYDB_AUTH_TOKEN"
+  auth_token_env: "VALKEY_AUTH_TOKEN"
 
 auth:
   webhook_secret_env: "FORGE_WEBHOOK_SECRET"

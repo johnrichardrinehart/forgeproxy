@@ -1,15 +1,15 @@
 { config, lib, ... }:
 {
   imports = [
-    ./keydb.nix
-    ./keydb-secrets.nix
-    ./keydb-tls.nix
+    ./valkey.nix
+    ./valkey-secrets.nix
+    ./valkey-tls.nix
     ./hardening.nix
     ./compliance/default.nix
     ./local-vm.nix
   ];
 
   config = {
-    services.keydb.enable = lib.mkDefault true;
+    services.valkey.enable = lib.mkDefault true;
   };
 }

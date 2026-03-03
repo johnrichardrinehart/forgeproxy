@@ -8,7 +8,7 @@
 //! This module provides two strategies for assigning tokens:
 //!
 //! 1. **Atomic counter** ([`next_creation_token`]) -- increments a per-repo
-//!    counter in KeyDB by a fixed step (1000) to leave room for manual
+//!    counter in Valkey by a fixed step (1000) to leave room for manual
 //!    insertions.  This is the primary strategy used during incremental bundle
 //!    generation.
 //!
@@ -26,14 +26,14 @@ use fred::interfaces::HashesInterface;
 
 /// Atomically allocate the next creation token for a repository.
 ///
-/// Increments the `latest_creation_token` field in the repo's KeyDB hash
+/// Increments the `latest_creation_token` field in the repo's Valkey hash
 /// by 1000 and returns the new value.  The step of 1000 leaves room for
 /// out-of-band insertions or manual corrections without risking collisions.
 ///
 /// Key: `forgeproxy:repo:{owner_repo}`, field: `latest_creation_token`.
 pub async fn next_creation_token(state: &crate::AppState, owner_repo: &str) -> Result<u64> {
     let key = format!("forgeproxy:repo:{owner_repo}");
-    let new_val: i64 = HashesInterface::hincrby(&state.keydb, &key, "latest_creation_token", 1000)
+    let new_val: i64 = HashesInterface::hincrby(&state.valkey, &key, "latest_creation_token", 1000)
         .await
         .with_context(|| format!("failed to increment creation token for {owner_repo}"))?;
     Ok(new_val as u64)

@@ -303,7 +303,7 @@ async fn handle_webhook(
 async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health_state = crate::health::HealthState {
         config: Arc::clone(&state.config),
-        keydb: state.keydb.clone(),
+        valkey: state.valkey.clone(),
         http_client: state.http_client.clone(),
     };
     crate::health::health_handler(axum::extract::State(health_state)).await

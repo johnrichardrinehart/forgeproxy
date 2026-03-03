@@ -3,9 +3,11 @@
 module "forgeproxy" {
   source = "../../"
 
-  flake_ref = var.flake_ref
+  flake_ref       = var.flake_ref
+  closure_variant = var.closure_variant
 
   aws_region  = var.aws_region
+  aws_profile = var.aws_profile
   name_prefix = var.name_prefix
 
   upstream_hostname     = var.upstream_hostname
@@ -21,11 +23,28 @@ module "forgeproxy" {
   forgeproxy_count          = var.forgeproxy_count
   forgeproxy_root_volume_gb = var.forgeproxy_root_volume_gb
 
-  keydb_instance_type  = var.keydb_instance_type
-  keydb_root_volume_gb = var.keydb_root_volume_gb
-  vpc_cidr             = var.vpc_cidr
-  public_subnet_cidr   = var.public_subnet_cidr
-  private_subnet_cidr  = var.private_subnet_cidr
+  valkey_instance_type  = var.valkey_instance_type
+  valkey_root_volume_gb = var.valkey_root_volume_gb
+
+  enable_ghe_key_lookup              = var.enable_ghe_key_lookup
+  ghe_key_lookup_instance_type       = var.ghe_key_lookup_instance_type
+  ghe_key_lookup_count               = var.ghe_key_lookup_count
+  ghe_key_lookup_root_volume_gb      = var.ghe_key_lookup_root_volume_gb
+  ghe_key_lookup_vpc_id              = var.ghe_key_lookup_vpc_id
+  ghe_key_lookup_subnet_ids          = var.ghe_key_lookup_subnet_ids
+  ghe_key_lookup_security_group_ids  = var.ghe_key_lookup_security_group_ids
+  ghe_key_lookup_listen_ports        = var.ghe_key_lookup_listen_ports
+  ghe_key_lookup_allowed_cidrs       = var.ghe_key_lookup_allowed_cidrs
+  ghe_key_lookup_ssh_target_endpoint = var.ghe_key_lookup_ssh_target_endpoint
+  ghe_key_lookup_ghe_url             = var.ghe_key_lookup_ghe_url
+  ghe_key_lookup_ssh_user            = var.ghe_key_lookup_ssh_user
+  ghe_key_lookup_ssh_port            = var.ghe_key_lookup_ssh_port
+  ghe_key_lookup_cache_ttl_pos       = var.ghe_key_lookup_cache_ttl_pos
+  ghe_key_lookup_cache_ttl_neg       = var.ghe_key_lookup_cache_ttl_neg
+
+  vpc_cidr            = var.vpc_cidr
+  public_subnet_cidr  = var.public_subnet_cidr
+  private_subnet_cidr = var.private_subnet_cidr
 
   allowed_client_cidrs = var.allowed_client_cidrs
   nlb_internal         = var.nlb_internal

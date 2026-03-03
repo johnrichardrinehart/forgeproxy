@@ -7,10 +7,15 @@ bundle_bucket_name = "my-forgeproxy-bundles"
 
 # Optional overrides (uncomment to customise):
 # aws_region               = "us-east-1"
+# aws_profile              = "your-sso-profile"
 # name_prefix              = "forgeproxy"
 # flake_ref                = "github:johnrichardrinehart/forgeproxy"
+# closure_variant          = "hardened" # or "dev"
 # forgeproxy_instance_type = "t3.large"
 # forgeproxy_count         = 1
-# keydb_instance_type      = "r6i.large"
+# valkey_instance_type      = "r6i.large"
+# enable_ghe_key_lookup    = true
+# ghe_key_lookup_ssh_target_endpoint = "ghe.example.com"
+# ghe_key_lookup_ghe_url   = "https://ghe.example.com"
 # nlb_internal             = true
 # log_level                = "info"

@@ -5,15 +5,15 @@ use super::middleware::Permission;
 use crate::AppState;
 
 /// Resolve SSH fingerprint to upstream username via the forge admin API, with
-/// KeyDB cache.
+/// Valkey cache.
 #[instrument(skip(state), fields(fingerprint))]
 pub async fn resolve_user_by_fingerprint(
     state: &AppState,
     fingerprint: &str,
 ) -> Result<Option<String>> {
-    // 1. Check KeyDB cache: forgeproxy:ssh:auth:{fingerprint}
+    // 1. Check Valkey cache: forgeproxy:ssh:auth:{fingerprint}
     let cache_key = format!("forgeproxy:ssh:auth:{fingerprint}");
-    if let Some(cached) = crate::auth::cache::get_cached_auth(&state.keydb, &cache_key).await? {
+    if let Some(cached) = crate::auth::cache::get_cached_auth(&state.valkey, &cache_key).await? {
         debug!(fingerprint, username = %cached, "resolved user from cache");
         return Ok(Some(cached));
     }
@@ -33,7 +33,7 @@ pub async fn resolve_user_by_fingerprint(
     if let Some(ref username) = resolved {
         debug!(fingerprint, username = %username, "resolved user from upstream API");
         crate::auth::cache::set_cached_auth(
-            &state.keydb,
+            &state.valkey,
             &cache_key,
             username,
             state.config.auth.ssh_cache_ttl,
@@ -46,7 +46,7 @@ pub async fn resolve_user_by_fingerprint(
     Ok(resolved)
 }
 
-/// Check SSH user's permission on a repo via the forge API, with KeyDB cache.
+/// Check SSH user's permission on a repo via the forge API, with Valkey cache.
 #[instrument(skip(state), fields(fingerprint, username, owner, repo))]
 pub async fn check_ssh_repo_access(
     state: &AppState,
@@ -56,7 +56,7 @@ pub async fn check_ssh_repo_access(
     repo: &str,
 ) -> Result<Permission> {
     let cache_key = format!("forgeproxy:ssh:access:{fingerprint}:{owner}/{repo}");
-    if let Some(cached) = crate::auth::cache::get_cached_auth(&state.keydb, &cache_key).await? {
+    if let Some(cached) = crate::auth::cache::get_cached_auth(&state.valkey, &cache_key).await? {
         debug!(cache_key, permission = %cached, "repo access from cache");
         return Ok(Permission::parse(&cached));
     }
@@ -82,7 +82,7 @@ pub async fn check_ssh_repo_access(
         "resolved repo permission"
     );
     crate::auth::cache::set_cached_auth(
-        &state.keydb,
+        &state.valkey,
         &cache_key,
         perm_str,
         state.config.auth.ssh_cache_ttl,

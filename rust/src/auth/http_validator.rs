@@ -1,7 +1,7 @@
 //! HTTP credential validation against the upstream forge API.
 //!
 //! Validates an HTTP `Authorization` header by forwarding it to the upstream
-//! forge API (via the [`ForgeBackend`] trait) and caching the result in KeyDB.
+//! forge API (via the [`ForgeBackend`] trait) and caching the result in Valkey.
 //! The cache key is derived from a SHA-256 hash of the token so that raw
 //! credentials are never stored.
 
@@ -14,7 +14,7 @@ use crate::auth::cache;
 use crate::auth::middleware::Permission;
 
 /// Validate an HTTP `Authorization` header value by forwarding it to the
-/// upstream forge API and caching the result in KeyDB.
+/// upstream forge API and caching the result in Valkey.
 ///
 /// Returns `Ok(())` if the caller has at least read permission on the
 /// repository, or an error otherwise.
@@ -36,8 +36,8 @@ pub async fn validate_http_auth(
 
     let cache_key = format!("forgeproxy:http:auth:{token_hash}:{owner}/{repo}");
 
-    // 2. Check KeyDB cache.
-    if let Some(cached) = cache::get_cached_auth(&state.keydb, &cache_key).await? {
+    // 2. Check Valkey cache.
+    if let Some(cached) = cache::get_cached_auth(&state.valkey, &cache_key).await? {
         let perm = Permission::parse(&cached);
         if perm.has_read() {
             debug!(%owner, %repo, permission = %cached, "http auth cache hit (allowed)");
@@ -72,7 +72,7 @@ pub async fn validate_http_auth(
         state.config.auth.negative_cache_ttl
     };
     let perm_str = perm.as_str();
-    cache::set_cached_auth(&state.keydb, &cache_key, perm_str, ttl)
+    cache::set_cached_auth(&state.valkey, &cache_key, perm_str, ttl)
         .await
         .ok();
 

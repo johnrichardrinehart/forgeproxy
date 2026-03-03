@@ -1,12 +1,12 @@
-//! Least Frequently Used (LFU) eviction policy backed by KeyDB.
+//! Least Frequently Used (LFU) eviction policy backed by Valkey.
 //!
-//! Each clone/fetch increments a per-repo counter stored in the KeyDB hash
+//! Each clone/fetch increments a per-repo counter stored in the Valkey hash
 //! `forgeproxy:repo:{owner/repo}` under the `clone_count` field.  When the cache
 //! manager needs to free space, this module ranks repos by ascending clone
 //! count and returns the least-accessed ones as eviction candidates.
 //!
 //! Repos that are marked as "pinned" via the `eviction_priority` field in
-//! their KeyDB hash are never returned as eviction candidates.
+//! their Valkey hash are never returned as eviction candidates.
 
 use anyhow::Result;
 use fred::interfaces::HashesInterface;
@@ -19,10 +19,10 @@ use tracing::debug;
 /// Return up to `count` repos from `repos` ordered by ascending clone count
 /// (least frequently used first).
 ///
-/// Repos whose `eviction_priority` field is set to `"pinned"` in KeyDB are
+/// Repos whose `eviction_priority` field is set to `"pinned"` in Valkey are
 /// excluded and will never be returned as eviction candidates.
 pub async fn get_eviction_candidates(
-    keydb: &fred::clients::Pool,
+    valkey: &fred::clients::Pool,
     repos: &[String],
     count: usize,
 ) -> Result<Vec<String>> {
@@ -36,9 +36,9 @@ pub async fn get_eviction_candidates(
         let key = crate::coordination::registry::repo_key(owner_repo);
 
         // Fetch both clone_count and eviction_priority in one round-trip.
-        let clone_count: Option<i64> = keydb.hget(&key, "clone_count").await.unwrap_or(None);
+        let clone_count: Option<i64> = valkey.hget(&key, "clone_count").await.unwrap_or(None);
 
-        let priority: Option<String> = keydb.hget(&key, "eviction_priority").await.unwrap_or(None);
+        let priority: Option<String> = valkey.hget(&key, "eviction_priority").await.unwrap_or(None);
 
         // Never evict pinned repos.
         if priority.as_deref() == Some("pinned") {

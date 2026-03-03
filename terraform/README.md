@@ -3,7 +3,8 @@
 This directory contains Terraform infrastructure-as-code for a fully dynamic, runtime-configured deployment of forgeproxy with:
 - Network Load Balancer for multi-instance support (TCP passthrough on ports 443/2222)
 - Scalable forgeproxy instances (count-based)
-- KeyDB instance for distributed caching
+- Valkey instance for distributed caching
+- Optional ghe-key-lookup sidecar fleet (AMI + internal NLB + runtime config via Secrets Manager)
 - Automatic NixOS AMI building and registration
 - Runtime-configurable upstream and secrets via AWS Secrets Manager
 - No hardcoded hostnames, API URLs, or credentials in AMIs
@@ -23,6 +24,14 @@ vim terraform.tfvars  # Edit with your values
 - `proxy_fqdn` - Fully-qualified domain name for the forgeproxy proxy
 - `bundle_bucket_name` - Globally unique S3 bucket name for bundles
 
+**Closure variants:**
+- `closure_variant = "hardened"`: locked-down baseline (default)
+- `closure_variant = "dev"`: debugging-friendly profile (SSH/console enabled, env secret fallback enabled for app-level secret resolution)
+
+**AWS CLI profile fallback for AMI build scripts:**
+- Set `aws_profile` when your Terraform AWS provider uses a named profile (for example SSO).
+- The module uses this only when `AWS_PROFILE` is not already set in the shell running Terraform.
+
 ### 2. Initialize Terraform
 
 ```bash
@@ -36,12 +45,12 @@ terraform plan
 ```
 
 This will:
-1. Build NixOS AMIs for forgeproxy and keydb
+1. Build NixOS AMIs for forgeproxy and valkey (and ghe-key-lookup when enabled)
 2. Create VPC, subnets, Internet Gateway, NAT Gateway
 3. Create security groups and NLB
 4. Generate self-signed TLS certificates
 5. Create all AWS Secrets Manager secrets
-6. Launch KeyDB and forgeproxy instances
+6. Launch Valkey and forgeproxy instances
 7. Attach instances to NLB target groups
 
 ### 4. Apply the configuration
@@ -54,22 +63,29 @@ The build step for AMIs may take 10-15 minutes. Snapshot import can take 5-10 ad
 
 ### 5. Populate required secrets
 
-After `terraform apply` completes, populate these Secrets Manager secrets with actual values:
+After `terraform apply` completes, populate these Secrets Manager secrets with actual values.
+Note: this module creates secrets with `name_prefix`, so final names include a random suffix.
+Use Terraform outputs (or prefix lookup) to get exact names.
 
 ```bash
-aws secretsmanager put-secret-value \
-  --secret-id forgeproxy/forge-admin-token \
-  --secret-string "your-forge-admin-pat"
+terraform output -json secrets_to_populate | jq -r '.[]'
+# Example output:
+# forgeproxy/forge-admin-token-abc123
+# forgeproxy/webhook-secret-def456
+# forgeproxy/otlp-config-ghi789
+```
 
+When `enable_ghe_key_lookup = true`, also populate:
+```bash
 aws secretsmanager put-secret-value \
-  --secret-id forgeproxy/webhook-secret \
-  --secret-string "your-webhook-hmac-secret"
+  --secret-id "$(terraform output -json secrets_to_populate | jq -r '.[] | select(startswith("forgeproxy/ghe-key-lookup-admin-key-"))')" \
+  --secret-string "$(cat /path/to/ghe-admin-private-key)"
 ```
 
 For each organization in `org_creds`, populate:
 ```bash
 aws secretsmanager put-secret-value \
-  --secret-id forgeproxy/creds/example-org \
+  --secret-id "$(terraform output -json secrets_to_populate | jq -r '.[] | select(startswith("forgeproxy/creds-example-org-"))')" \
   --secret-string "org-specific-credentials-or-pat"
 ```
 
@@ -109,6 +125,7 @@ terraform/
 ├── secrets.tf                     # Secrets Manager secrets
 ├── ami.tf                         # NixOS AMI build and registration
 ├── ec2.tf                         # EC2 instances and NLB attachments
+├── ghe-key-lookup.tf              # Optional ghe-key-lookup sidecar fleet + internal NLB
 └── templates/
     └── service-config.yaml.tpl    # forgeproxy config.yaml template
 ```
@@ -116,7 +133,7 @@ terraform/
 ## Key Design Decisions
 
 ### 1. Provider Pattern
-All secrets and runtime configuration come from AWS Secrets Manager. The forgeproxy and keydb AMIs are completely generic:
+All secrets and runtime configuration come from AWS Secrets Manager. The forgeproxy and valkey AMIs are completely generic:
 - No hardcoded hostnames
 - No hardcoded credentials
 - No organization lists
@@ -135,15 +152,29 @@ Configuration is fetched at boot time via `ExecStartPre` scripts in systemd serv
 ### 3. TLS Configuration
 - **nginx**: Uses self-signed cert from Terraform; suitable for internal deployments
   - For production: replace with real certs in Secrets Manager
-- **KeyDB**: TLS disabled in reference deployment (plaintext on port 6379 in private subnet)
+- **Valkey**: TLS disabled in reference deployment (plaintext on port 6379 in private subnet)
   - Network isolation via security groups provides security
-  - For production: set `services.keydb.tls.enable = true` in flake.nix
+  - For production: set `services.valkey.tls.enable = true` in flake.nix
 
-### 4. Single `terraform apply`
+### 4. Optional ghe-key-lookup Sidecar
+- Set `enable_ghe_key_lookup = true` to deploy sidecars.
+- Configure shape with:
+  - `ghe_key_lookup_count`
+  - `ghe_key_lookup_instance_type`
+  - `ghe_key_lookup_listen_ports`
+  - `ghe_key_lookup_vpc_id` / `ghe_key_lookup_subnet_ids`
+  - `ghe_key_lookup_security_group_ids` (or let module create one)
+- Provide runtime upstream details with:
+  - `ghe_key_lookup_ssh_target_endpoint` (required when enabled)
+  - optional `ghe_key_lookup_ghe_url`
+  - optional SSH/cache variables
+- Terraform creates `forgeproxy/ghe-key-lookup-config` and `forgeproxy/ghe-key-lookup-admin-key` secrets; sidecar instances fetch these at boot.
+
+### 5. Single `terraform apply`
 Proper `depends_on` ordering ensures:
 1. IAM roles → S3 bucket
 2. S3 bucket → AMI build
-3. AMI build → TLS cert request (needs KeyDB private IP)
+3. AMI build → TLS cert request (needs Valkey private IP)
 4. TLS resources → Secrets Manager secrets
 5. Secrets → EC2 instances
 6. EC2 instances → NLB attachments
@@ -161,11 +192,11 @@ No AMI rebuild; existing instances unaffected.
 ### Change upstream Git forge
 ```bash
 aws secretsmanager put-secret-value \
-  --secret-id forgeproxy/nginx-upstream-hostname \
+  --secret-id "$(aws secretsmanager list-secrets --query 'SecretList[?starts_with(Name, `forgeproxy/nginx-upstream-hostname-`)].Name | [0]' --output text)" \
   --secret-string "new-ghe.example.com"
 
 aws secretsmanager put-secret-value \
-  --secret-id forgeproxy/nginx-upstream-port \
+  --secret-id "$(aws secretsmanager list-secrets --query 'SecretList[?starts_with(Name, `forgeproxy/nginx-upstream-port-`)].Name | [0]' --output text)" \
   --secret-string "443"
 
 # Restart nginx on all instances (via SSM)
@@ -196,21 +227,21 @@ aws ssm send-command \
      --targets "Key=tag:Role,Values=forgeproxy"
    ```
 
-### Rotate KeyDB password
+### Rotate Valkey password
 ```bash
 # Generate new password
 NEW_PASS=$(openssl rand -base64 32)
 
 # Update the secret
 aws secretsmanager put-secret-value \
-  --secret-id forgeproxy/keydb-auth-token \
+  --secret-id "$(aws secretsmanager list-secrets --query 'SecretList[?starts_with(Name, `forgeproxy/valkey-auth-token-`)].Name | [0]' --output text)" \
   --secret-string "$NEW_PASS"
 
-# Restart keydb and forgeproxy
+# Restart valkey and forgeproxy
 aws ssm send-command \
   --document-name "AWS-RunShellScript" \
-  --parameters 'commands=["systemctl restart keydb && systemctl restart forgeproxy"]' \
-  --targets "Key=tag:Name,Values=forgeproxy-keydb"
+  --parameters 'commands=["systemctl restart valkey && systemctl restart forgeproxy"]' \
+  --targets "Key=tag:Name,Values=forgeproxy-valkey"
 ```
 
 ## Region and Partition Support
@@ -267,7 +298,7 @@ Check systemd logs on the instance:
 aws ssm start-session --target <instance-id>
 sudo journalctl -u forgeproxy -n 50
 sudo journalctl -u nginx -n 50
-sudo journalctl -u keydb -n 50
+sudo journalctl -u valkey -n 50
 ```
 
 ### NLB health checks failing

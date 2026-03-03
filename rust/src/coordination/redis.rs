@@ -1,7 +1,7 @@
-//! KeyDB / Redis client pool creation.
+//! Valkey / Redis client pool creation.
 //!
-//! Builds a [`fred::clients::Pool`] configured for the KeyDB instance
-//! described in [`crate::config::KeyDbConfig`], optionally enabling TLS
+//! Builds a [`fred::clients::Pool`] configured for the Valkey instance
+//! described in [`crate::config::ValkeyConfig`], optionally enabling TLS
 //! via `rustls` and reading the auth token from an environment variable.
 
 use anyhow::{Context, Result};
@@ -27,15 +27,15 @@ mod tests {
 
     #[test]
     fn test_parse_host_port_with_port() {
-        let (host, port) = parse_host_port("keydb.local:6380").unwrap();
-        assert_eq!(host, "keydb.local");
+        let (host, port) = parse_host_port("valkey.local:6380").unwrap();
+        assert_eq!(host, "valkey.local");
         assert_eq!(port, 6380);
     }
 
     #[test]
     fn test_parse_host_port_default() {
-        let (host, port) = parse_host_port("keydb.local").unwrap();
-        assert_eq!(host, "keydb.local");
+        let (host, port) = parse_host_port("valkey.local").unwrap();
+        assert_eq!(host, "valkey.local");
         assert_eq!(port, 6379);
     }
 }

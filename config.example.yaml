@@ -19,10 +19,10 @@ proxy:
   ssh_listen: "0.0.0.0:2222"
   http_listen: "127.0.0.1:8080"
   bundle_uri_base_url: "https://forgeproxy.internal.example.com/bundles"
-keydb:
-  endpoint: "keydb.internal.example.com:6380"
+valkey:
+  endpoint: "valkey.internal.example.com:6380"
   tls: true
-  auth_token_env: "KEYDB_AUTH_TOKEN"
+  auth_token_env: "VALKEY_AUTH_TOKEN"
 auth:
   ssh_cache_ttl: 300
   http_cache_ttl: 120
@@ -55,8 +55,8 @@ storage:
   s3:
     bucket: "forgeproxy-bundles"
     prefix: ""
-    region: "us-west-1"
-    use_fips: true
+    region: "us-east-1"
+    use_fips: false
     presigned_url_ttl: 60
 repo_overrides:
   "org/monorepo":

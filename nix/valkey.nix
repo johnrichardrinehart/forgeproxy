@@ -6,9 +6,9 @@
 }:
 
 let
-  cfg = config.services.keydb;
+  cfg = config.services.valkey;
 
-  keydbConfig = pkgs.writeText "keydb.conf" ''
+  valkeyConfig = pkgs.writeText "valkey.conf" ''
     # ── Network ────────────────────────────────────────────────────────
     bind 0.0.0.0
     port 6379
@@ -33,8 +33,8 @@ let
     # ── Persistence (RDB snapshots) ────────────────────────────────────
     save 300 10
     save 60 10000
-    dbfilename keydb-dump.rdb
-    dir /var/lib/keydb
+    dbfilename valkey-dump.rdb
+    dir /var/lib/valkey
 
     # ── Memory management ──────────────────────────────────────────────
     maxmemory ${cfg.maxMemory}
@@ -42,7 +42,7 @@ let
 
     # ── Logging ────────────────────────────────────────────────────────
     loglevel notice
-    logfile /var/log/keydb/keydb.log
+    logfile /var/log/valkey/valkey.log
 
     # ── Safety ─────────────────────────────────────────────────────────
     rename-command FLUSHALL ""
@@ -56,32 +56,32 @@ let
   '';
 in
 {
-  options.services.keydb = {
+  options.services.valkey = {
     enable = lib.mkEnableOption "Valkey server (Redis-compatible)";
 
     tls = {
       enable = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Enable TLS for KeyDB.";
+        description = "Enable TLS for Valkey.";
       };
 
       certFile = lib.mkOption {
         type = lib.types.path;
-        default = "/var/lib/keydb/tls/cert.pem";
-        description = "Path to the TLS certificate for KeyDB.";
+        default = "/var/lib/valkey/tls/cert.pem";
+        description = "Path to the TLS certificate for Valkey.";
       };
 
       keyFile = lib.mkOption {
         type = lib.types.path;
-        default = "/var/lib/keydb/tls/key.pem";
-        description = "Path to the TLS private key for KeyDB.";
+        default = "/var/lib/valkey/tls/key.pem";
+        description = "Path to the TLS private key for Valkey.";
       };
 
       caFile = lib.mkOption {
         type = lib.types.path;
-        default = "/var/lib/keydb/tls/ca.pem";
-        description = "Path to the TLS CA certificate for KeyDB.";
+        default = "/var/lib/valkey/tls/ca.pem";
+        description = "Path to the TLS CA certificate for Valkey.";
       };
     };
 
@@ -89,7 +89,7 @@ in
       type = lib.types.str;
       default = "CHANGE_ME_USE_SOPS_OR_SECRETS_MANAGER";
       description = ''
-        Password required to authenticate to KeyDB.
+        Password required to authenticate to Valkey.
         In production this MUST come from a secrets manager.
       '';
     };
@@ -97,34 +97,34 @@ in
     maxMemory = lib.mkOption {
       type = lib.types.str;
       default = "2gb";
-      description = "Maximum memory KeyDB is allowed to use.";
+      description = "Maximum memory Valkey is allowed to use.";
     };
 
     dataDir = lib.mkOption {
       type = lib.types.path;
-      default = "/var/lib/keydb";
-      description = "Directory for KeyDB data files (RDB snapshots).";
+      default = "/var/lib/valkey";
+      description = "Directory for Valkey data files (RDB snapshots).";
     };
 
     extraConfFile = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = ''
-        Optional second configuration file to pass to keydb-server.
+        Optional second configuration file to pass to valkey-server.
         This allows runtime configuration overrides (e.g., requirepass).
       '';
     };
 
     user = lib.mkOption {
       type = lib.types.str;
-      default = "keydb";
-      description = "System user to run the KeyDB service.";
+      default = "valkey";
+      description = "System user to run the Valkey service.";
     };
 
     group = lib.mkOption {
       type = lib.types.str;
-      default = "keydb";
-      description = "System group for the KeyDB service.";
+      default = "valkey";
+      description = "System group for the Valkey service.";
     };
   };
 
@@ -141,15 +141,15 @@ in
     users.groups.${cfg.group} = { };
 
     # ── Configuration file ─────────────────────────────────────────────
-    environment.etc."keydb/keydb.conf" = {
-      source = keydbConfig;
+    environment.etc."valkey/valkey.conf" = {
+      source = valkeyConfig;
       mode = "0640";
       user = cfg.user;
       group = cfg.group;
     };
 
     # ── systemd service ────────────────────────────────────────────────
-    systemd.services.keydb = {
+    systemd.services.valkey = {
       description = "Valkey Server";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -160,13 +160,13 @@ in
         User = cfg.user;
         Group = cfg.group;
 
-        ExecStart = "${pkgs.valkey}/bin/valkey-server /etc/keydb/keydb.conf";
+        ExecStart = "${pkgs.valkey}/bin/valkey-server /etc/valkey/valkey.conf";
 
         Restart = "on-failure";
         RestartSec = 5;
 
-        StateDirectory = "keydb";
-        RuntimeDirectory = "keydb";
+        StateDirectory = "valkey";
+        RuntimeDirectory = "valkey";
 
         # ── Hardening ──────────────────────────────────────────────
         ProtectSystem = "strict";
@@ -183,10 +183,10 @@ in
 
         ReadWritePaths = [
           cfg.dataDir
-          "/var/log/keydb"
+          "/var/log/valkey"
         ]
         ++ lib.optionals cfg.tls.enable [
-          "/var/lib/keydb/tls"
+          "/var/lib/valkey/tls"
         ];
       };
     };
@@ -204,10 +204,10 @@ in
 
     # ── Log directory via tmpfiles ─────────────────────────────────────
     systemd.tmpfiles.rules = [
-      "d /var/log/keydb 0750 ${cfg.user} ${cfg.group} -"
+      "d /var/log/valkey 0750 ${cfg.user} ${cfg.group} -"
     ]
     ++ lib.optionals cfg.tls.enable [
-      "d /var/lib/keydb/tls 0750 ${cfg.user} ${cfg.group} -"
+      "d /var/lib/valkey/tls 0750 ${cfg.user} ${cfg.group} -"
     ];
   };
 }

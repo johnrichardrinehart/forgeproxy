@@ -13,14 +13,14 @@ output "forgeproxy_instance_ids" {
   description = "List of forgeproxy instance IDs"
 }
 
-output "keydb_instance_id" {
-  value       = module.forgeproxy.keydb_instance_id
-  description = "KeyDB instance ID"
+output "valkey_instance_id" {
+  value       = module.forgeproxy.valkey_instance_id
+  description = "Valkey instance ID"
 }
 
-output "keydb_private_ip" {
-  value       = module.forgeproxy.keydb_private_ip
-  description = "Private IP address of the KeyDB instance"
+output "valkey_private_ip" {
+  value       = module.forgeproxy.valkey_private_ip
+  description = "Private IP address of the Valkey instance"
 }
 
 output "bundle_bucket_name" {
@@ -33,9 +33,9 @@ output "forgeproxy_ami_id" {
   description = "AMI ID of the forgeproxy image"
 }
 
-output "keydb_ami_id" {
-  value       = module.forgeproxy.keydb_ami_id
-  description = "AMI ID of the keydb image"
+output "valkey_ami_id" {
+  value       = module.forgeproxy.valkey_ami_id
+  description = "AMI ID of the valkey image"
 }
 
 output "secrets_to_populate" {
