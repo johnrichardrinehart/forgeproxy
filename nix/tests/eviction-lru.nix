@@ -52,10 +52,10 @@ let
       http_listen: "0.0.0.0:8080"
       bundle_uri_base_url: "http://proxy:8080/bundles"
 
-    keydb:
-      endpoint: "keydb:6379"
+    valkey:
+      endpoint: "valkey:6379"
       tls: false
-      auth_token_env: "KEYDB_AUTH_TOKEN"
+      auth_token_env: "VALKEY_AUTH_TOKEN"
 
     auth:
       ssh_cache_ttl: 300
@@ -162,8 +162,8 @@ pkgs.testers.runNixOSTest {
         virtualisation.memorySize = 2048;
       };
 
-    # ── KeyDB / Redis ───────────────────────────────────────────────────
-    keydb =
+    # ── Valkey / Redis ───────────────────────────────────────────────────
+    valkey =
       {
         config,
         pkgs,
@@ -262,9 +262,9 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Infrastructure comes up ───────────────────────────────────────────
-    with subtest("KeyDB starts"):
-        keydb.wait_for_unit("redis-default.service")
-        keydb.wait_for_open_port(6379)
+    with subtest("Valkey starts"):
+        valkey.wait_for_unit("redis-default.service")
+        valkey.wait_for_open_port(6379)
 
     with subtest("Gitea starts"):
         ghe.wait_for_unit("gitea.service")
@@ -340,8 +340,8 @@ pkgs.testers.runNixOSTest {
     with subtest("Health endpoint responds with LRU policy active"):
         result = proxy.succeed("curl -sf http://localhost:8080/healthz")
         health = json.loads(result)
-        assert health["checks"]["keydb"]["ok"] is True, \
-            f"KeyDB health check failed: {result}"
+        assert health["checks"]["valkey"]["ok"] is True, \
+            f"Valkey health check failed: {result}"
 
     # ── Clone all 3 repos through the proxy ──────────────────────────────
     with subtest("Clone repos through proxy"):
@@ -373,37 +373,37 @@ pkgs.testers.runNixOSTest {
 
         # repo-a: fetched long ago (least recently used)
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-a'"
+            "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-a'"
             " last_fetch_ts 1000000"
         )
         # repo-b: fetched recently
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-b'"
+            "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-b'"
             " last_fetch_ts 1700000000"
         )
         # repo-c: fetched very recently (most recently used)
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-c'"
+            "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-c'"
             " last_fetch_ts 1700000999"
         )
 
         # Set bundle_list_key for all repos (required for eviction eligibility)
         for repo in ["repo-a", "repo-b", "repo-c"]:
             proxy.succeed(
-                f"redis-cli -h keydb HSET 'forgeproxy:repo:octocat/{repo}'"
+                f"redis-cli -h valkey HSET 'forgeproxy:repo:octocat/{repo}'"
                 f" bundle_list_key 's3://test-bucket/octocat/{repo}/bundle-list'"
             )
 
-    # ── Verify KeyDB state is correct ─────────────────────────────────────
-    with subtest("Verify KeyDB last_fetch_ts values are set correctly"):
+    # ── Verify Valkey state is correct ─────────────────────────────────────
+    with subtest("Verify Valkey last_fetch_ts values are set correctly"):
         ts_a = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-a' last_fetch_ts"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-a' last_fetch_ts"
         ).strip()
         ts_b = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-b' last_fetch_ts"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-b' last_fetch_ts"
         ).strip()
         ts_c = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-c' last_fetch_ts"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-c' last_fetch_ts"
         ).strip()
 
         assert ts_a == "1000000", f"Expected repo-a last_fetch_ts=1000000, got {ts_a}"
@@ -415,7 +415,7 @@ pkgs.testers.runNixOSTest {
             f"Expected ts_a < ts_b < ts_c for LRU ordering, got {ts_a}, {ts_b}, {ts_c}"
 
     # ── Verify proxy is still healthy after seeding ───────────────────────
-    with subtest("Proxy remains healthy after KeyDB seeding"):
+    with subtest("Proxy remains healthy after Valkey seeding"):
         result = proxy.succeed("curl -sf http://localhost:8080/healthz")
         health = json.loads(result)
         assert health["status"] in ("ok", "degraded"), \

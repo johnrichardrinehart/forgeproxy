@@ -19,10 +19,10 @@ proxy:
   ssh_listen: "0.0.0.0:2222"
   http_listen: "127.0.0.1:8080"
   bundle_uri_base_url: "https://forgeproxy.internal.example.gov/bundles"
-keydb:
-  endpoint: "keydb.internal.example.gov:6380"
+valkey:
+  endpoint: "valkey.internal.example.gov:6380"
   tls: true
-  auth_token_env: "KEYDB_AUTH_TOKEN"
+  auth_token_env: "VALKEY_AUTH_TOKEN"
 auth:
   ssh_cache_ttl: 300
   http_cache_ttl: 120

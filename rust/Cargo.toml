@@ -32,7 +32,7 @@ tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
 
-# Redis/KeyDB client
+# Redis/Valkey client
 fred = { version = "10", features = ["enable-rustls", "i-scripts", "subscriber-client"] }
 
 # AWS SDK

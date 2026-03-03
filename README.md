@@ -16,12 +16,12 @@ load on the upstream forge and speeding up clones.
 - **Bundle-URI** — automatic bundle generation with incremental, daily, and weekly consolidation; clients that support `bundle-uri` fetch most data from pre-built bundles
 - **Filtered bundles** — optional blobless / treeless bundle variants for partial-clone workflows
 - **Multi-forge support** — pluggable backend for GitHub Enterprise, GitHub.com, GitLab, Gitea, and Forgejo
-- **Distributed coordination** — KeyDB/Redis-backed locks, pub/sub invalidation, and node registry for multi-node deployments
+- **Distributed coordination** — Valkey/Redis-backed locks, pub/sub invalidation, and node registry for multi-node deployments
 - **Adaptive fetch scheduling** — background re-fetch interval adapts to repo activity with exponential backoff for idle repos
 - **Two-tier cache eviction** — local disk cache with configurable LRU or LFU eviction and high/low water marks
 - **S3 bundle storage** — bundles are persisted to S3 (with optional FIPS endpoints) and served via pre-signed URLs
 - **Linux kernel keyring credentials** — upstream PATs and SSH keys stored in the kernel keyring via `linux-keyutils`
-- **Auth caching** — SSH fingerprint and HTTP token auth results cached in KeyDB with configurable TTLs
+- **Auth caching** — SSH fingerprint and HTTP token auth results cached in Valkey with configurable TTLs
 - **Webhook-driven invalidation** — push webhooks trigger immediate re-fetch of affected repos
 - **Forge API rate-limit awareness** — self-throttles when the upstream API rate-limit budget runs low
 - **Prometheus metrics** — counters, gauges, and histograms for clone latency, cache hit rate, bundle generation, and more
@@ -42,7 +42,7 @@ load on the upstream forge and speeding up clones.
                                    ┌──────────┼──────────┐
                                    ▼          ▼          ▼
                               ┌────────┐ ┌────────┐ ┌────────┐
-                              │ Local  │ │ KeyDB  │ │   S3   │
+                              │ Local  │ │ Valkey │ │   S3   │
                               │ Disk   │ │ Redis  │ │Bundles │
                               │ Cache  │ │        │ │        │
                               └────────┘ └────────┘ └────────┘
@@ -74,7 +74,7 @@ Copy and edit the example configuration:
 
 ```bash
 cp config.example.yaml /run/forgeproxy/config.yaml
-# edit upstream hostname, API URL, KeyDB endpoint, S3 bucket, etc.
+# edit upstream hostname, API URL, Valkey endpoint, S3 bucket, etc.
 ```
 
 Run:
@@ -94,7 +94,7 @@ Top-level sections:
 | `backend_type`         | Forge flavour (`github-enterprise`, `github`, `gitlab`, etc.)  |
 | `upstream_credentials` | Default credential mode and per-org overrides (PAT / SSH)      |
 | `proxy`                | SSH and HTTP listen addresses, bundle-URI base URL             |
-| `keydb`                | KeyDB/Redis endpoint, TLS, auth token                          |
+| `valkey`               | Valkey/Redis endpoint, TLS, auth token                          |
 | `auth`                 | SSH/HTTP auth cache TTLs, webhook secret env var               |
 | `clone`                | Freshness threshold, lock TTLs, concurrency semaphores         |
 | `fetch_schedule`       | Background re-fetch interval, backoff, rolling window          |
@@ -131,7 +131,7 @@ The flake exports a NixOS module for declarative deployment:
 
 Additional NixOS modules are available for companion services:
 
-- `forgeproxy.nixosModules.keydb` — KeyDB instance
+- `forgeproxy.nixosModules.valkey` — Valkey instance
 - `forgeproxy.nixosModules.nginx` — nginx TLS termination
 - `forgeproxy.nixosModules.hardening` — extra systemd hardening
 - `forgeproxy.nixosModules.secrets` — sops-nix secrets integration

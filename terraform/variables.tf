@@ -81,10 +81,10 @@ variable "forgeproxy_count" {
   }
 }
 
-variable "keydb_instance_type" {
+variable "valkey_instance_type" {
   type        = string
   default     = "r6i.large"
-  description = "EC2 instance type for KeyDB instance"
+  description = "EC2 instance type for Valkey instance"
 }
 
 variable "forgeproxy_root_volume_gb" {
@@ -93,10 +93,10 @@ variable "forgeproxy_root_volume_gb" {
   description = "Root volume size (GB) for forgeproxy instances"
 }
 
-variable "keydb_root_volume_gb" {
+variable "valkey_root_volume_gb" {
   type        = number
   default     = 50
-  description = "Root volume size (GB) for KeyDB instance"
+  description = "Root volume size (GB) for Valkey instance"
 }
 
 
@@ -140,13 +140,13 @@ variable "private_subnet_cidr" {
 variable "forgeproxy_security_group_id" {
   type        = string
   default     = null
-  description = "ID of an existing security group to attach to forgeproxy instances. When set, keydb_security_group_id must also be provided and the module will not create security groups. The caller is responsible for ensuring the keydb SG allows ingress from the forgeproxy SG."
+  description = "ID of an existing security group to attach to forgeproxy instances. When set, valkey_security_group_id must also be provided and the module will not create security groups. The caller is responsible for ensuring the valkey SG allows ingress from the forgeproxy SG."
 }
 
-variable "keydb_security_group_id" {
+variable "valkey_security_group_id" {
   type        = string
   default     = null
-  description = "ID of an existing security group to attach to the KeyDB instance. Must be set when forgeproxy_security_group_id is provided."
+  description = "ID of an existing security group to attach to the Valkey instance. Must be set when forgeproxy_security_group_id is provided."
 }
 
 variable "allowed_client_cidrs" {

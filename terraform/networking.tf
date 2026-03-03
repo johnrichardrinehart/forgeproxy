@@ -13,20 +13,20 @@ locals {
   )
 
   # When forgeproxy_security_group_id is null the module creates both security
-  # groups. Both must be provided together (or neither) because the keydb SG
+  # groups. Both must be provided together (or neither) because the valkey SG
   # rule references the forgeproxy SG – that relationship is the caller's
   # responsibility when bringing their own SGs.
   create_security_groups       = var.forgeproxy_security_group_id == null
   forgeproxy_security_group_id = local.create_security_groups ? aws_security_group.forgeproxy[0].id : var.forgeproxy_security_group_id
-  keydb_security_group_id      = local.create_security_groups ? aws_security_group.keydb[0].id : var.keydb_security_group_id
+  valkey_security_group_id     = local.create_security_groups ? aws_security_group.valkey[0].id : var.valkey_security_group_id
 }
 
-# Validate that forgeproxy_security_group_id and keydb_security_group_id are
+# Validate that forgeproxy_security_group_id and valkey_security_group_id are
 # either both set or both null.
 check "sg_inputs_consistent" {
   assert {
-    condition     = (var.forgeproxy_security_group_id == null) == (var.keydb_security_group_id == null)
-    error_message = "forgeproxy_security_group_id and keydb_security_group_id must both be set (bring-your-own SGs) or both be null (module creates security groups)."
+    condition     = (var.forgeproxy_security_group_id == null) == (var.valkey_security_group_id == null)
+    error_message = "forgeproxy_security_group_id and valkey_security_group_id must both be set (bring-your-own SGs) or both be null (module creates security groups)."
   }
 }
 
@@ -213,29 +213,29 @@ resource "aws_security_group" "forgeproxy" {
   }
 }
 
-# ── Security Group: KeyDB instance ──────────────────────────────────────────
-resource "aws_security_group" "keydb" {
+# ── Security Group: Valkey instance ──────────────────────────────────────────
+resource "aws_security_group" "valkey" {
   count       = local.create_security_groups ? 1 : 0
-  name        = "${var.name_prefix}-keydb-sg"
-  description = "Security group for KeyDB instance"
+  name        = "${var.name_prefix}-valkey-sg"
+  description = "Security group for Valkey instance"
   vpc_id      = local.vpc_id
 
-  # KeyDB TLS port from forgeproxy instances
+  # Valkey TLS port from forgeproxy instances
   ingress {
     from_port       = 6380
     to_port         = 6380
     protocol        = "tcp"
     security_groups = [aws_security_group.forgeproxy[0].id]
-    description     = "KeyDB TLS port from forgeproxy instances"
+    description     = "Valkey TLS port from forgeproxy instances"
   }
 
-  # KeyDB plaintext port from forgeproxy instances (for development/testing)
+  # Valkey plaintext port from forgeproxy instances (for development/testing)
   ingress {
     from_port       = 6379
     to_port         = 6379
     protocol        = "tcp"
     security_groups = [aws_security_group.forgeproxy[0].id]
-    description     = "KeyDB plaintext port from forgeproxy instances"
+    description     = "Valkey plaintext port from forgeproxy instances"
   }
 
   # All outbound
@@ -248,7 +248,7 @@ resource "aws_security_group" "keydb" {
   }
 
   tags = {
-    Name = "${var.name_prefix}-keydb-sg"
+    Name = "${var.name_prefix}-valkey-sg"
   }
 }
 

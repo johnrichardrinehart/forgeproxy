@@ -52,10 +52,10 @@ let
       http_listen: "0.0.0.0:8080"
       bundle_uri_base_url: "http://proxy:8080/bundles"
 
-    keydb:
-      endpoint: "keydb:6379"
+    valkey:
+      endpoint: "valkey:6379"
       tls: false
-      auth_token_env: "KEYDB_AUTH_TOKEN"
+      auth_token_env: "VALKEY_AUTH_TOKEN"
 
     auth:
       ssh_cache_ttl: 300
@@ -162,8 +162,8 @@ pkgs.testers.runNixOSTest {
         virtualisation.memorySize = 2048;
       };
 
-    # ── KeyDB / Redis ───────────────────────────────────────────────────
-    keydb =
+    # ── Valkey / Redis ───────────────────────────────────────────────────
+    valkey =
       {
         config,
         pkgs,
@@ -262,9 +262,9 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Infrastructure comes up ───────────────────────────────────────────
-    with subtest("KeyDB starts"):
-        keydb.wait_for_unit("redis-default.service")
-        keydb.wait_for_open_port(6379)
+    with subtest("Valkey starts"):
+        valkey.wait_for_unit("redis-default.service")
+        valkey.wait_for_open_port(6379)
 
     with subtest("Gitea starts"):
         ghe.wait_for_unit("gitea.service")
@@ -340,8 +340,8 @@ pkgs.testers.runNixOSTest {
     with subtest("Health endpoint responds with LFU policy active"):
         result = proxy.succeed("curl -sf http://localhost:8080/healthz")
         health = json.loads(result)
-        assert health["checks"]["keydb"]["ok"] is True, \
-            f"KeyDB health check failed: {result}"
+        assert health["checks"]["valkey"]["ok"] is True, \
+            f"Valkey health check failed: {result}"
 
     # ── Clone all 3 repos through the proxy ──────────────────────────────
     with subtest("Clone repos through proxy"):
@@ -360,41 +360,41 @@ pkgs.testers.runNixOSTest {
                 f"test -d /var/cache/forgeproxy/repos/octocat/{repo}.git"
             )
 
-    # ── Seed KeyDB with LFU-relevant metadata ────────────────────────────
-    with subtest("Seed KeyDB with clone_count and bundle_list_key"):
+    # ── Seed Valkey with LFU-relevant metadata ────────────────────────────
+    with subtest("Seed Valkey with clone_count and bundle_list_key"):
         # repo-a: most popular (clone_count = 100)
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-a'"
+            "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-a'"
             " clone_count 100"
         )
         # repo-b: medium popularity (clone_count = 50)
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-b'"
+            "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-b'"
             " clone_count 50"
         )
         # repo-c: least popular (clone_count = 1)
         proxy.succeed(
-            "redis-cli -h keydb HSET 'forgeproxy:repo:octocat/repo-c'"
+            "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-c'"
             " clone_count 1"
         )
 
         # Set bundle_list_key for all repos (required for eviction eligibility)
         for repo in ["repo-a", "repo-b", "repo-c"]:
             proxy.succeed(
-                f"redis-cli -h keydb HSET 'forgeproxy:repo:octocat/{repo}'"
+                f"redis-cli -h valkey HSET 'forgeproxy:repo:octocat/{repo}'"
                 f" bundle_list_key 's3://test-bucket/octocat/{repo}/bundle-list'"
             )
 
-    # ── Verify KeyDB state is correct ─────────────────────────────────────
-    with subtest("Verify KeyDB clone_count values are set correctly"):
+    # ── Verify Valkey state is correct ─────────────────────────────────────
+    with subtest("Verify Valkey clone_count values are set correctly"):
         count_a = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-a' clone_count"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-a' clone_count"
         ).strip()
         count_b = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-b' clone_count"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-b' clone_count"
         ).strip()
         count_c = proxy.succeed(
-            "redis-cli -h keydb HGET 'forgeproxy:repo:octocat/repo-c' clone_count"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-c' clone_count"
         ).strip()
 
         assert count_a == "100", f"Expected repo-a clone_count=100, got {count_a}"
@@ -402,7 +402,7 @@ pkgs.testers.runNixOSTest {
         assert count_c == "1", f"Expected repo-c clone_count=1, got {count_c}"
 
     # ── Verify proxy is still healthy after seeding ───────────────────────
-    with subtest("Proxy remains healthy after KeyDB seeding"):
+    with subtest("Proxy remains healthy after Valkey seeding"):
         result = proxy.succeed("curl -sf http://localhost:8080/healthz")
         health = json.loads(result)
         assert health["status"] in ("ok", "degraded"), \

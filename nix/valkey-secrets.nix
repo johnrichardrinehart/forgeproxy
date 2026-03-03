@@ -5,19 +5,19 @@
 }:
 
 let
-  cfg = config.services.keydb-secrets;
+  cfg = config.services.valkey-secrets;
 in
 {
-  options.services.keydb-secrets = {
-    enable = lib.mkEnableOption "auth secrets loader for KeyDB";
+  options.services.valkey-secrets = {
+    enable = lib.mkEnableOption "auth secrets loader for Valkey";
 
     providerScript = lib.mkOption {
       type = lib.types.package;
       description = ''
-        Derivation containing a script that fetches the KeyDB authentication
+        Derivation containing a script that fetches the Valkey authentication
         token from a secrets manager (e.g., AWS Secrets Manager) and writes the
-        requirepass value to services.keydb.extraConfFile.
-        Users provide this derivation; see flake.nix awsKeydbAuthProvider for reference.
+        requirepass value to services.valkey.extraConfFile.
+        Users provide this derivation; see flake.nix awsValkeyAuthProvider for reference.
       '';
     };
 
@@ -30,10 +30,10 @@ in
     };
   };
 
-  config = lib.mkIf (cfg.enable && (config.services.keydb.enable or false)) {
-    services.keydb.extraConfFile = "/run/keydb/runtime.conf";
+  config = lib.mkIf (cfg.enable && (config.services.valkey.enable or false)) {
+    services.valkey.extraConfFile = "/run/valkey/runtime.conf";
 
-    systemd.services.keydb = {
+    systemd.services.valkey = {
       environment = cfg.environment;
       serviceConfig.ExecStartPre = [ "${cfg.providerScript}" ];
     };

@@ -28,7 +28,7 @@ pub enum HealthStatus {
 
 #[derive(Debug, Serialize)]
 pub struct HealthChecks {
-    pub keydb: CheckResult,
+    pub valkey: CheckResult,
     pub ghe: CheckResult,
     pub disk: CheckResult,
 }
@@ -66,7 +66,7 @@ impl CheckResult {
 #[derive(Clone)]
 pub struct HealthState {
     pub config: Arc<Config>,
-    pub keydb: fred::clients::Pool,
+    pub valkey: fred::clients::Pool,
     pub http_client: reqwest::Client,
 }
 
@@ -74,7 +74,7 @@ pub struct HealthState {
 // Individual checks
 // ---------------------------------------------------------------------------
 
-async fn check_keydb(pool: &fred::clients::Pool) -> CheckResult {
+async fn check_valkey(pool: &fred::clients::Pool) -> CheckResult {
     match fred::interfaces::ClientLike::ping::<String>(pool, None).await {
         Ok(_) => CheckResult::healthy(),
         Err(e) => CheckResult::unhealthy(format!("PING failed: {e}")),
@@ -153,8 +153,8 @@ fn fs_capacity_for(_path: &std::path::Path) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 fn aggregate_status(checks: &HealthChecks) -> HealthStatus {
-    let all_ok = checks.keydb.ok && checks.ghe.ok && checks.disk.ok;
-    let any_critical = !checks.keydb.ok; // KeyDB is required for operation
+    let all_ok = checks.valkey.ok && checks.ghe.ok && checks.disk.ok;
+    let any_critical = !checks.valkey.ok; // Valkey is required for operation
 
     if all_ok {
         HealthStatus::Ok
@@ -171,13 +171,13 @@ fn aggregate_status(checks: &HealthChecks) -> HealthStatus {
 
 /// `GET /healthz` handler.  Returns 200 on Ok/Degraded, 503 on Unhealthy.
 pub async fn health_handler(State(state): State<HealthState>) -> impl IntoResponse {
-    let (keydb, ghe, disk) = tokio::join!(
-        check_keydb(&state.keydb),
+    let (valkey, ghe, disk) = tokio::join!(
+        check_valkey(&state.valkey),
         check_ghe(&state.http_client, &state.config.upstream.api_url),
         check_disk(&state.config),
     );
 
-    let checks = HealthChecks { keydb, ghe, disk };
+    let checks = HealthChecks { valkey, ghe, disk };
     let status = aggregate_status(&checks);
     let body = HealthResponse { status, checks };
 

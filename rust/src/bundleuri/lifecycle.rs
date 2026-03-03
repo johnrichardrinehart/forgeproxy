@@ -4,7 +4,7 @@
 //!
 //! 1. Scan the repo registry for repos that need a background fetch from the upstream forge.
 //! 2. Generate incremental bundles after each fetch.
-//! 3. Upload bundles to S3 and update the KeyDB registry.
+//! 3. Upload bundles to S3 and update the Valkey registry.
 //! 4. Consolidate hourly bundles into daily bundles.
 //! 5. Consolidate daily bundles into a new base bundle.
 //!
@@ -53,7 +53,7 @@ pub async fn run_bundle_lifecycle(state: Arc<AppState>) {
 /// those that are due for a fetch and bundle refresh.
 #[instrument(skip(state))]
 async fn tick(state: &AppState) -> Result<()> {
-    let repos = crate::coordination::registry::list_all_repos(&state.keydb).await?;
+    let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
     debug!(repo_count = repos.len(), "lifecycle tick: scanning repos");
 
     for owner_repo in &repos {
@@ -74,14 +74,14 @@ async fn tick(state: &AppState) -> Result<()> {
 #[instrument(skip(state), fields(%owner_repo))]
 async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     // 1. Read the dynamic fetch schedule for this repo.
-    let schedule = crate::coordination::registry::get_fetch_schedule(&state.keydb, owner_repo)
+    let schedule = crate::coordination::registry::get_fetch_schedule(&state.valkey, owner_repo)
         .await?
         .unwrap_or_default();
 
     // 2. Check if the repo is due for a fetch.
     // Use the repo info's last_fetch_ts to determine timing.
     let now = Utc::now().timestamp() as u64;
-    let repo_info = crate::coordination::registry::get_repo_info(&state.keydb, owner_repo).await?;
+    let repo_info = crate::coordination::registry::get_repo_info(&state.valkey, owner_repo).await?;
     let last_fetch = repo_info
         .as_ref()
         .map(|r| r.last_fetch_ts as u64)
@@ -100,7 +100,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
     // 3. Check minimum clone count threshold before investing in bundles.
     let repo_key = crate::coordination::registry::repo_key(owner_repo);
-    let clone_count: Option<i64> = HashesInterface::hget(&state.keydb, &repo_key, "clone_count")
+    let clone_count: Option<i64> = HashesInterface::hget(&state.valkey, &repo_key, "clone_count")
         .await
         .unwrap_or(None);
     let min_clones = state.config.bundles.min_clone_count_for_bundles;
@@ -119,7 +119,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     let lock_ttl = state.config.bundles.bundle_lock_ttl;
     let node_id = crate::coordination::node::node_id();
     let lock_acquired =
-        crate::coordination::locks::acquire_lock(&state.keydb, &lock_key, &node_id, lock_ttl)
+        crate::coordination::locks::acquire_lock(&state.valkey, &lock_key, &node_id, lock_ttl)
             .await?;
 
     if !lock_acquired {
@@ -167,13 +167,13 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             "repo not locally cached; skipping bundle generation"
         );
         // Release lock and return.
-        let _ = crate::coordination::locks::release_lock(&state.keydb, &lock_key, &node_id).await;
+        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
         return Ok(());
     };
 
     // 6. Record fetch timestamp in repo info.
     crate::coordination::registry::update_repo_field(
-        &state.keydb,
+        &state.valkey,
         owner_repo,
         "last_fetch_ts",
         &now.to_string(),
@@ -194,9 +194,9 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                 update_fetch_schedule(state, owner_repo, result.bytes_received).await?;
 
             // 8. Generate an incremental bundle.
-            // Read the previously recorded refs (if any) from KeyDB.
+            // Read the previously recorded refs (if any) from Valkey.
             let prev_refs_json: Option<String> =
-                HashesInterface::hget(&state.keydb, &repo_key, "prev_refs")
+                HashesInterface::hget(&state.valkey, &repo_key, "prev_refs")
                     .await
                     .unwrap_or(None);
 
@@ -245,7 +245,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                     let current_refs = crate::bundleuri::generator::get_refs(&repo_path).await?;
                     let refs_json = serde_json::to_string(&current_refs)?;
                     HashesInterface::hset::<(), _, _>(
-                        &state.keydb,
+                        &state.valkey,
                         &repo_key,
                         [
                             ("prev_refs", refs_json.as_str()),
@@ -313,7 +313,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     }
 
     // Release the distributed lock.
-    let _ = crate::coordination::locks::release_lock(&state.keydb, &lock_key, &node_id).await;
+    let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
 
     Ok(())
 }
@@ -369,7 +369,7 @@ pub async fn update_fetch_schedule(
     owner_repo: &str,
     delta_bytes: u64,
 ) -> Result<Duration> {
-    let current = crate::coordination::registry::get_fetch_schedule(&state.keydb, owner_repo)
+    let current = crate::coordination::registry::get_fetch_schedule(&state.valkey, owner_repo)
         .await?
         .unwrap_or_default();
 
@@ -426,7 +426,7 @@ pub async fn update_fetch_schedule(
         max_interval: current.max_interval,
         last_delta_bytes: delta_bytes,
     };
-    crate::coordination::registry::set_fetch_schedule(&state.keydb, owner_repo, &new_schedule)
+    crate::coordination::registry::set_fetch_schedule(&state.valkey, owner_repo, &new_schedule)
         .await?;
 
     Ok(Duration::from_secs(new_interval))
@@ -469,7 +469,7 @@ pub async fn run_daily_consolidation(state: Arc<AppState>) {
 
 /// Perform one round of daily consolidation across all repos.
 async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
-    let repos = crate::coordination::registry::list_all_repos(&state.keydb).await?;
+    let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
 
     for owner_repo in &repos {
         // Check if bundles are disabled for this repo.
@@ -507,7 +507,7 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
                     Utc::now().format("%Y%m%d"),
                 );
                 HashesInterface::hset::<(), _, _>(
-                    &state.keydb,
+                    &state.valkey,
                     &repo_key,
                     [
                         ("latest_daily_bundle_s3_key", s3_key.as_str()),
@@ -617,7 +617,7 @@ pub async fn run_weekly_consolidation(state: Arc<AppState>) {
 
 /// Perform one round of weekly consolidation across all repos.
 async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
-    let repos = crate::coordination::registry::list_all_repos(&state.keydb).await?;
+    let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
 
     for owner_repo in &repos {
         if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo.as_str())
@@ -651,7 +651,7 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
                     Utc::now().format("%Y%m%d"),
                 );
                 HashesInterface::hset::<(), _, _>(
-                    &state.keydb,
+                    &state.valkey,
                     &repo_key,
                     [
                         ("base_bundle_s3_key", s3_key.as_str()),

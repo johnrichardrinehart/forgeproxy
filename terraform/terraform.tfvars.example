@@ -19,11 +19,11 @@ bundle_bucket_name = "my-org-forgeproxy-bundles-12345"
 # Instance types and counts
 forgeproxy_instance_type = "t3.large"
 forgeproxy_count         = 1
-keydb_instance_type      = "r6i.large"
+valkey_instance_type      = "r6i.large"
 
 # Volume sizes (GB)
 forgeproxy_root_volume_gb = 50
-keydb_root_volume_gb      = 50
+valkey_root_volume_gb      = 50
 
 # Network configuration
 vpc_cidr           = "10.0.0.0/16"

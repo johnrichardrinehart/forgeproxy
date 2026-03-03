@@ -187,6 +187,8 @@
               ];
           };
 
+          legacyPackages = pkgs;
+
           packages = {
             forgeproxy = pkgs.callPackage ./nix/package.nix { };
             forgeproxy-fips = pkgs.callPackage ./nix/package.nix { fipsEnabled = true; };
@@ -208,8 +210,8 @@
 
         nixosModules = {
           forgeproxy = ./nix/module.nix;
-          keydb = ./nix/keydb.nix;
-          keydb-tls = ./nix/keydb-tls.nix;
+          valkey = ./nix/valkey.nix;
+          valkey-tls = ./nix/valkey-tls.nix;
           nginx = ./nix/nginx.nix;
           hardening = ./nix/hardening.nix;
           secrets = ./nix/secrets.nix;
@@ -217,7 +219,7 @@
           backend = ./nix/backend.nix;
           compliance = ./nix/compliance/default.nix;
           proxy-host = ./nix/proxy-host.nix;
-          keydb-host = ./nix/keydb-host.nix;
+          valkey-host = ./nix/valkey-host.nix;
           dev = ./nix/dev.nix;
           ghe-key-lookup = ./nix/ghe-key-lookup/module.nix;
           ghe-key-lookup-host = ./nix/ghe-key-lookup/host.nix;
@@ -270,12 +272,12 @@
                     --secret-id "$(resolve service-config)" \
                     --query 'SecretString' --output text > /run/forgeproxy/config.yaml
 
-                  # ── Write KeyDB CA cert (for TLS verification) ─────────────────────
-                  KEYDB_CA_SECRET=$(resolve keydb-tls-ca)
-                  if [ "$KEYDB_CA_SECRET" != "null" ]; then
+                  # ── Write Valkey CA cert (for TLS verification) ─────────────────────
+                  VALKEY_CA_SECRET=$(resolve valkey-tls-ca)
+                  if [ "$VALKEY_CA_SECRET" != "null" ]; then
                     ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                      --secret-id "$KEYDB_CA_SECRET" \
-                      --query 'SecretString' --output text > /run/forgeproxy/keydb-ca.pem
+                      --secret-id "$VALKEY_CA_SECRET" \
+                      --query 'SecretString' --output text > /run/forgeproxy/valkey-ca.pem
                   fi
 
                   # ── Load per-org credentials into the kernel keyring ──────────────
@@ -300,7 +302,7 @@
                   # up from the user keyring (same pattern as org credentials).
                   declare -A SUFFIX_TO_ENV=(
                     [forge-admin-token]=FORGE_ADMIN_TOKEN
-                    [keydb-auth-token]=KEYDB_AUTH_TOKEN
+                    [valkey-auth-token]=VALKEY_AUTH_TOKEN
                     [webhook-secret]=FORGE_WEBHOOK_SECRET
                   )
 
@@ -382,12 +384,12 @@
           ];
         };
 
-        nixosConfigurations.keydb = inputs.nixpkgs.lib.nixosSystem {
+        nixosConfigurations.valkey = inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
           modules = [
             { nixpkgs.overlays = [ self.overlays.default ]; }
             inputs.sops-nix.nixosModules.sops
-            self.nixosModules.keydb-host
+            self.nixosModules.valkey-host
             self.nixosModules.ami
 
             # ── AWS provider configuration ──────────────────────────────────────
@@ -399,7 +401,7 @@
                 ...
               }:
               let
-                awsKeydbAuthProvider = pkgs.writeShellScript "keydb-aws-auth-provider" ''
+                awsValkeyAuthProvider = pkgs.writeShellScript "valkey-aws-auth-provider" ''
                   set -euo pipefail
 
                   # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
@@ -425,14 +427,14 @@
                       --secret-id "$(resolve "$1")" --query 'SecretString' --output text
                   }
 
-                  # Write runtime conf (second keydb-server arg, overrides requirepass from main conf)
-                  # Path matches services.keydb.extraConfFile (default: /run/keydb/runtime.conf)
-                  printf 'requirepass %s\n' "$(fetch keydb-auth-token)" \
-                    > /run/keydb/runtime.conf
-                  chmod 600 /run/keydb/runtime.conf
+                  # Write runtime conf (second valkey-server arg, overrides requirepass from main conf)
+                  # Path matches services.valkey.extraConfFile (default: /run/valkey/runtime.conf)
+                  printf 'requirepass %s\n' "$(fetch valkey-auth-token)" \
+                    > /run/valkey/runtime.conf
+                  chmod 600 /run/valkey/runtime.conf
                 '';
 
-                awsKeydbTlsProvider = pkgs.writeShellScript "keydb-aws-tls-provider" ''
+                awsValkeyTlsProvider = pkgs.writeShellScript "valkey-aws-tls-provider" ''
                   set -euo pipefail
 
                   # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
@@ -458,26 +460,26 @@
                       --secret-id "$(resolve "$1")" --query 'SecretString' --output text
                   }
 
-                  # Write TLS material to paths configured in services.keydb.tls.{certFile,keyFile,caFile}
-                  # (defaults: /var/lib/keydb/tls/{cert,key,ca}.pem — writable under ProtectSystem=strict)
-                  mkdir -p /var/lib/keydb/tls
-                  fetch keydb-tls-cert > /var/lib/keydb/tls/cert.pem
-                  fetch keydb-tls-key  > /var/lib/keydb/tls/key.pem
-                  fetch keydb-tls-ca   > /var/lib/keydb/tls/ca.pem
-                  chmod 600 /var/lib/keydb/tls/key.pem
+                  # Write TLS material to paths configured in services.valkey.tls.{certFile,keyFile,caFile}
+                  # (defaults: /var/lib/valkey/tls/{cert,key,ca}.pem — writable under ProtectSystem=strict)
+                  mkdir -p /var/lib/valkey/tls
+                  fetch valkey-tls-cert > /var/lib/valkey/tls/cert.pem
+                  fetch valkey-tls-key  > /var/lib/valkey/tls/key.pem
+                  fetch valkey-tls-ca   > /var/lib/valkey/tls/ca.pem
+                  chmod 600 /var/lib/valkey/tls/key.pem
                 '';
               in
               {
-                services.keydb.tls.enable = lib.mkDefault true;
+                services.valkey.tls.enable = lib.mkDefault true;
 
-                services.keydb-secrets = lib.mkDefault {
+                services.valkey-secrets = lib.mkDefault {
                   enable = true;
-                  providerScript = awsKeydbAuthProvider;
+                  providerScript = awsValkeyAuthProvider;
                 };
 
-                services.keydb-tls = {
-                  enable = lib.mkDefault config.services.keydb.tls.enable;
-                  providerScript = awsKeydbTlsProvider;
+                services.valkey-tls = {
+                  enable = lib.mkDefault config.services.valkey.tls.enable;
+                  providerScript = awsValkeyTlsProvider;
                 };
               }
             )
@@ -488,7 +490,7 @@
           modules = [ self.nixosModules.dev ];
         };
 
-        nixosConfigurations.keydb-dev = self.nixosConfigurations.keydb.extendModules {
+        nixosConfigurations.valkey-dev = self.nixosConfigurations.valkey.extendModules {
           modules = [ self.nixosModules.dev ];
         };
 

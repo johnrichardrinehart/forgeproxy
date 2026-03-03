@@ -1,10 +1,10 @@
-//! Least Recently Used (LRU) eviction policy backed by KeyDB.
+//! Least Recently Used (LRU) eviction policy backed by Valkey.
 //!
 //! Ranks repos by ascending `last_fetch_ts` — repos that were fetched longest
 //! ago are evicted first.
 //!
 //! Repos that are marked as "pinned" via the `eviction_priority` field in
-//! their KeyDB hash are never returned as eviction candidates.
+//! their Valkey hash are never returned as eviction candidates.
 
 use anyhow::Result;
 use fred::interfaces::HashesInterface;
@@ -17,10 +17,10 @@ use tracing::debug;
 /// Return up to `count` repos from `repos` ordered by ascending last-fetch
 /// timestamp (least recently used first).
 ///
-/// Repos whose `eviction_priority` field is set to `"pinned"` in KeyDB are
+/// Repos whose `eviction_priority` field is set to `"pinned"` in Valkey are
 /// excluded and will never be returned as eviction candidates.
 pub async fn get_eviction_candidates(
-    keydb: &fred::clients::Pool,
+    valkey: &fred::clients::Pool,
     repos: &[String],
     count: usize,
 ) -> Result<Vec<String>> {
@@ -33,9 +33,9 @@ pub async fn get_eviction_candidates(
     for owner_repo in repos {
         let key = crate::coordination::registry::repo_key(owner_repo);
 
-        let last_fetch_ts: Option<i64> = keydb.hget(&key, "last_fetch_ts").await.unwrap_or(None);
+        let last_fetch_ts: Option<i64> = valkey.hget(&key, "last_fetch_ts").await.unwrap_or(None);
 
-        let priority: Option<String> = keydb.hget(&key, "eviction_priority").await.unwrap_or(None);
+        let priority: Option<String> = valkey.hget(&key, "eviction_priority").await.unwrap_or(None);
 
         // Never evict pinned repos.
         if priority.as_deref() == Some("pinned") {

@@ -1,5 +1,5 @@
-# Random password for KeyDB authentication
-resource "random_password" "keydb_auth" {
+# Random password for Valkey authentication
+resource "random_password" "valkey_auth" {
   length  = 32
   special = true
 }
@@ -19,25 +19,27 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
   secret_id = aws_secretsmanager_secret.forgeproxy_config.id
 
   secret_string = templatefile("${path.module}/templates/service-config.yaml.tpl", {
-    upstream_hostname     = var.upstream_hostname
-    upstream_api_url      = var.upstream_api_url
-    backend_type          = var.backend_type
-    proxy_fqdn            = var.proxy_fqdn
-    keydb_private_ip      = aws_instance.keydb.private_ip
-    keydb_enable_tls      = local.keydb_tls_enable
-    backend_port          = local.backend_port
-    bundle_bucket         = aws_s3_bucket.bundle.id
-    s3_bundle_prefix      = var.s3_bundle_prefix
-    aws_region            = var.aws_region
-    s3_use_fips           = var.s3_use_fips
-    s3_presigned_url_ttl  = var.s3_presigned_url_ttl
-    local_cache_max_bytes = var.local_cache_max_bytes
-    eviction_policy       = var.eviction_policy
-    otlp_enabled          = var.otlp_endpoint != "" ? true : false
-    otlp_endpoint         = var.otlp_endpoint != "" ? var.otlp_endpoint : ""
-    log_level             = var.log_level
-    name_prefix           = var.name_prefix
-    org_creds             = var.org_creds
+    upstream_hostname      = var.upstream_hostname
+    upstream_api_url       = var.upstream_api_url
+    backend_type           = var.backend_type
+    proxy_fqdn             = var.proxy_fqdn
+    valkey_private_ip      = aws_instance.valkey.private_ip
+    valkey_enable_tls      = local.valkey_tls_enable
+    backend_port           = local.backend_port
+    bundle_bucket          = aws_s3_bucket.bundle.id
+    s3_bundle_prefix       = var.s3_bundle_prefix
+    aws_region             = var.aws_region
+    s3_use_fips            = var.s3_use_fips
+    s3_presigned_url_ttl   = var.s3_presigned_url_ttl
+    local_cache_max_bytes  = var.local_cache_max_bytes
+    eviction_policy        = var.eviction_policy
+    otlp_enabled           = var.otlp_endpoint != "" ? true : false
+    otlp_endpoint          = var.otlp_endpoint != "" ? var.otlp_endpoint : ""
+    log_level              = var.log_level
+    name_prefix            = var.name_prefix
+    org_creds              = var.org_creds
+    ghe_key_lookup_enabled = local.ghe_key_lookup_enabled
+    ghe_key_lookup_url     = local.ghe_key_lookup_enabled ? "http://${aws_lb.ghe_key_lookup[0].dns_name}:${local.ghe_key_lookup_listen_port}" : ""
   })
 }
 
@@ -61,20 +63,20 @@ resource "aws_secretsmanager_secret_version" "forge_admin_token" {
   }
 }
 
-# ── KeyDB Auth Token Secret ───────────────────────────────────────────────
-resource "aws_secretsmanager_secret" "keydb_auth_token" {
-  name_prefix = "${var.name_prefix}/keydb-auth-token-"
-  description = "Authentication token for KeyDB"
+# ── Valkey Auth Token Secret ───────────────────────────────────────────────
+resource "aws_secretsmanager_secret" "valkey_auth_token" {
+  name_prefix = "${var.name_prefix}/valkey-auth-token-"
+  description = "Authentication token for Valkey"
 
   tags = {
-    Name = "${var.name_prefix}-keydb-auth-token"
+    Name = "${var.name_prefix}-valkey-auth-token"
   }
 }
 
-resource "aws_secretsmanager_secret_version" "keydb_auth_token" {
-  secret_id = aws_secretsmanager_secret.keydb_auth_token.id
+resource "aws_secretsmanager_secret_version" "valkey_auth_token" {
+  secret_id = aws_secretsmanager_secret.valkey_auth_token.id
 
-  secret_string = random_password.keydb_auth.result
+  secret_string = random_password.valkey_auth.result
 }
 
 # ── Webhook Secret ────────────────────────────────────────────────────────
@@ -181,62 +183,62 @@ resource "aws_secretsmanager_secret_version" "nginx_tls_key" {
   secret_string = tls_private_key.nginx.private_key_pem
 }
 
-# ── KeyDB TLS Certificate Secret ──────────────────────────────────────────
-resource "aws_secretsmanager_secret" "keydb_tls_cert" {
-  count = local.keydb_tls_enable ? 1 : 0
+# ── Valkey TLS Certificate Secret ──────────────────────────────────────────
+resource "aws_secretsmanager_secret" "valkey_tls_cert" {
+  count = local.valkey_tls_enable ? 1 : 0
 
-  name_prefix = "${var.name_prefix}/keydb-tls-cert-"
-  description = "KeyDB TLS certificate (public part)"
+  name_prefix = "${var.name_prefix}/valkey-tls-cert-"
+  description = "Valkey TLS certificate (public part)"
 
   tags = {
-    Name = "${var.name_prefix}-keydb-tls-cert"
+    Name = "${var.name_prefix}-valkey-tls-cert"
   }
 }
 
-resource "aws_secretsmanager_secret_version" "keydb_tls_cert" {
-  count = local.keydb_tls_enable ? 1 : 0
+resource "aws_secretsmanager_secret_version" "valkey_tls_cert" {
+  count = local.valkey_tls_enable ? 1 : 0
 
-  secret_id = aws_secretsmanager_secret.keydb_tls_cert[0].id
+  secret_id = aws_secretsmanager_secret.valkey_tls_cert[0].id
 
-  secret_string = tls_locally_signed_cert.keydb[0].cert_pem
+  secret_string = tls_locally_signed_cert.valkey[0].cert_pem
 }
 
-# ── KeyDB TLS Key Secret ──────────────────────────────────────────────────
-resource "aws_secretsmanager_secret" "keydb_tls_key" {
-  count = local.keydb_tls_enable ? 1 : 0
+# ── Valkey TLS Key Secret ──────────────────────────────────────────────────
+resource "aws_secretsmanager_secret" "valkey_tls_key" {
+  count = local.valkey_tls_enable ? 1 : 0
 
-  name_prefix = "${var.name_prefix}/keydb-tls-key-"
-  description = "KeyDB TLS private key"
+  name_prefix = "${var.name_prefix}/valkey-tls-key-"
+  description = "Valkey TLS private key"
 
   tags = {
-    Name = "${var.name_prefix}-keydb-tls-key"
+    Name = "${var.name_prefix}-valkey-tls-key"
   }
 }
 
-resource "aws_secretsmanager_secret_version" "keydb_tls_key" {
-  count = local.keydb_tls_enable ? 1 : 0
+resource "aws_secretsmanager_secret_version" "valkey_tls_key" {
+  count = local.valkey_tls_enable ? 1 : 0
 
-  secret_id = aws_secretsmanager_secret.keydb_tls_key[0].id
+  secret_id = aws_secretsmanager_secret.valkey_tls_key[0].id
 
-  secret_string = tls_private_key.keydb[0].private_key_pem
+  secret_string = tls_private_key.valkey[0].private_key_pem
 }
 
-# ── KeyDB TLS CA Certificate Secret ───────────────────────────────────────
-resource "aws_secretsmanager_secret" "keydb_tls_ca" {
-  count = local.keydb_tls_enable ? 1 : 0
+# ── Valkey TLS CA Certificate Secret ───────────────────────────────────────
+resource "aws_secretsmanager_secret" "valkey_tls_ca" {
+  count = local.valkey_tls_enable ? 1 : 0
 
-  name_prefix = "${var.name_prefix}/keydb-tls-ca-"
-  description = "KeyDB TLS CA certificate"
+  name_prefix = "${var.name_prefix}/valkey-tls-ca-"
+  description = "Valkey TLS CA certificate"
 
   tags = {
-    Name = "${var.name_prefix}-keydb-tls-ca"
+    Name = "${var.name_prefix}-valkey-tls-ca"
   }
 }
 
-resource "aws_secretsmanager_secret_version" "keydb_tls_ca" {
-  count = local.keydb_tls_enable ? 1 : 0
+resource "aws_secretsmanager_secret_version" "valkey_tls_ca" {
+  count = local.valkey_tls_enable ? 1 : 0
 
-  secret_id = aws_secretsmanager_secret.keydb_tls_ca[0].id
+  secret_id = aws_secretsmanager_secret.valkey_tls_ca[0].id
 
   secret_string = tls_self_signed_cert.ca.cert_pem
 }
@@ -264,6 +266,61 @@ resource "aws_secretsmanager_secret_version" "org_creds" {
   secret_id = aws_secretsmanager_secret.org_creds[each.key].id
 
   secret_string = "REPLACE_ME_WITH_${upper(replace(each.value.name, "-", "_"))}_CREDENTIALS"
+
+  lifecycle {
+    ignore_changes = [secret_string]
+  }
+}
+
+# ── ghe-key-lookup Runtime Config Secret ───────────────────────────────────
+resource "aws_secretsmanager_secret" "ghe_key_lookup_config" {
+  count = local.ghe_key_lookup_enabled ? 1 : 0
+
+  name_prefix = "${var.name_prefix}/ghe-key-lookup-config-"
+  description = "Runtime TOML config for ghe-key-lookup sidecar"
+
+  tags = {
+    Name = "${var.name_prefix}-ghe-key-lookup-config"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "ghe_key_lookup_config" {
+  count = local.ghe_key_lookup_enabled ? 1 : 0
+
+  secret_id = aws_secretsmanager_secret.ghe_key_lookup_config[0].id
+  secret_string = templatefile("${path.module}/templates/ghe-key-lookup-config.toml.tpl", {
+    listen               = "0.0.0.0:${local.ghe_key_lookup_listen_port}"
+    identity_keyring_key = "GHE_KEY_LOOKUP_IDENTITY"
+    identity_env_var     = var.closure_variant == "dev" ? "GHE_KEY_LOOKUP_IDENTITY_PEM" : ""
+    identity_file        = var.closure_variant == "dev" ? "/run/ghe-key-lookup/admin-key" : ""
+    ssh_user             = var.ghe_key_lookup_ssh_user
+    ssh_target_endpoint  = var.ghe_key_lookup_ssh_target_endpoint
+    ssh_port             = var.ghe_key_lookup_ssh_port
+    ghe_url              = trimspace(var.ghe_key_lookup_ghe_url)
+    cache_ttl_pos        = var.ghe_key_lookup_cache_ttl_pos
+    cache_ttl_neg        = var.ghe_key_lookup_cache_ttl_neg
+  })
+}
+
+# ── ghe-key-lookup Admin Key Secret ────────────────────────────────────────
+resource "aws_secretsmanager_secret" "ghe_key_lookup_admin_key" {
+  count = local.ghe_key_lookup_enabled ? 1 : 0
+
+  name_prefix = "${var.name_prefix}/ghe-key-lookup-admin-key-"
+  description = "SSH private key used by ghe-key-lookup to reach the GHE admin console"
+
+  tags = {
+    Name = "${var.name_prefix}-ghe-key-lookup-admin-key"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "ghe_key_lookup_admin_key" {
+  count = local.ghe_key_lookup_enabled ? 1 : 0
+
+  secret_id     = aws_secretsmanager_secret.ghe_key_lookup_admin_key[0].id
+  secret_string = <<-EOT
+REPLACE_ME_WITH_GHE_ADMIN_PRIVATE_KEY
+EOT
 
   lifecycle {
     ignore_changes = [secret_string]

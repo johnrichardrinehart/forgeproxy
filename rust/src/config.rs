@@ -68,7 +68,7 @@ pub struct Config {
     pub backend_type: BackendType,
     pub upstream_credentials: UpstreamCredentials,
     pub proxy: ProxyConfig,
-    pub keydb: KeyDbConfig,
+    pub valkey: ValkeyConfig,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
@@ -174,20 +174,20 @@ pub struct ProxyConfig {
 }
 
 // ---------------------------------------------------------------------------
-// KeyDB / Redis
+// Valkey / Redis
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct KeyDbConfig {
-    /// Connection string (e.g. `rediss://keydb.local:6380`).
+pub struct ValkeyConfig {
+    /// Connection string (e.g. `rediss://valkey.local:6380`).
     pub endpoint: String,
-    /// Enable TLS for the KeyDB connection.
+    /// Enable TLS for the Valkey connection.
     #[serde(default = "bool_true")]
     pub tls: bool,
-    /// Path to an additional CA certificate to trust (e.g. self-signed KeyDB CA).
+    /// Path to an additional CA certificate to trust (e.g. self-signed Valkey CA).
     pub ca_cert_file: Option<String>,
-    /// Name of the environment variable that holds the KeyDB auth token.
-    #[serde(default = "default_keydb_auth_env")]
+    /// Name of the environment variable that holds the Valkey auth token.
+    #[serde(default = "default_valkey_auth_env")]
     pub auth_token_env: String,
 }
 
@@ -195,8 +195,8 @@ fn bool_true() -> bool {
     true
 }
 
-fn default_keydb_auth_env() -> String {
-    "KEYDB_AUTH_TOKEN".to_string()
+fn default_valkey_auth_env() -> String {
+    "VALKEY_AUTH_TOKEN".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +256,7 @@ pub struct CloneConfig {
     /// required to serve it.
     #[serde(default = "default_freshness_threshold")]
     pub freshness_threshold: u64,
-    /// TTL (seconds) of the distributed clone/fetch lock in KeyDB.
+    /// TTL (seconds) of the distributed clone/fetch lock in Valkey.
     #[serde(default = "default_lock_ttl")]
     pub lock_ttl: u64,
     /// How long (seconds) a waiter will block for the lock before giving up.

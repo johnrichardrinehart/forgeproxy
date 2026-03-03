@@ -139,9 +139,9 @@ resource "aws_iam_role_policy" "forgeproxy" {
   })
 }
 
-# ── IAM Role for KeyDB instance ─────────────────────────────────────────────
-resource "aws_iam_role" "keydb" {
-  name_prefix = "${var.name_prefix}-keydb-"
+# ── IAM Role for Valkey instance ─────────────────────────────────────────────
+resource "aws_iam_role" "valkey" {
+  name_prefix = "${var.name_prefix}-valkey-"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -157,22 +157,22 @@ resource "aws_iam_role" "keydb" {
   })
 
   tags = {
-    Name = "${var.name_prefix}-keydb-role"
+    Name = "${var.name_prefix}-valkey-role"
   }
 }
 
-resource "aws_iam_instance_profile" "keydb" {
-  name_prefix = "${var.name_prefix}-keydb-"
-  role        = aws_iam_role.keydb.name
+resource "aws_iam_instance_profile" "valkey" {
+  name_prefix = "${var.name_prefix}-valkey-"
+  role        = aws_iam_role.valkey.name
 }
 
-# Allow KeyDB instance to:
+# Allow Valkey instance to:
 # - Read secrets from Secrets Manager (TLS certs)
 # - Use SSM Session Manager for access
 # - Write CloudWatch logs
-resource "aws_iam_role_policy" "keydb" {
-  name_prefix = "${var.name_prefix}-keydb-"
-  role        = aws_iam_role.keydb.id
+resource "aws_iam_role_policy" "valkey" {
+  name_prefix = "${var.name_prefix}-valkey-"
+  role        = aws_iam_role.valkey.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -182,7 +182,7 @@ resource "aws_iam_role_policy" "keydb" {
         Action = [
           "secretsmanager:GetSecretValue",
         ]
-        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}/keydb-*"
+        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}/valkey-*"
       },
       {
         Effect   = "Allow"
@@ -207,7 +207,7 @@ resource "aws_iam_role_policy" "keydb" {
           "logs:CreateLogStream",
           "logs:PutLogEvents",
         ]
-        Resource = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/keydb-*"
+        Resource = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/valkey-*"
       },
     ]
   })

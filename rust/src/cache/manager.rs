@@ -111,10 +111,10 @@ impl CacheManager {
         // Select candidates using the configured eviction policy.
         let candidates = match self.eviction_policy {
             EvictionPolicy::Lfu => {
-                lfu::get_eviction_candidates(&state.keydb, &repos, repos.len()).await?
+                lfu::get_eviction_candidates(&state.valkey, &repos, repos.len()).await?
             }
             EvictionPolicy::Lru => {
-                lru::get_eviction_candidates(&state.keydb, &repos, repos.len()).await?
+                lru::get_eviction_candidates(&state.valkey, &repos, repos.len()).await?
             }
         };
 
@@ -123,7 +123,7 @@ impl CacheManager {
 
         for owner_repo in &candidates {
             // Collect metadata for telemetry before we possibly evict.
-            let info = crate::coordination::registry::get_repo_info(&state.keydb, owner_repo)
+            let info = crate::coordination::registry::get_repo_info(&state.valkey, owner_repo)
                 .await
                 .ok()
                 .flatten();
@@ -152,14 +152,14 @@ impl CacheManager {
             // Safety: never evict a repo that has no S3 bundle backup.
             let bundle_key = format!("forgeproxy:repo:{owner_repo}");
             let has_bundle: Option<String> =
-                HashesInterface::hget(&state.keydb, &bundle_key, "bundle_list_key")
+                HashesInterface::hget(&state.valkey, &bundle_key, "bundle_list_key")
                     .await
                     .unwrap_or(None);
 
             if has_bundle.is_none() {
                 warn!(
                     repo = %owner_repo,
-                    "skipping eviction: no S3 bundle backup recorded in KeyDB"
+                    "skipping eviction: no S3 bundle backup recorded in Valkey"
                 );
                 if telemetry.is_some() {
                     repo_details.push(super::telemetry::RepoDetail {
@@ -182,10 +182,10 @@ impl CacheManager {
                 debug!(repo = %owner_repo, path = %path.display(), "evicted repo from local cache");
             }
 
-            // Update KeyDB registry: mark repo as not locally cached.
+            // Update Valkey registry: mark repo as not locally cached.
             let registry_key = format!("forgeproxy:repo:{owner_repo}");
             HashesInterface::hset::<(), _, _>(
-                &state.keydb,
+                &state.valkey,
                 &registry_key,
                 [("local_cached", "false")],
             )

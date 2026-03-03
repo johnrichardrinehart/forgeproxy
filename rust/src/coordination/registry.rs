@@ -45,7 +45,7 @@ pub struct FetchSchedule {
 
 pub(crate) fn repo_key(owner_repo: &str) -> String {
     // Normalize: strip trailing ".git" so that "owner/repo" and
-    // "owner/repo.git" map to the same KeyDB key.
+    // "owner/repo.git" map to the same Valkey key.
     let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
     format!("forgeproxy:repo:{normalized}")
 }
@@ -230,8 +230,8 @@ pub async fn is_repo_cached_and_fresh(state: &crate::AppState, owner_repo: &str)
         return Ok(false);
     }
 
-    // Look up the last fetch timestamp in KeyDB.
-    let info = get_repo_info(&state.keydb, owner_repo).await?;
+    // Look up the last fetch timestamp in Valkey.
+    let info = get_repo_info(&state.valkey, owner_repo).await?;
     let last_fetch_ts = match info {
         Some(ref ri) => ri.last_fetch_ts as u64,
         None => return Ok(false),
@@ -253,7 +253,7 @@ pub async fn is_repo_cached_and_fresh(state: &crate::AppState, owner_repo: &str)
 ///
 /// Acquires a distributed lock so that only one node clones at a time.  If
 /// the lock is already held, waits for the cloning node to finish.  After the
-/// clone completes the repo is registered in KeyDB and a "ready" notification
+/// clone completes the repo is registered in Valkey and a "ready" notification
 /// is published.
 pub async fn ensure_repo_cloned(
     state: &crate::AppState,
@@ -270,7 +270,7 @@ pub async fn ensure_repo_cloned(
 
     // Try to acquire the distributed clone lock.
     let lock_acquired = crate::coordination::locks::acquire_lock(
-        &state.keydb,
+        &state.valkey,
         &lock_key,
         &node_id,
         state.config.clone.lock_ttl,
@@ -280,7 +280,7 @@ pub async fn ensure_repo_cloned(
     if !lock_acquired {
         // Another node is cloning; wait for it.
         let timeout = std::time::Duration::from_secs(state.config.clone.lock_wait_timeout);
-        crate::coordination::locks::wait_for_lock(&state.keydb, &lock_key, timeout).await?;
+        crate::coordination::locks::wait_for_lock(&state.valkey, &lock_key, timeout).await?;
         return Ok(());
     }
 
@@ -325,7 +325,7 @@ pub async fn ensure_repo_cloned(
 
         crate::git::commands::git_clone_bare(&clone_url, &repo_path, &env_vars).await?;
 
-        // Register in KeyDB.
+        // Register in Valkey.
         let now = chrono::Utc::now().timestamp();
         let info = RepoInfo {
             status: "ready".to_string(),
@@ -333,17 +333,17 @@ pub async fn ensure_repo_cloned(
             last_fetch_ts: now,
             ..Default::default()
         };
-        set_repo_info(&state.keydb, &owner_repo, &info).await?;
+        set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
         // Publish ready notification.
-        crate::coordination::pubsub::publish_ready(&state.keydb, &owner_repo, &node_id).await?;
+        crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id).await?;
 
         Ok::<(), anyhow::Error>(())
     }
     .await;
 
     // Always release the lock.
-    let _ = crate::coordination::locks::release_lock(&state.keydb, &lock_key, &node_id).await;
+    let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
 
     result
 }

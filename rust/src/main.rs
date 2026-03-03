@@ -48,7 +48,7 @@ struct Cli {
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
-    pub keydb: Pool,
+    pub valkey: Pool,
     pub s3_client: aws_sdk_s3::Client,
     pub metrics: MetricsRegistry,
     pub http_client: reqwest::Client,
@@ -65,15 +65,15 @@ pub struct AppState {
 }
 
 // ---------------------------------------------------------------------------
-// KeyDB pool setup
+// Valkey pool setup
 // ---------------------------------------------------------------------------
 
-async fn build_keydb_pool(config: &Config) -> Result<Pool> {
+async fn build_valkey_pool(config: &Config) -> Result<Pool> {
     let auth_token =
-        crate::credentials::keyring::resolve_secret(&config.keydb.auth_token_env).await;
+        crate::credentials::keyring::resolve_secret(&config.valkey.auth_token_env).await;
 
     let endpoint = config
-        .keydb
+        .valkey
         .endpoint
         .trim_start_matches("rediss://")
         .trim_start_matches("redis://");
@@ -85,7 +85,7 @@ async fn build_keydb_pool(config: &Config) -> Result<Pool> {
         ..FredConfig::default()
     };
 
-    if config.keydb.tls {
+    if config.valkey.tls {
         let mut root_store = rustls::RootCertStore::empty();
 
         // Load native system root certificates.
@@ -93,8 +93,8 @@ async fn build_keydb_pool(config: &Config) -> Result<Pool> {
             root_store.add(cert).ok();
         }
 
-        // Load an additional CA cert (e.g. self-signed KeyDB CA) if configured.
-        if let Some(ref path) = config.keydb.ca_cert_file {
+        // Load an additional CA cert (e.g. self-signed Valkey CA) if configured.
+        if let Some(ref path) = config.valkey.ca_cert_file {
             let pem = std::fs::read(path)
                 .with_context(|| format!("failed to read CA cert file: {path}"))?;
             let certs = rustls_pemfile::certs(&mut pem.as_slice())
@@ -121,9 +121,9 @@ async fn build_keydb_pool(config: &Config) -> Result<Pool> {
     builder.set_policy(ReconnectPolicy::new_exponential(0, 100, 30_000, 2));
 
     let pool = builder.build_pool(3)?;
-    pool.init().await.context("failed to connect to KeyDB")?;
+    pool.init().await.context("failed to connect to Valkey")?;
 
-    tracing::info!("KeyDB pool initialised");
+    tracing::info!("Valkey pool initialised");
     Ok(pool)
 }
 
@@ -210,7 +210,7 @@ async fn run_bundle_lifecycle(state: AppState) -> Result<()> {
 }
 
 async fn run_node_heartbeat(state: AppState) -> Result<()> {
-    coordination::node::run_heartbeat(state.keydb.clone(), state.node_id.clone()).await;
+    coordination::node::run_heartbeat(state.valkey.clone(), state.node_id.clone()).await;
     Ok(())
 }
 
@@ -279,7 +279,7 @@ async fn main() -> Result<()> {
         })?;
 
     // ---- Infrastructure clients ----
-    let keydb = build_keydb_pool(&config).await?;
+    let valkey = build_valkey_pool(&config).await?;
     let s3 = build_s3_client(&config).await?;
 
     let http_client = reqwest::Client::builder()
@@ -316,7 +316,7 @@ async fn main() -> Result<()> {
     // ---- App state ----
     let state = AppState {
         config: Arc::clone(&config),
-        keydb,
+        valkey,
         s3_client: s3,
         metrics,
         http_client,

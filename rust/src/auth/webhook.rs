@@ -1,7 +1,7 @@
 //! Webhook receiver for cache invalidation and event processing.
 //!
 //! Validates the webhook signature via the [`ForgeBackend`] trait, parses the
-//! event type, and invalidates the appropriate KeyDB auth cache entries so that
+//! event type, and invalidates the appropriate Valkey auth cache entries so that
 //! permission changes take effect without waiting for TTL expiry.
 
 use axum::http::{HeaderMap, StatusCode};
@@ -63,10 +63,10 @@ async fn invalidate_repo_auth(state: &AppState, full_name: &str) {
     let http_pattern = format!("forgeproxy:http:auth:*:{full_name}");
     let ssh_pattern = format!("forgeproxy:ssh:access:*:{full_name}");
 
-    let http_count = cache::invalidate_auth(&state.keydb, &http_pattern)
+    let http_count = cache::invalidate_auth(&state.valkey, &http_pattern)
         .await
         .unwrap_or(0);
-    let ssh_count = cache::invalidate_auth(&state.keydb, &ssh_pattern)
+    let ssh_count = cache::invalidate_auth(&state.valkey, &ssh_pattern)
         .await
         .unwrap_or(0);
 
@@ -83,10 +83,10 @@ async fn invalidate_org_auth(state: &AppState, org: &str) {
     let http_pattern = format!("forgeproxy:http:auth:*:{org}/*");
     let ssh_pattern = format!("forgeproxy:ssh:access:*:{org}/*");
 
-    let http_count = cache::invalidate_auth(&state.keydb, &http_pattern)
+    let http_count = cache::invalidate_auth(&state.valkey, &http_pattern)
         .await
         .unwrap_or(0);
-    let ssh_count = cache::invalidate_auth(&state.keydb, &ssh_pattern)
+    let ssh_count = cache::invalidate_auth(&state.valkey, &ssh_pattern)
         .await
         .unwrap_or(0);
 

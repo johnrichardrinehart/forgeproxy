@@ -52,10 +52,10 @@ let
       http_listen: "0.0.0.0:8080"
       bundle_uri_base_url: "http://proxy:8080/bundles"
 
-    keydb:
-      endpoint: "keydb:6379"
+    valkey:
+      endpoint: "valkey:6379"
       tls: false
-      auth_token_env: "KEYDB_AUTH_TOKEN"
+      auth_token_env: "VALKEY_AUTH_TOKEN"
 
     auth:
       ssh_cache_ttl: 300
@@ -162,8 +162,8 @@ pkgs.testers.runNixOSTest {
         virtualisation.memorySize = 2048;
       };
 
-    # -- KeyDB / Redis ---------------------------------------------------------
-    keydb =
+    # -- Valkey / Redis ---------------------------------------------------------
+    valkey =
       {
         config,
         pkgs,
@@ -252,9 +252,9 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # -- Infrastructure comes up -----------------------------------------------
-    with subtest("KeyDB starts"):
-        keydb.wait_for_unit("redis-default.service")
-        keydb.wait_for_open_port(6379)
+    with subtest("Valkey starts"):
+        valkey.wait_for_unit("redis-default.service")
+        valkey.wait_for_open_port(6379)
 
     with subtest("Gitea starts"):
         ghe.wait_for_unit("gitea.service")
@@ -314,7 +314,7 @@ pkgs.testers.runNixOSTest {
     with subtest("Health endpoint responds"):
         proxy.succeed(
             "curl -sf http://localhost:8080/healthz"
-            " | jq -e '.checks.keydb.ok == true'"
+            " | jq -e '.checks.valkey.ok == true'"
         )
 
     # -- Clone through the proxy (HTTP, no TLS) --------------------------------

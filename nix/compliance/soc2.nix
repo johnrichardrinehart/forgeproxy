@@ -6,7 +6,7 @@
 
 let
   cfg = config.services.forgeproxy.compliance.soc2;
-  keydbEnabled = config.services.keydb.enable or false;
+  valkeyEnabled = config.services.valkey.enable or false;
   nginxEnabled = config.services.nginx.enable or false;
   firewallPorts = config.networking.firewall.allowedTCPPorts or [ ];
 in
@@ -82,15 +82,15 @@ in
         message = "SOC2 CC6: nginx must use recommendedTlsSettings when enabled.";
       }
     ]
-    ++ lib.optionals keydbEnabled [
+    ++ lib.optionals valkeyEnabled [
       # ── CC9: Confidentiality ─────────────────────────────────────────
       {
         assertion = builtins.elem 6380 firewallPorts;
-        message = "SOC2 CC9: KeyDB TLS port (6380) must be in firewall allowedTCPPorts.";
+        message = "SOC2 CC9: Valkey TLS port (6380) must be in firewall allowedTCPPorts.";
       }
       {
         assertion = !(builtins.elem 6379 firewallPorts);
-        message = "SOC2 CC6: KeyDB plaintext port (6379) must NOT be in firewall allowedTCPPorts.";
+        message = "SOC2 CC6: Valkey plaintext port (6379) must NOT be in firewall allowedTCPPorts.";
       }
     ];
 

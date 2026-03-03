@@ -3,7 +3,7 @@
 //! When a Git client sees the `bundle-uri` capability in the protocol v2
 //! info/refs response it will fetch the advertised bundle-list URL.  This
 //! module generates that document on-the-fly from the bundle registry stored
-//! in KeyDB, replacing the raw S3 keys with short-lived pre-signed download
+//! in Valkey, replacing the raw S3 keys with short-lived pre-signed download
 //! URLs.
 //!
 //! # Bundle-list format
@@ -38,10 +38,10 @@ use tracing::{debug, instrument};
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
-// KeyDB schema constants
+// Valkey schema constants
 // ---------------------------------------------------------------------------
 
-/// KeyDB hash key that stores the bundle registry for a repository.
+/// Valkey hash key that stores the bundle registry for a repository.
 ///
 /// Structure: `HGETALL bundles:{owner}/{repo}` returns a map of
 /// `bundle_name -> s3_object_key`.
@@ -49,7 +49,7 @@ fn bundle_registry_key(owner: &str, repo: &str) -> String {
     format!("bundles:{owner}/{repo}")
 }
 
-/// KeyDB sorted-set key that stores creation tokens (ordering) for bundles.
+/// Valkey sorted-set key that stores creation tokens (ordering) for bundles.
 ///
 /// Structure: `ZSCORE bundle_tokens:{owner}/{repo} <bundle_name>` returns the
 /// creation token.
@@ -76,11 +76,11 @@ pub async fn handle_bundle_list(
         .await
         .context("bundle-list auth validation failed")?;
 
-    // 2. Fetch the bundle registry from KeyDB.
+    // 2. Fetch the bundle registry from Valkey.
     let registry: std::collections::HashMap<String, String> =
-        HashesInterface::hgetall(&state.keydb, bundle_registry_key(owner, repo))
+        HashesInterface::hgetall(&state.valkey, bundle_registry_key(owner, repo))
             .await
-            .context("failed to read bundle registry from KeyDB")?;
+            .context("failed to read bundle registry from Valkey")?;
 
     if registry.is_empty() {
         debug!("no bundles registered for {owner}/{repo}");
@@ -100,7 +100,7 @@ pub async fn handle_bundle_list(
         std::collections::HashMap::new();
 
     for name in &bundle_names {
-        let score: Option<f64> = SortedSetsInterface::zscore(&state.keydb, &token_key, name)
+        let score: Option<f64> = SortedSetsInterface::zscore(&state.valkey, &token_key, name)
             .await
             .unwrap_or(None);
         let token = score.map(|s| s as u64).unwrap_or(0);

@@ -100,9 +100,9 @@ in
             "-w /etc/crontab -p wa -k cron"
             "-w /etc/cron.d -p wa -k cron"
 
-            # Monitor TLS certificate stores used by forgeproxy and KeyDB.
+            # Monitor TLS certificate stores used by forgeproxy and Valkey.
             "-w /run/nginx/ssl/ -p wa -k tls_certs"
-            "-w /var/lib/keydb/tls/ -p wa -k tls_certs"
+            "-w /var/lib/valkey/tls/ -p wa -k tls_certs"
 
             # Make audit configuration immutable until next boot (-e 2).
             "-e 2"

@@ -2,17 +2,17 @@ use anyhow::{Context, Result};
 use fred::interfaces::KeysInterface;
 use tracing::trace;
 
-/// Retrieve a cached auth value from KeyDB by key.
+/// Retrieve a cached auth value from Valkey by key.
 /// Returns `Ok(Some(value))` on cache hit, `Ok(None)` on miss.
 pub async fn get_cached_auth(pool: &fred::clients::Pool, key: &str) -> Result<Option<String>> {
-    let val: Option<String> = pool.get(key).await.context("KeyDB GET failed")?;
+    let val: Option<String> = pool.get(key).await.context("Valkey GET failed")?;
     if val.is_some() {
         trace!(key, "auth cache hit");
     }
     Ok(val)
 }
 
-/// Store an auth value in KeyDB with a TTL (in seconds).
+/// Store an auth value in Valkey with a TTL (in seconds).
 pub async fn set_cached_auth(
     pool: &fred::clients::Pool,
     key: &str,
@@ -28,14 +28,14 @@ pub async fn set_cached_auth(
             false,
         )
         .await
-        .context("KeyDB SET failed")?;
+        .context("Valkey SET failed")?;
     trace!(key, ttl_secs, "auth cache set");
     Ok(())
 }
 
 /// Invalidate all auth cache keys matching a glob pattern.
 ///
-/// Uses SCAN-based iteration to avoid blocking the KeyDB server, then
+/// Uses SCAN-based iteration to avoid blocking the Valkey server, then
 /// DELetes each matching key.  Returns the number of keys deleted.
 pub async fn invalidate_auth(pool: &fred::clients::Pool, pattern: &str) -> Result<u64> {
     let mut count: u64 = 0;
@@ -45,7 +45,7 @@ pub async fn invalidate_auth(pool: &fred::clients::Pool, pattern: &str) -> Resul
         let (next_cursor, keys): (String, Vec<String>) = pool
             .scan_page(&cursor, pattern, Some(100), None)
             .await
-            .context("KeyDB SCAN failed")?;
+            .context("Valkey SCAN failed")?;
 
         for key in &keys {
             let _: () = pool.del(key).await.unwrap_or_default();

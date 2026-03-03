@@ -1,33 +1,36 @@
-# ── KeyDB Instance ────────────────────────────────────────────────────────
-resource "aws_instance" "keydb" {
-  ami                         = data.aws_ami.keydb.id
-  instance_type               = var.keydb_instance_type
+# ── Valkey Instance ────────────────────────────────────────────────────────
+resource "aws_instance" "valkey" {
+  ami                         = data.aws_ami.valkey.id
+  instance_type               = var.valkey_instance_type
   subnet_id                   = local.private_subnet_id
   associate_public_ip_address = false
-  iam_instance_profile        = aws_iam_instance_profile.keydb.name
-  vpc_security_group_ids      = [local.keydb_security_group_id]
-  user_data                   = var.name_prefix
+  iam_instance_profile        = aws_iam_instance_profile.valkey.name
+  vpc_security_group_ids      = [local.valkey_security_group_id]
+  user_data                   = <<-EOT
+    # SM_PREFIX=${var.name_prefix}
+    { ... }: {}
+  EOT
 
   root_block_device {
     volume_type           = "gp3"
-    volume_size           = var.keydb_root_volume_gb
+    volume_size           = var.valkey_root_volume_gb
     encrypted             = true
     delete_on_termination = true
     tags = {
-      Name = "${var.name_prefix}-keydb-root"
+      Name = "${var.name_prefix}-valkey-root"
     }
   }
 
   monitoring = true
 
   tags = {
-    Name = "${var.name_prefix}-keydb"
-    Role = "keydb"
+    Name = "${var.name_prefix}-valkey"
+    Role = "valkey"
   }
 
   depends_on = [
-    null_resource.build_keydb_ami,
-    aws_secretsmanager_secret_version.keydb_auth_token,
+    null_resource.build_valkey_ami,
+    aws_secretsmanager_secret_version.valkey_auth_token,
   ]
 
   lifecycle {
@@ -45,7 +48,10 @@ resource "aws_instance" "forgeproxy" {
   iam_instance_profile        = aws_iam_instance_profile.forgeproxy.name
   vpc_security_group_ids      = [local.forgeproxy_security_group_id]
   key_name                    = var.ec2_key_pair_name != "" ? var.ec2_key_pair_name : null
-  user_data                   = var.name_prefix
+  user_data                   = <<-EOT
+    # SM_PREFIX=${var.name_prefix}
+    { ... }: {}
+  EOT
 
   root_block_device {
     volume_type           = "gp3"
@@ -66,10 +72,10 @@ resource "aws_instance" "forgeproxy" {
 
   depends_on = [
     null_resource.build_forgeproxy_ami,
-    aws_instance.keydb,
+    aws_instance.valkey,
     aws_secretsmanager_secret_version.forgeproxy_config,
     aws_secretsmanager_secret_version.forge_admin_token,
-    aws_secretsmanager_secret_version.keydb_auth_token,
+    aws_secretsmanager_secret_version.valkey_auth_token,
     aws_secretsmanager_secret_version.webhook_secret,
     aws_secretsmanager_secret_version.nginx_upstream_hostname,
     aws_secretsmanager_secret_version.nginx_upstream_port,
@@ -79,7 +85,7 @@ resource "aws_instance" "forgeproxy" {
 
   lifecycle {
     create_before_destroy = true
-    replace_triggered_by  = [aws_instance.keydb.id]
+    replace_triggered_by  = [aws_instance.valkey.id]
   }
 }
 
