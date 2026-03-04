@@ -217,7 +217,7 @@
           secrets = ./nix/secrets.nix;
           ami = ./nix/ami.nix;
           backend = ./nix/backend.nix;
-          compliance = ./nix/compliance/default.nix;
+          security-controls = ./nix/compliance/default.nix;
           proxy-host = ./nix/proxy-host.nix;
           valkey-host = ./nix/valkey-host.nix;
           dev = ./nix/dev.nix;

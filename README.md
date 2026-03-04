@@ -135,7 +135,7 @@ Additional NixOS modules are available for companion services:
 - `forgeproxy.nixosModules.nginx` — nginx TLS termination
 - `forgeproxy.nixosModules.hardening` — extra systemd hardening
 - `forgeproxy.nixosModules.secrets` — sops-nix secrets integration
-- `forgeproxy.nixosModules.compliance` — FedRAMP compliance profile
+- `forgeproxy.nixosModules.security-controls` — security control profiles (FedRAMP, SOC2)
 
 ## Metrics
 
