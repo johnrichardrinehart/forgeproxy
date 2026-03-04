@@ -82,13 +82,6 @@ aws secretsmanager put-secret-value \
   --secret-string "$(cat /path/to/ghe-admin-private-key)"
 ```
 
-When `enable_ghe_key_lookup = true`, also populate:
-```bash
-aws secretsmanager put-secret-value \
-  --secret-id forgeproxy/ghe-key-lookup-admin-key \
-  --secret-string "$(cat /path/to/ghe-admin-private-key)"
-```
-
 For each organization in `org_creds`, populate:
 ```bash
 aws secretsmanager put-secret-value \
