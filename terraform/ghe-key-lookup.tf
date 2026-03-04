@@ -132,7 +132,10 @@ resource "aws_instance" "ghe_key_lookup" {
   associate_public_ip_address = false
   iam_instance_profile        = aws_iam_instance_profile.ghe_key_lookup[0].name
   vpc_security_group_ids      = local.ghe_key_lookup_security_group_ids
-  user_data                   = var.name_prefix
+  user_data                   = <<-EOT
+    # SM_PREFIX=${var.name_prefix}
+    { ... }: {}
+  EOT
 
   root_block_device {
     volume_type           = "gp3"

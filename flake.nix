@@ -247,11 +247,20 @@
                 awsForgeProxyProvider = pkgs.writeShellScript "forgeproxy-aws-provider" ''
                   set -euo pipefail
 
-                  # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
+                  # ── Read SM_PREFIX from EC2 user_data ─────────────────────────────
+                  # Supports:
+                  # 1) legacy raw prefix payload: "forgeproxy"
+                  # 2) amazon-init-safe payload:
+                  #      # SM_PREFIX=forgeproxy
+                  #      { ... }: {}
                   _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
-                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                  _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                  SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
                   if [ -z "$SM_PREFIX" ]; then
-                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                    SM_PREFIX=$(printf '%s' "$_USER_DATA" | ${pkgs.coreutils}/bin/tr -d '\r\n')
+                  fi
+                  if [ -z "$SM_PREFIX" ] || [ "$SM_PREFIX" = "{ ... }: {}" ]; then
+                    echo "FATAL: Could not resolve SM_PREFIX from EC2 user_data" >&2
                     exit 1
                   fi
 
@@ -319,11 +328,15 @@
                 awsNginxProvider = pkgs.writeShellScript "forgeproxy-nginx-provider" ''
                                   set -euo pipefail
 
-                                  # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
+                                  # ── Read SM_PREFIX from EC2 user_data ─────────────────────────
                                   _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
-                                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                                  _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                                  SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
                                   if [ -z "$SM_PREFIX" ]; then
-                                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                                    SM_PREFIX=$(printf '%s' "$_USER_DATA" | ${pkgs.coreutils}/bin/tr -d '\r\n')
+                                  fi
+                                  if [ -z "$SM_PREFIX" ] || [ "$SM_PREFIX" = "{ ... }: {}" ]; then
+                                    echo "FATAL: Could not resolve SM_PREFIX from EC2 user_data" >&2
                                     exit 1
                                   fi
 
@@ -404,11 +417,15 @@
                 awsValkeyAuthProvider = pkgs.writeShellScript "valkey-aws-auth-provider" ''
                   set -euo pipefail
 
-                  # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
+                  # ── Read SM_PREFIX from EC2 user_data ─────────────────────────────
                   _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
-                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                  _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                  SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
                   if [ -z "$SM_PREFIX" ]; then
-                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                    SM_PREFIX=$(printf '%s' "$_USER_DATA" | ${pkgs.coreutils}/bin/tr -d '\r\n')
+                  fi
+                  if [ -z "$SM_PREFIX" ] || [ "$SM_PREFIX" = "{ ... }: {}" ]; then
+                    echo "FATAL: Could not resolve SM_PREFIX from EC2 user_data" >&2
                     exit 1
                   fi
 
@@ -437,11 +454,15 @@
                 awsValkeyTlsProvider = pkgs.writeShellScript "valkey-aws-tls-provider" ''
                   set -euo pipefail
 
-                  # ── Read SM_PREFIX from EC2 user_data (required, set by Terraform) ──
+                  # ── Read SM_PREFIX from EC2 user_data ─────────────────────────────
                   _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
-                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                  _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                  SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
                   if [ -z "$SM_PREFIX" ]; then
-                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                    SM_PREFIX=$(printf '%s' "$_USER_DATA" | ${pkgs.coreutils}/bin/tr -d '\r\n')
+                  fi
+                  if [ -z "$SM_PREFIX" ] || [ "$SM_PREFIX" = "{ ... }: {}" ]; then
+                    echo "FATAL: Could not resolve SM_PREFIX from EC2 user_data" >&2
                     exit 1
                   fi
 
@@ -516,9 +537,13 @@
                   set -euo pipefail
 
                   _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
-                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                  _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                  SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
                   if [ -z "$SM_PREFIX" ]; then
-                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                    SM_PREFIX=$(printf '%s' "$_USER_DATA" | ${pkgs.coreutils}/bin/tr -d '\r\n')
+                  fi
+                  if [ -z "$SM_PREFIX" ] || [ "$SM_PREFIX" = "{ ... }: {}" ]; then
+                    echo "FATAL: Could not resolve SM_PREFIX from EC2 user_data" >&2
                     exit 1
                   fi
 
