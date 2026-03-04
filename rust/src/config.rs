@@ -92,6 +92,10 @@ pub struct UpstreamConfig {
     pub hostname: String,
     /// Full URL to the upstream API root (e.g. `https://ghe.corp.example.com/api/v3`).
     pub api_url: String,
+    /// Base URL for upstream Git smart-HTTP traffic. Defaults to
+    /// `https://<hostname>` when omitted.
+    #[serde(default)]
+    pub git_url_base: Option<String>,
     /// Name of the environment variable that holds the upstream admin PAT.
     ///
     /// This token is used for SSH fingerprint-to-username resolution and
@@ -117,6 +121,17 @@ pub struct UpstreamConfig {
     /// `[0]["user"]["login"]`.
     #[serde(default)]
     pub key_lookup_url: Option<String>,
+}
+
+impl UpstreamConfig {
+    pub fn git_url_base(&self) -> String {
+        self.git_url_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| format!("https://{}", self.hostname))
+    }
 }
 
 fn default_admin_token_env() -> String {

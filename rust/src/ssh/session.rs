@@ -40,6 +40,15 @@ pub struct SshSession {
     child_stdin: Option<tokio::process::ChildStdin>,
     /// `GIT_PROTOCOL` value sent by the client via SSH env request.
     git_protocol: Option<String>,
+    /// For PAT-mode upstream proxy (uncached repos):
+    /// `(owner_repo, want_have_buf, authenticated)`.
+    ///
+    /// `authenticated` is `true` iff the connecting SSH user's identity was
+    /// resolved via the ghe-key-lookup sidecar.  When `false` the upstream
+    /// HTTP clone is attempted without a token; private repos will naturally
+    /// reject the request, enforcing forge-side access control for anonymous
+    /// SSH clients.
+    upstream_proxy_buf: Option<(String, Vec<u8>, bool)>,
 }
 
 impl SshSession {
@@ -54,6 +63,7 @@ impl SshSession {
             cache_manager,
             child_stdin: None,
             git_protocol: None,
+            upstream_proxy_buf: None,
         }
     }
 }
@@ -201,14 +211,18 @@ impl Handler for SshSession {
                 Ok(Auth::Accept)
             }
             Err(e) => {
-                error!(
+                // Sidecar unreachable or returned an unexpected error.
+                // Treat as anonymous rather than rejecting — the forge will
+                // enforce access control when the unauthenticated clone is
+                // attempted.  (Rejecting here would lock out all SSH users
+                // whenever the sidecar is temporarily unavailable.)
+                warn!(
                     fingerprint = %fp,
                     error = %e,
-                    "failed to resolve SSH key"
+                    "sidecar key resolution failed; accepting as anonymous"
                 );
-                Ok(Auth::Reject {
-                    proceed_with_methods: None,
-                })
+                self.fingerprint = Some(fp);
+                Ok(Auth::Accept)
             }
         }
     }
@@ -240,32 +254,169 @@ impl Handler for SshSession {
     }
 
     /// Forward data received from the client to the running `git upload-pack`
-    /// process stdin.  This enables protocol v2 negotiation where the client
-    /// sends `command=ls-refs` after receiving the capability advertisement.
+    /// process stdin (cached path), or accumulate it for the upstream HTTP
+    /// proxy (uncached path).
+    ///
+    /// For the proxy path, git never sends `SSH_MSG_CHANNEL_EOF` after "done"
+    /// — it keeps the channel open to read the packfile.  We therefore detect
+    /// the `0009done\n` pkt-line here and trigger the upstream POST immediately.
     async fn data(
         &mut self,
-        _channel: ChannelId,
+        channel_id: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Cached path: forward to upload-pack stdin.
         if let Some(ref mut stdin) = self.child_stdin
             && let Err(e) = stdin.write_all(data).await
         {
             debug!(error = %e, "failed to write to upload-pack stdin (process may have exited)");
             self.child_stdin.take();
         }
+
+        // PAT-mode upstream proxy: accumulate want/have, then POST when "done".
+        //
+        // Git protocol v1 and v2 both use the pkt-line "0009done\n" to signal
+        // the end of the negotiation phase.  The client then waits for the
+        // packfile without closing its write side — so `channel_eof` never
+        // fires for the proxy path.
+        let should_post = if let Some((ref repo, ref mut buf, _)) = self.upstream_proxy_buf {
+            info!(
+                repo = %repo,
+                incoming_bytes = data.len(),
+                total_buffered = buf.len() + data.len(),
+                "DIAG: upstream proxy received client data"
+            );
+            buf.extend_from_slice(data);
+            buf.windows(9).any(|w| w == b"0009done\n")
+        } else {
+            false
+        };
+
+        if should_post
+            && let Some((owner_repo, want_have, authenticated)) = self.upstream_proxy_buf.take()
+        {
+            info!(
+                repo = %owner_repo,
+                want_have_bytes = want_have.len(),
+                authenticated,
+                "upstream proxy: detected done pkt-line, POSTing to upstream"
+            );
+            let state = Arc::clone(&self.state);
+            let handle = session.handle();
+            tokio::spawn(async move {
+                match super::upstream::post_upload_pack(
+                    &state,
+                    &owner_repo,
+                    &want_have,
+                    authenticated,
+                )
+                .await
+                {
+                    Ok(pack_data) => {
+                        info!(
+                            repo = %owner_repo,
+                            pack_bytes = pack_data.len(),
+                            "upstream proxy packfile received"
+                        );
+                        let _ = handle
+                            .data(channel_id, CryptoVec::from_slice(&pack_data))
+                            .await;
+                        let _ = handle.exit_status_request(channel_id, 0).await;
+                        let _ = handle.eof(channel_id).await;
+                        let _ = handle.close(channel_id).await;
+                    }
+                    Err(e) => {
+                        error!(
+                            repo = %owner_repo,
+                            error = %format!("{e:#}"),
+                            "upstream proxy POST failed"
+                        );
+                        let msg = format!(
+                            "Repository '{}' upstream proxy failed: {}\n\
+                                 Try cloning directly from the upstream forge.\n",
+                            owner_repo, e,
+                        );
+                        let _ = handle
+                            .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
+                            .await;
+                        let _ = handle.exit_status_request(channel_id, 1).await;
+                        let _ = handle.eof(channel_id).await;
+                        let _ = handle.close(channel_id).await;
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
-    /// When the client signals EOF, close upload-pack's stdin so it knows the
-    /// negotiation is complete and can exit.
+    /// When the client signals EOF, close upload-pack's stdin (cached path).
+    /// For the proxy path, the POST is triggered from `data` on the "done"
+    /// pkt-line; this is a fallback in case that detection missed it.
     async fn channel_eof(
         &mut self,
-        _channel: ChannelId,
-        _session: &mut Session,
+        channel_id: ChannelId,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Dropping the ChildStdin closes the pipe, signalling EOF to the child.
+        // Cached path: dropping ChildStdin closes the pipe → child exits.
         self.child_stdin.take();
+
+        info!(
+            channel = ?channel_id,
+            has_upstream_buf = self.upstream_proxy_buf.is_some(),
+            "DIAG: channel_eof fired"
+        );
+
+        // PAT-mode upstream proxy: POST buffered want/have, stream packfile back.
+        if let Some((owner_repo, want_have, authenticated)) = self.upstream_proxy_buf.take() {
+            debug!(repo = %owner_repo, want_have_bytes = want_have.len(), authenticated, "upstream proxy: channel_eof received, POSTing to upstream");
+            let state = Arc::clone(&self.state);
+            let handle = session.handle();
+            tokio::spawn(async move {
+                match super::upstream::post_upload_pack(
+                    &state,
+                    &owner_repo,
+                    &want_have,
+                    authenticated,
+                )
+                .await
+                {
+                    Ok(pack_data) => {
+                        info!(
+                            repo = %owner_repo,
+                            pack_bytes = pack_data.len(),
+                            "upstream proxy packfile received"
+                        );
+                        let _ = handle
+                            .data(channel_id, CryptoVec::from_slice(&pack_data))
+                            .await;
+                        let _ = handle.exit_status_request(channel_id, 0).await;
+                        let _ = handle.eof(channel_id).await;
+                        let _ = handle.close(channel_id).await;
+                    }
+                    Err(e) => {
+                        error!(
+                            repo = %owner_repo,
+                            error = %format!("{e:#}"),
+                            "upstream proxy POST failed"
+                        );
+                        let msg = format!(
+                            "Repository '{}' upstream proxy failed: {}\n\
+                             Try cloning directly from the upstream forge.\n",
+                            owner_repo, e,
+                        );
+                        let _ = handle
+                            .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
+                            .await;
+                        let _ = handle.exit_status_request(channel_id, 1).await;
+                        let _ = handle.eof(channel_id).await;
+                        let _ = handle.close(channel_id).await;
+                    }
+                }
+            });
+        }
+
         Ok(())
     }
 
@@ -432,6 +583,12 @@ impl Handler for SshSession {
                             // callbacks can forward client data / signal EOF.
                             self.child_stdin = stdin;
 
+                            // RFC 4254 §6.5: the client won't read channel data
+                            // until it receives SSH_MSG_CHANNEL_SUCCESS for the
+                            // exec request.  Send it now, before the background
+                            // task starts streaming upload-pack stdout.
+                            session.channel_success(channel_id);
+
                             // Obtain an async Handle for sending data from the
                             // background task (the sync Session methods cannot
                             // be used outside the handler call).
@@ -516,33 +673,83 @@ impl Handler for SshSession {
                         }
                     }
                 } else {
-                    // Repository is not in local cache.  Attempt to proxy
-                    // upstream.  If the upstream module is not yet wired, return
-                    // an actionable error message.
-                    warn!(repo = %repo, "repository not in local cache");
-                    match super::upstream::proxy_upload_pack_upstream(&self.state, &repo, &[]).await
-                    {
-                        Ok(data) => {
-                            session.data(channel_id, CryptoVec::from_slice(&data));
-                            finish_channel(session, channel_id, 0);
-                        }
-                        Err(e) => {
-                            warn!(repo = %repo, error = %e, "upstream proxy failed");
-                            session.extended_data(
-                                channel_id,
-                                1,
-                                CryptoVec::from_slice(
-                                    format!(
-                                        "Repository '{}' is not cached and upstream proxy failed: {}\n\
-                                         Try cloning directly from the upstream forge.\n",
-                                        repo, e,
+                    // Repository is not in local cache — proxy upstream via HTTP
+                    // smart protocol.  Phase 1: fetch ref advertisement (async,
+                    // via background task so we don't block the russh event
+                    // loop and match the same handle.data() pattern used by the
+                    // cached path).  Phase 2 happens in `channel_eof`.
+                    warn!(repo = %repo, "repository not in local cache; proxying upstream");
+
+                    // Capture whether this session has a resolved username.
+                    // Anonymous sessions (sidecar unavailable / key unknown)
+                    // will use unauthenticated upstream clones so private repos
+                    // are rejected naturally by the forge.
+                    let authenticated = self.username.is_some();
+
+                    // Initialise the accumulation buffer NOW, before spawning,
+                    // so the `data` callback can capture any client bytes that
+                    // arrive while the advertisement is being fetched (in
+                    // practice git won't send anything until it receives the
+                    // advertisement, but initialising here is race-safe).
+                    self.upstream_proxy_buf = Some((repo.clone(), Vec::new(), authenticated));
+
+                    // RFC 4254 §6.5: OpenSSH won't read channel data until it
+                    // receives SSH_MSG_CHANNEL_SUCCESS.  Send it now so the
+                    // client starts reading before the background task writes
+                    // the ref advertisement (avoids TCP deadlock).
+                    session.channel_success(channel_id);
+
+                    let state = Arc::clone(&self.state);
+                    let handle = session.handle();
+                    let repo_bg = repo.clone();
+                    tokio::spawn(async move {
+                        match super::upstream::fetch_ref_advertisement(
+                            &state,
+                            &repo_bg,
+                            authenticated,
+                        )
+                        .await
+                        {
+                            Ok(advert) => {
+                                // Forward ref advertisement; channel stays open
+                                // for want/have — `channel_eof` will POST.
+                                info!(repo = %repo_bg, bytes = advert.len(), "DIAG: sending ref advertisement via handle.data");
+                                match handle
+                                    .data(channel_id, CryptoVec::from_slice(&advert))
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        info!(repo = %repo_bg, "DIAG: handle.data returned Ok")
+                                    }
+                                    Err(_) => {
+                                        warn!(repo = %repo_bg, "DIAG: handle.data returned Err — session receiver dropped")
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    repo = %repo_bg,
+                                    error = %format!("{e:#}"),
+                                    "upstream proxy ref advertisement failed"
+                                );
+                                let msg = format!(
+                                    "Repository '{}' is not cached and upstream proxy failed: {}\n\
+                                     Try cloning directly from the upstream forge.\n",
+                                    repo_bg, e,
+                                );
+                                let _ = handle
+                                    .extended_data(
+                                        channel_id,
+                                        1,
+                                        CryptoVec::from_slice(msg.as_bytes()),
                                     )
-                                    .as_bytes(),
-                                ),
-                            );
-                            finish_channel(session, channel_id, 1);
+                                    .await;
+                                let _ = handle.exit_status_request(channel_id, 1).await;
+                                let _ = handle.eof(channel_id).await;
+                                let _ = handle.close(channel_id).await;
+                            }
                         }
-                    }
+                    });
                 }
 
                 Ok(())

@@ -1,14 +1,22 @@
 //! SSH upstream proxy.
 //!
 //! When a requested repository is not available in the local bare-repo cache,
-//! this module proxies the `git-upload-pack` exchange to the upstream forge.
-//! It resolves the appropriate credential (PAT or SSH key) from the application
-//! configuration and shells out to `git` for the actual transport.
+//! this module proxies the `git-upload-pack` exchange to the upstream forge
+//! using the HTTP smart protocol (RFC 7230 / git's dumb-vs-smart HTTP spec).
+//!
+//! Two-phase exchange:
+//!   1. `fetch_ref_advertisement` — `GET /info/refs?service=git-upload-pack`
+//!      strips the HTTP service-line preamble and returns pkt-line data
+//!      suitable for forwarding to an SSH git client.
+//!   2. `post_upload_pack` — `POST /git-upload-pack` with the accumulated
+//!      want/have/done bytes from the client; returns the packfile.
+//!
+//! Only PAT (token / HTTPS) credential mode is supported for the upstream
+//! proxy path.  SSH credential mode requires a bidirectional subprocess pipe
+//! that has not yet been implemented.
 
 use anyhow::{Context, Result, bail};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use crate::AppState;
 use crate::config::{Config, CredentialMode};
@@ -17,43 +25,128 @@ use crate::config::{Config, CredentialMode};
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Proxy a `git-upload-pack` request to the upstream forge.
+/// Phase 1: Fetch the ref advertisement from the upstream forge.
 ///
-/// The function resolves the upstream clone URL and credential for the given
-/// `owner_repo` slug (`"owner/repo"`) and then runs a local
-/// `git upload-pack` (or `git ls-remote` + stateless transport) against
-/// the upstream, piping `input` to the process stdin and returning stdout.
+/// Returns pkt-line-formatted bytes ready to send directly to a git SSH
+/// client.  The HTTP service-line preamble (`001e# service=…\n0000`) is
+/// stripped; it is only present in the HTTP transport, not SSH.
 ///
-/// Returns the raw bytes produced by the upstream `git-upload-pack`.
-#[instrument(skip(state, input), fields(%owner_repo))]
-pub async fn proxy_upload_pack_upstream(
+/// `authenticated` controls whether a token is injected into the upstream URL.
+/// Pass `false` for anonymous SSH sessions so private repos are rejected
+/// naturally by the forge rather than being served under the admin token.
+///
+/// Supports PAT (HTTPS) credential mode.  SSH credential mode returns an
+/// error — configure a PAT for uncached repository proxying.
+#[instrument(skip(state), fields(%owner_repo, authenticated))]
+pub async fn fetch_ref_advertisement(
     state: &AppState,
     owner_repo: &str,
-    input: &[u8],
+    authenticated: bool,
 ) -> Result<Vec<u8>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
+    let (clone_url, _) =
+        resolve_upstream_url_and_creds(&state.config, owner, repo, authenticated).await?;
 
-    // Resolve clone URL and environment variables for credential injection.
-    let (clone_url, env_vars) = resolve_upstream_url_and_creds(&state.config, owner, repo).await?;
+    match credential_mode(&state.config, owner) {
+        CredentialMode::Pat => {
+            let url = format!("{clone_url}/info/refs?service=git-upload-pack");
+            debug!(%url, "fetching ref advertisement via HTTP GET");
 
-    debug!(
-        clone_url = %clone_url,
-        "proxying git-upload-pack to upstream forge"
-    );
+            let resp = state
+                .http_client
+                .get(&url)
+                .header("Accept", "application/x-git-upload-pack-advertisement")
+                .send()
+                .await
+                .context("HTTP GET /info/refs failed")?;
 
-    // Use `git-upload-pack` in stateless-rpc mode against the remote URL
-    // by leveraging `git upload-pack --stateless-rpc <url>`.  In practice
-    // this requires the remote to support the smart HTTP protocol.  For SSH
-    // mode, we fall back to a direct `git ls-remote` + packfile fetch.
-    let output = git_upload_pack_remote(&clone_url, input, &env_vars).await?;
+            if !resp.status().is_success() {
+                bail!("upstream returned {} for ref advertisement", resp.status());
+            }
 
-    info!(
-        owner_repo = %owner_repo,
-        output_bytes = output.len(),
-        "upstream proxy complete"
-    );
+            let body = resp
+                .bytes()
+                .await
+                .context("failed to read ref advertisement body")?;
 
-    Ok(output)
+            let stripped = strip_http_service_line(&body).to_vec();
+
+            info!(
+                %owner_repo,
+                bytes = stripped.len(),
+                "fetched ref advertisement from upstream"
+            );
+
+            Ok(stripped)
+        }
+
+        CredentialMode::Ssh => {
+            bail!(
+                "SSH credential mode is not supported for the uncached upstream proxy; \
+                 configure PAT (token) credentials instead"
+            )
+        }
+    }
+}
+
+/// Phase 2: POST want/have/done to the upstream and return the packfile.
+///
+/// `want_have` is the accumulated bytes the git client sent after receiving
+/// the ref advertisement (want/have/done pkt-lines).  Supports PAT mode only.
+///
+/// `authenticated` must match the value used for phase 1 — it controls
+/// whether a token is embedded in the upstream URL.
+#[instrument(skip(state, want_have), fields(%owner_repo, input_bytes = want_have.len(), authenticated))]
+pub async fn post_upload_pack(
+    state: &AppState,
+    owner_repo: &str,
+    want_have: &[u8],
+    authenticated: bool,
+) -> Result<Vec<u8>> {
+    let (owner, repo) = split_owner_repo(owner_repo)?;
+    let (clone_url, _) =
+        resolve_upstream_url_and_creds(&state.config, owner, repo, authenticated).await?;
+
+    match credential_mode(&state.config, owner) {
+        CredentialMode::Pat => {
+            let url = format!("{clone_url}/git-upload-pack");
+            debug!(%url, input_bytes = want_have.len(), "posting want/have to upstream");
+
+            let resp = state
+                .http_client
+                .post(&url)
+                .header("Content-Type", "application/x-git-upload-pack-request")
+                .header("Accept", "application/x-git-upload-pack-result")
+                .body(want_have.to_vec())
+                .send()
+                .await
+                .context("HTTP POST /git-upload-pack failed")?;
+
+            if !resp.status().is_success() {
+                bail!(
+                    "upstream returned {} for git-upload-pack POST",
+                    resp.status()
+                );
+            }
+
+            let body = resp.bytes().await.context("failed to read packfile body")?;
+
+            info!(
+                %owner_repo,
+                pack_bytes = body.len(),
+                "upstream proxy POST complete"
+            );
+
+            Ok(body.to_vec())
+        }
+
+        CredentialMode::Ssh => {
+            bail!(
+                "SSH credential mode is not supported for the uncached upstream proxy; \
+                 configure PAT (token) credentials instead"
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -71,217 +164,119 @@ pub(crate) fn split_owner_repo(slug: &str) -> Result<(&str, &str)> {
     Ok((owner, repo))
 }
 
-/// Resolve the clone URL and any environment variables needed for credential
-/// injection based on the application configuration.
-///
-/// For PAT mode the clone URL is an HTTPS URL and the environment contains
-/// the `GIT_ASKPASS` or header-based auth.  For SSH mode the URL uses the
-/// `git@host:owner/repo.git` form and the environment is empty (the SSH key
-/// is expected to be available via the agent or keyring).
-async fn resolve_upstream_url_and_creds(
-    config: &Config,
-    owner: &str,
-    repo: &str,
-) -> Result<(String, Vec<(String, String)>)> {
-    // Determine credential mode: check per-org override, then fall back to default.
-    let mode = config
+/// Return the effective credential mode for the given owner.
+fn credential_mode(config: &Config, owner: &str) -> CredentialMode {
+    config
         .upstream_credentials
         .orgs
         .get(owner)
         .map(|oc| oc.mode)
-        .unwrap_or(config.upstream_credentials.default_mode);
+        .unwrap_or(config.upstream_credentials.default_mode)
+}
 
-    match mode {
+/// Resolve the upstream clone URL and any environment variables needed for
+/// credential injection.
+///
+/// For PAT mode: HTTPS URL with embedded token (or bare HTTPS when
+/// `authenticated` is `false` — anonymous SSH sessions must not receive a
+/// token, so private repos are rejected by the forge rather than silently
+/// served under the admin token).
+/// For SSH mode: `git@host:owner/repo.git` URL.
+async fn resolve_upstream_url_and_creds(
+    config: &Config,
+    owner: &str,
+    repo: &str,
+    authenticated: bool,
+) -> Result<(String, Vec<(String, String)>)> {
+    match credential_mode(config, owner) {
         CredentialMode::Pat => {
-            // Resolve the PAT: try the kernel keyring first, fall back to env var.
-            let key_name = config
-                .upstream_credentials
-                .orgs
-                .get(owner)
-                .map(|oc| oc.keyring_key_name.as_str())
-                .unwrap_or(&config.upstream.admin_token_env);
+            let token = if authenticated {
+                let key_name = config
+                    .upstream_credentials
+                    .orgs
+                    .get(owner)
+                    .map(|oc| oc.keyring_key_name.as_str())
+                    .unwrap_or(&config.upstream.admin_token_env);
+                crate::credentials::keyring::resolve_secret(key_name)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                // Anonymous SSH session — do not inject a token.  The forge
+                // will reject the request if the repo is private, which is the
+                // correct behaviour.
+                String::new()
+            };
 
-            let token = crate::credentials::keyring::resolve_secret(key_name)
-                .await
-                .unwrap_or_default();
-
-            // HTTPS clone URL with embedded token for authentication.
             let url = if token.is_empty() {
-                format!(
-                    "https://{}/{}/{}.git",
-                    config.upstream.hostname, owner, repo
-                )
+                format!("{}/{}/{}.git", config.upstream.git_url_base(), owner, repo)
             } else {
                 format!(
-                    "https://x-access-token:{token}@{}/{}/{}.git",
-                    config.upstream.hostname, owner, repo,
+                    "{}/{}/{}.git",
+                    authenticated_git_base_url(config, &format!("x-access-token:{token}")),
+                    owner,
+                    repo,
                 )
             };
 
-            // Set GIT_TERMINAL_PROMPT=0 to prevent interactive prompts.
-            let env_vars = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
-
-            Ok((url, env_vars))
+            Ok((url, vec![]))
         }
 
         CredentialMode::Ssh => {
-            let url = format!("git@{}:{}/{}.git", config.upstream.hostname, owner, repo,);
-
-            // For SSH mode the key should be available via ssh-agent or the
-            // kernel keyring; no extra env vars needed beyond disabling prompts.
-            let env_vars = vec![
-                ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-                (
-                    "GIT_SSH_COMMAND".to_string(),
-                    "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null".to_string(),
-                ),
-            ];
-
-            Ok((url, env_vars))
+            let url = format!("git@{}:{}/{}.git", config.upstream.hostname, owner, repo);
+            Ok((url, vec![]))
         }
     }
 }
 
-/// Run a `git-upload-pack` exchange against a remote URL.
-///
-/// For HTTPS remotes this uses the stateless-rpc smart HTTP protocol via
-/// `git upload-pack --stateless-rpc`.  The `input` bytes are piped to stdin
-/// and stdout is captured.
-///
-/// If the input is empty (initial advertisement request), we use
-/// `git ls-remote` instead to fetch the initial ref advertisement.
-async fn git_upload_pack_remote(
-    url: &str,
-    input: &[u8],
-    env_vars: &[(String, String)],
-) -> Result<Vec<u8>> {
-    if input.is_empty() {
-        // Initial ref advertisement -- use ls-remote to get the ref list.
-        debug!(url = %url, "fetching ref advertisement via git ls-remote");
-
-        let mut cmd = Command::new("git");
-        cmd.arg("ls-remote").arg(url);
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-        for (k, v) in env_vars {
-            cmd.env(k, v);
+fn authenticated_git_base_url(config: &Config, userinfo: &str) -> String {
+    let base = config.upstream.git_url_base();
+    if let Ok(mut parsed) = url::Url::parse(&base) {
+        if let Some((username, password)) = userinfo.split_once(':') {
+            let _ = parsed.set_username(username);
+            let _ = parsed.set_password(Some(password));
+        } else {
+            let _ = parsed.set_username(userinfo);
         }
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let output = cmd
-            .output()
-            .await
-            .context("failed to spawn git ls-remote")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "git ls-remote failed (status {}): {}",
-                output.status,
-                stderr
-            );
-        }
-
-        return Ok(output.stdout);
+        parsed.to_string().trim_end_matches('/').to_string()
+    } else {
+        base
     }
+}
 
-    // Full pack negotiation -- use git upload-pack --stateless-rpc with the
-    // URL treated as a local path (this only works for local repos).  For
-    // remote URLs we need to use the HTTP transport directly.
-    //
-    // The most portable approach is to use `git fetch` into a temporary bare
-    // repo from which we then serve upload-pack locally.  Since upstream
-    // proxy is a fallback path, we optimise for correctness over performance.
-    debug!(
-        url = %url,
-        input_bytes = input.len(),
-        "proxying pack data via temporary clone"
-    );
-
-    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for upstream proxy")?;
-    let tmp_repo = tmp_dir.path().join("proxy.git");
-
-    // Initialise a temporary bare repo.
-    let init_status = Command::new("git")
-        .arg("init")
-        .arg("--bare")
-        .arg(&tmp_repo)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .status()
-        .await
-        .context("failed to init temporary bare repo")?;
-
-    if !init_status.success() {
-        bail!("git init --bare failed for temporary proxy repo");
+/// Strip the HTTP service-line preamble from a git smart-HTTP response.
+///
+/// The HTTP transport prepends the following before the pkt-line ref
+/// advertisement:
+///
+/// ```text
+/// 001e# service=git-upload-pack\n   ← pkt-line (30 bytes)
+/// 0000                               ← flush
+/// ```
+///
+/// The SSH transport does not include this preamble, so we must strip it
+/// before forwarding to an SSH client.
+fn strip_http_service_line(data: &[u8]) -> &[u8] {
+    if data.len() < 4 {
+        return data;
     }
-
-    // Fetch from upstream into the temporary repo.
-    let mut fetch_cmd = Command::new("git");
-    fetch_cmd
-        .arg("-C")
-        .arg(&tmp_repo)
-        .arg("fetch")
-        .arg(url)
-        .arg("+refs/*:refs/*");
-    fetch_cmd.env("GIT_TERMINAL_PROMPT", "0");
-    for (k, v) in env_vars {
-        fetch_cmd.env(k, v);
+    let len_str = match std::str::from_utf8(&data[..4]) {
+        Ok(s) => s,
+        Err(_) => return data,
+    };
+    let pkt_len = match usize::from_str_radix(len_str, 16) {
+        Ok(n) => n,
+        Err(_) => return data,
+    };
+    // pkt_len includes the 4-byte length prefix itself.
+    if pkt_len < 4 || pkt_len > data.len() {
+        return data;
     }
-    fetch_cmd.stdout(std::process::Stdio::piped());
-    fetch_cmd.stderr(std::process::Stdio::piped());
-
-    let fetch_output = fetch_cmd
-        .output()
-        .await
-        .context("failed to fetch from upstream")?;
-
-    if !fetch_output.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch_output.stderr);
-        bail!(
-            "git fetch from upstream failed (status {}): {}",
-            fetch_output.status,
-            stderr,
-        );
+    if !data[4..pkt_len].starts_with(b"# service=") {
+        return data;
     }
-
-    // Now serve upload-pack from the temporary repo.
-    let mut upload_cmd = Command::new("git");
-    upload_cmd
-        .arg("upload-pack")
-        .arg("--stateless-rpc")
-        .arg(&tmp_repo);
-    upload_cmd.stdin(std::process::Stdio::piped());
-    upload_cmd.stdout(std::process::Stdio::piped());
-    upload_cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = upload_cmd
-        .spawn()
-        .context("failed to spawn git upload-pack on temp repo")?;
-
-    // Write input to stdin.
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input).await.ok();
-        drop(stdin);
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .context("git upload-pack on temp repo failed")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(
-            status = %output.status,
-            stderr = %stderr,
-            "git upload-pack on temp repo exited with error"
-        );
-    }
-
-    // The temporary directory is cleaned up when `tmp_dir` is dropped.
-    Ok(output.stdout)
+    // Skip past the service pkt-line and the following 0000 flush.
+    let after_service = &data[pkt_len..];
+    after_service.strip_prefix(b"0000").unwrap_or(after_service)
 }
 
 // ---------------------------------------------------------------------------
@@ -311,5 +306,33 @@ mod tests {
         assert!(split_owner_repo("noslash").is_err());
         assert!(split_owner_repo("/repo").is_err());
         assert!(split_owner_repo("owner/").is_err());
+    }
+
+    #[test]
+    fn strip_service_line_valid() {
+        // "# service=git-upload-pack\n" = 26 bytes; pkt_len = 30 = 0x1e.
+        let mut data = b"001e# service=git-upload-pack\n".to_vec();
+        data.extend_from_slice(b"0000");
+        data.extend_from_slice(b"001fsome-ref-advertisement-data");
+
+        let result = strip_http_service_line(&data);
+        assert_eq!(result, b"001fsome-ref-advertisement-data");
+    }
+
+    #[test]
+    fn strip_service_line_passthrough_if_no_service() {
+        // First pkt-line does not start with "# service=" — pass through.
+        let data = b"0012not a service line\n";
+        assert_eq!(strip_http_service_line(data), data.as_ref());
+    }
+
+    #[test]
+    fn strip_service_line_empty() {
+        assert_eq!(strip_http_service_line(b""), b"");
+    }
+
+    #[test]
+    fn strip_service_line_too_short() {
+        assert_eq!(strip_http_service_line(b"001"), b"001");
     }
 }
