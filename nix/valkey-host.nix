@@ -10,6 +10,7 @@
   ];
 
   config = {
+    networking.hostName = lib.mkForce "valkey";
     services.valkey.enable = lib.mkDefault true;
   };
 }

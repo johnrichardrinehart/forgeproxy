@@ -7,6 +7,7 @@
     ../local-vm.nix
   ];
   config = {
+    networking.hostName = lib.mkForce "ghe-key-lookup";
     services.ghe-key-lookup.enable = lib.mkDefault true;
 
     # Hardened default: no inbound SSH on production closure.
