@@ -38,6 +38,21 @@ output "valkey_ami_id" {
   description = "AMI ID of the valkey image"
 }
 
+output "ghe_key_lookup_ami_id" {
+  value       = module.forgeproxy.ghe_key_lookup_ami_id
+  description = "AMI ID of the ghe-key-lookup image"
+}
+
+output "ghe_key_lookup_instance_ids" {
+  value       = module.forgeproxy.ghe_key_lookup_instance_ids
+  description = "List of ghe-key-lookup instance IDs"
+}
+
+output "ghe_key_lookup_nlb_dns_name" {
+  value       = module.forgeproxy.ghe_key_lookup_nlb_dns_name
+  description = "Internal NLB DNS name for ghe-key-lookup"
+}
+
 output "secrets_to_populate" {
   value       = module.forgeproxy.secrets_to_populate
   description = "List of Secrets Manager secrets that must be populated before first use"

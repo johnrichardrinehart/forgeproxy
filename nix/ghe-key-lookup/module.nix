@@ -7,6 +7,8 @@
 
 let
   cfg = config.services.ghe-key-lookup;
+  listenPortMatch = builtins.match ".*:([0-9]+)$" cfg.listen;
+  listenPort = if listenPortMatch == null then null else lib.toInt (builtins.elemAt listenPortMatch 0);
 
   # Generate a Nix-store TOML config from module options.
   # ghe_url is omitted when null; the binary then derives it as
@@ -36,6 +38,16 @@ in
       type = lib.types.package;
       default = pkgs.ghe-key-lookup;
       description = "The ghe-key-lookup package to use.";
+    };
+
+    configPath = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Optional runtime path to a TOML config file passed to
+        `ghe-key-lookup --config`. When null, a Nix-store config is generated
+        from module options.
+      '';
     };
 
     listen = lib.mkOption {
@@ -118,6 +130,12 @@ in
       default = "info";
       description = "RUST_LOG verbosity level.";
     };
+
+    openFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Open the host firewall for the listen port derived from `listen`.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -143,7 +161,7 @@ in
         ExecStart = lib.escapeShellArgs [
           "${cfg.package}/bin/ghe-key-lookup"
           "--config"
-          "${configFile}"
+          (if cfg.configPath != null then cfg.configPath else toString configFile)
         ];
 
         Restart = "on-failure";
@@ -162,6 +180,6 @@ in
       };
     };
 
-    networking.firewall.allowedTCPPorts = [ 3000 ];
+    networking.firewall.allowedTCPPorts = lib.optionals (cfg.openFirewall && listenPort != null) [ listenPort ];
   };
 }

@@ -500,13 +500,56 @@
             { nixpkgs.overlays = [ self.overlays.default ]; }
             self.nixosModules.ghe-key-lookup-host
             (
-              { lib, ... }:
+              { lib, pkgs, ... }:
+              let
+                awsGheKeyLookupProvider = pkgs.writeShellScript "ghe-key-lookup-aws-provider" ''
+                  set -euo pipefail
+
+                  _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+                  SM_PREFIX=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data")
+                  if [ -z "$SM_PREFIX" ]; then
+                    echo "FATAL: EC2 user_data is empty; SM_PREFIX must be set via user_data" >&2
+                    exit 1
+                  fi
+
+                  ALL_SECRETS=$(${pkgs.awscli2}/bin/aws secretsmanager list-secrets \
+                    --filters "Key=name,Values=''${SM_PREFIX}/" \
+                    --query 'SecretList[].Name' --output json)
+
+                  resolve() {
+                    echo "$ALL_SECRETS" | ${pkgs.jq}/bin/jq -r --arg p "''${SM_PREFIX}/$1" \
+                      '[.[] | select(startswith($p))][0]'
+                  }
+
+                  mkdir -p /run/ghe-key-lookup
+
+                  ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                    --secret-id "$(resolve ghe-key-lookup-config)" \
+                    --query 'SecretString' --output text > /run/ghe-key-lookup/config.toml
+
+                  ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                    --secret-id "$(resolve ghe-key-lookup-admin-key)" \
+                    --query 'SecretString' --output text > /run/ghe-key-lookup/admin-key
+                  chmod 600 /run/ghe-key-lookup/admin-key
+                '';
+              in
               {
                 services.ghe-key-lookup = {
                   sshTargetEndpoint = lib.mkDefault "ghe.internal.example.com";
                   identityFile = lib.mkDefault "/run/ghe-key-lookup/admin-key";
+                  configPath = lib.mkDefault "/run/ghe-key-lookup/config.toml";
+                  openFirewall = lib.mkDefault false;
                   # gheUrl defaults to https://<sshTargetEndpoint>; set explicitly
                   # only when the HTTPS hostname differs from the SSH endpoint.
+                };
+
+                systemd.services.ghe-key-lookup = {
+                  preStart = lib.mkBefore "${awsGheKeyLookupProvider}";
+                  path = lib.mkAfter [
+                    pkgs.awscli2
+                    pkgs.curl
+                    pkgs.jq
+                  ];
                 };
               }
             )

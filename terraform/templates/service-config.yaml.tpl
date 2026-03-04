@@ -2,6 +2,9 @@ upstream:
   hostname: "${upstream_hostname}"
   api_url: "${upstream_api_url}"
   admin_token_env: "FORGE_ADMIN_TOKEN"
+%{ if ghe_key_lookup_enabled ~}
+  key_lookup_url: "${ghe_key_lookup_url}"
+%{ endif ~}
 
 backend_type: "${backend_type}"
 
