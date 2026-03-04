@@ -3,6 +3,9 @@ upstream:
   api_url: "${upstream_api_url}"
   git_url_base: "${upstream_git_url_base}"
   admin_token_env: "FORGE_ADMIN_TOKEN"
+%{ if ghe_key_lookup_enabled ~}
+  key_lookup_url: "${ghe_key_lookup_url}"
+%{ endif ~}
 
 backend_type: "${backend_type}"
 

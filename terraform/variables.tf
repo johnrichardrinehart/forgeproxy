@@ -105,6 +105,108 @@ variable "valkey_root_volume_gb" {
   description = "Root volume size (GB) for Valkey instance"
 }
 
+variable "enable_ghe_key_lookup" {
+  type        = bool
+  default     = false
+  description = "Enable deployment of ghe-key-lookup sidecar instances and AMI."
+}
+
+variable "ghe_key_lookup_instance_type" {
+  type        = string
+  default     = "t3.small"
+  description = "EC2 instance type for ghe-key-lookup sidecar instances"
+}
+
+variable "ghe_key_lookup_count" {
+  type        = number
+  default     = 1
+  description = "Number of ghe-key-lookup sidecar instances"
+
+  validation {
+    condition     = var.ghe_key_lookup_count >= 1
+    error_message = "ghe_key_lookup_count must be at least 1"
+  }
+}
+
+variable "ghe_key_lookup_root_volume_gb" {
+  type        = number
+  default     = 20
+  description = "Root volume size (GB) for ghe-key-lookup sidecar instances"
+}
+
+variable "ghe_key_lookup_vpc_id" {
+  type        = string
+  default     = null
+  description = "Optional VPC ID override for ghe-key-lookup resources. Defaults to this module's VPC."
+}
+
+variable "ghe_key_lookup_subnet_ids" {
+  type        = list(string)
+  default     = []
+  description = "Subnet IDs for ghe-key-lookup instances and internal NLB. Defaults to this module's private subnet."
+}
+
+variable "ghe_key_lookup_security_group_ids" {
+  type        = list(string)
+  default     = []
+  description = "Security groups to attach to ghe-key-lookup instances. When empty, the module creates one."
+}
+
+variable "ghe_key_lookup_allowed_cidrs" {
+  type        = list(string)
+  default     = []
+  description = "Additional CIDR blocks allowed to reach ghe-key-lookup listen ports when module-managed SG is used."
+}
+
+variable "ghe_key_lookup_listen_ports" {
+  type        = list(number)
+  default     = [3000]
+  description = "Listen ports exposed by ghe-key-lookup. First port is used for the service bind and target group."
+
+  validation {
+    condition = (
+      length(var.ghe_key_lookup_listen_ports) > 0 &&
+      alltrue([for p in var.ghe_key_lookup_listen_ports : p >= 1 && p <= 65535])
+    )
+    error_message = "ghe_key_lookup_listen_ports must contain one or more valid TCP ports (1-65535)."
+  }
+}
+
+variable "ghe_key_lookup_ssh_target_endpoint" {
+  type        = string
+  default     = ""
+  description = "SSH admin endpoint for GHE queried by ghe-key-lookup (e.g., ghe.example.com)."
+}
+
+variable "ghe_key_lookup_ghe_url" {
+  type        = string
+  default     = ""
+  description = "Optional HTTPS base URL for GHE (e.g., https://ghe.example.com). Leave empty to derive from ssh target endpoint."
+}
+
+variable "ghe_key_lookup_ssh_user" {
+  type        = string
+  default     = "admin"
+  description = "SSH username used by ghe-key-lookup to query GHE admin console."
+}
+
+variable "ghe_key_lookup_ssh_port" {
+  type        = number
+  default     = 122
+  description = "SSH port used by ghe-key-lookup to query GHE admin console."
+}
+
+variable "ghe_key_lookup_cache_ttl_pos" {
+  type        = number
+  default     = 300
+  description = "Positive lookup cache TTL in seconds for ghe-key-lookup."
+}
+
+variable "ghe_key_lookup_cache_ttl_neg" {
+  type        = number
+  default     = 30
+  description = "Negative lookup cache TTL in seconds for ghe-key-lookup."
+}
 
 variable "vpc_id" {
   type        = string

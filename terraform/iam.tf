@@ -212,3 +212,79 @@ resource "aws_iam_role_policy" "valkey" {
     ]
   })
 }
+
+# ── IAM Role for ghe-key-lookup instances ───────────────────────────────────
+resource "aws_iam_role" "ghe_key_lookup" {
+  count = local.ghe_key_lookup_enabled ? 1 : 0
+
+  name_prefix = "${var.name_prefix}-ghe-key-lookup-"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${var.name_prefix}-ghe-key-lookup-role"
+  }
+}
+
+resource "aws_iam_instance_profile" "ghe_key_lookup" {
+  count = local.ghe_key_lookup_enabled ? 1 : 0
+
+  name_prefix = "${var.name_prefix}-ghe-key-lookup-"
+  role        = aws_iam_role.ghe_key_lookup[0].name
+}
+
+resource "aws_iam_role_policy" "ghe_key_lookup" {
+  count = local.ghe_key_lookup_enabled ? 1 : 0
+
+  name_prefix = "${var.name_prefix}-ghe-key-lookup-"
+  role        = aws_iam_role.ghe_key_lookup[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+        ]
+        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}/ghe-key-lookup-*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["secretsmanager:ListSecrets"]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:UpdateInstanceInformation",
+          "ssmmessages:AcknowledgeMessage",
+          "ssmmessages:GetEndpoint",
+          "ssmmessages:GetMessages",
+          "ec2messages:GetMessages",
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ]
+        Resource = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/ghe-key-lookup-*"
+      },
+    ]
+  })
+}
