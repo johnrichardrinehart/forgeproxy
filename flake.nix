@@ -217,7 +217,7 @@
           secrets = ./nix/secrets.nix;
           ami = ./nix/ami.nix;
           backend = ./nix/backend.nix;
-          compliance = ./nix/compliance/default.nix;
+          security-controls = ./nix/compliance/default.nix;
           proxy-host = ./nix/proxy-host.nix;
           valkey-host = ./nix/valkey-host.nix;
           dev = ./nix/dev.nix;
@@ -232,13 +232,8 @@
             inputs.sops-nix.nixosModules.sops
             self.nixosModules.proxy-host
             self.nixosModules.ami
-<<<<<<< HEAD
             # Regulated compliance is opt-in:
             # { services.forgeproxy.compliance.regulated.enable = true; }
-=======
-            # Regulated compliance is opt-in:
-            # { services.forgeproxy.compliance.regulated.enable = true; }
->>>>>>> db70f7a (Rename forgecache to forgeproxy across the entire codebase)
 
             # ── AWS provider configuration ──────────────────────────────────────
             (
