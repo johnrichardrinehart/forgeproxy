@@ -8,7 +8,8 @@
 let
   cfg = config.services.ghe-key-lookup;
   listenPortMatch = builtins.match ".*:([0-9]+)$" cfg.listen;
-  listenPort = if listenPortMatch == null then null else lib.toInt (builtins.elemAt listenPortMatch 0);
+  listenPort =
+    if listenPortMatch == null then null else lib.toInt (builtins.elemAt listenPortMatch 0);
 
   # Generate a Nix-store TOML config from module options.
   # ghe_url is omitted when null; the binary then derives it as
@@ -213,6 +214,8 @@ in
       };
     };
 
-    networking.firewall.allowedTCPPorts = lib.optionals (cfg.openFirewall && listenPort != null) [ listenPort ];
+    networking.firewall.allowedTCPPorts = lib.optionals (cfg.openFirewall && listenPort != null) [
+      listenPort
+    ];
   };
 }

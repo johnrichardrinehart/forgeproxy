@@ -36,6 +36,16 @@ in
       example = "debug";
       description = "Log verbosity level for the forgeproxy binary.";
     };
+
+    allowEnvSecretFallback = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Allow forgeproxy to read secrets from environment variables when a
+        kernel keyring lookup misses. Hardened closures should keep this false;
+        dev closures may set true for convenience.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -48,6 +58,7 @@ in
 
       environment = {
         RUST_LOG = cfg.logLevel;
+        FORGEPROXY_ALLOW_ENV_SECRET_FALLBACK = if cfg.allowEnvSecretFallback then "true" else "false";
       };
 
       path = [

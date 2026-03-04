@@ -8,11 +8,11 @@ use std::{
 
 use anyhow::Context;
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};

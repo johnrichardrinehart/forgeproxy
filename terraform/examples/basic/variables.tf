@@ -4,6 +4,12 @@ variable "flake_ref" {
   description = "Nix flake reference for building AMIs (e.g., github:owner/repo, path:./local)"
 }
 
+variable "closure_variant" {
+  type        = string
+  default     = "hardened"
+  description = "NixOS closure variant: 'hardened' or 'dev'."
+}
+
 variable "aws_region" {
   type        = string
   default     = "us-east-1"

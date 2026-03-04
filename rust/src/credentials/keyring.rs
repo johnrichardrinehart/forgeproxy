@@ -36,7 +36,20 @@ pub async fn resolve_secret(name: &str) -> Option<String> {
     {
         return Some(val);
     }
-    std::env::var(name).ok().filter(|v| !v.is_empty())
+    if allow_env_secret_fallback() {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
+    } else {
+        None
+    }
+}
+
+fn allow_env_secret_fallback() -> bool {
+    std::env::var("FORGEPROXY_ALLOW_ENV_SECRET_FALLBACK")
+        .map(|v| {
+            let normalized = v.trim().to_ascii_lowercase();
+            normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+        })
+        .unwrap_or(false)
 }
 
 /// Read a key from the user keyring using the `linux-keyutils` crate (direct syscall).

@@ -225,7 +225,7 @@
           ghe-key-lookup-host = ./nix/ghe-key-lookup/host.nix;
         };
 
-        nixosConfigurations.forgeproxy = inputs.nixpkgs.lib.nixosSystem {
+        nixosConfigurations.forgeproxy-hardened = inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
           modules = [
             { nixpkgs.overlays = [ self.overlays.default ]; }
@@ -384,7 +384,7 @@
           ];
         };
 
-        nixosConfigurations.valkey = inputs.nixpkgs.lib.nixosSystem {
+        nixosConfigurations.valkey-hardened = inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
           modules = [
             { nixpkgs.overlays = [ self.overlays.default ]; }
@@ -486,21 +486,31 @@
           ];
         };
 
-        nixosConfigurations.forgeproxy-dev = self.nixosConfigurations.forgeproxy.extendModules {
+        nixosConfigurations.forgeproxy = self.nixosConfigurations.forgeproxy-hardened.extendModules {
+          modules = [
+            self.nixosModules.dev
+            {
+              services.forgeproxy.allowEnvSecretFallback = true;
+            }
+          ];
+        };
+
+        nixosConfigurations.valkey = self.nixosConfigurations.valkey-hardened.extendModules {
           modules = [ self.nixosModules.dev ];
         };
 
-        nixosConfigurations.valkey-dev = self.nixosConfigurations.valkey.extendModules {
-          modules = [ self.nixosModules.dev ];
-        };
-
-        nixosConfigurations.ghe-key-lookup = inputs.nixpkgs.lib.nixosSystem {
+        nixosConfigurations.ghe-key-lookup-hardened = inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
           modules = [
             { nixpkgs.overlays = [ self.overlays.default ]; }
             self.nixosModules.ghe-key-lookup-host
             (
-              { config, lib, pkgs, ... }:
+              {
+                config,
+                lib,
+                pkgs,
+                ...
+              }:
               let
                 awsGheKeyLookupProvider = pkgs.writeShellScript "ghe-key-lookup-aws-provider" ''
                   set -euo pipefail
@@ -570,24 +580,26 @@
           ];
         };
 
-        nixosConfigurations.ghe-key-lookup-dev = self.nixosConfigurations.ghe-key-lookup.extendModules {
-          modules = [
-            self.nixosModules.dev
-            (
-              { lib, ... }:
-              {
-                services.openssh.enable = lib.mkDefault true;
-                networking.firewall.allowedTCPPorts = lib.mkAfter [ 22 ];
+        nixosConfigurations.ghe-key-lookup =
+          self.nixosConfigurations.ghe-key-lookup-hardened.extendModules
+            {
+              modules = [
+                self.nixosModules.dev
+                (
+                  { lib, ... }:
+                  {
+                    services.openssh.enable = lib.mkDefault true;
+                    networking.firewall.allowedTCPPorts = lib.mkAfter [ 22 ];
 
-                services.ghe-key-lookup = {
-                  # Dev fallback chain: keyring -> env -> filesystem path.
-                  identityEnvVar = lib.mkDefault "GHE_KEY_LOOKUP_IDENTITY_PEM";
-                  identityFile = lib.mkDefault "/run/ghe-key-lookup/admin-key";
-                };
-              }
-            )
-          ];
-        };
+                    services.ghe-key-lookup = {
+                      # Dev fallback chain: keyring -> env -> filesystem path.
+                      identityEnvVar = lib.mkOverride 40 "GHE_KEY_LOOKUP_IDENTITY_PEM";
+                      identityFile = lib.mkOverride 40 "/run/ghe-key-lookup/admin-key";
+                    };
+                  }
+                )
+              ];
+            };
       };
     };
 }
