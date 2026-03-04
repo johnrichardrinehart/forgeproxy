@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use axum::http::HeaderMap;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::auth::middleware::Permission;
 use crate::config::Config;
@@ -107,6 +107,7 @@ impl ForgeBackend for GitHubBackend {
             &[("fingerprint", fingerprint)],
         )?;
 
+        debug!(fingerprint, %url, "querying ghe-key-lookup sidecar");
         let resp = http_client
             .get(url)
             .send()
