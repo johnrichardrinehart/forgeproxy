@@ -329,7 +329,7 @@ pkgs.testers.runNixOSTest {
             f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
             f"cat > /run/systemd/system/forgeproxy.service.d/token.conf <<UNIT\n"
             f"[Service]\n"
-            f"Environment=FORGE_ADMIN_TOKEN={TOKEN}\n"
+            f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user FORGE_ADMIN_TOKEN @u >/dev/null'\n"
             f"UNIT"
         )
         proxy.succeed("systemctl daemon-reload")

@@ -342,13 +342,13 @@ pkgs.testers.runNixOSTest {
     # -- Load PAT into kernel keyring and start forgeproxy ---------------------
     with subtest("Load PAT into keyring and start forgeproxy"):
         # Inject the Gitea admin token into the forgeproxy service via a
-        # systemd drop-in that sets FORGE_ADMIN_TOKEN (needed for permission
-        # checks) and loads the PAT into the kernel keyring via ExecStartPre.
+        # systemd drop-in that loads required secrets into the kernel keyring
+        # via ExecStartPre.
         proxy.succeed(
             f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
             f"cat > /run/systemd/system/forgeproxy.service.d/keyring.conf <<'UNIT'\n"
             f"[Service]\n"
-            f"Environment=FORGE_ADMIN_TOKEN={TOKEN}\n"
+            f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user FORGE_ADMIN_TOKEN @u >/dev/null'\n"
             f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user forgeproxy:octocat_pat @u'\n"
             f"UNIT"
         )

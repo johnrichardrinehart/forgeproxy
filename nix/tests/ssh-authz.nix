@@ -427,7 +427,7 @@ pkgs.testers.runNixOSTest {
             f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
             f"cat > /run/systemd/system/forgeproxy.service.d/token.conf <<'UNIT'\n"
             f"[Service]\n"
-            f"Environment=FORGE_ADMIN_TOKEN={TOKEN}\n"
+            f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user FORGE_ADMIN_TOKEN @u >/dev/null'\n"
             f"ExecStartPre=/bin/sh -c 'mkdir -p /var/cache/forgeproxy/repos/octocat && git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git /var/cache/forgeproxy/repos/octocat/repo-cached.git'\n"
             f"UNIT"
         )
