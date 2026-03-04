@@ -375,15 +375,21 @@ async fn main() -> Result<()> {
     });
 
     // ---- Await shutdown ----
-    // We wait for ALL tasks; when the shutdown signal fires each task will
-    // see it through its own `shutdown_signal()` future and wind down.
-    let _ = tokio::try_join!(
-        http_handle,
-        ssh_handle,
-        bundle_handle,
-        heartbeat_handle,
-        telemetry_handle,
-    );
+    // Wait for a shutdown signal or for any task to exit unexpectedly.
+    // On shutdown, abort all remaining tasks so the process exits promptly.
+    let abort_handles = [
+        http_handle.abort_handle(),
+        ssh_handle.abort_handle(),
+        bundle_handle.abort_handle(),
+        heartbeat_handle.abort_handle(),
+        telemetry_handle.abort_handle(),
+    ];
+    tokio::select! {
+        _ = shutdown_signal() => {
+            for h in &abort_handles { h.abort(); }
+        }
+        _ = async { let _ = tokio::try_join!(http_handle, ssh_handle, bundle_handle, heartbeat_handle, telemetry_handle); } => {}
+    }
 
     tracing::info!("forgeproxy shut down cleanly");
     Ok(())
