@@ -16,7 +16,6 @@ let
   configFile = (pkgs.formats.toml { }).generate "ghe-key-lookup.toml" (
     {
       listen = cfg.listen;
-      identity_file = toString cfg.identityFile;
       ssh_user = cfg.sshUser;
       ssh_target_endpoint = cfg.sshTargetEndpoint;
       ssh_port = cfg.sshPort;
@@ -24,6 +23,15 @@ let
       ssh_control_persist = cfg.sshControlPersist;
       cache_ttl_pos = cfg.cacheTtlPos;
       cache_ttl_neg = cfg.cacheTtlNeg;
+    }
+    // lib.optionalAttrs (cfg.identityFile != null) {
+      identity_file = toString cfg.identityFile;
+    }
+    // lib.optionalAttrs (cfg.identityKeyringKey != null) {
+      identity_keyring_key = cfg.identityKeyringKey;
+    }
+    // lib.optionalAttrs (cfg.identityEnvVar != null) {
+      identity_env_var = cfg.identityEnvVar;
     }
     // lib.optionalAttrs (cfg.gheUrl != null) {
       ghe_url = cfg.gheUrl;
@@ -57,8 +65,30 @@ in
     };
 
     identityFile = lib.mkOption {
-      type = lib.types.path;
-      description = "Path to the SSH private key used to connect to the GHE admin console.";
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Optional path to the SSH private key used to connect to the GHE admin
+        console. Intended as a dev fallback when keyring/env material is absent.
+      '';
+    };
+
+    identityKeyringKey = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "GHE_KEY_LOOKUP_IDENTITY";
+      description = ''
+        Kernel keyring key name containing PEM private key material.
+        `ghe-key-lookup` reads this first.
+      '';
+    };
+
+    identityEnvVar = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Optional environment variable name containing PEM private key material.
+        Checked after keyring and before identityFile.
+      '';
     };
 
     sshUser = lib.mkOption {
@@ -149,14 +179,17 @@ in
         RUST_LOG = cfg.logLevel;
       };
 
-      path = [ pkgs.openssh ];
+      path = [
+        pkgs.openssh
+        pkgs.keyutils
+      ];
 
       serviceConfig = {
         Type = "simple";
         DynamicUser = true;
         KeyringMode = "shared";
 
-        BindReadOnlyPaths = [ (toString cfg.identityFile) ];
+        BindReadOnlyPaths = lib.optionals (cfg.identityFile != null) [ (toString cfg.identityFile) ];
 
         ExecStart = lib.escapeShellArgs [
           "${cfg.package}/bin/ghe-key-lookup"
