@@ -28,6 +28,7 @@ pkgs.testers.runNixOSTest {
         services.amazon-ssm-agent.enable = lib.mkForce false;
 
         services.forgeproxy.compliance.fedramp.enable = true;
+        networking.hostName = lib.mkOverride 40 "fedramp";
 
         virtualisation.memorySize = 1024;
       };
@@ -49,6 +50,7 @@ pkgs.testers.runNixOSTest {
         services.forgeproxy.package = pkgs.forgeproxy;
         services.forgeproxy-nginx.enable = lib.mkForce false;
         services.amazon-ssm-agent.enable = lib.mkForce false;
+        networking.hostName = lib.mkOverride 40 "base";
 
         virtualisation.memorySize = 1024;
       };

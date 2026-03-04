@@ -12,6 +12,7 @@
   ];
 
   config = {
+    networking.hostName = lib.mkForce "forgeproxy";
     services.forgeproxy.enable = lib.mkDefault true;
     services.forgeproxy-nginx.enable = lib.mkDefault true;
   };
