@@ -1,11 +1,11 @@
 variable "closure_variant" {
   type        = string
-  default     = "prod"
-  description = "NixOS closure variant: 'prod' (hardened) or 'dev' (root SSH + console logs)."
+  default     = "hardened"
+  description = "NixOS closure variant: 'hardened' (locked down) or 'dev' (root SSH + console logs + env secret fallback)."
 
   validation {
-    condition     = contains(["prod", "dev"], var.closure_variant)
-    error_message = "closure_variant must be 'prod' or 'dev'."
+    condition     = contains(["hardened", "dev"], var.closure_variant)
+    error_message = "closure_variant must be 'hardened' or 'dev'."
   }
 }
 

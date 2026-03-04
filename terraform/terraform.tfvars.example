@@ -4,6 +4,9 @@ aws_region = "us-east-1"
 # Resource naming
 name_prefix = "forgeproxy"
 
+# Closure variant: "hardened" (default) or "dev"
+closure_variant = "hardened"
+
 # Upstream forge configuration
 upstream_hostname  = "ghe.example.com"
 upstream_port      = 443
