@@ -1,22 +1,24 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
+    process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use axum::{
-    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
+    Json, Router,
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 // ── CLI (all fields optional — defaults live in `resolve()`) ──────────────────
 
@@ -38,6 +40,14 @@ struct Cli {
     /// Path to the SSH private key for the GHE admin console
     #[arg(short = 'i', long)]
     identity_file: Option<String>,
+
+    /// Kernel keyring key name containing PEM private key content.
+    #[arg(long)]
+    identity_keyring_key: Option<String>,
+
+    /// Environment variable containing PEM private key content.
+    #[arg(long)]
+    identity_env_var: Option<String>,
 
     /// SSH username for the GHE admin console [default: admin]
     #[arg(long)]
@@ -85,6 +95,8 @@ struct Cli {
 struct ConfigFile {
     listen: Option<String>,
     identity_file: Option<String>,
+    identity_keyring_key: Option<String>,
+    identity_env_var: Option<String>,
     ssh_user: Option<String>,
     ssh_target_endpoint: Option<String>,
     ghe_url: Option<String>,
@@ -100,7 +112,9 @@ struct ConfigFile {
 #[derive(Debug)]
 struct ResolvedConfig {
     listen: String,
-    identity_file: String,
+    identity_file: Option<String>,
+    identity_keyring_key: Option<String>,
+    identity_env_var: Option<String>,
     ssh_user: String,
     /// Hostname of the GHE SSH admin endpoint.
     ssh_target_endpoint: String,
@@ -116,9 +130,12 @@ struct ResolvedConfig {
 
 /// Merge: CLI flags > config-file values > hardcoded defaults.
 fn resolve(cli: Cli, file: ConfigFile) -> anyhow::Result<ResolvedConfig> {
-    let ssh_target_endpoint = cli.ssh_target_endpoint
+    let ssh_target_endpoint = cli
+        .ssh_target_endpoint
         .or(file.ssh_target_endpoint)
-        .context("ssh_target_endpoint is required: pass --ssh-target-endpoint or set it in the config file")?;
+        .context(
+        "ssh_target_endpoint is required: pass --ssh-target-endpoint or set it in the config file",
+    )?;
 
     // ghe_url defaults to https://<ssh_target_endpoint> when absent.
     let ghe_url = cli
@@ -126,15 +143,15 @@ fn resolve(cli: Cli, file: ConfigFile) -> anyhow::Result<ResolvedConfig> {
         .or(file.ghe_url)
         .unwrap_or_else(|| format!("https://{}", ssh_target_endpoint));
 
-    Ok(ResolvedConfig {
+    ResolvedConfig {
         listen: cli
             .listen
             .or(file.listen)
             .unwrap_or_else(|| "0.0.0.0:3000".to_owned()),
 
-        identity_file: cli.identity_file.or(file.identity_file).context(
-            "identity_file is required: pass --identity-file or set it in the config file",
-        )?,
+        identity_file: cli.identity_file.or(file.identity_file),
+        identity_keyring_key: cli.identity_keyring_key.or(file.identity_keyring_key),
+        identity_env_var: cli.identity_env_var.or(file.identity_env_var),
 
         ssh_user: cli
             .ssh_user
@@ -159,7 +176,33 @@ fn resolve(cli: Cli, file: ConfigFile) -> anyhow::Result<ResolvedConfig> {
         cache_ttl_pos: cli.cache_ttl_pos.or(file.cache_ttl_pos).unwrap_or(300),
 
         cache_ttl_neg: cli.cache_ttl_neg.or(file.cache_ttl_neg).unwrap_or(30),
-    })
+    }
+    .validate_identity_source()
+}
+
+impl ResolvedConfig {
+    fn validate_identity_source(self) -> anyhow::Result<Self> {
+        let has_source = self
+            .identity_keyring_key
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+            || self
+                .identity_env_var
+                .as_ref()
+                .is_some_and(|v| !v.trim().is_empty())
+            || self
+                .identity_file
+                .as_ref()
+                .is_some_and(|v| !v.trim().is_empty());
+
+        if has_source {
+            Ok(self)
+        } else {
+            anyhow::bail!(
+                "no identity source configured: set identity_keyring_key, identity_env_var, or identity_file"
+            )
+        }
+    }
 }
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
@@ -316,10 +359,10 @@ fn cache_insert(cache: &Cache, key: String, value: CacheValue, ttl: Duration) {
 
 // ── SSH + SQL ─────────────────────────────────────────────────────────────────
 
-fn build_ssh_args(cfg: &ResolvedConfig, remote_cmd: &str) -> Vec<String> {
+fn build_ssh_args(cfg: &ResolvedConfig, remote_cmd: &str, identity_path: &str) -> Vec<String> {
     let mut args = vec![
         "-i".to_owned(),
-        cfg.identity_file.clone(),
+        identity_path.to_owned(),
         "-p".to_owned(),
         cfg.ssh_port.to_string(),
         "-o".to_owned(),
@@ -346,6 +389,82 @@ fn build_ssh_args(cfg: &ResolvedConfig, remote_cmd: &str) -> Vec<String> {
     args
 }
 
+enum IdentityMaterial {
+    File(String),
+    Pem(String),
+}
+
+async fn read_keyring_secret_cli(key_name: &str) -> anyhow::Result<String> {
+    let search = Command::new("keyctl")
+        .args(["search", "@u", "user", key_name])
+        .output()
+        .await
+        .context("keyctl search failed to execute")?;
+
+    if !search.status.success() {
+        let stderr = String::from_utf8_lossy(&search.stderr);
+        anyhow::bail!(
+            "keyctl search failed for key '{}': {}",
+            key_name,
+            stderr.trim()
+        );
+    }
+
+    let key_id = String::from_utf8_lossy(&search.stdout).trim().to_string();
+    if key_id.is_empty() {
+        anyhow::bail!("keyctl search returned empty key id for '{}'", key_name);
+    }
+
+    let pipe = Command::new("keyctl")
+        .args(["pipe", &key_id])
+        .output()
+        .await
+        .context("keyctl pipe failed to execute")?;
+
+    if !pipe.status.success() {
+        let stderr = String::from_utf8_lossy(&pipe.stderr);
+        anyhow::bail!(
+            "keyctl pipe failed for key id '{}': {}",
+            key_id,
+            stderr.trim()
+        );
+    }
+
+    String::from_utf8(pipe.stdout).context("keyring key data is not valid UTF-8")
+}
+
+async fn resolve_identity(cfg: &ResolvedConfig) -> anyhow::Result<IdentityMaterial> {
+    if let Some(key_name) = cfg.identity_keyring_key.as_deref() {
+        if !key_name.trim().is_empty() {
+            match read_keyring_secret_cli(key_name).await {
+                Ok(pem) if !pem.trim().is_empty() => {
+                    return Ok(IdentityMaterial::Pem(pem));
+                }
+                Ok(_) => warn!(key_name, "identity keyring entry was empty"),
+                Err(e) => warn!(key_name, error = %e, "failed to read identity from keyring"),
+            }
+        }
+    }
+
+    if let Some(env_name) = cfg.identity_env_var.as_deref() {
+        if !env_name.trim().is_empty() {
+            if let Ok(pem) = std::env::var(env_name) {
+                if !pem.trim().is_empty() {
+                    return Ok(IdentityMaterial::Pem(pem));
+                }
+            }
+        }
+    }
+
+    if let Some(path) = cfg.identity_file.as_deref() {
+        if !path.trim().is_empty() {
+            return Ok(IdentityMaterial::File(path.to_owned()));
+        }
+    }
+
+    anyhow::bail!("no usable identity material found in keyring/env/file")
+}
+
 async fn ssh_query(cfg: &ResolvedConfig, fingerprint: &str) -> anyhow::Result<Vec<KeyRow>> {
     // `verified_at IS NOT NULL` produces 1/0 in MySQL TSV output, which the
     // parser maps to bool.  `accessed_at` is the actual column name for what
@@ -360,13 +479,39 @@ async fn ssh_query(cfg: &ResolvedConfig, fingerprint: &str) -> anyhow::Result<Ve
     );
 
     let remote_cmd = format!("echo \"{}\" | /usr/local/bin/ghe-dbconsole -y", sql);
-    let args = build_ssh_args(cfg, &remote_cmd);
+    let identity = resolve_identity(cfg).await?;
+    let output = match identity {
+        IdentityMaterial::File(path) => {
+            let args = build_ssh_args(cfg, &remote_cmd, &path);
+            let output = Command::new("ssh")
+                .args(&args)
+                .output()
+                .await
+                .context("failed to spawn ssh")?;
+            output
+        }
+        IdentityMaterial::Pem(pem) => {
+            let args = build_ssh_args(cfg, &remote_cmd, "/dev/stdin");
+            let mut child = Command::new("ssh")
+                .args(&args)
+                .stdin(Stdio::piped())
+                .spawn()
+                .context("failed to spawn ssh with piped identity")?;
 
-    let output = Command::new("ssh")
-        .args(&args)
-        .output()
-        .await
-        .context("failed to spawn ssh")?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(pem.as_bytes())
+                    .await
+                    .context("failed to write identity PEM to ssh stdin")?;
+            }
+
+            let output = child
+                .wait_with_output()
+                .await
+                .context("failed waiting for ssh output")?;
+            output
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -570,7 +715,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
 
     fn minimal_file() -> ConfigFile {
         ConfigFile {
-            identity_file: Some("/run/secrets/key".to_owned()),
+            identity_keyring_key: Some("GHE_KEY_LOOKUP_IDENTITY".to_owned()),
             ssh_target_endpoint: Some("ghe.example.com".to_owned()),
             ..Default::default()
         }
@@ -634,7 +779,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
     fn resolve_required_field_missing_errors() {
         let file = ConfigFile {
             ssh_target_endpoint: Some("ghe.example.com".to_owned()),
-            ..Default::default() // no identity_file
+            ..Default::default() // no identity source
         };
         assert!(resolve(empty_cli(), file).is_err());
     }
@@ -642,6 +787,8 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
     #[test]
     fn resolve_toml_roundtrip() {
         let toml_str = r#"
+            identity_keyring_key = "GHE_KEY_LOOKUP_IDENTITY"
+            identity_env_var     = "GHE_KEY_LOOKUP_IDENTITY_PEM"
             identity_file        = "/run/secrets/key"
             ssh_target_endpoint  = "ghe.example.com"
             ghe_url              = "https://ghe.corp.example.com"
@@ -655,6 +802,10 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
         assert_eq!(resolved.ghe_url, "https://ghe.corp.example.com");
         assert_eq!(resolved.cache_ttl_pos, 600);
         assert_eq!(resolved.ssh_control_path, "/run/ghe-key-lookup/ctrl");
+        assert_eq!(
+            resolved.identity_keyring_key.as_deref(),
+            Some("GHE_KEY_LOOKUP_IDENTITY")
+        );
     }
 
     #[test]
@@ -672,7 +823,9 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
     fn base_config() -> ResolvedConfig {
         ResolvedConfig {
             listen: "0.0.0.0:3000".to_owned(),
-            identity_file: "/run/secrets/key".to_owned(),
+            identity_file: Some("/run/secrets/key".to_owned()),
+            identity_keyring_key: None,
+            identity_env_var: None,
             ssh_user: "admin".to_owned(),
             ssh_target_endpoint: "ghe.example.com".to_owned(),
             ghe_url: "https://ghe.example.com".to_owned(),
@@ -687,7 +840,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
     #[test]
     fn ssh_args_no_control_master() {
         let cfg = base_config();
-        let args = build_ssh_args(&cfg, "echo hi");
+        let args = build_ssh_args(&cfg, "echo hi", "/run/secrets/key");
         assert!(!args.iter().any(|a| a.starts_with("ControlMaster")));
         assert!(!args.iter().any(|a| a.starts_with("ControlPath")));
         assert!(!args.iter().any(|a| a.starts_with("ControlPersist")));
@@ -703,7 +856,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
             ghe_url: "https://ghe.example.com".to_owned(),
             ..base_config()
         };
-        let args = build_ssh_args(&cfg, "echo hi");
+        let args = build_ssh_args(&cfg, "echo hi", "/run/secrets/key");
         assert!(args.contains(&"admin@ghe-internal.corp.net".to_owned()));
         assert!(!args.iter().any(|a| a == "admin@ghe.example.com"));
     }
@@ -715,7 +868,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
             ssh_control_persist: "120".to_owned(),
             ..base_config()
         };
-        let args = build_ssh_args(&cfg, "echo hi");
+        let args = build_ssh_args(&cfg, "echo hi", "/run/secrets/key");
         let joined = args.join(" ");
         assert!(joined.contains("ControlMaster=auto"));
         assert!(joined.contains("ControlPath=/run/ghe-key-lookup/ssh-control"));
@@ -728,7 +881,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
             ssh_control_path: "/run/ghe-key-lookup/ssh-control".to_owned(),
             ..base_config()
         };
-        let args = build_ssh_args(&cfg, "echo hi");
+        let args = build_ssh_args(&cfg, "echo hi", "/run/secrets/key");
         assert!(args.iter().any(|a| a == "ControlPersist=yes"));
     }
 
