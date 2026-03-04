@@ -16,6 +16,12 @@ variable "aws_region" {
   description = "AWS region for deployment"
 }
 
+variable "aws_profile" {
+  type        = string
+  default     = ""
+  description = "Optional AWS profile for provider auth and module local-exec AWS CLI fallback."
+}
+
 variable "name_prefix" {
   type        = string
   default     = "forgeproxy"

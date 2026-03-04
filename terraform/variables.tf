@@ -26,6 +26,12 @@ variable "aws_region" {
   }
 }
 
+variable "aws_profile" {
+  type        = string
+  default     = ""
+  description = "Optional AWS CLI profile name used as fallback by module local-exec scripts when AWS_PROFILE is unset."
+}
+
 variable "name_prefix" {
   type        = string
   default     = "forgeproxy"
