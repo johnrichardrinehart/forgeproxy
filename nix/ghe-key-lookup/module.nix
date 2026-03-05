@@ -190,7 +190,13 @@ in
         DynamicUser = true;
         KeyringMode = "shared";
 
-        BindReadOnlyPaths = lib.optionals (cfg.identityFile != null) [ (toString cfg.identityFile) ];
+        # Only bind-mount identityFile when it lives outside the RuntimeDirectory;
+        # paths inside /run/ghe-key-lookup/ are already accessible and may not
+        # exist until ExecStartPre creates them (BindReadOnlyPaths requires the
+        # source to exist before the mount namespace is set up).
+        BindReadOnlyPaths = lib.optionals (
+          cfg.identityFile != null && !lib.hasPrefix "/run/ghe-key-lookup/" (toString cfg.identityFile)
+        ) [ (toString cfg.identityFile) ];
 
         ExecStart = lib.escapeShellArgs [
           "${cfg.package}/bin/ghe-key-lookup"
