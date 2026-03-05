@@ -79,6 +79,6 @@ output "connection_string" {
 }
 
 output "ssh_connection_string" {
-  value       = "git@${var.proxy_fqdn}:22"
-  description = "SSH connection information (port 2222 is proxied through NLB)"
+  value       = var.nlb_ssh_listen_port == 22 ? "git@${var.proxy_fqdn}" : "ssh://git@${var.proxy_fqdn}:${var.nlb_ssh_listen_port}"
+  description = "SSH connection string for Git cloning"
 }
