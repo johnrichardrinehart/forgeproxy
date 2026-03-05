@@ -17,6 +17,7 @@ module "forgeproxy" {
 
   proxy_fqdn         = var.proxy_fqdn
   bundle_bucket_name = var.bundle_bucket_name
+  force_destroy      = var.force_destroy
 
   forgeproxy_instance_type  = var.forgeproxy_instance_type
   forgeproxy_count          = var.forgeproxy_count

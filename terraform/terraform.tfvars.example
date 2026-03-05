@@ -19,6 +19,7 @@ proxy_fqdn = "cache.example.com"
 
 # S3 bundle bucket name (MUST be globally unique)
 bundle_bucket_name = "my-org-forgeproxy-bundles-12345"
+force_destroy      = false
 
 # Instance types and counts
 forgeproxy_instance_type = "t3.large"

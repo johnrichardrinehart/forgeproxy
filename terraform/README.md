@@ -24,6 +24,9 @@ vim terraform.tfvars  # Edit with your values
 - `proxy_fqdn` - Fully-qualified domain name for the forgeproxy proxy
 - `bundle_bucket_name` - Globally unique S3 bucket name for bundles
 
+**Optional bucket deletion behavior:**
+- `force_destroy` - Defaults to `false`; set to `true` to allow Terraform to destroy non-empty S3 buckets
+
 **Closure variants:**
 - `closure_variant = "hardened"`: locked-down baseline (default)
 - `closure_variant = "dev"`: debugging-friendly profile (SSH/console enabled, env secret fallback enabled for app-level secret resolution)
