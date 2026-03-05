@@ -591,7 +591,7 @@
                 services.ghe-key-lookup = {
                   sshTargetEndpoint = lib.mkDefault "ghe.internal.example.com";
                   configPath = lib.mkDefault "/run/ghe-key-lookup/config.toml";
-                  openFirewall = lib.mkDefault false;
+                  openFirewall = lib.mkDefault true;
                   identityKeyringKey = lib.mkDefault "GHE_KEY_LOOKUP_IDENTITY";
                   identityFile = lib.mkDefault null;
                   identityEnvVar = lib.mkDefault null;
