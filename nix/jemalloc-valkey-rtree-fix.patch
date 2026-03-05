@@ -1,0 +1,333 @@
+diff --git a/include/jemalloc/internal/emap.h b/include/jemalloc/internal/emap.h
+index 88692356..8b51959a 100644
+--- a/include/jemalloc/internal/emap.h
++++ b/include/jemalloc/internal/emap.h
+@@ -378,8 +378,17 @@ emap_edata_lookup_batch(tsd_t *tsd, emap_t *emap, size_t nptrs,
+ 
+ 	for (size_t i = 0; i < nptrs; i++) {
+ 		rtree_leaf_elm_t *elm = result[i].rtree_leaf;
+-		rtree_contents_t  contents = rtree_leaf_elm_read(
+-                    tsd_tsdn(tsd), &emap->rtree, elm, /* dependent */ true);
++		rtree_contents_t  contents;
++		if (unlikely(elm == NULL)) {
++			contents.edata = NULL;
++			contents.metadata.szind = SC_NSIZES;
++			contents.metadata.slab = false;
++			contents.metadata.is_head = false;
++			contents.metadata.state = (extent_state_t)0;
++		} else {
++			contents = rtree_leaf_elm_read(tsd_tsdn(tsd), &emap->rtree,
++			    elm, /* dependent */ true);
++		}
+ 		result[i].edata = contents.edata;
+ 		emap_full_alloc_ctx_t alloc_ctx;
+ 		/*
+diff --git a/include/jemalloc/internal/rtree.h b/include/jemalloc/internal/rtree.h
+index 07205958..43ae7ede 100644
+--- a/include/jemalloc/internal/rtree.h
++++ b/include/jemalloc/internal/rtree.h
+@@ -359,7 +359,9 @@ rtree_leaf_elm_lookup_fast(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ 	}
+ 
+ 	rtree_leaf_elm_t *leaf = rtree_ctx->cache[slot].leaf;
+-	assert(leaf != NULL);
++	if (unlikely(leaf == NULL)) {
++		return true;
++	}
+ 	uintptr_t subkey = rtree_subkey(key, RTREE_HEIGHT - 1);
+ 	*elm = &leaf[subkey];
+ 
+@@ -379,7 +381,9 @@ rtree_leaf_elm_lookup(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ 	/* Fast path: L1 direct mapped cache. */
+ 	if (likely(rtree_ctx->cache[slot].leafkey == leafkey)) {
+ 		rtree_leaf_elm_t *leaf = rtree_ctx->cache[slot].leaf;
+-		assert(leaf != NULL);
++		if (unlikely(leaf == NULL)) {
++			goto hard;
++		}
+ 		uintptr_t subkey = rtree_subkey(key, RTREE_HEIGHT - 1);
+ 		return &leaf[subkey];
+ 	}
+@@ -391,7 +395,9 @@ rtree_leaf_elm_lookup(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ 	do {                                                                   \
+ 		if (likely(rtree_ctx->l2_cache[i].leafkey == leafkey)) {       \
+ 			rtree_leaf_elm_t *leaf = rtree_ctx->l2_cache[i].leaf;  \
+-			assert(leaf != NULL);                                  \
++			if (unlikely(leaf == NULL)) {                          \
++				break;                                         \
++			}                                                      \
+ 			if (i > 0) {                                           \
+ 				/* Bubble up by one. */                        \
+ 				rtree_ctx->l2_cache[i].leafkey =               \
+@@ -423,6 +429,7 @@ rtree_leaf_elm_lookup(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ 	}
+ #undef RTREE_CACHE_CHECK_L2
+ 
++hard:
+ 	return rtree_leaf_elm_lookup_hard(
+ 	    tsdn, rtree, rtree_ctx, key, dependent, init_missing);
+ }
+@@ -448,7 +455,12 @@ rtree_read(
+     tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx, uintptr_t key) {
+ 	rtree_leaf_elm_t *elm = rtree_leaf_elm_lookup(tsdn, rtree, rtree_ctx,
+ 	    key, /* dependent */ true, /* init_missing */ false);
+-	assert(elm != NULL);
++	if (unlikely(elm == NULL)) {
++		rtree_contents_t zero;
++		memset(&zero, 0, sizeof(zero));
++		zero.metadata.szind = SC_NSIZES;
++		return zero;
++	}
+ 	return rtree_leaf_elm_read(tsdn, rtree, elm, /* dependent */ true);
+ }
+ 
+diff --git a/src/arena.c b/src/arena.c
+index 962a325d..17c1c0ed 100644
+--- a/src/arena.c
++++ b/src/arena.c
+@@ -30,6 +30,7 @@ ssize_t opt_muzzy_decay_ms = MUZZY_DECAY_MS_DEFAULT;
+ 
+ static atomic_zd_t dirty_decay_ms_default;
+ static atomic_zd_t muzzy_decay_ms_default;
++static atomic_zu_t arena_dalloc_small_missing_edata = ATOMIC_INIT(0);
+ 
+ emap_t              arena_emap_global;
+ static pa_central_t arena_pa_central_global;
+@@ -1466,6 +1467,25 @@ arena_dalloc_bin(tsdn_t *tsdn, arena_t *arena, edata_t *edata, void *ptr) {
+ void
+ arena_dalloc_small(tsdn_t *tsdn, void *ptr) {
+ 	edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global, ptr);
++	if (unlikely(edata == NULL)) {
++		atomic_fetch_add_zu(&arena_dalloc_small_missing_edata, 1,
++		    ATOMIC_RELAXED);
++		if (config_opt_safety_checks) {
++			safety_check_fail(
++			    "<jemalloc>: invalid deallocation detected "
++			    "(pointer %p is not present in the extent map). "
++			    "Likely caused by application deallocation bugs. "
++			    "Abort.\n",
++			    ptr);
++			return;
++		}
++		/*
++		 * ptr is not present in jemalloc's extent map.  For production
++		 * builds, skip deallocation instead of crashing in dependent lookup
++		 * paths.
++		 */
++		return;
++	}
+ 	arena_t *arena = arena_get_from_edata(edata);
+ 
+ 	arena_dalloc_bin(tsdn, arena, edata, ptr);
+diff --git a/src/rtree.c b/src/rtree.c
+index ac27f829..f1914a38 100644
+--- a/src/rtree.c
++++ b/src/rtree.c
+@@ -109,6 +109,15 @@ rtree_child_node_tryread(rtree_node_elm_t *elm, bool dependent) {
+ 	if (dependent) {
+ 		node = (rtree_node_elm_t *)atomic_load_p(
+ 		    &elm->child, ATOMIC_RELAXED);
++		if (unlikely(!rtree_node_valid(node))) {
++			/*
++			 * Belt-and-suspenders retry: dependent lookups use relaxed
++			 * loads; if that observes NULL, retry with acquire before
++			 * handing control to higher-level NULL handling.
++			 */
++			node = (rtree_node_elm_t *)atomic_load_p(
++			    &elm->child, ATOMIC_ACQUIRE);
++		}
+ 	} else {
+ 		node = (rtree_node_elm_t *)atomic_load_p(
+ 		    &elm->child, ATOMIC_ACQUIRE);
+@@ -138,6 +147,15 @@ rtree_child_leaf_tryread(rtree_node_elm_t *elm, bool dependent) {
+ 	if (dependent) {
+ 		leaf = (rtree_leaf_elm_t *)atomic_load_p(
+ 		    &elm->child, ATOMIC_RELAXED);
++		if (unlikely(!rtree_leaf_valid(leaf))) {
++			/*
++			 * Belt-and-suspenders retry: dependent lookups use relaxed
++			 * loads; if that observes NULL, retry with acquire before
++			 * handing control to higher-level NULL handling.
++			 */
++			leaf = (rtree_leaf_elm_t *)atomic_load_p(
++			    &elm->child, ATOMIC_ACQUIRE);
++		}
+ 	} else {
+ 		leaf = (rtree_leaf_elm_t *)atomic_load_p(
+ 		    &elm->child, ATOMIC_ACQUIRE);
+@@ -184,8 +202,7 @@ rtree_leaf_elm_lookup_hard(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ #define RTREE_GET_CHILD(level)                                                 \
+ 	{                                                                      \
+ 		assert(level < RTREE_HEIGHT - 1);                              \
+-		if (level != 0 && !dependent                                   \
+-		    && unlikely(!rtree_node_valid(node))) {                    \
++		if (level != 0 && unlikely(!rtree_node_valid(node))) {         \
+ 			return NULL;                                           \
+ 		}                                                              \
+ 		uintptr_t subkey = rtree_subkey(key, level);                   \
+@@ -211,7 +228,7 @@ rtree_leaf_elm_lookup_hard(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ #define RTREE_GET_LEAF(level)                                                  \
+ 	{                                                                      \
+ 		assert(level == RTREE_HEIGHT - 1);                             \
+-		if (!dependent && unlikely(!rtree_leaf_valid(leaf))) {         \
++		if (unlikely(!rtree_leaf_valid(leaf))) {                       \
+ 			return NULL;                                           \
+ 		}                                                              \
+ 		if (RTREE_CTX_NCACHE_L2 > 1) {                                 \
+diff --git a/src/tcache.c b/src/tcache.c
+index 2d73237b..b9aa5327 100644
+--- a/src/tcache.c
++++ b/src/tcache.c
+@@ -84,6 +84,7 @@ static cache_bin_info_t opt_tcache_ncached_max[TCACHE_NBINS_MAX] = {{0}};
+ static bool opt_tcache_ncached_max_set[TCACHE_NBINS_MAX] = {0};
+ 
+ tcaches_t *tcaches;
++static atomic_zu_t tcache_flush_missing_edata = ATOMIC_INIT(0);
+ 
+ /* Index of first element within tcaches that has never been used. */
+ static unsigned tcaches_past;
+@@ -627,6 +628,11 @@ static void
+ tcache_bin_flush_metadata_visitor(
+     void *szind_sum_ctx, emap_full_alloc_ctx_t *alloc_ctx) {
+ 	size_t *szind_sum = (size_t *)szind_sum_ctx;
++	if (alloc_ctx->edata == NULL) {
++		atomic_fetch_add_zu(&tcache_flush_missing_edata, 1,
++		    ATOMIC_RELAXED);
++		return;
++	}
+ 	*szind_sum -= alloc_ctx->szind;
+ 	util_prefetch_write_range(alloc_ctx->edata, sizeof(edata_t));
+ }
+@@ -636,7 +642,22 @@ tcache_bin_flush_size_check_fail(cache_bin_ptr_array_t *arr, szind_t szind,
+     size_t nptrs, emap_batch_lookup_result_t *edatas) {
+ 	bool found_mismatch = false;
+ 	for (size_t i = 0; i < nptrs; i++) {
+-		szind_t true_szind = edata_szind_get(edatas[i].edata);
++		edata_t *edata = edatas[i].edata;
++		if (unlikely(edata == NULL)) {
++			atomic_fetch_add_zu(&tcache_flush_missing_edata, 1,
++			    ATOMIC_RELAXED);
++			found_mismatch = true;
++			safety_check_fail(
++			    "<jemalloc>: invalid deallocation detected "
++			    "(pointer %p in thread cache is not present in the "
++			    "extent map; input size %zu). "
++			    "Likely caused by application sized deallocation bugs. "
++			    "Abort.\n",
++			    tcache_bin_flush_ptr_getter(arr, i),
++			    sz_index2size(szind));
++			continue;
++		}
++		szind_t true_szind = edata_szind_get(edata);
+ 		if (true_szind != szind) {
+ 			found_mismatch = true;
+ 			safety_check_fail_sized_dealloc(
+@@ -711,6 +732,13 @@ tcache_bin_flush_impl_small(tsd_t *tsd, tcache_t *tcache,
+ 	unsigned flush_start = 0;
+ 
+ 	while (flush_start < nflush) {
++		while (flush_start < nflush
++		    && item_edata[flush_start].edata == NULL) {
++			flush_start++;
++		}
++		if (flush_start == nflush) {
++			break;
++		}
+ 		/*
+ 		 * After our partitioning step, all objects to flush will be in
+ 		 * the half-open range [prev_flush_start, flush_start), and
+@@ -734,7 +762,10 @@ tcache_bin_flush_impl_small(tsd_t *tsd, tcache_t *tcache,
+ 		for (unsigned i = flush_start; i < nflush; i++) {
+ 			void    *ptr = ptrs->ptr[i];
+ 			edata_t *edata = item_edata[i].edata;
+-			assert(ptr != NULL && edata != NULL);
++			assert(ptr != NULL);
++			if (unlikely(edata == NULL)) {
++				continue;
++			}
+ 			assert(
+ 			    (uintptr_t)ptr >= (uintptr_t)edata_addr_get(edata));
+ 			assert(
+@@ -755,9 +786,9 @@ tcache_bin_flush_impl_small(tsd_t *tsd, tcache_t *tcache,
+ 		}
+ 		/* Make sure we implemented partitioning correctly. */
+ 		if (config_debug) {
+-			for (unsigned i = prev_flush_start; i < flush_start;
+-			     i++) {
++			for (unsigned i = prev_flush_start; i < flush_start; i++) {
+ 				edata_t *edata = item_edata[i].edata;
++				assert(edata != NULL);
+ 				unsigned arena_ind = edata_arena_ind_get(edata);
+ 				assert(arena_ind == cur_arena_ind);
+ 				unsigned binshard = edata_binshard_get(edata);
+@@ -765,10 +796,12 @@ tcache_bin_flush_impl_small(tsd_t *tsd, tcache_t *tcache,
+ 			}
+ 			for (unsigned i = flush_start; i < nflush; i++) {
+ 				edata_t *edata = item_edata[i].edata;
++				if (edata == NULL) {
++					continue;
++				}
+ 				assert(
+ 				    edata_arena_ind_get(edata) != cur_arena_ind
+-				    || edata_binshard_get(edata)
+-				        != cur_binshard);
++				    || edata_binshard_get(edata) != cur_binshard);
+ 			}
+ 		}
+ 
+@@ -797,6 +830,9 @@ tcache_bin_flush_impl_small(tsd_t *tsd, tcache_t *tcache,
+ 		for (unsigned i = prev_flush_start; i < flush_start; i++) {
+ 			void    *ptr = ptrs->ptr[i];
+ 			edata_t *edata = item_edata[i].edata;
++			if (unlikely(edata == NULL)) {
++				continue;
++			}
+ 			if (arena_dalloc_bin_locked_step(tsdn, cur_arena,
+ 			        cur_bin, &dalloc_bin_info, binind, edata,
+ 			        ptr)) {
+@@ -863,6 +899,21 @@ tcache_bin_flush_impl_large(tsd_t *tsd, tcache_t *tcache,
+ 	 */
+ 	bool merged_stats = false;
+ 	while (nflush > 0) {
++		unsigned first_valid = 0;
++		while (first_valid < nflush && item_edata[first_valid].edata == NULL) {
++			first_valid++;
++		}
++		if (first_valid == nflush) {
++			break;
++		}
++		if (first_valid != 0) {
++			void *tmp_ptr = ptrs->ptr[0];
++			ptrs->ptr[0] = ptrs->ptr[first_valid];
++			ptrs->ptr[first_valid] = tmp_ptr;
++			emap_batch_lookup_result_t tmp_edata = item_edata[0];
++			item_edata[0] = item_edata[first_valid];
++			item_edata[first_valid] = tmp_edata;
++		}
+ 		/* Lock the arena, or bin, associated with the first object. */
+ 		edata_t *edata = item_edata[0].edata;
+ 		unsigned cur_arena_ind = edata_arena_ind_get(edata);
+@@ -892,7 +943,10 @@ tcache_bin_flush_impl_large(tsd_t *tsd, tcache_t *tcache,
+ 		for (unsigned i = 0; i < nflush; i++) {
+ 			void *ptr = ptrs->ptr[i];
+ 			edata = item_edata[i].edata;
+-			assert(ptr != NULL && edata != NULL);
++			assert(ptr != NULL);
++			if (unlikely(edata == NULL)) {
++				continue;
++			}
+ 
+ 			if (edata_arena_ind_get(edata) == cur_arena_ind) {
+ 				large_dalloc_prep_locked(tsdn, edata);
+@@ -907,7 +961,10 @@ tcache_bin_flush_impl_large(tsd_t *tsd, tcache_t *tcache,
+ 		for (unsigned i = 0; i < nflush; i++) {
+ 			void *ptr = ptrs->ptr[i];
+ 			edata = item_edata[i].edata;
+-			assert(ptr != NULL && edata != NULL);
++			assert(ptr != NULL);
++			if (unlikely(edata == NULL)) {
++				continue;
++			}
+ 			if (edata_arena_ind_get(edata) != cur_arena_ind) {
+ 				/*
+ 				 * The object was allocated either via a
