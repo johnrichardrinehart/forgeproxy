@@ -10,6 +10,17 @@ locals {
   ghe_key_lookup_security_group_ids = local.ghe_key_lookup_enabled ? (
     local.create_ghe_key_lookup_security_group ? [aws_security_group.ghe_key_lookup[0].id] : var.ghe_key_lookup_security_group_ids
   ) : []
+
+  # Subnet CIDRs for NLB health check traffic — the NLB's internal health
+  # probes originate from its ENI IPs and are not tagged with a security group.
+  ghe_key_lookup_subnet_cidrs = local.ghe_key_lookup_enabled ? [
+    for s in data.aws_subnet.ghe_key_lookup : s.cidr_block
+  ] : []
+}
+
+data "aws_subnet" "ghe_key_lookup" {
+  for_each = local.ghe_key_lookup_enabled ? toset(local.ghe_key_lookup_subnet_ids) : toset([])
+  id       = each.value
 }
 
 check "ghe_key_lookup_requires_target_endpoint" {
@@ -48,8 +59,21 @@ resource "aws_security_group" "ghe_key_lookup" {
     }
   }
 
+  # NLB health checks originate from the NLB's ENI private IPs within the
+  # subnet; allow the subnet CIDRs so health probes can reach the target.
   dynamic "ingress" {
-    for_each = var.ghe_key_lookup_listen_ports
+    for_each = length(local.ghe_key_lookup_subnet_cidrs) > 0 ? var.ghe_key_lookup_listen_ports : []
+    content {
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "tcp"
+      cidr_blocks = local.ghe_key_lookup_subnet_cidrs
+      description = "ghe-key-lookup from NLB health checks (subnet CIDRs)"
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = length(var.ghe_key_lookup_allowed_cidrs) > 0 ? var.ghe_key_lookup_listen_ports : []
     content {
       from_port   = ingress.value
       to_port     = ingress.value
