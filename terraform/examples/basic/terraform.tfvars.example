@@ -4,6 +4,7 @@ upstream_hostname  = "ghe.example.com"
 upstream_api_url   = "https://ghe.example.com/api/v3"
 proxy_fqdn         = "forgeproxy.example.com"
 bundle_bucket_name = "my-forgeproxy-bundles"
+force_destroy      = false
 
 # Optional overrides (uncomment to customise):
 # aws_region               = "us-east-1"

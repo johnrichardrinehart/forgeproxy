@@ -76,6 +76,12 @@ variable "bundle_bucket_name" {
   description = "S3 bucket name for bundle storage (must be globally unique)"
 }
 
+variable "force_destroy" {
+  type        = bool
+  default     = false
+  description = "When true, allow Terraform to destroy non-empty S3 buckets."
+}
+
 variable "forgeproxy_instance_type" {
   type        = string
   default     = "t3.large"

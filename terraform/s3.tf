@@ -2,6 +2,7 @@
 # Used to upload the NixOS AMI before importing into EC2
 resource "aws_s3_bucket" "ami_staging" {
   bucket_prefix = "${var.name_prefix}-ami-staging-"
+  force_destroy = var.force_destroy
 
   tags = {
     Name = "${var.name_prefix}-ami-staging"
@@ -80,7 +81,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "ami_staging" {
 # ── S3 Bucket: Bundle Storage ──────────────────────────────────────────────
 # Long-term storage for git bundle archives
 resource "aws_s3_bucket" "bundle" {
-  bucket = var.bundle_bucket_name
+  bucket        = var.bundle_bucket_name
+  force_destroy = var.force_destroy
 
   tags = {
     Name = var.bundle_bucket_name
