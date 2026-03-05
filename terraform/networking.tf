@@ -354,10 +354,10 @@ resource "aws_lb_listener" "https" {
   }
 }
 
-# ── Listener: SSH Git (port 2222) ──────────────────────────────────────────
+# ── Listener: SSH Git ─────────────────────────────────────────────────────
 resource "aws_lb_listener" "ssh" {
   load_balancer_arn = aws_lb.nlb.arn
-  port              = 2222
+  port              = var.nlb_ssh_listen_port
   protocol          = "TCP"
   default_action {
     type             = "forward"

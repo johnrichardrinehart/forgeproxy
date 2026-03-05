@@ -275,6 +275,17 @@ variable "nlb_internal" {
   description = "Whether NLB should be internal (private) vs internet-facing. Set to false to expose via public EIP (corporate internal traffic only, not internet-routable)"
 }
 
+variable "nlb_ssh_listen_port" {
+  type        = number
+  default     = 2222
+  description = "Port the NLB listens on for SSH Git traffic. The target group always forwards to instance port 2222; set this to 22 to allow clients to use the standard SSH port."
+
+  validation {
+    condition     = var.nlb_ssh_listen_port >= 1 && var.nlb_ssh_listen_port <= 65535
+    error_message = "nlb_ssh_listen_port must be a valid TCP port (1-65535)."
+  }
+}
+
 variable "metrics_scrape_cidrs" {
   type        = list(string)
   default     = []
