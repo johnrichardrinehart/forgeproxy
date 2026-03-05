@@ -203,6 +203,14 @@
       # ────────────────────────────────────────────────────────────────────
       flake = {
         overlays.default = final: prev: {
+          jemalloc-valkey-rtree-fix = prev.jemalloc.overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [
+              ./nix/jemalloc-valkey-rtree-fix.patch
+            ];
+          });
+          valkey = prev.valkey.override {
+            jemalloc = final.jemalloc-valkey-rtree-fix;
+          };
           forgeproxy = final.callPackage ./nix/package.nix { };
           forgeproxy-fips = final.callPackage ./nix/package.nix { fipsEnabled = true; };
           ghe-key-lookup = final.callPackage ./nix/ghe-key-lookup/package.nix { };
