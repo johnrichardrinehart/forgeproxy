@@ -132,7 +132,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
     let repo_path = state.cache_manager.repo_path(owner_repo);
 
-    let fetch_result = if repo_path.exists() && repo_path.join("HEAD").is_file() {
+    let fetch_result = if state.cache_manager.has_repo(owner_repo) {
         // Repo is locally cached -- do an incremental fetch.
         let upstream_url = format!(
             "https://{}/{}.git",
