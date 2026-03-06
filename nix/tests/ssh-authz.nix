@@ -457,6 +457,16 @@ pkgs.testers.runNixOSTest {
         assert "Access denied" not in result, \
             f"Alice should not be denied access to repo-uncached, got: {result}"
 
+    # ── Subtest 1b: Uncached SSH access populates local cache ──────────────
+    with subtest("Uncached SSH access triggers background cache clone"):
+        proxy.wait_until_succeeds(
+            "test -d /var/cache/forgeproxy/repos/octocat/repo-uncached.git"
+        )
+        proxy.wait_until_succeeds(
+            "redis-cli -h valkey HEXISTS 'forgeproxy:repo:octocat/repo-uncached' last_fetch_ts"
+            " | grep -qx 1"
+        )
+
     # ── Subtest 2: Privileged user, cached repo ──────────────────────────
     with subtest("Alice can clone cached repo"):
         result = client.succeed(
