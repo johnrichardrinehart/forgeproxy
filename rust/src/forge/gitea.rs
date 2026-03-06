@@ -58,6 +58,24 @@ impl GiteaBackend {
     }
 }
 
+fn permission_from_repo_response(body: &serde_json::Value) -> Permission {
+    let perm = crate::forge::extract_permission(body);
+    if perm.has_read() {
+        return perm;
+    }
+
+    // Anonymous public repos are readable even when "permissions" is absent.
+    if body
+        .get("private")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|is_private| !is_private)
+    {
+        return Permission::Read;
+    }
+
+    Permission::None
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementation
 // ---------------------------------------------------------------------------
@@ -96,18 +114,7 @@ impl ForgeBackend for GiteaBackend {
             .await
             .context("failed to parse Gitea API response")?;
 
-        let perm = crate::forge::extract_permission(&body);
-        if perm.has_read() {
-            return Ok(perm);
-        }
-        if body
-            .get("private")
-            .and_then(|v| v.as_bool())
-            .is_some_and(|is_private| !is_private)
-        {
-            return Ok(Permission::Read);
-        }
-        Ok(Permission::None)
+        Ok(permission_from_repo_response(&body))
     }
 
     async fn resolve_ssh_user(
@@ -329,6 +336,12 @@ mod tests {
             "permissions": {"admin": false, "push": false, "pull": true}
         });
         assert_eq!(crate::forge::extract_permission(&body), Permission::Read);
+    }
+
+    #[test]
+    fn public_repo_without_permissions_is_readable() {
+        let body = serde_json::json!({"private": false});
+        assert_eq!(permission_from_repo_response(&body), Permission::Read);
     }
 
     // ── Gitea HMAC verification (no sha256= prefix) ────────────────────

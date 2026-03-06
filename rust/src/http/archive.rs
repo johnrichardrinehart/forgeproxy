@@ -143,11 +143,11 @@ pub async fn handle_archive(
 
     debug!(%upstream_url, "proxying archive request to upstream forge");
 
-    let mut req = state.http_client.get(&upstream_url);
+    let mut upstream_req = state.http_client.get(&upstream_url);
     if let Some(header) = auth_header.as_deref() {
-        req = req.header(header::AUTHORIZATION, header);
+        upstream_req = upstream_req.header(header::AUTHORIZATION, header);
     }
-    let upstream_resp = req
+    let upstream_resp = upstream_req
         .send()
         .await
         .context("failed to reach upstream forge for archive")?;
