@@ -14,6 +14,13 @@ pub struct RepoInfo {
     pub status: String,
     /// Comma-separated list of node IDs that hold a local clone.
     pub node_ids: String,
+    /// Node currently hydrating this repo, if any.
+    pub hydrating_node_id: String,
+    /// Unix timestamp when the current hydration attempt started.
+    pub hydrating_since_ts: i64,
+    /// Whether the current hydrator still needs to publish a bootstrap S3
+    /// bundle before the repo is warm for other nodes.
+    pub bootstrap_bundle_pending: bool,
     /// S3 key where the bundle-list manifest is stored.
     pub s3_bundle_list_key: String,
     /// Unix timestamp of the last successful fetch from the origin.
@@ -64,6 +71,15 @@ fn repo_info_to_pairs(info: &RepoInfo) -> Vec<(String, String)> {
     vec![
         ("status".into(), info.status.clone()),
         ("node_ids".into(), info.node_ids.clone()),
+        ("hydrating_node_id".into(), info.hydrating_node_id.clone()),
+        (
+            "hydrating_since_ts".into(),
+            info.hydrating_since_ts.to_string(),
+        ),
+        (
+            "bootstrap_bundle_pending".into(),
+            info.bootstrap_bundle_pending.to_string(),
+        ),
         ("s3_bundle_list_key".into(), info.s3_bundle_list_key.clone()),
         ("last_fetch_ts".into(), info.last_fetch_ts.to_string()),
         ("last_bundle_ts".into(), info.last_bundle_ts.to_string()),
@@ -81,6 +97,15 @@ fn repo_info_from_map(map: HashMap<String, String>) -> RepoInfo {
     RepoInfo {
         status: map.get("status").cloned().unwrap_or_default(),
         node_ids: map.get("node_ids").cloned().unwrap_or_default(),
+        hydrating_node_id: map.get("hydrating_node_id").cloned().unwrap_or_default(),
+        hydrating_since_ts: map
+            .get("hydrating_since_ts")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        bootstrap_bundle_pending: map
+            .get("bootstrap_bundle_pending")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(false),
         s3_bundle_list_key: map.get("s3_bundle_list_key").cloned().unwrap_or_default(),
         last_fetch_ts: map
             .get("last_fetch_ts")
@@ -262,6 +287,16 @@ pub async fn try_ensure_repo_cloned(
     repo: &str,
     auth_header: Option<&str>,
 ) -> Result<()> {
+    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, false).await
+}
+
+async fn try_ensure_repo_cloned_inner(
+    state: &crate::AppState,
+    owner: &str,
+    repo: &str,
+    auth_header: Option<&str>,
+    waited_for_bootstrap: bool,
+) -> Result<()> {
     // Strip trailing ".git" from repo if present to avoid double-suffixing
     // (the URL path extractor preserves it, and we append ".git" below).
     let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
@@ -279,9 +314,30 @@ pub async fn try_ensure_repo_cloned(
     .await?;
 
     if !lock_acquired {
+        if !waited_for_bootstrap && wait_for_bootstrap_bundle(state, &owner_repo, &node_id).await? {
+            return Box::pin(try_ensure_repo_cloned_inner(
+                state,
+                owner,
+                repo,
+                auth_header,
+                true,
+            ))
+            .await;
+        }
+
         debug!(%owner_repo, "hydrate already in progress; skipping duplicate background clone");
         return Ok(());
     }
+
+    let hydrate_started_at = chrono::Utc::now().timestamp();
+    let mut info = get_repo_info(&state.valkey, &owner_repo)
+        .await?
+        .unwrap_or_default();
+    info.status = "hydrating".to_string();
+    info.hydrating_node_id = node_id.clone();
+    info.hydrating_since_ts = hydrate_started_at;
+    info.bootstrap_bundle_pending = false;
+    set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
     // We hold the lock — perform the clone.
     let result = async {
@@ -296,6 +352,9 @@ pub async fn try_ensure_repo_cloned(
                     .unwrap_or_default();
                 info.status = "ready".to_string();
                 info.node_ids = node_id.clone();
+                info.hydrating_node_id.clear();
+                info.hydrating_since_ts = 0;
+                info.bootstrap_bundle_pending = false;
                 if info.last_fetch_ts == 0 {
                     info.last_fetch_ts = now;
                 }
@@ -372,6 +431,15 @@ pub async fn try_ensure_repo_cloned(
                 .await
                 .with_context(|| format!("failed to generate bootstrap bundle for {owner_repo}"))?;
 
+        let mut info = get_repo_info(&state.valkey, &owner_repo)
+            .await?
+            .unwrap_or_default();
+        info.status = "hydrating".to_string();
+        info.hydrating_node_id = node_id.clone();
+        info.hydrating_since_ts = hydrate_started_at;
+        info.bootstrap_bundle_pending = true;
+        set_repo_info(&state.valkey, &owner_repo, &info).await?;
+
         let s3_key = format!(
             "{}{}/bundles/{}.bundle",
             state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
@@ -399,6 +467,9 @@ pub async fn try_ensure_repo_cloned(
         let info = RepoInfo {
             status: "ready".to_string(),
             node_ids: node_id.clone(),
+            hydrating_node_id: String::new(),
+            hydrating_since_ts: 0,
+            bootstrap_bundle_pending: false,
             last_fetch_ts: now,
             last_bundle_ts: now,
             latest_creation_token: bundle.creation_token,
@@ -412,6 +483,18 @@ pub async fn try_ensure_repo_cloned(
         Ok::<(), anyhow::Error>(())
     }
     .await;
+
+    if let Err(error) = &result {
+        let mut info = get_repo_info(&state.valkey, &owner_repo)
+            .await?
+            .unwrap_or_default();
+        info.status = "failed".to_string();
+        info.hydrating_node_id.clear();
+        info.hydrating_since_ts = 0;
+        info.bootstrap_bundle_pending = false;
+        set_repo_info(&state.valkey, &owner_repo, &info).await?;
+        info!(%owner_repo, error = %error, "repo hydration failed");
+    }
 
     // Always release the lock.
     let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
@@ -513,6 +596,51 @@ async fn register_bundle_in_valkey(
     Ok(())
 }
 
+async fn wait_for_bootstrap_bundle(
+    state: &crate::AppState,
+    owner_repo: &str,
+    node_id: &str,
+) -> Result<bool> {
+    let Some(info) = get_repo_info(&state.valkey, owner_repo).await? else {
+        return Ok(false);
+    };
+
+    if info.hydrating_node_id.is_empty()
+        || info.hydrating_node_id == node_id
+        || !info.bootstrap_bundle_pending
+    {
+        return Ok(false);
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let poll_interval = std::time::Duration::from_millis(250);
+
+    loop {
+        let Some(info) = get_repo_info(&state.valkey, owner_repo).await? else {
+            return Ok(false);
+        };
+
+        if !info.bootstrap_bundle_pending {
+            let repo_key = repo_key(owner_repo);
+            let latest_bundle_s3_key: Option<String> =
+                HashesInterface::hget(&state.valkey, &repo_key, "latest_bundle_s3_key")
+                    .await
+                    .unwrap_or(None);
+            let base_bundle_s3_key: Option<String> =
+                HashesInterface::hget(&state.valkey, &repo_key, "base_bundle_s3_key")
+                    .await
+                    .unwrap_or(None);
+            return Ok(latest_bundle_s3_key.or(base_bundle_s3_key).is_some());
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 /// List all tracked repository names by scanning for `forgeproxy:repo:*` keys
 /// (excluding `:fetch_schedule` sub-keys).
 ///
@@ -546,4 +674,33 @@ pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
 
     debug!(count = repos.len(), "listed all repos");
     Ok(repos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_info_round_trip_preserves_hydration_fields() {
+        let info = RepoInfo {
+            status: "hydrating".to_string(),
+            node_ids: "node-a".to_string(),
+            hydrating_node_id: "node-a".to_string(),
+            hydrating_since_ts: 1234,
+            bootstrap_bundle_pending: true,
+            s3_bundle_list_key: "bundle-list".to_string(),
+            last_fetch_ts: 10,
+            last_bundle_ts: 11,
+            latest_creation_token: 12,
+            refs_hash: "abc".to_string(),
+            size_bytes: 13,
+            clone_count: 14,
+        };
+
+        let round_trip = repo_info_from_map(repo_info_to_pairs(&info).into_iter().collect());
+        assert_eq!(round_trip.status, "hydrating");
+        assert_eq!(round_trip.hydrating_node_id, "node-a");
+        assert_eq!(round_trip.hydrating_since_ts, 1234);
+        assert!(round_trip.bootstrap_bundle_pending);
+    }
 }

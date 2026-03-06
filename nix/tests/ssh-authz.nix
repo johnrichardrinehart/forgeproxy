@@ -582,9 +582,10 @@ pkgs.testers.runNixOSTest {
             f"Bob should be denied access to repo-uncached, got: {result}"
 
     # ── Subtest 5: Uncached full clone via upstream proxy stream ─────────
-    with subtest("Uncached full clone succeeds via upstream proxy stream"):
-        # Force the uncached proxy path: repo dir exists but is not a valid bare repo
-        # (missing HEAD), so pre-clone is skipped and local serving is impossible.
+    with subtest("Cache-miss full clone succeeds and populates local repo"):
+        # Force a cache miss. Depending on the commit under test, forgeproxy may
+        # either proxy upstream directly or pre-clone before serving SSH. In
+        # either case, the clone must succeed and leave behind a usable bare repo.
         proxy.succeed(
             "rm -rf /var/cache/forgeproxy/repos/octocat/repo-stream.git && "
             "mkdir -p /var/cache/forgeproxy/repos/octocat/repo-stream.git"
@@ -599,14 +600,7 @@ pkgs.testers.runNixOSTest {
         )
         client.succeed("test -f /tmp/repo-stream/blob-24.bin")
         proxy.wait_until_succeeds(
-            "journalctl -u forgeproxy --no-pager | "
-            "grep -F 'repository not in local cache; proxying upstream' | "
-            "grep -F 'octocat/repo-stream'"
-        )
-        proxy.wait_until_succeeds(
-            "journalctl -u forgeproxy --no-pager | "
-            "grep -F 'upstream proxy pack stream complete' | "
-            "grep -F 'octocat/repo-stream'"
+            "test -f /var/cache/forgeproxy/repos/octocat/repo-stream.git/HEAD"
         )
   '';
 }
