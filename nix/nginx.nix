@@ -275,11 +275,11 @@ in
     systemd.services.nginx.preStart = lib.mkBefore ''
       mkdir -p /run/nginx
       if [ ! -f /run/nginx/forgeproxy-upstream.conf ]; then
-        echo 'upstream forge-upstream { server 127.0.0.1:443; }' \
+        echo 'upstream forge-upstream { server ${cfg.upstreamHostname}:${toString cfg.upstreamPort}; }' \
           > /run/nginx/forgeproxy-upstream.conf
       fi
       if [ ! -f /run/nginx/forgeproxy-server.conf ]; then
-        printf 'set $%s "%s";\n' forge_upstream_host localhost \
+        printf 'set $%s "%s";\n' forge_upstream_host ${cfg.upstreamHostname} \
           > /run/nginx/forgeproxy-server.conf
       fi
     '';
