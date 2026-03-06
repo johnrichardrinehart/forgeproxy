@@ -501,7 +501,7 @@ pkgs.testers.runNixOSTest {
             "cp ${testSshKeys}/bob /tmp/bob_key && chmod 600 /tmp/bob_key"
         )
 
-    # ── HTTP anonymous authz parity ─────────────────────────────────────
+    # ── Subtest 0: Anonymous HTTP clone parity ───────────────────────────
     with subtest("Anonymous HTTP clone allows public repo and denies private repo"):
         proxy.succeed("rm -rf /tmp/http-public")
         proxy.succeed(

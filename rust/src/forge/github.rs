@@ -49,6 +49,7 @@ fn permission_from_repo_response(body: &serde_json::Value) -> Permission {
         return perm;
     }
 
+    // Anonymous public repos are readable even when "permissions" is absent.
     if body
         .get("private")
         .and_then(|v| v.as_bool())
@@ -342,6 +343,12 @@ mod tests {
     fn extract_permission_missing_permissions_key() {
         let body = serde_json::json!({"id": 1});
         assert_eq!(crate::forge::extract_permission(&body), Permission::None);
+    }
+
+    #[test]
+    fn public_repo_without_permissions_is_readable() {
+        let body = serde_json::json!({"private": false});
+        assert_eq!(permission_from_repo_response(&body), Permission::Read);
     }
 
     // ── ghe-key-lookup sidecar login extraction ─────────────────────────

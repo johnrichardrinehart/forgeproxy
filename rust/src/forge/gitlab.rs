@@ -70,18 +70,7 @@ impl ForgeBackend for GitLabBackend {
             .await
             .context("failed to parse GitLab API response")?;
 
-        let perm = access_level_to_permission(&body);
-        if perm.has_read() {
-            return Ok(perm);
-        }
-        if body
-            .get("visibility")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| v == "public")
-        {
-            return Ok(Permission::Read);
-        }
-        Ok(Permission::None)
+        Ok(permission_from_project_response(&body))
     }
 
     async fn resolve_ssh_user(
@@ -319,6 +308,21 @@ fn access_level_to_permission(body: &serde_json::Value) -> Permission {
     }
 }
 
+fn permission_from_project_response(body: &serde_json::Value) -> Permission {
+    let perm = access_level_to_permission(body);
+    if perm.has_read() {
+        return perm;
+    }
+    if body
+        .get("visibility")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("public"))
+    {
+        return Permission::Read;
+    }
+    Permission::None
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -373,6 +377,12 @@ mod tests {
     fn access_level_missing() {
         let body = serde_json::json!({"id": 1});
         assert_eq!(access_level_to_permission(&body), Permission::None);
+    }
+
+    #[test]
+    fn public_project_without_membership_is_readable() {
+        let body = serde_json::json!({"visibility": "public"});
+        assert_eq!(permission_from_project_response(&body), Permission::Read);
     }
 
     // ── SSH user extraction ─────────────────────────────────────────────
