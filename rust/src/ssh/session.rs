@@ -363,6 +363,7 @@ impl Handler for SshSession {
                                 total_bytes,
                                 "upstream proxy pack stream complete"
                             );
+                            spawn_background_cache_clone(&state, &owner_repo, authenticated);
                             let _ = handle.exit_status_request(channel_id, 0).await;
                         }
                         let _ = handle.eof(channel_id).await;
@@ -464,6 +465,7 @@ impl Handler for SshSession {
                                 total_bytes,
                                 "upstream proxy pack stream complete"
                             );
+                            spawn_background_cache_clone(&state, &owner_repo, authenticated);
                             let _ = handle.exit_status_request(channel_id, 0).await;
                         }
                         let _ = handle.eof(channel_id).await;
@@ -843,6 +845,66 @@ impl Handler for SshSession {
             }
         }
     }
+}
+
+/// Spawn a background clone so future SSH requests can hit local cache, mirroring
+/// the HTTP upload-pack handler behavior.
+fn spawn_background_cache_clone(state: &Arc<AppState>, owner_repo: &str, authenticated: bool) {
+    if !authenticated {
+        return;
+    }
+
+    let state = Arc::clone(state);
+    let owner_repo = owner_repo.to_owned();
+    tokio::spawn(async move {
+        let (owner, repo) = match super::upstream::split_owner_repo(&owner_repo) {
+            Ok(parts) => parts,
+            Err(e) => {
+                warn!(
+                    repo = %owner_repo,
+                    error = %e,
+                    "skipping background cache clone: invalid owner/repo"
+                );
+                return;
+            }
+        };
+
+        let token_key = state
+            .config
+            .upstream_credentials
+            .orgs
+            .get(owner)
+            .map(|oc| oc.keyring_key_name.as_str())
+            .unwrap_or(&state.config.upstream.admin_token_env);
+
+        let Some(token) = crate::credentials::keyring::resolve_secret(token_key).await else {
+            warn!(
+                repo = %owner_repo,
+                token_key,
+                "skipping background cache clone: token not found"
+            );
+            return;
+        };
+
+        if token.is_empty() {
+            warn!(
+                repo = %owner_repo,
+                token_key,
+                "skipping background cache clone: token is empty"
+            );
+            return;
+        }
+
+        let auth_header = format!("Bearer {token}");
+        if let Err(e) =
+            crate::coordination::registry::ensure_repo_cloned(&state, owner, repo, &auth_header)
+                .await
+        {
+            warn!(repo = %owner_repo, error = %e, "background cache clone failed");
+        } else {
+            info!(repo = %owner_repo, "background cache clone succeeded");
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
