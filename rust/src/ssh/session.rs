@@ -910,22 +910,30 @@ async fn proxy_upstream_upload_pack(
                 if let Some(active_capture) = capture.take() {
                     let capture_dir = active_capture.dir().to_path_buf();
                     let _ = active_capture.finish(true).await;
-                    if let Ok((owner, repo)) = super::upstream::split_owner_repo(&owner_repo)
-                        && let Err(e) =
-                            crate::coordination::registry::try_ensure_repo_cloned_from_tee(
-                                &state,
-                                owner,
-                                repo,
-                                auth_header.as_deref(),
-                                capture_dir,
-                            )
-                            .await
-                    {
-                        warn!(
-                            repo = %owner_repo,
-                            error = %e,
-                            "tee hydration after SSH miss failed"
-                        );
+                    if let Ok((owner, repo)) = super::upstream::split_owner_repo(&owner_repo) {
+                        let state_bg = Arc::clone(&state);
+                        let owner_bg = owner.to_string();
+                        let repo_bg = repo.to_string();
+                        let owner_repo_bg = owner_repo.clone();
+                        let auth_bg = auth_header.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                                    &state_bg,
+                                    &owner_bg,
+                                    &repo_bg,
+                                    auth_bg.as_deref(),
+                                    capture_dir,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    repo = %owner_repo_bg,
+                                    error = %e,
+                                    "tee hydration after SSH miss failed"
+                                );
+                            }
+                        });
                     }
                 }
                 let _ = handle.exit_status_request(channel_id, 0).await;

@@ -516,21 +516,28 @@ async fn proxy_upload_pack_to_upstream(
         if let Some(active_capture) = capture {
             let capture_dir = active_capture.dir().to_path_buf();
             let _ = active_capture.finish(true).await;
-            if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned_from_tee(
-                &state,
-                &owner,
-                &repo,
-                auth_header.as_deref(),
-                capture_dir,
-            )
-            .await
-            {
-                warn!(
-                    repo = %owner_repo,
-                    error = %e,
-                    "tee hydration after HTTP miss failed"
-                );
-            }
+            let state_bg = state.clone();
+            let owner_bg = owner.clone();
+            let repo_bg = repo.clone();
+            let owner_repo_bg = owner_repo.clone();
+            let auth_bg = auth_header.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                    &state_bg,
+                    &owner_bg,
+                    &repo_bg,
+                    auth_bg.as_deref(),
+                    capture_dir,
+                )
+                .await
+                {
+                    warn!(
+                        repo = %owner_repo_bg,
+                        error = %e,
+                        "tee hydration after HTTP miss failed"
+                    );
+                }
+            });
         }
     });
 
