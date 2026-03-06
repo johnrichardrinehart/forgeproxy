@@ -274,12 +274,14 @@ impl Handler for SshSession {
             self.child_stdin.take();
         }
 
-        // PAT-mode upstream proxy: accumulate want/have, then POST when "done".
+        // PAT-mode upstream proxy: accumulate want/have, then POST when the
+        // client signals end-of-negotiation.
         //
-        // Git protocol v1 and v2 both use the pkt-line "0009done\n" to signal
-        // the end of the negotiation phase.  The client then waits for the
-        // packfile without closing its write side — so `channel_eof` never
-        // fires for the proxy path.
+        // Two termination patterns in git protocol v1:
+        //   1. "0009done\n" — normal multi-round have/ack negotiation.
+        //   2. Flush "0000" after wants (no haves) — shallow/single-round fetch
+        //      (e.g. `git clone --depth 1`).  The client never sends "done" in
+        //      this case; the flush IS the signal.
         let should_post = if let Some((ref repo, ref mut buf, _)) = self.upstream_proxy_buf {
             info!(
                 repo = %repo,
@@ -288,7 +290,11 @@ impl Handler for SshSession {
                 "DIAG: upstream proxy received client data"
             );
             buf.extend_from_slice(data);
-            buf.windows(9).any(|w| w == b"0009done\n")
+            let has_done = buf.windows(9).any(|w| w == b"0009done\n");
+            // Shallow/no-negotiation: wants followed by flush, no haves.
+            let has_flush_after_wants =
+                buf.len() >= 4 && buf.ends_with(b"0000") && !buf.windows(4).any(|w| w == b"have");
+            has_done || has_flush_after_wants
         } else {
             false
         };
