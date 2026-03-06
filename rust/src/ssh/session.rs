@@ -1189,9 +1189,9 @@ async fn proxy_upstream_upload_pack(
                                     break;
                                 }
                             }
-                        }
-                        if had_error {
-                            break;
+                            if had_error {
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
