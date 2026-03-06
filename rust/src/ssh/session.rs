@@ -311,7 +311,7 @@ impl Handler for SshSession {
             let state = Arc::clone(&self.state);
             let handle = session.handle();
             tokio::spawn(async move {
-                match super::upstream::post_upload_pack(
+                match super::upstream::post_upload_pack_stream(
                     &state,
                     &owner_repo,
                     &want_have,
@@ -319,16 +319,52 @@ impl Handler for SshSession {
                 )
                 .await
                 {
-                    Ok(pack_data) => {
-                        info!(
-                            repo = %owner_repo,
-                            pack_bytes = pack_data.len(),
-                            "upstream proxy packfile received"
-                        );
-                        let _ = handle
-                            .data(channel_id, CryptoVec::from_slice(&pack_data))
-                            .await;
-                        let _ = handle.exit_status_request(channel_id, 0).await;
+                    Ok(stream) => {
+                        use futures::Stream;
+                        use std::pin::Pin;
+                        let mut stream = Pin::new(Box::new(stream));
+                        let mut total_bytes: u64 = 0;
+                        let mut had_error = false;
+                        while let Some(chunk_result) =
+                            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
+                        {
+                            match chunk_result {
+                                Ok(chunk) => {
+                                    total_bytes += chunk.len() as u64;
+                                    if handle
+                                        .data(channel_id, CryptoVec::from_slice(&chunk))
+                                        .await
+                                        .is_err()
+                                    {
+                                        warn!(
+                                            repo = %owner_repo,
+                                            "client disconnected during pack stream"
+                                        );
+                                        had_error = true;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        repo = %owner_repo,
+                                        error = %e,
+                                        "error reading upstream pack stream"
+                                    );
+                                    had_error = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if had_error {
+                            let _ = handle.exit_status_request(channel_id, 1).await;
+                        } else {
+                            info!(
+                                repo = %owner_repo,
+                                total_bytes,
+                                "upstream proxy pack stream complete"
+                            );
+                            let _ = handle.exit_status_request(channel_id, 0).await;
+                        }
                         let _ = handle.eof(channel_id).await;
                         let _ = handle.close(channel_id).await;
                     }
@@ -380,7 +416,7 @@ impl Handler for SshSession {
             let state = Arc::clone(&self.state);
             let handle = session.handle();
             tokio::spawn(async move {
-                match super::upstream::post_upload_pack(
+                match super::upstream::post_upload_pack_stream(
                     &state,
                     &owner_repo,
                     &want_have,
@@ -388,16 +424,48 @@ impl Handler for SshSession {
                 )
                 .await
                 {
-                    Ok(pack_data) => {
-                        info!(
-                            repo = %owner_repo,
-                            pack_bytes = pack_data.len(),
-                            "upstream proxy packfile received"
-                        );
-                        let _ = handle
-                            .data(channel_id, CryptoVec::from_slice(&pack_data))
-                            .await;
-                        let _ = handle.exit_status_request(channel_id, 0).await;
+                    Ok(stream) => {
+                        use futures::Stream;
+                        use std::pin::Pin;
+                        let mut stream = Pin::new(Box::new(stream));
+                        let mut total_bytes: u64 = 0;
+                        let mut had_error = false;
+                        while let Some(chunk_result) =
+                            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
+                        {
+                            match chunk_result {
+                                Ok(chunk) => {
+                                    total_bytes += chunk.len() as u64;
+                                    if handle
+                                        .data(channel_id, CryptoVec::from_slice(&chunk))
+                                        .await
+                                        .is_err()
+                                    {
+                                        had_error = true;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        repo = %owner_repo,
+                                        error = %e,
+                                        "error reading upstream pack stream"
+                                    );
+                                    had_error = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if had_error {
+                            let _ = handle.exit_status_request(channel_id, 1).await;
+                        } else {
+                            info!(
+                                repo = %owner_repo,
+                                total_bytes,
+                                "upstream proxy pack stream complete"
+                            );
+                            let _ = handle.exit_status_request(channel_id, 0).await;
+                        }
                         let _ = handle.eof(channel_id).await;
                         let _ = handle.close(channel_id).await;
                     }

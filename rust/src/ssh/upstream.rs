@@ -8,14 +8,16 @@
 //!   1. `fetch_ref_advertisement` — `GET /info/refs?service=git-upload-pack`
 //!      strips the HTTP service-line preamble and returns pkt-line data
 //!      suitable for forwarding to an SSH git client.
-//!   2. `post_upload_pack` — `POST /git-upload-pack` with the accumulated
-//!      want/have/done bytes from the client; returns the packfile.
+//!   2. `post_upload_pack_stream` — `POST /git-upload-pack` with the
+//!      accumulated want/have/done bytes from the client; returns a stream of
+//!      packfile chunks.
 //!
 //! Only PAT (token / HTTPS) credential mode is supported for the upstream
 //! proxy path.  SSH credential mode requires a bidirectional subprocess pipe
 //! that has not yet been implemented.
 
 use anyhow::{Context, Result, bail};
+use futures::Stream;
 use tracing::{debug, info, instrument};
 
 use crate::AppState;
@@ -89,7 +91,7 @@ pub async fn fetch_ref_advertisement(
     }
 }
 
-/// Phase 2: POST want/have/done to the upstream and return the packfile.
+/// Phase 2: POST want/have/done to the upstream and return a byte stream.
 ///
 /// `want_have` is the accumulated bytes the git client sent after receiving
 /// the ref advertisement (want/have/done pkt-lines).  Supports PAT mode only.
@@ -97,12 +99,12 @@ pub async fn fetch_ref_advertisement(
 /// `authenticated` must match the value used for phase 1 — it controls
 /// whether a token is embedded in the upstream URL.
 #[instrument(skip(state, want_have), fields(%owner_repo, input_bytes = want_have.len(), authenticated))]
-pub async fn post_upload_pack(
+pub async fn post_upload_pack_stream(
     state: &AppState,
     owner_repo: &str,
     want_have: &[u8],
     authenticated: bool,
-) -> Result<Vec<u8>> {
+) -> Result<impl Stream<Item = reqwest::Result<bytes::Bytes>>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =
         resolve_upstream_url_and_creds(&state.config, owner, repo, authenticated).await?;
@@ -129,15 +131,8 @@ pub async fn post_upload_pack(
                 );
             }
 
-            let body = resp.bytes().await.context("failed to read packfile body")?;
-
-            info!(
-                %owner_repo,
-                pack_bytes = body.len(),
-                "upstream proxy POST complete"
-            );
-
-            Ok(body.to_vec())
+            info!(%owner_repo, "upstream proxy POST started, streaming response");
+            Ok(resp.bytes_stream())
         }
 
         CredentialMode::Ssh => {
