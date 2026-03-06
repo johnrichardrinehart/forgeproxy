@@ -6,6 +6,7 @@
 //! from the local bare-repo cache or returns a "not cached" error for repos
 //! that have not yet been mirrored.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -53,6 +54,9 @@ pub struct SshSession {
     /// SSH auth is fail-closed: unresolved fingerprints are rejected at auth
     /// time, so `authenticated` should be `true` for normal requests.
     upstream_proxy_buf: Option<(String, Vec<u8>, bool)>,
+    /// Open SSH channels keyed by channel id so background tasks can stream
+    /// large uncached pack responses with proper channel-window backpressure.
+    channels: HashMap<ChannelId, Channel<Msg>>,
 }
 
 impl SshSession {
@@ -68,6 +72,7 @@ impl SshSession {
             child_stdin: None,
             git_protocol: None,
             upstream_proxy_buf: None,
+            channels: HashMap::new(),
         }
     }
 }
@@ -224,9 +229,10 @@ impl Handler for SshSession {
     /// Accept new channel-open requests for sessions.
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        self.channels.insert(channel.id(), channel);
         Ok(true)
     }
 
@@ -301,6 +307,7 @@ impl Handler for SshSession {
         if should_post
             && let Some((owner_repo, want_have, authenticated)) = self.upstream_proxy_buf.take()
         {
+            let stream_channel = self.channels.remove(&channel_id);
             info!(
                 repo = %owner_repo,
                 want_have_bytes = want_have.len(),
@@ -314,6 +321,7 @@ impl Handler for SshSession {
                     state,
                     handle,
                     channel_id,
+                    stream_channel,
                     owner_repo,
                     want_have,
                     authenticated,
@@ -345,6 +353,7 @@ impl Handler for SshSession {
 
         // PAT-mode upstream proxy: POST buffered want/have, stream packfile back.
         if let Some((owner_repo, want_have, authenticated)) = self.upstream_proxy_buf.take() {
+            let stream_channel = self.channels.remove(&channel_id);
             debug!(repo = %owner_repo, want_have_bytes = want_have.len(), authenticated, "upstream proxy: channel_eof received, POSTing to upstream");
             let state = Arc::clone(&self.state);
             let handle = session.handle();
@@ -353,6 +362,7 @@ impl Handler for SshSession {
                     state,
                     handle,
                     channel_id,
+                    stream_channel,
                     owner_repo,
                     want_have,
                     authenticated,
@@ -798,10 +808,12 @@ impl Handler for SshSession {
 
 /// Proxy `git-upload-pack` to the upstream forge, stream the response back to
 /// the SSH client, and close the channel.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_upstream_upload_pack(
     state: Arc<AppState>,
     handle: russh::server::Handle,
     channel_id: ChannelId,
+    stream_channel: Option<Channel<Msg>>,
     owner_repo: String,
     want_have: Vec<u8>,
     authenticated: bool,
@@ -814,6 +826,7 @@ async fn proxy_upstream_upload_pack(
             use futures::Stream;
             use std::pin::Pin;
             let mut stream = Pin::new(Box::new(stream));
+            let mut channel_writer = stream_channel.map(|channel| channel.make_writer());
             let mut total_bytes: u64 = 0;
             let mut had_error = false;
             while let Some(chunk_result) =
@@ -822,24 +835,37 @@ async fn proxy_upstream_upload_pack(
                 match chunk_result {
                     Ok(chunk) => {
                         total_bytes += chunk.len() as u64;
-                        for part in chunk.chunks(SSH_DATA_CHUNK_SIZE) {
-                            if handle
-                                .data(channel_id, CryptoVec::from_slice(part))
-                                .await
-                                .is_err()
-                            {
+                        if let Some(writer) = channel_writer.as_mut() {
+                            if let Err(e) = writer.write_all(&chunk).await {
                                 if warn_on_disconnect {
                                     warn!(
                                         repo = %owner_repo,
+                                        error = %e,
                                         "client disconnected during pack stream"
                                     );
                                 }
                                 had_error = true;
+                            }
+                        } else {
+                            for part in chunk.chunks(SSH_DATA_CHUNK_SIZE) {
+                                if handle
+                                    .data(channel_id, CryptoVec::from_slice(part))
+                                    .await
+                                    .is_err()
+                                {
+                                    if warn_on_disconnect {
+                                        warn!(
+                                            repo = %owner_repo,
+                                            "client disconnected during pack stream"
+                                        );
+                                    }
+                                    had_error = true;
+                                    break;
+                                }
+                            }
+                            if had_error {
                                 break;
                             }
-                        }
-                        if had_error {
-                            break;
                         }
                     }
                     Err(e) => {
@@ -863,7 +889,11 @@ async fn proxy_upstream_upload_pack(
                 );
                 let _ = handle.exit_status_request(channel_id, 0).await;
             }
-            let _ = handle.eof(channel_id).await;
+            if let Some(writer) = channel_writer.as_mut() {
+                let _ = writer.shutdown().await;
+            } else {
+                let _ = handle.eof(channel_id).await;
+            }
             // Give the transport a brief window to flush trailing channel data
             // before we send channel close, reducing truncation risk on very
             // large pack streams.
