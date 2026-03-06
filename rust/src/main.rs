@@ -11,6 +11,7 @@ mod http;
 mod metrics;
 mod ssh;
 mod storage;
+mod tee_hydration;
 
 use std::sync::Arc;
 

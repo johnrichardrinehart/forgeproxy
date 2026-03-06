@@ -196,6 +196,40 @@ pub async fn git_fetch_bundle(repo_path: &Path, bundle_path: &Path) -> Result<()
     Ok(())
 }
 
+/// Run `git unpack-objects -r` in a bare repo, reading a pack stream from a
+/// local file.
+#[instrument(fields(repo = %repo_path.display(), pack = %pack_path.display()))]
+pub async fn git_unpack_objects(repo_path: &Path, pack_path: &Path) -> Result<()> {
+    let pack_file = std::fs::File::open(pack_path)
+        .with_context(|| format!("open pack file {}", pack_path.display()))?;
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo_path).arg("unpack-objects").arg("-r");
+
+    cmd.stdin(Stdio::from(pack_file));
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git unpack-objects");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git unpack-objects")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git unpack-objects failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git unpack-objects succeeded");
+    Ok(())
+}
+
 /// Count the number of ref-update lines in `git fetch` stderr.
 ///
 /// Lines matching patterns like ` -> ` or `[new branch]` are counted.
