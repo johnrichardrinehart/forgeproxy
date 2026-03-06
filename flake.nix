@@ -62,6 +62,9 @@
                   nixos-vm-test-backend = pkgs.callPackage ./nix/tests/backend.nix { inherit self; };
                   nixos-vm-test-ssh-authz = pkgs.callPackage ./nix/tests/ssh-authz.nix { inherit self; };
                   nixos-vm-test-keyring-creds = pkgs.callPackage ./nix/tests/keyring-creds.nix { inherit self; };
+                  nixos-vm-test-ghe-key-lookup-keyring = pkgs.callPackage ./nix/tests/ghe-key-lookup-keyring.nix {
+                    inherit self;
+                  };
                   nixos-vm-test-eviction-lfu = pkgs.callPackage ./nix/tests/eviction-lfu.nix { inherit self; };
                   nixos-vm-test-eviction-lru = pkgs.callPackage ./nix/tests/eviction-lru.nix { inherit self; };
                   nixos-vm-test-filtered-bundles = pkgs.callPackage ./nix/tests/filtered-bundles.nix {
@@ -221,6 +224,7 @@
           valkey = ./nix/valkey.nix;
           valkey-tls = ./nix/valkey-tls.nix;
           nginx = ./nix/nginx.nix;
+          nginx-runtime = ./nix/nginx-runtime.nix;
           hardening = ./nix/hardening.nix;
           secrets = ./nix/secrets.nix;
           ami = ./nix/ami.nix;
@@ -292,9 +296,15 @@
                   # ── Write Valkey CA cert (for TLS verification) ─────────────────────
                   VALKEY_CA_SECRET=$(resolve valkey-tls-ca)
                   if [ "$VALKEY_CA_SECRET" != "null" ]; then
-                    ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                    VALKEY_CA_VALUE=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$VALKEY_CA_SECRET" \
-                      --query 'SecretString' --output text > /run/forgeproxy/valkey-ca.pem
+                      --query 'SecretString' --output text)
+                    EXISTING_ID=$(${pkgs.keyutils}/bin/keyctl search @u user FORGEPROXY_VALKEY_CA 2>/dev/null || true)
+                    if [ -n "$EXISTING_ID" ]; then
+                      printf %s "$VALKEY_CA_VALUE" | ${pkgs.keyutils}/bin/keyctl pupdate "$EXISTING_ID"
+                    else
+                      printf %s "$VALKEY_CA_VALUE" | ${pkgs.keyutils}/bin/keyctl padd user FORGEPROXY_VALKEY_CA @u >/dev/null
+                    fi
                   fi
 
                   # ── Load per-org credentials into the kernel keyring ──────────────
@@ -358,23 +368,32 @@
                                       '[.[] | select(startswith($p))][0]'
                                   }
 
+                                  put_key() {
+                                    local key_desc="$1"
+                                    local secret_name="$2"
+                                    local secret_value
+
+                                    secret_value=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                                      --secret-id "$(resolve "$secret_name")" \
+                                      --query 'SecretString' --output text)
+
+                                    existing_id=$(${pkgs.keyutils}/bin/keyctl search @u user "$key_desc" 2>/dev/null || true)
+                                    if [ -n "$existing_id" ]; then
+                                      printf %s "$secret_value" | ${pkgs.keyutils}/bin/keyctl pupdate "$existing_id"
+                                    else
+                                      printf %s "$secret_value" | ${pkgs.keyutils}/bin/keyctl padd user "$key_desc" @u >/dev/null
+                                    fi
+                                  }
+
                                   UPSTREAM=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                                     --secret-id "$(resolve nginx-upstream-hostname)" \
                                     --query 'SecretString' --output text)
                                   UPSTREAM_PORT=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                                     --secret-id "$(resolve nginx-upstream-port)" \
                                     --query 'SecretString' --output text)
-
-                                  mkdir -p /run/nginx/ssl
-
-                                  # TLS material for nginx
-                                  ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                                    --secret-id "$(resolve nginx-tls-cert)" --query 'SecretString' --output text \
-                                    > /run/nginx/ssl/cert.pem
-                                  ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-                                    --secret-id "$(resolve nginx-tls-key)" --query 'SecretString' --output text \
-                                    > /run/nginx/ssl/key.pem
-                                  chmod 600 /run/nginx/ssl/key.pem
+                                  # TLS material for nginx goes into the kernel keyring.
+                                  put_key "NGINX_TLS_CERT" "nginx-tls-cert"
+                                  put_key "NGINX_TLS_KEY" "nginx-tls-key"
 
                                   # Upstream block (http-level include)
                                   cat > /run/nginx/forgeproxy-upstream.conf <<EOF
@@ -396,9 +415,29 @@
                   providerScript = awsForgeProxyProvider;
                 };
 
+                systemd.services.forgeproxy = {
+                  serviceConfig.ExecStartPre = lib.mkAfter [
+                    (pkgs.writeShellScript "forgeproxy-materialize-keyring-secrets" ''
+                      set -euo pipefail
+
+                      CA_ID=$(keyctl search @u user FORGEPROXY_VALKEY_CA 2>/dev/null || true)
+                      if [ -n "$CA_ID" ]; then
+                        keyctl pipe "$CA_ID" > /run/forgeproxy/valkey-ca.pem
+                      fi
+                    '')
+                  ];
+                };
+
                 services.forgeproxy-nginx-runtime = lib.mkDefault {
                   enable = true;
                   providerScript = awsNginxProvider;
+                };
+
+                systemd.services.nginx = {
+                  # KeyringMode + keyutils are required by nix/nginx-runtime.nix,
+                  # which materializes TLS cert/key in mkBefore preStart.
+                  path = lib.mkAfter [ pkgs.keyutils ];
+                  serviceConfig.KeyringMode = lib.mkDefault "shared";
                 };
               }
             )
@@ -452,11 +491,13 @@
                       --secret-id "$(resolve "$1")" --query 'SecretString' --output text
                   }
 
-                  # Write runtime conf (second valkey-server arg, overrides requirepass from main conf)
-                  # Path matches services.valkey.extraConfFile (default: /run/valkey/runtime.conf)
-                  printf 'requirepass %s\n' "$(fetch valkey-auth-token)" \
-                    > /run/valkey/runtime.conf
-                  chmod 600 /run/valkey/runtime.conf
+                  AUTH_TOKEN=$(fetch valkey-auth-token)
+                  EXISTING_ID=$(${pkgs.keyutils}/bin/keyctl search @u user "VALKEY_AUTH_TOKEN" 2>/dev/null || true)
+                  if [ -n "$EXISTING_ID" ]; then
+                    printf %s "$AUTH_TOKEN" | ${pkgs.keyutils}/bin/keyctl pupdate "$EXISTING_ID"
+                  else
+                    printf %s "$AUTH_TOKEN" | ${pkgs.keyutils}/bin/keyctl padd user "VALKEY_AUTH_TOKEN" @u >/dev/null
+                  fi
                 '';
 
                 awsValkeyTlsProvider = pkgs.writeShellScript "valkey-aws-tls-provider" ''
@@ -489,17 +530,30 @@
                       --secret-id "$(resolve "$1")" --query 'SecretString' --output text
                   }
 
-                  # Write TLS material to paths configured in services.valkey.tls.{certFile,keyFile,caFile}
-                  # (defaults: /var/lib/valkey/tls/{cert,key,ca}.pem — writable under ProtectSystem=strict)
-                  mkdir -p /var/lib/valkey/tls
-                  fetch valkey-tls-cert > /var/lib/valkey/tls/cert.pem
-                  fetch valkey-tls-key  > /var/lib/valkey/tls/key.pem
-                  fetch valkey-tls-ca   > /var/lib/valkey/tls/ca.pem
-                  chmod 600 /var/lib/valkey/tls/key.pem
+                  put_key() {
+                    local key_desc="$1"
+                    local secret_name="$2"
+                    local secret_value
+
+                    secret_value="$(fetch "$secret_name")"
+                    existing_id=$(${pkgs.keyutils}/bin/keyctl search @u user "$key_desc" 2>/dev/null || true)
+                    if [ -n "$existing_id" ]; then
+                      printf %s "$secret_value" | ${pkgs.keyutils}/bin/keyctl pupdate "$existing_id"
+                    else
+                      printf %s "$secret_value" | ${pkgs.keyutils}/bin/keyctl padd user "$key_desc" @u >/dev/null
+                    fi
+                  }
+
+                  put_key "VALKEY_TLS_CERT" "valkey-tls-cert"
+                  put_key "VALKEY_TLS_KEY" "valkey-tls-key"
+                  put_key "VALKEY_TLS_CA" "valkey-tls-ca"
                 '';
               in
               {
                 services.valkey.tls.enable = lib.mkDefault true;
+                services.valkey.tls.certFile = lib.mkDefault "/run/valkey/tls/cert.pem";
+                services.valkey.tls.keyFile = lib.mkDefault "/run/valkey/tls/key.pem";
+                services.valkey.tls.caFile = lib.mkDefault "/run/valkey/tls/ca.pem";
 
                 services.valkey-secrets = lib.mkDefault {
                   enable = true;
@@ -509,6 +563,29 @@
                 services.valkey-tls = {
                   enable = lib.mkDefault config.services.valkey.tls.enable;
                   providerScript = awsValkeyTlsProvider;
+                };
+
+                systemd.services.valkey = {
+                  path = lib.mkAfter [ pkgs.keyutils ];
+                  serviceConfig.KeyringMode = lib.mkDefault "shared";
+                  serviceConfig.ExecStartPre = lib.mkAfter [
+                    (pkgs.writeShellScript "valkey-materialize-keyring-secrets" ''
+                      set -euo pipefail
+
+                      mkdir -p /run/valkey/tls
+                      AUTH_ID=$(keyctl search @u user VALKEY_AUTH_TOKEN)
+                      CERT_ID=$(keyctl search @u user VALKEY_TLS_CERT)
+                      KEY_ID=$(keyctl search @u user VALKEY_TLS_KEY)
+                      CA_ID=$(keyctl search @u user VALKEY_TLS_CA)
+
+                      printf 'requirepass %s\n' "$(keyctl pipe "$AUTH_ID")" > /run/valkey/runtime.conf
+                      keyctl pipe "$CERT_ID" > /run/valkey/tls/cert.pem
+                      keyctl pipe "$KEY_ID" > /run/valkey/tls/key.pem
+                      keyctl pipe "$CA_ID" > /run/valkey/tls/ca.pem
+
+                      chmod 600 /run/valkey/runtime.conf /run/valkey/tls/key.pem
+                    '')
+                  ];
                 };
               }
             )
@@ -583,6 +660,10 @@
                   fi
                   ${lib.optionalString (config.services.ghe-key-lookup.identityFile != null) ''
                     printf %s "$ADMIN_KEY" > ${toString config.services.ghe-key-lookup.identityFile}
+                    case "$ADMIN_KEY" in
+                      *$'\n') ;;
+                      *) printf '\n' >> ${toString config.services.ghe-key-lookup.identityFile} ;;
+                    esac
                     chmod 600 ${toString config.services.ghe-key-lookup.identityFile}
                   ''}
                 '';

@@ -209,6 +209,7 @@ pkgs.testers.runNixOSTest {
         imports = [
           self.nixosModules.forgeproxy
           self.nixosModules.nginx
+          self.nixosModules.nginx-runtime
         ];
 
         services.forgeproxy = {
@@ -221,26 +222,37 @@ pkgs.testers.runNixOSTest {
         services.forgeproxy-nginx = {
           enable = true;
           serverName = "proxy";
-          sslCertificate = "${testCerts}/proxy.crt";
-          sslCertificateKey = "${testCerts}/proxy.key";
-          upstreamHostname = "ghe";
-          resolver = "127.0.0.53";
         };
 
-        # Create nginx runtime config includes before nginx starts (normally written by the provider script)
-        systemd.services.nginx.serviceConfig.ExecStartPre = lib.mkBefore [
-          "${pkgs.writeShellScript "nginx-runtime-config" ''
-                        cat > /run/nginx/forgeproxy-upstream.conf <<'EOFCONF'
+        # Exercise the runtime provider + keyring materialization path used in prod.
+        services.forgeproxy-nginx-runtime = {
+          enable = true;
+          providerScript = pkgs.writeShellScript "nginx-runtime-config" ''
+            set -euo pipefail
+            put_key() {
+              local key_desc="$1"
+              local src_file="$2"
+              local existing_id
+              existing_id=$(${pkgs.keyutils}/bin/keyctl search @u user "$key_desc" 2>/dev/null || true)
+              if [ -n "$existing_id" ]; then
+                ${pkgs.keyutils}/bin/keyctl pupdate "$existing_id" < "$src_file"
+              else
+                ${pkgs.keyutils}/bin/keyctl padd user "$key_desc" @u < "$src_file" >/dev/null
+              fi
+            }
+            cat > /run/nginx/forgeproxy-upstream.conf <<'EOFCONF'
             upstream forge-upstream {
               server ghe:443;
               keepalive 32;
             }
             EOFCONF
-                        cat > /run/nginx/forgeproxy-server.conf <<'EOFCONF'
+            cat > /run/nginx/forgeproxy-server.conf <<'EOFCONF'
             set $forge_upstream_host "ghe";
             EOFCONF
-          ''}"
-        ];
+            put_key NGINX_TLS_CERT "${testCerts}/proxy.crt"
+            put_key NGINX_TLS_KEY "${testCerts}/proxy.key"
+          '';
+        };
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
         systemd.services.forgeproxy.environment = {
