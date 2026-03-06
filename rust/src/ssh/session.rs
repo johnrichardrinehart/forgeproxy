@@ -70,6 +70,10 @@ pub struct SshSession {
     /// Stdin handle for a running `git upload-pack` child process.
     /// Data received from the SSH client is forwarded here.
     child_stdin: Option<tokio::process::ChildStdin>,
+    /// Session channels opened for this connection, keyed by channel id.
+    /// Cached-path upload-pack streaming uses the channel writer API so large
+    /// responses honor SSH window backpressure.
+    channels: HashMap<ChannelId, Channel<Msg>>,
     /// `GIT_PROTOCOL` value sent by the client via SSH env request.
     git_protocol: Option<String>,
     /// For PAT-mode upstream proxy (uncached repos):
@@ -78,9 +82,6 @@ pub struct SshSession {
     /// SSH auth is fail-closed: unresolved fingerprints are rejected at auth
     /// time, so `authenticated` should be `true` for normal requests.
     upstream_proxy_buf: Option<(String, Vec<u8>, bool, Option<String>)>,
-    /// Open SSH channels keyed by channel id so background tasks can stream
-    /// large uncached pack responses with proper channel-window backpressure.
-    channels: HashMap<ChannelId, Channel<Msg>>,
     /// Per-channel lifecycle state for the uncached upstream proxy path.
     upstream_proxy_channels: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
 }
@@ -96,9 +97,9 @@ impl SshSession {
             username: None,
             cache_manager,
             child_stdin: None,
+            channels: HashMap::new(),
             git_protocol: None,
             upstream_proxy_buf: None,
-            channels: HashMap::new(),
             upstream_proxy_channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -652,6 +653,7 @@ impl Handler for SshSession {
             .lock()
             .await
             .remove(&channel_id);
+        self.channels.remove(&channel_id);
         Ok(())
     }
 
