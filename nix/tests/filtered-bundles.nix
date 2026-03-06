@@ -159,7 +159,7 @@ pkgs.testers.runNixOSTest {
           443
           3000
         ];
-        virtualisation.memorySize = 2048;
+        virtualisation.memorySize = 1536;
       };
 
     # -- Valkey / Redis ---------------------------------------------------------
@@ -225,7 +225,7 @@ pkgs.testers.runNixOSTest {
           8080
           2222
         ];
-        virtualisation.memorySize = 1024;
+        virtualisation.memorySize = 768;
       };
 
     # -- Client ----------------------------------------------------------------
