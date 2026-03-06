@@ -259,7 +259,7 @@ pub async fn ensure_repo_cloned(
     state: &crate::AppState,
     owner: &str,
     repo: &str,
-    auth_header: &str,
+    auth_header: Option<&str>,
 ) -> Result<()> {
     // Strip trailing ".git" from repo if present to avoid double-suffixing
     // (the URL path extractor preserves it, and we append ".git" below).
@@ -292,25 +292,33 @@ pub async fn ensure_repo_cloned(
         // For Basic auth, decode the base64 to recover "user:pass" and embed
         // directly in the URL.  For Bearer/token auth, use the x-access-token
         // format understood by GitHub/Gitea.
-        let clone_url = if let Some(b64) = auth_header.strip_prefix("Basic ") {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(b64.trim())
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .unwrap_or_default();
-            format!(
-                "https://{decoded}@{}/{owner}/{repo_clean}.git",
+        let clone_url = match auth_header {
+            Some(auth_header) => {
+                if let Some(b64) = auth_header.strip_prefix("Basic ") {
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(b64.trim())
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default();
+                    format!(
+                        "https://{decoded}@{}/{owner}/{repo_clean}.git",
+                        state.config.upstream.hostname,
+                    )
+                } else {
+                    let token = auth_header
+                        .strip_prefix("Bearer ")
+                        .or_else(|| auth_header.strip_prefix("token "))
+                        .unwrap_or(auth_header);
+                    format!(
+                        "https://x-access-token:{token}@{}/{owner}/{repo_clean}.git",
+                        state.config.upstream.hostname,
+                    )
+                }
+            }
+            None => format!(
+                "https://{}/{owner}/{repo_clean}.git",
                 state.config.upstream.hostname,
-            )
-        } else {
-            let token = auth_header
-                .strip_prefix("Bearer ")
-                .or_else(|| auth_header.strip_prefix("token "))
-                .unwrap_or(auth_header);
-            format!(
-                "https://x-access-token:{token}@{}/{owner}/{repo_clean}.git",
-                state.config.upstream.hostname,
-            )
+            ),
         };
 
         // Acquire the clone semaphore to respect concurrency limits.

@@ -19,10 +19,17 @@ use sha2::{Digest, Sha256};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::AppState;
 use crate::cache::CacheManager;
+
+/// Upper bound for a single SSH channel data message payload.
+///
+/// Keeping frames at or below 32 KiB avoids relying on library-side
+/// fragmentation behavior for large buffers while streaming big packfiles.
+const SSH_DATA_CHUNK_SIZE: usize = 32 * 1024;
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -43,11 +50,8 @@ pub struct SshSession {
     /// For PAT-mode upstream proxy (uncached repos):
     /// `(owner_repo, want_have_buf, authenticated)`.
     ///
-    /// `authenticated` is `true` iff the connecting SSH user's identity was
-    /// resolved via the ghe-key-lookup sidecar.  When `false` the upstream
-    /// HTTP clone is attempted without a token; private repos will naturally
-    /// reject the request, enforcing forge-side access control for anonymous
-    /// SSH clients.
+    /// SSH auth is fail-closed: unresolved fingerprints are rejected at auth
+    /// time, so `authenticated` should be `true` for normal requests.
     upstream_proxy_buf: Option<(String, Vec<u8>, bool)>,
 }
 
@@ -161,12 +165,9 @@ impl Handler for SshSession {
 
     /// Authenticate a client by public key.
     ///
-    /// We compute the key fingerprint and attempt to resolve the upstream
-    /// username (via the ghe-key-lookup sidecar if configured).  If resolution
-    /// succeeds the connection is accepted as that user.  If resolution returns
-    /// `None` (sidecar not configured or fingerprint unknown) the connection is
-    /// still accepted but treated as anonymous — downstream repo access is
-    /// delegated entirely to the upstream forge via unauthenticated HTTPS.
+    /// We compute the key fingerprint and resolve the upstream username via
+    /// sidecar + cache.  Resolution must succeed; unresolved fingerprints are
+    /// rejected so cached repos cannot bypass forge authorization checks.
     async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         let fp = fingerprint_of(key);
         info!(
@@ -202,27 +203,20 @@ impl Handler for SshSession {
                 Ok(Auth::Accept)
             }
             Ok(None) => {
-                // Username could not be resolved (sidecar not configured or
-                // fingerprint unknown).  Accept the connection as anonymous;
-                // per-repo access will be enforced by the upstream forge when
-                // the unauthenticated HTTPS clone is attempted.
-                info!(fingerprint = %fp, "SSH key unresolved; accepting as anonymous");
-                self.fingerprint = Some(fp);
-                Ok(Auth::Accept)
+                warn!(fingerprint = %fp, "SSH key unresolved; rejecting");
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                })
             }
             Err(e) => {
-                // Sidecar unreachable or returned an unexpected error.
-                // Treat as anonymous rather than rejecting — the forge will
-                // enforce access control when the unauthenticated clone is
-                // attempted.  (Rejecting here would lock out all SSH users
-                // whenever the sidecar is temporarily unavailable.)
                 warn!(
                     fingerprint = %fp,
                     error = %e,
-                    "sidecar key resolution failed; accepting as anonymous"
+                    "sidecar key resolution failed; rejecting"
                 );
-                self.fingerprint = Some(fp);
-                Ok(Auth::Accept)
+                Ok(Auth::Reject {
+                    proceed_with_methods: None,
+                })
             }
         }
     }
@@ -291,9 +285,14 @@ impl Handler for SshSession {
             );
             buf.extend_from_slice(data);
             let has_done = buf.windows(9).any(|w| w == b"0009done\n");
-            // Shallow/no-negotiation: wants followed by flush, no haves.
-            let has_flush_after_wants =
-                buf.len() >= 4 && buf.ends_with(b"0000") && !buf.windows(4).any(|w| w == b"have");
+            // Shallow/no-negotiation (protocol v1): wants followed by flush, no haves.
+            //
+            // For protocol v2, `0000` appears in-section and is not a reliable
+            // end-of-request marker, so we wait for `done`/`channel_eof`.
+            let has_flush_after_wants = self.git_protocol.as_deref() != Some("version=2")
+                && buf.len() >= 4
+                && buf.ends_with(b"0000")
+                && !buf.windows(4).any(|w| w == b"have");
             has_done || has_flush_after_wants
         } else {
             false
@@ -311,83 +310,16 @@ impl Handler for SshSession {
             let state = Arc::clone(&self.state);
             let handle = session.handle();
             tokio::spawn(async move {
-                match super::upstream::post_upload_pack_stream(
-                    &state,
-                    &owner_repo,
-                    &want_have,
+                proxy_upstream_upload_pack(
+                    state,
+                    handle,
+                    channel_id,
+                    owner_repo,
+                    want_have,
                     authenticated,
+                    true,
                 )
-                .await
-                {
-                    Ok(stream) => {
-                        use futures::Stream;
-                        use std::pin::Pin;
-                        let mut stream = Pin::new(Box::new(stream));
-                        let mut total_bytes: u64 = 0;
-                        let mut had_error = false;
-                        while let Some(chunk_result) =
-                            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
-                        {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    total_bytes += chunk.len() as u64;
-                                    if handle
-                                        .data(channel_id, CryptoVec::from_slice(&chunk))
-                                        .await
-                                        .is_err()
-                                    {
-                                        warn!(
-                                            repo = %owner_repo,
-                                            "client disconnected during pack stream"
-                                        );
-                                        had_error = true;
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        repo = %owner_repo,
-                                        error = %e,
-                                        "error reading upstream pack stream"
-                                    );
-                                    had_error = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if had_error {
-                            let _ = handle.exit_status_request(channel_id, 1).await;
-                        } else {
-                            info!(
-                                repo = %owner_repo,
-                                total_bytes,
-                                "upstream proxy pack stream complete"
-                            );
-                            spawn_background_cache_clone(&state, &owner_repo, authenticated);
-                            let _ = handle.exit_status_request(channel_id, 0).await;
-                        }
-                        let _ = handle.eof(channel_id).await;
-                        let _ = handle.close(channel_id).await;
-                    }
-                    Err(e) => {
-                        error!(
-                            repo = %owner_repo,
-                            error = %format!("{e:#}"),
-                            "upstream proxy POST failed"
-                        );
-                        let msg = format!(
-                            "Repository '{}' upstream proxy failed: {}\n\
-                                 Try cloning directly from the upstream forge.\n",
-                            owner_repo, e,
-                        );
-                        let _ = handle
-                            .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
-                            .await;
-                        let _ = handle.exit_status_request(channel_id, 1).await;
-                        let _ = handle.eof(channel_id).await;
-                        let _ = handle.close(channel_id).await;
-                    }
-                }
+                .await;
             });
         }
 
@@ -417,79 +349,16 @@ impl Handler for SshSession {
             let state = Arc::clone(&self.state);
             let handle = session.handle();
             tokio::spawn(async move {
-                match super::upstream::post_upload_pack_stream(
-                    &state,
-                    &owner_repo,
-                    &want_have,
+                proxy_upstream_upload_pack(
+                    state,
+                    handle,
+                    channel_id,
+                    owner_repo,
+                    want_have,
                     authenticated,
+                    false,
                 )
-                .await
-                {
-                    Ok(stream) => {
-                        use futures::Stream;
-                        use std::pin::Pin;
-                        let mut stream = Pin::new(Box::new(stream));
-                        let mut total_bytes: u64 = 0;
-                        let mut had_error = false;
-                        while let Some(chunk_result) =
-                            std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
-                        {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    total_bytes += chunk.len() as u64;
-                                    if handle
-                                        .data(channel_id, CryptoVec::from_slice(&chunk))
-                                        .await
-                                        .is_err()
-                                    {
-                                        had_error = true;
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        repo = %owner_repo,
-                                        error = %e,
-                                        "error reading upstream pack stream"
-                                    );
-                                    had_error = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if had_error {
-                            let _ = handle.exit_status_request(channel_id, 1).await;
-                        } else {
-                            info!(
-                                repo = %owner_repo,
-                                total_bytes,
-                                "upstream proxy pack stream complete"
-                            );
-                            spawn_background_cache_clone(&state, &owner_repo, authenticated);
-                            let _ = handle.exit_status_request(channel_id, 0).await;
-                        }
-                        let _ = handle.eof(channel_id).await;
-                        let _ = handle.close(channel_id).await;
-                    }
-                    Err(e) => {
-                        error!(
-                            repo = %owner_repo,
-                            error = %format!("{e:#}"),
-                            "upstream proxy POST failed"
-                        );
-                        let msg = format!(
-                            "Repository '{}' upstream proxy failed: {}\n\
-                             Try cloning directly from the upstream forge.\n",
-                            owner_repo, e,
-                        );
-                        let _ = handle
-                            .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
-                            .await;
-                        let _ = handle.exit_status_request(channel_id, 1).await;
-                        let _ = handle.eof(channel_id).await;
-                        let _ = handle.close(channel_id).await;
-                    }
-                }
+                .await;
             });
         }
 
@@ -544,65 +413,74 @@ impl Handler for SshSession {
                 }
 
                 // ── Per-repo authorization ────────────────────────────
-                // Split "owner/repo" so we can check access on the forge.
-                // Anonymous sessions (no resolved username) skip this check:
-                // repo visibility is enforced by the upstream forge when the
-                // unauthenticated HTTPS clone is attempted.
+                // Split "owner/repo" so we can check read access on the forge.
                 match super::upstream::split_owner_repo(&repo) {
                     Ok((owner, repo_name)) => {
-                        if let Some(username) = self.username.as_deref() {
-                            let fingerprint = self.fingerprint.as_deref().unwrap_or("");
-                            match crate::auth::ssh_resolver::check_ssh_repo_access(
-                                &self.state,
-                                fingerprint,
-                                username,
-                                owner,
-                                repo_name,
-                            )
-                            .await
-                            {
-                                Ok(perm) if !perm.has_read() => {
-                                    warn!(
-                                        username,
-                                        repo = %repo,
-                                        "SSH repo access denied"
-                                    );
-                                    session.extended_data(
-                                        channel_id,
-                                        1,
-                                        CryptoVec::from_slice(
-                                            format!(
-                                                "ERROR: Access denied to repository {owner}/{repo_name}\n"
-                                            )
-                                            .as_bytes(),
-                                        ),
-                                    );
-                                    finish_channel(session, channel_id, 1);
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    error!(
-                                        username,
-                                        repo = %repo,
-                                        error = %e,
-                                        "SSH repo access check failed"
-                                    );
-                                    session.extended_data(
-                                        channel_id,
-                                        1,
-                                        CryptoVec::from_slice(
-                                            format!(
-                                                "ERROR: Failed to verify access to repository {owner}/{repo_name}: {e}\n"
-                                            )
-                                            .as_bytes(),
-                                        ),
-                                    );
-                                    finish_channel(session, channel_id, 1);
-                                    return Ok(());
-                                }
-                                Ok(_) => {
-                                    // Permission granted — fall through to cache/upstream logic.
-                                }
+                        let username = match self.username.as_deref() {
+                            Some(u) => u,
+                            None => {
+                                session.extended_data(
+                                    channel_id,
+                                    1,
+                                    CryptoVec::from_slice(
+                                        b"ERROR: SSH identity could not be resolved.\n",
+                                    ),
+                                );
+                                finish_channel(session, channel_id, 1);
+                                return Ok(());
+                            }
+                        };
+                        let fingerprint = self.fingerprint.as_deref().unwrap_or("");
+                        match crate::auth::ssh_resolver::check_ssh_repo_access(
+                            &self.state,
+                            fingerprint,
+                            username,
+                            owner,
+                            repo_name,
+                        )
+                        .await
+                        {
+                            Ok(perm) if !perm.has_read() => {
+                                warn!(
+                                    username,
+                                    repo = %repo,
+                                    "SSH repo access denied"
+                                );
+                                session.extended_data(
+                                    channel_id,
+                                    1,
+                                    CryptoVec::from_slice(
+                                        format!(
+                                            "ERROR: Access denied to repository {owner}/{repo_name}\n"
+                                        )
+                                        .as_bytes(),
+                                    ),
+                                );
+                                finish_channel(session, channel_id, 1);
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                error!(
+                                    username,
+                                    repo = %repo,
+                                    error = %e,
+                                    "SSH repo access check failed"
+                                );
+                                session.extended_data(
+                                    channel_id,
+                                    1,
+                                    CryptoVec::from_slice(
+                                        format!(
+                                            "ERROR: Failed to verify access to repository {owner}/{repo_name}: {e}\n"
+                                        )
+                                        .as_bytes(),
+                                    ),
+                                );
+                                finish_channel(session, channel_id, 1);
+                                return Ok(());
+                            }
+                            Ok(_) => {
+                                // Permission granted — fall through to cache/upstream logic.
                             }
                         }
                     }
@@ -627,6 +505,43 @@ impl Handler for SshSession {
                     exists = repo_path.exists(),
                     "handling git-upload-pack"
                 );
+
+                if !self.cache_manager.has_repo(&repo)
+                    && let Some(auth_header) =
+                        build_clone_auth_header_for_repo(&self.state, &repo).await
+                {
+                    let (owner, repo_name) = match super::upstream::split_owner_repo(&repo) {
+                        Ok(parts) => parts,
+                        Err(e) => {
+                            error!(repo = %repo, error = %e, "invalid repo slug for pre-clone");
+                            session.extended_data(
+                                channel_id,
+                                1,
+                                CryptoVec::from_slice(
+                                    b"Invalid repository path. Expected owner/repo.\n",
+                                ),
+                            );
+                            finish_channel(session, channel_id, 1);
+                            return Ok(());
+                        }
+                    };
+
+                    info!(repo = %repo, "repository not cached; cloning once before serving SSH");
+                    if let Err(e) = crate::coordination::registry::ensure_repo_cloned(
+                        &self.state,
+                        owner,
+                        repo_name,
+                        Some(auth_header.as_str()),
+                    )
+                    .await
+                    {
+                        warn!(
+                            repo = %repo,
+                            error = %e,
+                            "pre-clone failed; falling back to direct upstream proxy"
+                        );
+                    }
+                }
 
                 if repo_path.exists() && repo_path.join("HEAD").is_file() {
                     // ── Serve from local cache via bidirectional upload-pack ──
@@ -677,17 +592,24 @@ impl Handler for SshSession {
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
                                 let mut buf = vec![0u8; 65536];
+                                let mut disconnected = false;
 
                                 // Stream stdout → channel data.
                                 loop {
                                     match stdout.read(&mut buf).await {
                                         Ok(0) => break,
                                         Ok(n) => {
-                                            if handle
-                                                .data(channel_id, CryptoVec::from_slice(&buf[..n]))
-                                                .await
-                                                .is_err()
-                                            {
+                                            for part in buf[..n].chunks(SSH_DATA_CHUNK_SIZE) {
+                                                if handle
+                                                    .data(channel_id, CryptoVec::from_slice(part))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    disconnected = true;
+                                                    break;
+                                                }
+                                            }
+                                            if disconnected {
                                                 break;
                                             }
                                         }
@@ -725,9 +647,11 @@ impl Handler for SshSession {
                                 }
 
                                 // RFC 4254: exit-status → EOF → close.
-                                let _ = handle.exit_status_request(channel_id, exit_code).await;
-                                let _ = handle.eof(channel_id).await;
-                                let _ = handle.close(channel_id).await;
+                                if !disconnected {
+                                    let _ = handle.exit_status_request(channel_id, exit_code).await;
+                                    let _ = handle.eof(channel_id).await;
+                                    let _ = handle.close(channel_id).await;
+                                }
                             });
 
                             // Return immediately — the background task handles
@@ -757,9 +681,8 @@ impl Handler for SshSession {
                     warn!(repo = %repo, "repository not in local cache; proxying upstream");
 
                     // Capture whether this session has a resolved username.
-                    // Anonymous sessions (sidecar unavailable / key unknown)
-                    // will use unauthenticated upstream clones so private repos
-                    // are rejected naturally by the forge.
+                    // Auth is fail-closed, so this should be true in normal
+                    // operation.
                     let authenticated = self.username.is_some();
 
                     // Initialise the accumulation buffer NOW, before spawning,
@@ -847,64 +770,118 @@ impl Handler for SshSession {
     }
 }
 
-/// Spawn a background clone so future SSH requests can hit local cache, mirroring
-/// the HTTP upload-pack handler behavior.
-fn spawn_background_cache_clone(state: &Arc<AppState>, owner_repo: &str, authenticated: bool) {
-    if !authenticated {
-        return;
-    }
-
-    let state = Arc::clone(state);
-    let owner_repo = owner_repo.to_owned();
-    tokio::spawn(async move {
-        let (owner, repo) = match super::upstream::split_owner_repo(&owner_repo) {
-            Ok(parts) => parts,
-            Err(e) => {
-                warn!(
-                    repo = %owner_repo,
-                    error = %e,
-                    "skipping background cache clone: invalid owner/repo"
-                );
-                return;
+/// Proxy `git-upload-pack` to the upstream forge, stream the response back to
+/// the SSH client, and close the channel.
+async fn proxy_upstream_upload_pack(
+    state: Arc<AppState>,
+    handle: russh::server::Handle,
+    channel_id: ChannelId,
+    owner_repo: String,
+    want_have: Vec<u8>,
+    authenticated: bool,
+    warn_on_disconnect: bool,
+) {
+    match super::upstream::post_upload_pack_stream(&state, &owner_repo, &want_have, authenticated)
+        .await
+    {
+        Ok(stream) => {
+            use futures::Stream;
+            use std::pin::Pin;
+            let mut stream = Pin::new(Box::new(stream));
+            let mut total_bytes: u64 = 0;
+            let mut had_error = false;
+            while let Some(chunk_result) =
+                std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
+            {
+                match chunk_result {
+                    Ok(chunk) => {
+                        total_bytes += chunk.len() as u64;
+                        for part in chunk.chunks(SSH_DATA_CHUNK_SIZE) {
+                            if handle
+                                .data(channel_id, CryptoVec::from_slice(part))
+                                .await
+                                .is_err()
+                            {
+                                if warn_on_disconnect {
+                                    warn!(
+                                        repo = %owner_repo,
+                                        "client disconnected during pack stream"
+                                    );
+                                }
+                                had_error = true;
+                                break;
+                            }
+                        }
+                        if had_error {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            repo = %owner_repo,
+                            error = %e,
+                            "error reading upstream pack stream"
+                        );
+                        had_error = true;
+                        break;
+                    }
+                }
             }
-        };
-
-        let token_key = state
-            .config
-            .upstream_credentials
-            .orgs
-            .get(owner)
-            .map(|oc| oc.keyring_key_name.as_str())
-            .unwrap_or(&state.config.upstream.admin_token_env);
-
-        let Some(token) = crate::credentials::keyring::resolve_secret(token_key).await else {
-            warn!(
-                repo = %owner_repo,
-                token_key,
-                "skipping background cache clone: token not found"
-            );
-            return;
-        };
-
-        if token.is_empty() {
-            warn!(
-                repo = %owner_repo,
-                token_key,
-                "skipping background cache clone: token is empty"
-            );
-            return;
+            if had_error {
+                let _ = handle.exit_status_request(channel_id, 1).await;
+            } else {
+                info!(
+                    repo = %owner_repo,
+                    total_bytes,
+                    "upstream proxy pack stream complete"
+                );
+                let _ = handle.exit_status_request(channel_id, 0).await;
+            }
+            let _ = handle.eof(channel_id).await;
+            // Give the transport a brief window to flush trailing channel data
+            // before we send channel close, reducing truncation risk on very
+            // large pack streams.
+            sleep(Duration::from_millis(150)).await;
+            let _ = handle.close(channel_id).await;
         }
-
-        let auth_header = format!("Bearer {token}");
-        if let Err(e) =
-            crate::coordination::registry::ensure_repo_cloned(&state, owner, repo, &auth_header)
-                .await
-        {
-            warn!(repo = %owner_repo, error = %e, "background cache clone failed");
-        } else {
-            info!(repo = %owner_repo, "background cache clone succeeded");
+        Err(e) => {
+            error!(
+                repo = %owner_repo,
+                error = %format!("{e:#}"),
+                "upstream proxy POST failed"
+            );
+            let msg = format!(
+                "Repository '{}' upstream proxy failed: {}\n\
+                 Try cloning directly from the upstream forge.\n",
+                owner_repo, e,
+            );
+            let _ = handle
+                .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
+                .await;
+            let _ = handle.exit_status_request(channel_id, 1).await;
+            let _ = handle.eof(channel_id).await;
+            let _ = handle.close(channel_id).await;
         }
-    });
+    }
+}
+
+/// Build a `Bearer` auth header for clone/fetch operations for this repo's org.
+/// Returns `None` if the token cannot be resolved.
+async fn build_clone_auth_header_for_repo(state: &AppState, owner_repo: &str) -> Option<String> {
+    let (owner, _) = super::upstream::split_owner_repo(owner_repo).ok()?;
+    let token_key = state
+        .config
+        .upstream_credentials
+        .orgs
+        .get(owner)
+        .map(|oc| oc.keyring_key_name.as_str())
+        .unwrap_or(&state.config.upstream.admin_token_env);
+
+    let token = crate::credentials::keyring::resolve_secret(token_key).await?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(format!("Bearer {token}"))
 }
 
 // ---------------------------------------------------------------------------

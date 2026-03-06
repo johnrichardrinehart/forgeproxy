@@ -20,7 +20,7 @@ use crate::auth::middleware::Permission;
 /// repository, or an error otherwise.
 pub async fn validate_http_auth(
     state: &AppState,
-    auth_header: &str,
+    auth_header: Option<&str>,
     owner: &str,
     repo: &str,
 ) -> Result<()> {
@@ -28,10 +28,13 @@ pub async fn validate_http_auth(
     let repo = repo.trim_end_matches(".git");
 
     // 1. Hash the token for the cache key (never store raw credentials).
-    let token_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(auth_header.as_bytes());
-        hex::encode(hasher.finalize())
+    let token_hash = match auth_header {
+        Some(header) => {
+            let mut hasher = Sha256::new();
+            hasher.update(header.as_bytes());
+            hex::encode(hasher.finalize())
+        }
+        None => "anonymous".to_string(),
     };
 
     let cache_key = format!("forgeproxy:http:auth:{token_hash}:{owner}/{repo}");

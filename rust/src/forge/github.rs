@@ -43,6 +43,23 @@ impl GitHubBackend {
     }
 }
 
+fn permission_from_repo_response(body: &serde_json::Value) -> Permission {
+    let perm = super::extract_permission(body);
+    if perm.has_read() {
+        return perm;
+    }
+
+    if body
+        .get("private")
+        .and_then(|v| v.as_bool())
+        .is_some_and(|is_private| !is_private)
+    {
+        return Permission::Read;
+    }
+
+    Permission::None
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementation
 // ---------------------------------------------------------------------------
@@ -52,20 +69,20 @@ impl ForgeBackend for GitHubBackend {
     async fn validate_http_auth(
         &self,
         http_client: &reqwest::Client,
-        auth_header: &str,
+        auth_header: Option<&str>,
         owner: &str,
         repo: &str,
         rate_limit: &RateLimitState,
     ) -> Result<Permission> {
         let url = format!("{}/repos/{owner}/{repo}", self.api_url);
 
-        let resp = http_client
-            .get(&url)
-            .header("Authorization", auth_header)
-            .header("Accept", self.accept)
-            .send()
-            .await
-            .context("upstream API request failed")?;
+        let mut req = http_client.get(&url).header("Accept", self.accept);
+        if let Some(header) = auth_header
+            && !header.trim().is_empty()
+        {
+            req = req.header("Authorization", header);
+        }
+        let resp = req.send().await.context("upstream API request failed")?;
 
         rate_limit.update_from_headers(resp.headers());
 
@@ -80,7 +97,7 @@ impl ForgeBackend for GitHubBackend {
             .await
             .context("failed to parse upstream API response")?;
 
-        Ok(super::extract_permission(&body))
+        Ok(permission_from_repo_response(&body))
     }
 
     async fn resolve_ssh_user(
@@ -225,15 +242,18 @@ impl ForgeBackend for GitHubBackend {
         owner: &str,
         repo: &str,
         git_ref: &str,
-        auth_header: &str,
+        auth_header: Option<&str>,
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
         let url = format!("{}/repos/{owner}/{repo}/commits/{git_ref}", self.api_url);
 
-        let resp = http_client
-            .get(&url)
-            .header("Authorization", auth_header)
-            .header("Accept", self.accept)
+        let mut req = http_client.get(&url).header("Accept", self.accept);
+        if let Some(header) = auth_header
+            && !header.trim().is_empty()
+        {
+            req = req.header("Authorization", header);
+        }
+        let resp = req
             .send()
             .await
             .context("upstream API request failed for ref resolution")?;

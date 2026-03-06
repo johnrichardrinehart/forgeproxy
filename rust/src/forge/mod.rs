@@ -44,7 +44,7 @@ pub trait ForgeBackend: Send + Sync {
     async fn validate_http_auth(
         &self,
         http_client: &reqwest::Client,
-        auth_header: &str,
+        auth_header: Option<&str>,
         owner: &str,
         repo: &str,
         rate_limit: &RateLimitState,
@@ -93,7 +93,7 @@ pub trait ForgeBackend: Send + Sync {
         owner: &str,
         repo: &str,
         git_ref: &str,
-        auth_header: &str,
+        auth_header: Option<&str>,
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>>;
 }
