@@ -261,6 +261,10 @@ in
     # the preStart provider runs awscli2 (Python/libffi) which requires W|X memory.
     systemd.services.nginx.serviceConfig.MemoryDenyWriteExecute = lib.mkForce false;
 
+    # The runtime provider may load secrets into the kernel keyring during
+    # ExecStartPre. Keep nginx's syscall allowlist compatible with keyctl(2).
+    systemd.services.nginx.serviceConfig.SystemCallFilter = lib.mkAfter [ "@keyring" ];
+
     # Ensure the cache directory exists with correct ownership.
     systemd.tmpfiles.rules = [
       "d ${cfg.archiveCachePath} 0750 nginx nginx -"

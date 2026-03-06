@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    process::Stdio,
     sync::{Arc, Mutex},
+    time::SystemTime,
     time::{Duration, Instant},
 };
 
@@ -16,7 +16,6 @@ use axum::{
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
@@ -359,19 +358,27 @@ fn cache_insert(cache: &Cache, key: String, value: CacheValue, ttl: Duration) {
 
 // ── SSH + SQL ─────────────────────────────────────────────────────────────────
 
-fn build_ssh_args(cfg: &ResolvedConfig, remote_cmd: &str, identity_path: &str) -> Vec<String> {
+fn build_ssh_args(
+    cfg: &ResolvedConfig,
+    remote_cmd: &str,
+    identity_path: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
-        "-i".to_owned(),
-        identity_path.to_owned(),
         "-p".to_owned(),
         cfg.ssh_port.to_string(),
         "-o".to_owned(),
         "StrictHostKeyChecking=no".to_owned(),
         "-o".to_owned(),
+        "UserKnownHostsFile=/dev/null".to_owned(),
+        "-o".to_owned(),
         "BatchMode=yes".to_owned(),
         "-o".to_owned(),
         "ConnectTimeout=10".to_owned(),
     ];
+
+    if let Some(path) = identity_path {
+        args.extend(["-i".to_owned(), path.to_owned()]);
+    }
 
     if !cfg.ssh_control_path.is_empty() {
         args.extend([
@@ -482,7 +489,7 @@ async fn ssh_query(cfg: &ResolvedConfig, fingerprint: &str) -> anyhow::Result<Ve
     let identity = resolve_identity(cfg).await?;
     let output = match identity {
         IdentityMaterial::File(path) => {
-            let args = build_ssh_args(cfg, &remote_cmd, &path);
+            let args = build_ssh_args(cfg, &remote_cmd, Some(&path));
             let output = Command::new("ssh")
                 .args(&args)
                 .output()
@@ -491,25 +498,25 @@ async fn ssh_query(cfg: &ResolvedConfig, fingerprint: &str) -> anyhow::Result<Ve
             output
         }
         IdentityMaterial::Pem(pem) => {
-            let args = build_ssh_args(cfg, &remote_cmd, "/dev/stdin");
-            let mut child = Command::new("ssh")
-                .args(&args)
-                .stdin(Stdio::piped())
-                .spawn()
-                .context("failed to spawn ssh with piped identity")?;
-
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(pem.as_bytes())
+            let (agent_sock, agent_pid) = start_ssh_agent().await?;
+            let query_result = async {
+                add_pem_to_ssh_agent(&agent_sock, &pem).await?;
+                let args = build_ssh_args(cfg, &remote_cmd, None);
+                let output = Command::new("ssh")
+                    .args(&args)
+                    .env("SSH_AUTH_SOCK", &agent_sock)
+                    .output()
                     .await
-                    .context("failed to write identity PEM to ssh stdin")?;
+                    .context("failed to spawn ssh")?;
+                Ok::<_, anyhow::Error>(output)
+            }
+            .await;
+
+            if let Err(e) = stop_ssh_agent(&agent_sock, &agent_pid).await {
+                warn!(error = %e, "failed to stop ssh-agent cleanly");
             }
 
-            let output = child
-                .wait_with_output()
-                .await
-                .context("failed waiting for ssh output")?;
-            output
+            query_result?
         }
     };
 
@@ -520,6 +527,120 @@ async fn ssh_query(cfg: &ResolvedConfig, fingerprint: &str) -> anyhow::Result<Ve
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_mysql_output(&stdout, &cfg.ghe_url)
+}
+
+async fn start_ssh_agent() -> anyhow::Result<(String, String)> {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .context("system clock is before UNIX_EPOCH")?
+        .as_nanos();
+    const RUNTIME_DIR: &str = "/run/ghe-key-lookup";
+    tokio::fs::create_dir_all(RUNTIME_DIR)
+        .await
+        .context("failed to create ssh-agent runtime directory")?;
+    let socket_path = format!(
+        "{RUNTIME_DIR}/ssh-agent-{}-{nanos}.sock",
+        std::process::id()
+    );
+    let _ = tokio::fs::remove_file(&socket_path).await;
+
+    let output = Command::new("ssh-agent")
+        .args(["-s", "-a"])
+        .arg(&socket_path)
+        .env("HOME", RUNTIME_DIR)
+        .output()
+        .await
+        .context("failed to spawn ssh-agent")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ssh-agent exited with {}: {}", output.status, stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut sock: Option<String> = None;
+    let mut pid: Option<String> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("SSH_AUTH_SOCK=") {
+            sock = rest.split(';').next().map(str::to_owned);
+        } else if let Some(rest) = line.strip_prefix("SSH_AGENT_PID=") {
+            pid = rest.split(';').next().map(str::to_owned);
+        }
+    }
+
+    let sock = sock.context("ssh-agent output missing SSH_AUTH_SOCK")?;
+    let pid = pid.context("ssh-agent output missing SSH_AGENT_PID")?;
+    Ok((sock, pid))
+}
+
+async fn add_pem_to_ssh_agent(agent_sock: &str, pem: &str) -> anyhow::Result<()> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = Command::new("ssh-add")
+        .arg("-")
+        .env("SSH_AUTH_SOCK", agent_sock)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn ssh-add")?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to open ssh-add stdin")?;
+        stdin
+            .write_all(pem.as_bytes())
+            .await
+            .context("failed to write PEM to ssh-add stdin")?;
+        if !pem.ends_with('\n') {
+            stdin
+                .write_all(b"\n")
+                .await
+                .context("failed to write trailing newline to ssh-add stdin")?;
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed waiting for ssh-add")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ssh-add exited with {}: {}", output.status, stderr.trim());
+    }
+
+    Ok(())
+}
+
+async fn stop_ssh_agent(agent_sock: &str, agent_pid: &str) -> anyhow::Result<()> {
+    let output = Command::new("ssh-agent")
+        .arg("-k")
+        .env("SSH_AUTH_SOCK", agent_sock)
+        .env("SSH_AGENT_PID", agent_pid)
+        .output()
+        .await
+        .context("failed to spawn ssh-agent -k")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ssh-agent -k exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    if let Err(error) = std::fs::remove_file(agent_sock) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = agent_sock, %error, "failed to remove ssh-agent socket");
+        }
+    }
+
+    Ok(())
 }
 
 // ── Output parser ─────────────────────────────────────────────────────────────
@@ -840,7 +961,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
     #[test]
     fn ssh_args_no_control_master() {
         let cfg = base_config();
-        let args = build_ssh_args(&cfg, "echo hi", "/run/secrets/key");
+        let args = build_ssh_args(&cfg, "echo hi", Some("/run/secrets/key"));
         assert!(!args.iter().any(|a| a.starts_with("ControlMaster")));
         assert!(!args.iter().any(|a| a.starts_with("ControlPath")));
         assert!(!args.iter().any(|a| a.starts_with("ControlPersist")));
@@ -856,7 +977,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
             ghe_url: "https://ghe.example.com".to_owned(),
             ..base_config()
         };
-        let args = build_ssh_args(&cfg, "echo hi", "/run/secrets/key");
+        let args = build_ssh_args(&cfg, "echo hi", Some("/run/secrets/key"));
         assert!(args.contains(&"admin@ghe-internal.corp.net".to_owned()));
         assert!(!args.iter().any(|a| a == "admin@ghe.example.com"));
     }
@@ -868,7 +989,7 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
             ssh_control_persist: "120".to_owned(),
             ..base_config()
         };
-        let args = build_ssh_args(&cfg, "echo hi", "/run/secrets/key");
+        let args = build_ssh_args(&cfg, "echo hi", Some("/run/secrets/key"));
         let joined = args.join(" ");
         assert!(joined.contains("ControlMaster=auto"));
         assert!(joined.contains("ControlPath=/run/ghe-key-lookup/ssh-control"));
@@ -881,8 +1002,17 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
             ssh_control_path: "/run/ghe-key-lookup/ssh-control".to_owned(),
             ..base_config()
         };
-        let args = build_ssh_args(&cfg, "echo hi", "/run/secrets/key");
+        let args = build_ssh_args(&cfg, "echo hi", Some("/run/secrets/key"));
         assert!(args.iter().any(|a| a == "ControlPersist=yes"));
+    }
+
+    #[test]
+    fn ssh_args_without_identity_file_omit_i_flag() {
+        let cfg = base_config();
+        let args = build_ssh_args(&cfg, "echo hi", None);
+        assert!(!args.iter().any(|a| a == "-i"));
+        assert!(!args.iter().any(|a| a == "/run/secrets/key"));
+        assert!(args.contains(&"admin@ghe.example.com".to_owned()));
     }
 
     // ── Cache tests ───────────────────────────────────────────────────────────
