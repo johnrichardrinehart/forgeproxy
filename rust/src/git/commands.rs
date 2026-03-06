@@ -33,6 +33,35 @@ pub struct FetchResult {
 // Clone
 // ---------------------------------------------------------------------------
 
+/// Run `git init --bare <dest>`.
+#[instrument(fields(dest = %dest.display()))]
+pub async fn git_init_bare(dest: &Path) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("init").arg("--bare").arg(dest);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git init --bare");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git init --bare")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git init --bare failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git init --bare succeeded");
+    Ok(())
+}
+
 /// Run `git clone --bare <url> <dest>` with the supplied environment variables.
 #[instrument(skip(env_vars), fields(%url, dest = %dest.display()))]
 pub async fn git_clone_bare(url: &str, dest: &Path, env_vars: &[(String, String)]) -> Result<()> {
@@ -130,6 +159,41 @@ pub async fn git_fetch(
         refs_updated,
         bytes_received,
     })
+}
+
+/// Run `git fetch <bundle_path> +refs/*:refs/*` inside an existing bare repo.
+#[instrument(fields(repo = %repo_path.display(), bundle = %bundle_path.display()))]
+pub async fn git_fetch_bundle(repo_path: &Path, bundle_path: &Path) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("fetch")
+        .arg("--force")
+        .arg(bundle_path)
+        .arg("+refs/*:refs/*");
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git fetch from bundle");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git fetch from bundle")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git fetch from bundle failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git fetch from bundle succeeded");
+    Ok(())
 }
 
 /// Count the number of ref-update lines in `git fetch` stderr.
