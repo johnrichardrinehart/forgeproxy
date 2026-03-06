@@ -36,6 +36,44 @@ pub async fn upload_bundle(
     Ok(())
 }
 
+/// Download an S3 object to a local file path, creating parent directories if
+/// needed.
+#[instrument(skip(client), fields(%bucket, %key, path = %file_path.display()))]
+pub async fn download_to_path(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    file_path: &Path,
+) -> Result<()> {
+    if let Some(parent) = file_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create parent directories for {}", file_path.display()))?;
+    }
+
+    let response = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .context("S3 GetObject")?;
+
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .context("read S3 object body")?
+        .into_bytes();
+
+    tokio::fs::write(file_path, &bytes)
+        .await
+        .with_context(|| format!("write downloaded object to {}", file_path.display()))?;
+
+    debug!(path = %file_path.display(), bytes = bytes.len(), "S3 object downloaded");
+    Ok(())
+}
+
 /// Generate a pre-signed GET URL for an S3 object.
 #[instrument(skip(client), fields(%bucket, %key, ttl_secs))]
 pub async fn generate_presigned_url(

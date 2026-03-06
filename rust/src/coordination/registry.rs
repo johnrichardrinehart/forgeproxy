@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use fred::interfaces::{ClientLike, HashesInterface};
+use fred::interfaces::{ClientLike, HashesInterface, SortedSetsInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 /// Metadata about a cached repository.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -285,6 +286,44 @@ pub async fn try_ensure_repo_cloned(
     // We hold the lock — perform the clone.
     let result = async {
         let repo_path = state.cache_manager.ensure_repo_dir(&owner_repo)?;
+        reset_partial_repo_if_needed(&state.cache_manager, &owner_repo, &repo_path).await?;
+
+        match try_restore_repo_from_s3(state, &owner_repo, &repo_path).await {
+            Ok(true) => {
+                let now = chrono::Utc::now().timestamp();
+                let mut info = get_repo_info(&state.valkey, &owner_repo)
+                    .await?
+                    .unwrap_or_default();
+                info.status = "ready".to_string();
+                info.node_ids = node_id.clone();
+                if info.last_fetch_ts == 0 {
+                    info.last_fetch_ts = now;
+                }
+                set_repo_info(&state.valkey, &owner_repo, &info).await?;
+                crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
+                    .await?;
+                info!(%owner_repo, "repo hydrated from S3 bundle");
+                return Ok::<(), anyhow::Error>(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                info!(
+                    %owner_repo,
+                    error = %error,
+                    "S3 hydration unavailable; falling back to upstream clone"
+                );
+                if repo_path.exists() {
+                    tokio::fs::remove_dir_all(&repo_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove failed S3 hydration repo at {}",
+                                repo_path.display()
+                            )
+                        })?;
+                }
+            }
+        }
 
         // Build the upstream clone URL with embedded credentials.
         // For Basic auth, decode the base64 to recover "user:pass" and embed
@@ -328,12 +367,41 @@ pub async fn try_ensure_repo_cloned(
 
         crate::git::commands::git_clone_bare(&clone_url, &repo_path, &env_vars).await?;
 
+        let bundle =
+            crate::bundleuri::generator::generate_full_bundle(state, &repo_path, &owner_repo)
+                .await
+                .with_context(|| format!("failed to generate bootstrap bundle for {owner_repo}"))?;
+
+        let s3_key = format!(
+            "{}{}/bundles/{}.bundle",
+            state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
+        );
+        crate::storage::s3::upload_bundle(
+            &state.s3_client,
+            &state.config.storage.s3.bucket,
+            &s3_key,
+            &bundle.bundle_path,
+        )
+        .await
+        .with_context(|| format!("failed to upload bootstrap bundle for {owner_repo}"))?;
+
+        register_bundle_in_valkey(
+            state,
+            &owner_repo,
+            &repo_path,
+            &s3_key,
+            bundle.creation_token,
+        )
+        .await?;
+
         // Register in Valkey.
         let now = chrono::Utc::now().timestamp();
         let info = RepoInfo {
             status: "ready".to_string(),
             node_ids: node_id.clone(),
             last_fetch_ts: now,
+            last_bundle_ts: now,
+            latest_creation_token: bundle.creation_token,
             ..Default::default()
         };
         set_repo_info(&state.valkey, &owner_repo, &info).await?;
@@ -349,6 +417,100 @@ pub async fn try_ensure_repo_cloned(
     let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
 
     result
+}
+
+async fn reset_partial_repo_if_needed(
+    cache_manager: &crate::cache::CacheManager,
+    owner_repo: &str,
+    repo_path: &Path,
+) -> Result<()> {
+    if repo_path.exists() && !cache_manager.has_repo(owner_repo) {
+        tokio::fs::remove_dir_all(repo_path)
+            .await
+            .with_context(|| format!("failed to remove partial repo at {}", repo_path.display()))?;
+    }
+    Ok(())
+}
+
+async fn try_restore_repo_from_s3(
+    state: &crate::AppState,
+    owner_repo: &str,
+    repo_path: &Path,
+) -> Result<bool> {
+    let repo_key = repo_key(owner_repo);
+    let latest_bundle_s3_key: Option<String> =
+        HashesInterface::hget(&state.valkey, &repo_key, "latest_bundle_s3_key")
+            .await
+            .unwrap_or(None);
+    let base_bundle_s3_key: Option<String> =
+        HashesInterface::hget(&state.valkey, &repo_key, "base_bundle_s3_key")
+            .await
+            .unwrap_or(None);
+    let Some(s3_key) = latest_bundle_s3_key.or(base_bundle_s3_key) else {
+        return Ok(false);
+    };
+
+    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for S3 hydration")?;
+    let bundle_path = tmp_dir.path().join("hydrate.bundle");
+    crate::storage::s3::download_to_path(
+        &state.s3_client,
+        &state.config.storage.s3.bucket,
+        &s3_key,
+        &bundle_path,
+    )
+    .await
+    .with_context(|| format!("failed to download S3 bundle for {owner_repo}"))?;
+
+    crate::git::commands::git_init_bare(repo_path).await?;
+    crate::git::commands::git_fetch_bundle(repo_path, &bundle_path).await?;
+
+    Ok(state.cache_manager.has_repo(owner_repo))
+}
+
+async fn register_bundle_in_valkey(
+    state: &crate::AppState,
+    owner_repo: &str,
+    repo_path: &Path,
+    s3_key: &str,
+    creation_token: u64,
+) -> Result<()> {
+    let refs = crate::bundleuri::generator::get_refs(repo_path).await?;
+    let refs_json = serde_json::to_string(&refs)?;
+    let repo_key = repo_key(owner_repo);
+
+    HashesInterface::hset::<(), _, _>(
+        &state.valkey,
+        &repo_key,
+        [
+            ("prev_refs", refs_json.as_str()),
+            ("latest_bundle_s3_key", s3_key),
+            ("latest_bundle_token", &creation_token.to_string()),
+        ],
+    )
+    .await?;
+
+    let bundle_name = format!("bootstrap-{creation_token}");
+    let bundle_registry_key = format!("bundles:{owner_repo}");
+    HashesInterface::hset::<(), _, _>(
+        &state.valkey,
+        &bundle_registry_key,
+        [(bundle_name.as_str(), s3_key)],
+    )
+    .await?;
+
+    let bundle_tokens_key = format!("bundle_tokens:{owner_repo}");
+    SortedSetsInterface::zadd::<(), _, _>(
+        &state.valkey,
+        &bundle_tokens_key,
+        None,
+        None,
+        false,
+        false,
+        (creation_token as f64, bundle_name.as_str()),
+    )
+    .await?;
+
+    Ok(())
 }
 
 /// List all tracked repository names by scanning for `forgeproxy:repo:*` keys
