@@ -21,8 +21,11 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
+use futures::StreamExt;
 use serde::Deserialize;
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -222,30 +225,6 @@ async fn handle_upload_pack(
     info!("proxying upload-pack to upstream forge");
     let response =
         proxy_upload_pack_to_upstream(&state, &owner, &repo, auth_header.as_deref(), body).await?;
-
-    // 4. Spawn background clone so future requests can be served locally.
-    {
-        let state = Arc::clone(&state);
-        let owner = owner.clone();
-        let repo = repo.clone();
-        let auth = auth_header.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned(
-                &state,
-                &owner,
-                &repo,
-                auth.as_deref(),
-            )
-            .await
-            {
-                warn!(
-                    error = %e,
-                    repo = %format!("{}/{}", owner, repo),
-                    "background clone failed"
-                );
-            }
-        });
-    }
 
     Ok(response)
 }
@@ -447,6 +426,7 @@ async fn proxy_upload_pack_to_upstream(
     if let Some(header) = auth_header {
         req = req.header(header::AUTHORIZATION, header);
     }
+    let capture_body = body.clone();
     let upstream_resp = req
         .header("Git-Protocol", "version=2")
         .body(body)
@@ -467,9 +447,94 @@ async fn proxy_upload_pack_to_upstream(
             .into_response());
     }
 
-    // Stream the upstream body back to the client without buffering.
-    let byte_stream = upstream_resp.bytes_stream();
-    let body = Body::from_stream(byte_stream);
+    let owner_repo = format!("{owner}/{repo}");
+    let mut capture = match crate::tee_hydration::TeeCapture::start(
+        &state.cache_manager.base_path,
+        &owner_repo,
+        "https",
+    )
+    .await
+    {
+        Ok(capture) => Some(capture),
+        Err(e) => {
+            warn!(repo = %owner_repo, error = %e, "failed to start tee capture for HTTP miss");
+            None
+        }
+    };
+
+    let request_capture_failed = if let Some(active_capture) = capture.as_mut() {
+        if let Err(e) = active_capture.write_request(&capture_body).await {
+            warn!(repo = %owner_repo, error = %e, "failed to record HTTP tee request");
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if request_capture_failed {
+        capture = None;
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(8);
+    let state = state.clone();
+    let owner = owner.to_string();
+    let repo = repo.to_string();
+    let auth_header = auth_header.map(str::to_string);
+    tokio::spawn(async move {
+        let mut stream = upstream_resp.bytes_stream();
+        let mut capture = capture;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    if let Some(active_capture) = capture.as_mut()
+                        && let Err(e) = active_capture.write_response_chunk(&chunk).await
+                    {
+                        warn!(
+                            repo = %owner_repo,
+                            error = %e,
+                            "failed to record HTTP tee response chunk"
+                        );
+                        capture = None;
+                    }
+
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if let Some(active_capture) = capture.take() {
+                        let _ = active_capture.finish(false).await;
+                    }
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+
+        if let Some(active_capture) = capture {
+            let capture_dir = active_capture.dir().to_path_buf();
+            let _ = active_capture.finish(true).await;
+            if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                &state,
+                &owner,
+                &repo,
+                auth_header.as_deref(),
+                capture_dir,
+            )
+            .await
+            {
+                warn!(
+                    repo = %owner_repo,
+                    error = %e,
+                    "tee hydration after HTTP miss failed"
+                );
+            }
+        }
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(rx));
 
     Ok((
         StatusCode::OK,

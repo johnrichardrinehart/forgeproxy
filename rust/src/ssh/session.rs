@@ -683,32 +683,6 @@ impl Handler for SshSession {
                         }
                     }
                 } else {
-                    if let Ok((owner, repo_name)) = super::upstream::split_owner_repo(&repo) {
-                        let state = Arc::clone(&self.state);
-                        let owner = owner.to_string();
-                        let repo_name = repo_name.to_string();
-                        let repo_for_log = repo.clone();
-                        let auth_header =
-                            build_clone_auth_header_for_repo(&self.state, &repo).await;
-
-                        tokio::spawn(async move {
-                            if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned(
-                                &state,
-                                &owner,
-                                &repo_name,
-                                auth_header.as_deref(),
-                            )
-                            .await
-                            {
-                                warn!(
-                                    repo = %repo_for_log,
-                                    error = %e,
-                                    "background hydrate after SSH proxy miss failed"
-                                );
-                            }
-                        });
-                    }
-
                     // Repository is not in local cache — proxy upstream via HTTP
                     // smart protocol.  Phase 1: fetch ref advertisement (async,
                     // via background task so we don't block the russh event
@@ -829,12 +803,55 @@ async fn proxy_upstream_upload_pack(
             let mut channel_writer = stream_channel.map(|channel| channel.make_writer());
             let mut total_bytes: u64 = 0;
             let mut had_error = false;
+            let auth_header = if authenticated {
+                build_clone_auth_header_for_repo(&state, &owner_repo).await
+            } else {
+                None
+            };
+            let mut capture = match crate::tee_hydration::TeeCapture::start(
+                &state.cache_manager.base_path,
+                &owner_repo,
+                "ssh",
+            )
+            .await
+            {
+                Ok(mut capture) => {
+                    if let Err(e) = capture.write_request(&want_have).await {
+                        warn!(
+                            repo = %owner_repo,
+                            error = %e,
+                            "failed to record SSH tee request"
+                        );
+                        None
+                    } else {
+                        Some(capture)
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %e,
+                        "failed to start tee capture for SSH miss"
+                    );
+                    None
+                }
+            };
             while let Some(chunk_result) =
                 std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
             {
                 match chunk_result {
                     Ok(chunk) => {
                         total_bytes += chunk.len() as u64;
+                        if let Some(active_capture) = capture.as_mut()
+                            && let Err(e) = active_capture.write_response_chunk(&chunk).await
+                        {
+                            warn!(
+                                repo = %owner_repo,
+                                error = %e,
+                                "failed to record SSH tee response chunk"
+                            );
+                            capture = None;
+                        }
                         if let Some(writer) = channel_writer.as_mut() {
                             if let Err(e) = writer.write_all(&chunk).await {
                                 if warn_on_disconnect {
@@ -863,9 +880,9 @@ async fn proxy_upstream_upload_pack(
                                     break;
                                 }
                             }
-                            if had_error {
-                                break;
-                            }
+                        }
+                        if had_error {
+                            break;
                         }
                     }
                     Err(e) => {
@@ -880,6 +897,9 @@ async fn proxy_upstream_upload_pack(
                 }
             }
             if had_error {
+                if let Some(active_capture) = capture.take() {
+                    let _ = active_capture.finish(false).await;
+                }
                 let _ = handle.exit_status_request(channel_id, 1).await;
             } else {
                 info!(
@@ -887,6 +907,27 @@ async fn proxy_upstream_upload_pack(
                     total_bytes,
                     "upstream proxy pack stream complete"
                 );
+                if let Some(active_capture) = capture.take() {
+                    let capture_dir = active_capture.dir().to_path_buf();
+                    let _ = active_capture.finish(true).await;
+                    if let Ok((owner, repo)) = super::upstream::split_owner_repo(&owner_repo)
+                        && let Err(e) =
+                            crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                                &state,
+                                owner,
+                                repo,
+                                auth_header.as_deref(),
+                                capture_dir,
+                            )
+                            .await
+                    {
+                        warn!(
+                            repo = %owner_repo,
+                            error = %e,
+                            "tee hydration after SSH miss failed"
+                        );
+                    }
+                }
                 let _ = handle.exit_status_request(channel_id, 0).await;
             }
             if let Some(writer) = channel_writer.as_mut() {

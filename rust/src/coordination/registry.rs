@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -275,19 +275,23 @@ pub async fn is_repo_cached_and_fresh(state: &crate::AppState, owner_repo: &str)
     Ok(last_fetch_ts + threshold > now)
 }
 
-/// Ensure that a bare clone of `owner/repo` exists on this node, but do not
-/// wait if another node/task is already hydrating it.
-///
-/// This is intended for fire-and-forget background hydration triggered by live
-/// client traffic. At most one hydrator should actively clone a repo at a time;
-/// duplicate attempts should simply observe the held lock and return.
+pub async fn try_ensure_repo_cloned_from_tee(
+    state: &crate::AppState,
+    owner: &str,
+    repo: &str,
+    auth_header: Option<&str>,
+    capture_dir: PathBuf,
+) -> Result<()> {
+    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir), false).await
+}
+
 pub async fn try_ensure_repo_cloned(
     state: &crate::AppState,
     owner: &str,
     repo: &str,
     auth_header: Option<&str>,
 ) -> Result<()> {
-    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, false).await
+    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, None, false).await
 }
 
 async fn try_ensure_repo_cloned_inner(
@@ -295,6 +299,7 @@ async fn try_ensure_repo_cloned_inner(
     owner: &str,
     repo: &str,
     auth_header: Option<&str>,
+    tee_capture_dir: Option<PathBuf>,
     waited_for_bootstrap: bool,
 ) -> Result<()> {
     // Strip trailing ".git" from repo if present to avoid double-suffixing
@@ -320,6 +325,7 @@ async fn try_ensure_repo_cloned_inner(
                 owner,
                 repo,
                 auth_header,
+                tee_capture_dir,
                 true,
             ))
             .await;
@@ -384,35 +390,7 @@ async fn try_ensure_repo_cloned_inner(
             }
         }
 
-        // Build the upstream clone URL with embedded credentials.
-        // For Basic auth, decode the base64 to recover "user:pass" and embed
-        // directly in the URL.  For Bearer/token auth, use the x-access-token
-        // format understood by GitHub/Gitea.
-        let clone_url = if let Some(b64) = auth_header.and_then(|h| h.strip_prefix("Basic ")) {
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(b64.trim())
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .unwrap_or_default();
-            format!(
-                "https://{decoded}@{}/{owner}/{repo_clean}.git",
-                state.config.upstream.hostname,
-            )
-        } else if let Some(header) = auth_header.filter(|h| !h.trim().is_empty()) {
-            let token = header
-                .strip_prefix("Bearer ")
-                .or_else(|| header.strip_prefix("token "))
-                .unwrap_or(header);
-            format!(
-                "https://x-access-token:{token}@{}/{owner}/{repo_clean}.git",
-                state.config.upstream.hostname,
-            )
-        } else {
-            format!(
-                "https://{}/{owner}/{repo_clean}.git",
-                state.config.upstream.hostname,
-            )
-        };
+        let clone_url = clone_url(state, owner, repo_clean, auth_header);
 
         // Acquire the clone semaphore to respect concurrency limits.
         let _permit = state
@@ -424,7 +402,16 @@ async fn try_ensure_repo_cloned_inner(
         let env_vars: Vec<(String, String)> =
             vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
 
-        crate::git::commands::git_clone_bare(&clone_url, &repo_path, &env_vars).await?;
+        let hydrated_from_tee = if let Some(capture_dir) = tee_capture_dir.as_ref() {
+            hydrate_repo_from_tee_capture(state, &owner_repo, &repo_path, &clone_url, capture_dir)
+                .await?
+        } else {
+            false
+        };
+
+        if !hydrated_from_tee {
+            crate::git::commands::git_clone_bare(&clone_url, &repo_path, &env_vars).await?;
+        }
 
         let bundle =
             crate::bundleuri::generator::generate_full_bundle(state, &repo_path, &owner_repo)
@@ -502,6 +489,39 @@ async fn try_ensure_repo_cloned_inner(
     result
 }
 
+fn clone_url(
+    state: &crate::AppState,
+    owner: &str,
+    repo_clean: &str,
+    auth_header: Option<&str>,
+) -> String {
+    if let Some(b64) = auth_header.and_then(|h| h.strip_prefix("Basic ")) {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default();
+        format!(
+            "https://{decoded}@{}/{owner}/{repo_clean}.git",
+            state.config.upstream.hostname,
+        )
+    } else if let Some(header) = auth_header.filter(|h| !h.trim().is_empty()) {
+        let token = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("token "))
+            .unwrap_or(header);
+        format!(
+            "https://x-access-token:{token}@{}/{owner}/{repo_clean}.git",
+            state.config.upstream.hostname,
+        )
+    } else {
+        format!(
+            "https://{}/{owner}/{repo_clean}.git",
+            state.config.upstream.hostname,
+        )
+    }
+}
+
 async fn reset_partial_repo_if_needed(
     cache_manager: &crate::cache::CacheManager,
     owner_repo: &str,
@@ -546,6 +566,25 @@ async fn try_restore_repo_from_s3(
 
     crate::git::commands::git_init_bare(repo_path).await?;
     crate::git::commands::git_fetch_bundle(repo_path, &bundle_path).await?;
+
+    Ok(state.cache_manager.has_repo(owner_repo))
+}
+
+async fn hydrate_repo_from_tee_capture(
+    state: &crate::AppState,
+    owner_repo: &str,
+    repo_path: &Path,
+    clone_url: &str,
+    capture_dir: &Path,
+) -> Result<bool> {
+    let Some(pack_path) = crate::tee_hydration::extract_pack_from_capture(capture_dir).await?
+    else {
+        return Ok(false);
+    };
+
+    crate::git::commands::git_init_bare(repo_path).await?;
+    crate::git::commands::git_unpack_objects(repo_path, &pack_path).await?;
+    crate::git::commands::git_fetch(repo_path, clone_url, &[]).await?;
 
     Ok(state.cache_manager.has_repo(owner_repo))
 }
