@@ -498,6 +498,8 @@ async fn ssh_query(cfg: &ResolvedConfig, fingerprint: &str) -> anyhow::Result<Ve
             output
         }
         IdentityMaterial::Pem(pem) => {
+            // Keep private key fully in memory via ssh-agent and authenticate
+            // over SSH_AUTH_SOCK (no on-disk identity file ever created).
             let (agent_sock, agent_pid) = start_ssh_agent().await?;
             let query_result = async {
                 add_pem_to_ssh_agent(&agent_sock, &pem).await?;
@@ -639,7 +641,6 @@ async fn stop_ssh_agent(agent_sock: &str, agent_pid: &str) -> anyhow::Result<()>
             warn!(path = agent_sock, %error, "failed to remove ssh-agent socket");
         }
     }
-
     Ok(())
 }
 
