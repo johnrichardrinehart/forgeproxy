@@ -44,6 +44,7 @@ pub async fn fetch_ref_advertisement(
     state: &AppState,
     owner_repo: &str,
     authenticated: bool,
+    git_protocol: Option<&str>,
 ) -> Result<Vec<u8>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =
@@ -54,13 +55,14 @@ pub async fn fetch_ref_advertisement(
             let url = format!("{clone_url}/info/refs?service=git-upload-pack");
             debug!(%url, "fetching ref advertisement via HTTP GET");
 
-            let resp = state
+            let mut req = state
                 .http_client
                 .get(&url)
-                .header("Accept", "application/x-git-upload-pack-advertisement")
-                .send()
-                .await
-                .context("HTTP GET /info/refs failed")?;
+                .header("Accept", "application/x-git-upload-pack-advertisement");
+            if let Some(protocol) = git_protocol {
+                req = req.header("Git-Protocol", protocol);
+            }
+            let resp = req.send().await.context("HTTP GET /info/refs failed")?;
 
             if !resp.status().is_success() {
                 bail!("upstream returned {} for ref advertisement", resp.status());
@@ -104,6 +106,7 @@ pub async fn post_upload_pack_stream(
     owner_repo: &str,
     want_have: &[u8],
     authenticated: bool,
+    git_protocol: Option<&str>,
 ) -> Result<impl Stream<Item = reqwest::Result<bytes::Bytes>>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =
@@ -114,11 +117,15 @@ pub async fn post_upload_pack_stream(
             let url = format!("{clone_url}/git-upload-pack");
             debug!(%url, input_bytes = want_have.len(), "posting want/have to upstream");
 
-            let resp = state
+            let mut req = state
                 .http_client
                 .post(&url)
                 .header("Content-Type", "application/x-git-upload-pack-request")
-                .header("Accept", "application/x-git-upload-pack-result")
+                .header("Accept", "application/x-git-upload-pack-result");
+            if let Some(protocol) = git_protocol {
+                req = req.header("Git-Protocol", protocol);
+            }
+            let resp = req
                 .body(want_have.to_vec())
                 .send()
                 .await

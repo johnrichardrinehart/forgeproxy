@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::time::{Duration, sleep};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::AppState;
@@ -31,6 +31,30 @@ use crate::cache::CacheManager;
 /// Keeping frames at or below 32 KiB avoids relying on library-side
 /// fragmentation behavior for large buffers while streaming big packfiles.
 const SSH_DATA_CHUNK_SIZE: usize = 32 * 1024;
+
+#[derive(Debug, Default, Clone)]
+struct UpstreamProxyChannelState {
+    stream_finished: bool,
+    exit_status_sent: bool,
+    eof_sent: bool,
+    close_sent: bool,
+    client_eof_seen: bool,
+    client_close_seen: bool,
+}
+
+struct UpstreamUploadPackRequest {
+    owner_repo: String,
+    want_have: Vec<u8>,
+    authenticated: bool,
+    git_protocol: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct UpstreamUploadPackBehavior {
+    warn_on_disconnect: bool,
+    should_close_channel: bool,
+    capture_for_hydration: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -49,14 +73,16 @@ pub struct SshSession {
     /// `GIT_PROTOCOL` value sent by the client via SSH env request.
     git_protocol: Option<String>,
     /// For PAT-mode upstream proxy (uncached repos):
-    /// `(owner_repo, want_have_buf, authenticated)`.
+    /// `(owner_repo, want_have_buf, authenticated, git_protocol)`.
     ///
     /// SSH auth is fail-closed: unresolved fingerprints are rejected at auth
     /// time, so `authenticated` should be `true` for normal requests.
-    upstream_proxy_buf: Option<(String, Vec<u8>, bool)>,
+    upstream_proxy_buf: Option<(String, Vec<u8>, bool, Option<String>)>,
     /// Open SSH channels keyed by channel id so background tasks can stream
     /// large uncached pack responses with proper channel-window backpressure.
     channels: HashMap<ChannelId, Channel<Msg>>,
+    /// Per-channel lifecycle state for the uncached upstream proxy path.
+    upstream_proxy_channels: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
 }
 
 impl SshSession {
@@ -73,6 +99,7 @@ impl SshSession {
             git_protocol: None,
             upstream_proxy_buf: None,
             channels: HashMap::new(),
+            upstream_proxy_channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -89,6 +116,146 @@ fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32
     session.exit_status_request(channel_id, exit_status);
     session.eof(channel_id);
     session.close(channel_id);
+}
+
+fn parse_pkt_line_len(header: &[u8]) -> Option<usize> {
+    if header.len() != 4 {
+        return None;
+    }
+    let text = std::str::from_utf8(header).ok()?;
+    usize::from_str_radix(text, 16).ok()
+}
+
+fn is_single_round_fetch_request(buf: &[u8]) -> bool {
+    if !buf.ends_with(b"0000") {
+        return false;
+    }
+
+    let mut saw_want = false;
+    let mut offset = 0usize;
+
+    while offset + 4 <= buf.len() {
+        let len = match parse_pkt_line_len(&buf[offset..offset + 4]) {
+            Some(len) => len,
+            None => return false,
+        };
+
+        if len == 0 {
+            return offset + 4 == buf.len() && saw_want;
+        }
+
+        if len < 4 || offset + len > buf.len() {
+            return false;
+        }
+
+        let payload = &buf[offset + 4..offset + len];
+        if payload.starts_with(b"want ") {
+            saw_want = true;
+        } else if payload.starts_with(b"have ") || payload == b"done\n" {
+            return false;
+        }
+
+        offset += len;
+    }
+
+    false
+}
+
+#[cfg(test)]
+fn is_complete_v2_fetch_request(buf: &[u8]) -> bool {
+    matches!(complete_v2_request_kind(buf), Some(V2RequestKind::Fetch))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V2RequestKind {
+    LsRefs,
+    Fetch,
+}
+
+fn complete_v2_request_kind(buf: &[u8]) -> Option<V2RequestKind> {
+    let mut request_kind = None;
+    let mut offset = 0usize;
+    let mut last_was_flush = false;
+
+    while offset + 4 <= buf.len() {
+        let len = parse_pkt_line_len(&buf[offset..offset + 4])?;
+
+        if len == 0 {
+            last_was_flush = true;
+            offset += 4;
+            continue;
+        }
+
+        if len == 1 || len == 2 {
+            last_was_flush = false;
+            offset += 4;
+            continue;
+        }
+
+        last_was_flush = false;
+
+        if len < 4 || offset + len > buf.len() {
+            return None;
+        }
+
+        let payload = &buf[offset + 4..offset + len];
+        let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
+        if payload == b"command=fetch" {
+            request_kind = Some(V2RequestKind::Fetch);
+        } else if payload == b"command=ls-refs" {
+            request_kind = Some(V2RequestKind::LsRefs);
+        }
+
+        offset += len;
+    }
+
+    if offset != buf.len() || !last_was_flush {
+        return None;
+    }
+
+    request_kind
+}
+
+fn summarize_pkt_lines(buf: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+
+    while offset + 4 <= buf.len() {
+        let len = match parse_pkt_line_len(&buf[offset..offset + 4]) {
+            Some(len) => len,
+            None => {
+                out.push(format!("invalid-len@{offset}"));
+                break;
+            }
+        };
+
+        match len {
+            0 => {
+                out.push("flush".to_string());
+                offset += 4;
+            }
+            1 => {
+                out.push("delimiter".to_string());
+                offset += 4;
+            }
+            2 => {
+                out.push("response-end".to_string());
+                offset += 4;
+            }
+            n => {
+                if n < 4 || offset + n > buf.len() {
+                    out.push(format!("truncated@{offset}:{n}"));
+                    break;
+                }
+                let payload =
+                    String::from_utf8_lossy(&buf[offset + 4..offset + n]).replace('\n', "\\n");
+                out.push(payload);
+                offset += n;
+            }
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +449,9 @@ impl Handler for SshSession {
         //   2. Flush "0000" after wants (no haves) — shallow/single-round fetch
         //      (e.g. `git clone --depth 1`).  The client never sends "done" in
         //      this case; the flush IS the signal.
-        let should_post = if let Some((ref repo, ref mut buf, _)) = self.upstream_proxy_buf {
+        let post_action = if let Some((ref repo, ref mut buf, authenticated, ref git_protocol)) =
+            self.upstream_proxy_buf
+        {
             info!(
                 repo = %repo,
                 incoming_bytes = data.len(),
@@ -291,41 +460,98 @@ impl Handler for SshSession {
             );
             buf.extend_from_slice(data);
             let has_done = buf.windows(9).any(|w| w == b"0009done\n");
+            let ends_with_flush = buf.ends_with(b"0000");
             // Shallow/no-negotiation (protocol v1): wants followed by flush, no haves.
-            //
-            // For protocol v2, `0000` appears in-section and is not a reliable
-            // end-of-request marker, so we wait for `done`/`channel_eof`.
-            let has_flush_after_wants = self.git_protocol.as_deref() != Some("version=2")
-                && buf.len() >= 4
-                && buf.ends_with(b"0000")
-                && !buf.windows(4).any(|w| w == b"have");
-            has_done || has_flush_after_wants
+            // This exact request shape should POST immediately instead of
+            // waiting for channel EOF, which Git does not send before reading
+            // the packfile.
+            let pkt_summary = if self.git_protocol.as_deref() == Some("version=2") {
+                Some(summarize_pkt_lines(buf))
+            } else {
+                None
+            };
+            let v2_request_kind = if self.git_protocol.as_deref() == Some("version=2") {
+                complete_v2_request_kind(buf)
+            } else {
+                None
+            };
+            let has_flush_after_wants = if self.git_protocol.as_deref() == Some("version=2") {
+                v2_request_kind == Some(V2RequestKind::Fetch)
+            } else {
+                is_single_round_fetch_request(buf)
+            };
+            info!(
+                repo = %repo,
+                git_protocol = ?self.git_protocol,
+                has_done,
+                ends_with_flush,
+                has_flush_after_wants,
+                v2_request_kind = ?v2_request_kind,
+                pkt_summary = ?pkt_summary,
+                "DIAG: upstream proxy request completion check"
+            );
+            if self.git_protocol.as_deref() == Some("version=2") {
+                v2_request_kind
+                    .map(|kind| (repo.clone(), kind, authenticated, git_protocol.clone()))
+            } else if has_done || has_flush_after_wants {
+                Some((
+                    repo.clone(),
+                    V2RequestKind::Fetch,
+                    authenticated,
+                    git_protocol.clone(),
+                ))
+            } else {
+                None
+            }
         } else {
-            false
+            None
         };
 
-        if should_post
-            && let Some((owner_repo, want_have, authenticated)) = self.upstream_proxy_buf.take()
-        {
-            let stream_channel = self.channels.remove(&channel_id);
+        if let Some((owner_repo, request_kind, authenticated, git_protocol)) = post_action {
+            let stream_channel = if request_kind == V2RequestKind::Fetch {
+                self.channels.remove(&channel_id)
+            } else {
+                None
+            };
+            let want_have = if request_kind == V2RequestKind::LsRefs {
+                if let Some((_, buf, _, _)) = self.upstream_proxy_buf.as_mut() {
+                    std::mem::take(buf)
+                } else {
+                    Vec::new()
+                }
+            } else if let Some((_, want_have, _, _)) = self.upstream_proxy_buf.take() {
+                want_have
+            } else {
+                Vec::new()
+            };
             info!(
                 repo = %owner_repo,
+                request_kind = ?request_kind,
                 want_have_bytes = want_have.len(),
                 authenticated,
-                "upstream proxy: detected done pkt-line, POSTing to upstream"
+                "upstream proxy: request complete, POSTing to upstream"
             );
             let state = Arc::clone(&self.state);
+            let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let handle = session.handle();
             tokio::spawn(async move {
                 proxy_upstream_upload_pack(
                     state,
+                    channel_states,
                     handle,
                     channel_id,
                     stream_channel,
-                    owner_repo,
-                    want_have,
-                    authenticated,
-                    true,
+                    UpstreamUploadPackRequest {
+                        owner_repo,
+                        want_have,
+                        authenticated,
+                        git_protocol,
+                    },
+                    UpstreamUploadPackBehavior {
+                        warn_on_disconnect: true,
+                        should_close_channel: request_kind == V2RequestKind::Fetch,
+                        capture_for_hydration: request_kind == V2RequestKind::Fetch,
+                    },
                 )
                 .await;
             });
@@ -351,27 +577,81 @@ impl Handler for SshSession {
             "DIAG: channel_eof fired"
         );
 
+        if let Some(state) = self
+            .upstream_proxy_channels
+            .lock()
+            .await
+            .get_mut(&channel_id)
+        {
+            state.client_eof_seen = true;
+        }
+
         // PAT-mode upstream proxy: POST buffered want/have, stream packfile back.
-        if let Some((owner_repo, want_have, authenticated)) = self.upstream_proxy_buf.take() {
+        if let Some((owner_repo, want_have, authenticated, git_protocol)) =
+            self.upstream_proxy_buf.take()
+        {
             let stream_channel = self.channels.remove(&channel_id);
             debug!(repo = %owner_repo, want_have_bytes = want_have.len(), authenticated, "upstream proxy: channel_eof received, POSTing to upstream");
             let state = Arc::clone(&self.state);
+            let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let handle = session.handle();
             tokio::spawn(async move {
                 proxy_upstream_upload_pack(
                     state,
+                    channel_states,
                     handle,
                     channel_id,
                     stream_channel,
-                    owner_repo,
-                    want_have,
-                    authenticated,
-                    false,
+                    UpstreamUploadPackRequest {
+                        owner_repo,
+                        want_have,
+                        authenticated,
+                        git_protocol,
+                    },
+                    UpstreamUploadPackBehavior {
+                        warn_on_disconnect: false,
+                        should_close_channel: true,
+                        capture_for_hydration: true,
+                    },
                 )
                 .await;
             });
         }
 
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel_id: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let mut close_state = None;
+        {
+            let mut channels = self.upstream_proxy_channels.lock().await;
+            if let Some(state) = channels.get_mut(&channel_id) {
+                state.client_close_seen = true;
+                close_state = Some(state.clone());
+            }
+        }
+
+        if let Some(state) = close_state {
+            info!(
+                channel = ?channel_id,
+                stream_finished = state.stream_finished,
+                exit_status_sent = state.exit_status_sent,
+                eof_sent = state.eof_sent,
+                close_sent = state.close_sent,
+                client_eof_seen = state.client_eof_seen,
+                client_close_seen = state.client_close_seen,
+                "DIAG: channel_close fired"
+            );
+        }
+
+        self.upstream_proxy_channels
+            .lock()
+            .await
+            .remove(&channel_id);
         Ok(())
     }
 
@@ -556,6 +836,16 @@ impl Handler for SshSession {
                 if repo_path.exists() && repo_path.join("HEAD").is_file() {
                     // ── Serve from local cache via bidirectional upload-pack ──
                     info!(repo = %repo, "serving git-upload-pack from local cache");
+                    let Some(channel) = self.channels.remove(&channel_id) else {
+                        error!(repo = %repo, channel = ?channel_id, "missing SSH channel handle for cached upload-pack");
+                        session.extended_data(
+                            channel_id,
+                            1,
+                            CryptoVec::from_slice(b"ERROR: Internal SSH channel state missing.\n"),
+                        );
+                        finish_channel(session, channel_id, 1);
+                        return Ok(());
+                    };
 
                     let mut cmd = Command::new("git");
                     cmd.arg("upload-pack").arg("--strict").arg(&repo_path);
@@ -596,41 +886,22 @@ impl Handler for SshSession {
                             let handle = session.handle();
 
                             // Spawn a task that streams upload-pack stdout to
-                            // the SSH channel, then cleans up when the process
-                            // exits.
+                            // the SSH channel using russh's channel writer so
+                            // large responses obey SSH window backpressure.
                             tokio::spawn(async move {
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
-                                let mut buf = vec![0u8; 65536];
+                                let mut channel_writer = channel.make_writer();
                                 let mut disconnected = false;
 
-                                // Stream stdout → channel data.
-                                loop {
-                                    match stdout.read(&mut buf).await {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            for part in buf[..n].chunks(SSH_DATA_CHUNK_SIZE) {
-                                                if handle
-                                                    .data(channel_id, CryptoVec::from_slice(part))
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    disconnected = true;
-                                                    break;
-                                                }
-                                            }
-                                            if disconnected {
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            debug!(
-                                                error = %e,
-                                                "error reading upload-pack stdout"
-                                            );
-                                            break;
-                                        }
-                                    }
+                                if let Err(e) =
+                                    tokio::io::copy(&mut stdout, &mut channel_writer).await
+                                {
+                                    debug!(
+                                        error = %e,
+                                        "error streaming upload-pack stdout to SSH channel"
+                                    );
+                                    disconnected = true;
                                 }
 
                                 // Wait for the child to exit.
@@ -659,7 +930,8 @@ impl Handler for SshSession {
                                 // RFC 4254: exit-status → EOF → close.
                                 if !disconnected {
                                     let _ = handle.exit_status_request(channel_id, exit_code).await;
-                                    let _ = handle.eof(channel_id).await;
+                                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut channel_writer)
+                                        .await;
                                     let _ = handle.close(channel_id).await;
                                 }
                             });
@@ -700,7 +972,16 @@ impl Handler for SshSession {
                     // arrive while the advertisement is being fetched (in
                     // practice git won't send anything until it receives the
                     // advertisement, but initialising here is race-safe).
-                    self.upstream_proxy_buf = Some((repo.clone(), Vec::new(), authenticated));
+                    self.upstream_proxy_buf = Some((
+                        repo.clone(),
+                        Vec::new(),
+                        authenticated,
+                        self.git_protocol.clone(),
+                    ));
+                    self.upstream_proxy_channels
+                        .lock()
+                        .await
+                        .insert(channel_id, UpstreamProxyChannelState::default());
 
                     // RFC 4254 §6.5: OpenSSH won't read channel data until it
                     // receives SSH_MSG_CHANNEL_SUCCESS.  Send it now so the
@@ -709,13 +990,16 @@ impl Handler for SshSession {
                     session.channel_success(channel_id);
 
                     let state = Arc::clone(&self.state);
+                    let channel_states = Arc::clone(&self.upstream_proxy_channels);
                     let handle = session.handle();
                     let repo_bg = repo.clone();
+                    let git_protocol = self.git_protocol.clone();
                     tokio::spawn(async move {
                         match super::upstream::fetch_ref_advertisement(
                             &state,
                             &repo_bg,
                             authenticated,
+                            git_protocol.as_deref(),
                         )
                         .await
                         {
@@ -755,6 +1039,14 @@ impl Handler for SshSession {
                                     .await;
                                 let _ = handle.exit_status_request(channel_id, 1).await;
                                 let _ = handle.eof(channel_id).await;
+                                if let Some(state) =
+                                    channel_states.lock().await.get_mut(&channel_id)
+                                {
+                                    state.stream_finished = true;
+                                    state.exit_status_sent = true;
+                                    state.eof_sent = true;
+                                    state.close_sent = true;
+                                }
                                 let _ = handle.close(channel_id).await;
                             }
                         }
@@ -780,21 +1072,32 @@ impl Handler for SshSession {
     }
 }
 
-/// Proxy `git-upload-pack` to the upstream forge, stream the response back to
-/// the SSH client, and close the channel.
-#[allow(clippy::too_many_arguments)]
+/// Proxy `git-upload-pack` to the upstream forge and stream the response back
+/// to the SSH client. Channel close is coordinated by the main SSH handler
+/// after the client acknowledges teardown.
 async fn proxy_upstream_upload_pack(
     state: Arc<AppState>,
+    channel_states: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     handle: russh::server::Handle,
     channel_id: ChannelId,
     stream_channel: Option<Channel<Msg>>,
-    owner_repo: String,
-    want_have: Vec<u8>,
-    authenticated: bool,
-    warn_on_disconnect: bool,
+    request: UpstreamUploadPackRequest,
+    behavior: UpstreamUploadPackBehavior,
 ) {
-    match super::upstream::post_upload_pack_stream(&state, &owner_repo, &want_have, authenticated)
-        .await
+    let UpstreamUploadPackRequest {
+        owner_repo,
+        want_have,
+        authenticated,
+        git_protocol,
+    } = request;
+    match super::upstream::post_upload_pack_stream(
+        &state,
+        &owner_repo,
+        &want_have,
+        authenticated,
+        git_protocol.as_deref(),
+    )
+    .await
     {
         Ok(stream) => {
             use futures::Stream;
@@ -808,33 +1111,37 @@ async fn proxy_upstream_upload_pack(
             } else {
                 None
             };
-            let mut capture = match crate::tee_hydration::TeeCapture::start(
-                &state.cache_manager.base_path,
-                &owner_repo,
-                "ssh",
-            )
-            .await
-            {
-                Ok(mut capture) => {
-                    if let Err(e) = capture.write_request(&want_have).await {
+            let mut capture = if behavior.capture_for_hydration {
+                match crate::tee_hydration::TeeCapture::start(
+                    &state.cache_manager.base_path,
+                    &owner_repo,
+                    "ssh",
+                )
+                .await
+                {
+                    Ok(mut capture) => {
+                        if let Err(e) = capture.write_request(&want_have).await {
+                            warn!(
+                                repo = %owner_repo,
+                                error = %e,
+                                "failed to record SSH tee request"
+                            );
+                            None
+                        } else {
+                            Some(capture)
+                        }
+                    }
+                    Err(e) => {
                         warn!(
                             repo = %owner_repo,
                             error = %e,
-                            "failed to record SSH tee request"
+                            "failed to start tee capture for SSH miss"
                         );
                         None
-                    } else {
-                        Some(capture)
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        repo = %owner_repo,
-                        error = %e,
-                        "failed to start tee capture for SSH miss"
-                    );
-                    None
-                }
+            } else {
+                None
             };
             while let Some(chunk_result) =
                 std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
@@ -854,7 +1161,7 @@ async fn proxy_upstream_upload_pack(
                         }
                         if let Some(writer) = channel_writer.as_mut() {
                             if let Err(e) = writer.write_all(&chunk).await {
-                                if warn_on_disconnect {
+                                if behavior.warn_on_disconnect {
                                     warn!(
                                         repo = %owner_repo,
                                         error = %e,
@@ -870,7 +1177,7 @@ async fn proxy_upstream_upload_pack(
                                     .await
                                     .is_err()
                                 {
-                                    if warn_on_disconnect {
+                                    if behavior.warn_on_disconnect {
                                         warn!(
                                             repo = %owner_repo,
                                             "client disconnected during pack stream"
@@ -900,7 +1207,13 @@ async fn proxy_upstream_upload_pack(
                 if let Some(active_capture) = capture.take() {
                     let _ = active_capture.finish(false).await;
                 }
-                let _ = handle.exit_status_request(channel_id, 1).await;
+                if behavior.should_close_channel {
+                    let _ = handle.exit_status_request(channel_id, 1).await;
+                    if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+                        state.stream_finished = true;
+                        state.exit_status_sent = true;
+                    }
+                }
             } else {
                 info!(
                     repo = %owner_repo,
@@ -936,18 +1249,26 @@ async fn proxy_upstream_upload_pack(
                         });
                     }
                 }
-                let _ = handle.exit_status_request(channel_id, 0).await;
+                if behavior.should_close_channel {
+                    let _ = handle.exit_status_request(channel_id, 0).await;
+                    if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+                        state.stream_finished = true;
+                        state.exit_status_sent = true;
+                    }
+                }
             }
-            if let Some(writer) = channel_writer.as_mut() {
-                let _ = writer.shutdown().await;
-            } else {
-                let _ = handle.eof(channel_id).await;
+            if behavior.should_close_channel {
+                if let Some(writer) = channel_writer.as_mut() {
+                    let _ = writer.shutdown().await;
+                } else {
+                    let _ = handle.eof(channel_id).await;
+                }
+                if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+                    state.eof_sent = true;
+                    state.close_sent = true;
+                }
+                let _ = handle.close(channel_id).await;
             }
-            // Give the transport a brief window to flush trailing channel data
-            // before we send channel close, reducing truncation risk on very
-            // large pack streams.
-            sleep(Duration::from_millis(150)).await;
-            let _ = handle.close(channel_id).await;
         }
         Err(e) => {
             error!(
@@ -963,9 +1284,17 @@ async fn proxy_upstream_upload_pack(
             let _ = handle
                 .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
                 .await;
-            let _ = handle.exit_status_request(channel_id, 1).await;
-            let _ = handle.eof(channel_id).await;
-            let _ = handle.close(channel_id).await;
+            if behavior.should_close_channel {
+                let _ = handle.exit_status_request(channel_id, 1).await;
+                let _ = handle.eof(channel_id).await;
+                if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+                    state.stream_finished = true;
+                    state.exit_status_sent = true;
+                    state.eof_sent = true;
+                    state.close_sent = true;
+                }
+                let _ = handle.close(channel_id).await;
+            }
         }
     }
 }
@@ -996,6 +1325,10 @@ async fn build_clone_auth_header_for_repo(state: &AppState, owner_repo: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pkt_line(payload: &str) -> String {
+        format!("{:04x}{payload}", payload.len() + 4)
+    }
 
     #[test]
     fn parse_upload_pack_with_git_suffix() {
@@ -1082,5 +1415,81 @@ mod tests {
             fp.len(),
             fp
         );
+    }
+
+    #[test]
+    fn single_round_fetch_request_detects_want_want_deepen_flush() {
+        let req = format!(
+            "{}{}{}0000",
+            pkt_line(
+                "want 8ec1e5b69fa78abab5efd3fd9e63cbf0aa025b4f multi_ack_detailed side-band-64k thin-pack include-tag ofs-delta deepen-since deepen-not agent=git/2.51.2-Linux\n"
+            ),
+            pkt_line("want 8ec1e5b69fa78abab5efd3fd9e63cbf0aa025b4f\n"),
+            pkt_line("deepen 1\n"),
+        );
+        assert!(is_single_round_fetch_request(req.as_bytes()), "{req:?}");
+    }
+
+    #[test]
+    fn single_round_fetch_request_rejects_have_negotiation() {
+        let req = format!(
+            "{}{}0000",
+            pkt_line("want 8ec1e5b69fa78abab5efd3fd9e63cbf0aa025b4f\n"),
+            pkt_line("have 8ec1e5b69fa78abab5efd3fd9e63cbf0aa025b4f\n"),
+        );
+        assert!(!is_single_round_fetch_request(req.as_bytes()));
+    }
+
+    #[test]
+    fn complete_v2_fetch_request_detects_fetch_sections() {
+        let req = format!(
+            "{}{}0001{}{}0000",
+            pkt_line("command=fetch\n"),
+            pkt_line("agent=git/2.51.2\n"),
+            pkt_line("thin-pack\n"),
+            pkt_line("ofs-delta\n"),
+        );
+        assert!(is_complete_v2_fetch_request(req.as_bytes()), "{req:?}");
+    }
+
+    #[test]
+    fn complete_v2_request_kind_detects_fetch_without_trailing_newlines() {
+        let req = format!(
+            "{}{}0001{}{}{}0000",
+            pkt_line("command=fetch"),
+            pkt_line("agent=git/2.52.0-Linux"),
+            pkt_line("thin-pack"),
+            pkt_line("ofs-delta"),
+            pkt_line("done"),
+        );
+        assert_eq!(
+            complete_v2_request_kind(req.as_bytes()),
+            Some(V2RequestKind::Fetch),
+            "{req:?}"
+        );
+    }
+
+    #[test]
+    fn complete_v2_request_kind_detects_ls_refs() {
+        let req = format!(
+            "{}{}{}0001{}{}{}0000",
+            pkt_line("command=ls-refs\n"),
+            pkt_line("agent=git/2.52.0-Linux\n"),
+            pkt_line("object-format=sha1\n"),
+            pkt_line("peel\n"),
+            pkt_line("symrefs\n"),
+            pkt_line("unborn\n"),
+        );
+        assert_eq!(
+            complete_v2_request_kind(req.as_bytes()),
+            Some(V2RequestKind::LsRefs),
+            "{req:?}"
+        );
+    }
+
+    #[test]
+    fn complete_v2_fetch_request_rejects_missing_command() {
+        let req = format!("{}0000", pkt_line("agent=git/2.51.2\n"));
+        assert!(!is_complete_v2_fetch_request(req.as_bytes()));
     }
 }
