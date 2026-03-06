@@ -5,7 +5,7 @@
 //! `ssh/session.rs`.  No behavioural changes — just moved behind the
 //! [`ForgeBackend`] trait.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::http::HeaderMap;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -145,7 +145,7 @@ impl ForgeBackend for GitHubBackend {
             );
         }
         let url = format!(
-            "{}/repos/{owner}/{repo}/collaborators/{username}/permission",
+            "{}/repos/{owner}/{repo}/collaborators/{username}",
             self.api_url
         );
 
@@ -158,24 +158,24 @@ impl ForgeBackend for GitHubBackend {
 
         rate_limit.update_from_headers(resp.headers());
 
-        if !resp.status().is_success() {
-            warn!(
-                username,
-                owner,
-                repo,
-                status = %resp.status(),
-                "collaborator permission check failed"
-            );
-            return Ok(Permission::None);
+        match resp.status() {
+            reqwest::StatusCode::NO_CONTENT => Ok(Permission::Read),
+            reqwest::StatusCode::NOT_FOUND => Ok(Permission::None),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Err(anyhow!(
+                "collaborator access check unauthorized for {owner}/{repo} user {username}: {}",
+                resp.status()
+            )),
+            status => {
+                warn!(
+                    username,
+                    owner,
+                    repo,
+                    status = %status,
+                    "collaborator check returned unexpected status"
+                );
+                Ok(Permission::None)
+            }
         }
-
-        let body: serde_json::Value = resp.json().await?;
-        let perm_str = body
-            .get("permission")
-            .and_then(|p| p.as_str())
-            .unwrap_or("none");
-
-        Ok(Permission::parse(perm_str))
     }
 
     fn verify_webhook_signature(
