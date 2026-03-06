@@ -432,13 +432,6 @@
                   enable = true;
                   providerScript = awsNginxProvider;
                 };
-
-                systemd.services.nginx = {
-                  # KeyringMode + keyutils are required by nix/nginx-runtime.nix,
-                  # which materializes TLS cert/key in mkBefore preStart.
-                  path = lib.mkAfter [ pkgs.keyutils ];
-                  serviceConfig.KeyringMode = lib.mkDefault "shared";
-                };
               }
             )
           ];
