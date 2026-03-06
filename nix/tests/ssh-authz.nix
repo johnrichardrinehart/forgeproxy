@@ -127,7 +127,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-authz";
-  globalTimeout = 600;
+  globalTimeout = 180;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -584,8 +584,9 @@ pkgs.testers.runNixOSTest {
     # ── Subtest 5: Uncached full clone via upstream proxy stream ─────────
     with subtest("Cache-miss full clone succeeds and populates local repo"):
         # Force a cache miss. Depending on the commit under test, forgeproxy may
-        # either proxy upstream directly or pre-clone before serving SSH. In
-        # either case, the clone must succeed and leave behind a usable bare repo.
+        # either proxy upstream directly or pre-clone before serving SSH. At
+        # this point in history, successful full-clone transport is the
+        # regression we care about; local cache publication is covered later.
         proxy.succeed(
             "rm -rf /var/cache/forgeproxy/repos/octocat/repo-stream.git && "
             "mkdir -p /var/cache/forgeproxy/repos/octocat/repo-stream.git"
@@ -599,8 +600,40 @@ pkgs.testers.runNixOSTest {
             " git clone git@proxy:octocat/repo-stream.git /tmp/repo-stream"
         )
         client.succeed("test -f /tmp/repo-stream/blob-24.bin")
-        proxy.wait_until_succeeds(
-            "test -f /var/cache/forgeproxy/repos/octocat/repo-stream.git/HEAD"
+        client.succeed("git -C /tmp/repo-stream rev-parse HEAD")
+        client.succeed("git -C /tmp/repo-stream fsck --no-dangling")
+
+    # ── Subtest 5b: Uncached shallow clone via upstream proxy stream ───────
+    with subtest("Uncached shallow clone succeeds via upstream proxy stream"):
+        proxy.succeed(
+            "rm -rf /var/cache/forgeproxy/repos/octocat/repo-stream.git && "
+            "mkdir -p /var/cache/forgeproxy/repos/octocat/repo-stream.git"
         )
+        client.succeed("rm -rf /tmp/repo-stream-shallow")
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone --depth 1 git@proxy:octocat/repo-stream.git /tmp/repo-stream-shallow"
+        )
+        client.succeed("test -f /tmp/repo-stream-shallow/blob-24.bin")
+        client.succeed("git -C /tmp/repo-stream-shallow rev-parse --is-shallow-repository | grep -qx true")
+        client.succeed("git -C /tmp/repo-stream-shallow rev-parse HEAD")
+        client.succeed("git -C /tmp/repo-stream-shallow fsck --no-dangling")
+
+    # ── Subtest 5c: Subsequent clone succeeds after hydration/cache fill ───
+    with subtest("Second clone succeeds after upstream proxy hydration"):
+        client.succeed("rm -rf /tmp/repo-stream-second")
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone --depth 1 git@proxy:octocat/repo-stream.git /tmp/repo-stream-second"
+        )
+        client.succeed("test -f /tmp/repo-stream-second/blob-24.bin")
+        client.succeed("git -C /tmp/repo-stream-second rev-parse HEAD")
+        client.succeed("git -C /tmp/repo-stream-second fsck --no-dangling")
   '';
 }

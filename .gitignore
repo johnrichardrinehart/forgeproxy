@@ -1,4 +1,4 @@
-rust/target/
+target/
 .direnv/
 .pre-commit-config.yaml
 result
