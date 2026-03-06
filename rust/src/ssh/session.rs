@@ -527,7 +527,7 @@ impl Handler for SshSession {
                     };
 
                     info!(repo = %repo, "repository not cached; cloning once before serving SSH");
-                    if let Err(e) = crate::coordination::registry::ensure_repo_cloned(
+                    if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned(
                         &self.state,
                         owner,
                         repo_name,
@@ -673,6 +673,32 @@ impl Handler for SshSession {
                         }
                     }
                 } else {
+                    if let Ok((owner, repo_name)) = super::upstream::split_owner_repo(&repo) {
+                        let state = Arc::clone(&self.state);
+                        let owner = owner.to_string();
+                        let repo_name = repo_name.to_string();
+                        let repo_for_log = repo.clone();
+                        let auth_header =
+                            build_clone_auth_header_for_repo(&self.state, &repo).await;
+
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned(
+                                &state,
+                                &owner,
+                                &repo_name,
+                                auth_header.as_deref(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    repo = %repo_for_log,
+                                    error = %e,
+                                    "background hydrate after SSH proxy miss failed"
+                                );
+                            }
+                        });
+                    }
+
                     // Repository is not in local cache — proxy upstream via HTTP
                     // smart protocol.  Phase 1: fetch ref advertisement (async,
                     // via background task so we don't block the russh event

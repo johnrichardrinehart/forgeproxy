@@ -230,7 +230,7 @@ async fn handle_upload_pack(
         let repo = repo.clone();
         let auth = auth_header.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::coordination::registry::ensure_repo_cloned(
+            if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned(
                 &state,
                 &owner,
                 &repo,

@@ -64,10 +64,13 @@ impl CacheManager {
     }
 
     /// Check whether a cached bare repo exists for `owner/repo` and looks
-    /// like a valid bare Git repository (contains a `HEAD` file).
+    /// like a usable bare Git repository.
+    ///
+    /// A `HEAD` file alone is not enough: partially initialised clone targets
+    /// can contain the bare repo skeleton without any refs that `upload-pack`
+    /// can actually serve.
     pub fn has_repo(&self, owner_repo: &str) -> bool {
-        let path = self.repo_path(owner_repo);
-        path.is_dir() && path.join("HEAD").is_file()
+        is_usable_bare_repo(&self.repo_path(owner_repo))
     }
 
     /// Walk [`base_path`] and return the total size of all files in bytes.
@@ -262,8 +265,7 @@ impl CacheManager {
                 // Strip the `.git` suffix if present.
                 let repo_clean = repo_str.strip_suffix(".git").unwrap_or(&repo_str);
 
-                // Quick validity check: bare repos contain a HEAD file.
-                if repo_entry.path().join("HEAD").is_file() {
+                if is_usable_bare_repo(&repo_entry.path()) {
                     repos.push(format!("{}/{}", owner_str, repo_clean));
                 }
             }
@@ -387,8 +389,59 @@ pub(crate) fn dir_size(dir: &Path) -> Result<u64> {
     Ok(total)
 }
 
+fn is_usable_bare_repo(path: &Path) -> bool {
+    path.is_dir()
+        && path.join("HEAD").is_file()
+        && (has_packed_refs(path) || has_loose_refs(&path.join("refs")))
+}
+
+fn has_packed_refs(path: &Path) -> bool {
+    let packed_refs = path.join("packed-refs");
+    let contents = match std::fs::read_to_string(&packed_refs) {
+        Ok(contents) => contents,
+        Err(_) => return false,
+    };
+
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with('^')
+    })
+}
+
+fn has_loose_refs(refs_dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(refs_dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+
+        if file_type.is_dir() {
+            if has_loose_refs(&path) {
+                return true;
+            }
+            continue;
+        }
+
+        if file_type.is_file() {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -426,5 +479,44 @@ mod tests {
             without,
             PathBuf::from("/var/cache/forgeproxy/repos/acme-corp/my-service.git")
         );
+    }
+
+    #[test]
+    fn bare_repo_without_refs_is_not_usable() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("acme").join("widgets.git");
+        fs::create_dir_all(repo.join("refs")).unwrap();
+        fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        assert!(!is_usable_bare_repo(&repo));
+        assert!(!has_packed_refs(&repo));
+        assert!(!has_loose_refs(&repo.join("refs")));
+    }
+
+    #[test]
+    fn bare_repo_with_loose_refs_is_usable() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("acme").join("widgets.git");
+        fs::create_dir_all(repo.join("refs").join("heads")).unwrap();
+        fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(repo.join("refs").join("heads").join("main"), "deadbeef\n").unwrap();
+
+        assert!(is_usable_bare_repo(&repo));
+    }
+
+    #[test]
+    fn bare_repo_with_packed_refs_is_usable() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("acme").join("widgets.git");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            repo.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted\n\
+deadbeef refs/heads/main\n",
+        )
+        .unwrap();
+
+        assert!(is_usable_bare_repo(&repo));
     }
 }

@@ -249,13 +249,13 @@ pub async fn is_repo_cached_and_fresh(state: &crate::AppState, owner_repo: &str)
     Ok(last_fetch_ts + threshold > now)
 }
 
-/// Ensure that a bare clone of `owner/repo` exists on this node.
+/// Ensure that a bare clone of `owner/repo` exists on this node, but do not
+/// wait if another node/task is already hydrating it.
 ///
-/// Acquires a distributed lock so that only one node clones at a time.  If
-/// the lock is already held, waits for the cloning node to finish.  After the
-/// clone completes the repo is registered in Valkey and a "ready" notification
-/// is published.
-pub async fn ensure_repo_cloned(
+/// This is intended for fire-and-forget background hydration triggered by live
+/// client traffic. At most one hydrator should actively clone a repo at a time;
+/// duplicate attempts should simply observe the held lock and return.
+pub async fn try_ensure_repo_cloned(
     state: &crate::AppState,
     owner: &str,
     repo: &str,
@@ -278,9 +278,7 @@ pub async fn ensure_repo_cloned(
     .await?;
 
     if !lock_acquired {
-        // Another node is cloning; wait for it.
-        let timeout = std::time::Duration::from_secs(state.config.clone.lock_wait_timeout);
-        crate::coordination::locks::wait_for_lock(&state.valkey, &lock_key, timeout).await?;
+        debug!(%owner_repo, "hydrate already in progress; skipping duplicate background clone");
         return Ok(());
     }
 

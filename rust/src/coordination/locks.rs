@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use anyhow::{Context, Result};
 use fred::interfaces::{KeysInterface, LuaInterface};
 use tracing::{debug, warn};
@@ -55,48 +53,4 @@ pub async fn release_lock(pool: &fred::clients::Pool, key: &str, node_id: &str) 
         warn!(%key, %node_id, "lock release: key missing or owned by another node");
     }
     Ok(())
-}
-
-/// Wait until the lock identified by `key` is released or `timeout` elapses.
-///
-/// The function polls at a short interval and also subscribes to the
-/// `{key}:notify` pub/sub channel so it can return as soon as the holder
-/// publishes a release notification.
-///
-/// Returns `true` if the lock was released before the timeout, `false` if the
-/// timeout expired while the lock was still held.
-pub async fn wait_for_lock(
-    pool: &fred::clients::Pool,
-    key: &str,
-    timeout: Duration,
-) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let poll_interval = Duration::from_millis(250);
-
-    // Fast path: check whether the key already does not exist.
-    let exists: bool = pool.exists(key).await?;
-    if !exists {
-        return Ok(true);
-    }
-
-    // Poll until the deadline.  A production implementation would open a
-    // dedicated subscriber connection and race a SUBSCRIBE against the
-    // polling loop.  Here we keep things simple and just poll.
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-
-        tokio::time::sleep(poll_interval.min(remaining)).await;
-
-        let exists: bool = pool.exists(key).await?;
-        if !exists {
-            debug!(%key, "wait_for_lock: lock released");
-            return Ok(true);
-        }
-    }
-
-    warn!(%key, ?timeout, "wait_for_lock: timed out waiting for lock release");
-    Ok(false)
 }
