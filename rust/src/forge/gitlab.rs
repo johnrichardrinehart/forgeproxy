@@ -40,7 +40,7 @@ impl ForgeBackend for GitLabBackend {
     async fn validate_http_auth(
         &self,
         http_client: &reqwest::Client,
-        auth_header: &str,
+        auth_header: Option<&str>,
         owner: &str,
         repo: &str,
         rate_limit: &RateLimitState,
@@ -49,13 +49,13 @@ impl ForgeBackend for GitLabBackend {
         let project_path = format!("{owner}%2F{repo}");
         let url = format!("{}/projects/{project_path}", self.api_url);
 
-        let resp = http_client
-            .get(&url)
-            .header("Authorization", auth_header)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .context("upstream API request failed")?;
+        let mut req = http_client.get(&url).header("Accept", "application/json");
+        if let Some(header) = auth_header
+            && !header.trim().is_empty()
+        {
+            req = req.header("Authorization", header);
+        }
+        let resp = req.send().await.context("upstream API request failed")?;
 
         rate_limit.update_from_headers(resp.headers());
 
@@ -70,7 +70,18 @@ impl ForgeBackend for GitLabBackend {
             .await
             .context("failed to parse GitLab API response")?;
 
-        Ok(access_level_to_permission(&body))
+        let perm = access_level_to_permission(&body);
+        if perm.has_read() {
+            return Ok(perm);
+        }
+        if body
+            .get("visibility")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "public")
+        {
+            return Ok(Permission::Read);
+        }
+        Ok(Permission::None)
     }
 
     async fn resolve_ssh_user(
@@ -201,7 +212,7 @@ impl ForgeBackend for GitLabBackend {
         owner: &str,
         repo: &str,
         git_ref: &str,
-        auth_header: &str,
+        auth_header: Option<&str>,
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
         let project_path = format!("{owner}%2F{repo}");
@@ -210,10 +221,13 @@ impl ForgeBackend for GitLabBackend {
             self.api_url
         );
 
-        let resp = http_client
-            .get(&url)
-            .header("Authorization", auth_header)
-            .header("Accept", "application/json")
+        let mut req = http_client.get(&url).header("Accept", "application/json");
+        if let Some(header) = auth_header
+            && !header.trim().is_empty()
+        {
+            req = req.header("Authorization", header);
+        }
+        let resp = req
             .send()
             .await
             .context("upstream API request failed for ref resolution")?;

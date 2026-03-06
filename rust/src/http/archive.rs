@@ -19,7 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, instrument, warn};
 
-use super::handler::{AppError, extract_auth_header, validate_path_segment};
+use super::handler::{AppError, extract_optional_auth_header, validate_path_segment};
 use crate::AppState;
 use crate::cache::archive::{
     archive_local_path, archive_s3_key, download_from_s3, parse_archive_rest, s3_cache_hit,
@@ -62,8 +62,8 @@ pub async fn handle_archive(
     validate_archive_rest(&rest)?;
 
     // ---------- auth ----------
-    let auth_header = extract_auth_header(&headers)?;
-    crate::auth::http_validator::validate_http_auth(&state, &auth_header, &owner, &repo)
+    let auth_header = extract_optional_auth_header(&headers);
+    crate::auth::http_validator::validate_http_auth(&state, auth_header.as_deref(), &owner, &repo)
         .await
         .map_err(|e| {
             warn!(error = %e, "archive auth validation failed");
@@ -82,7 +82,7 @@ pub async fn handle_archive(
             &owner,
             &repo,
             &ref_name,
-            &auth_header,
+            auth_header.as_deref(),
             &state.rate_limit,
         )
         .await
@@ -143,10 +143,11 @@ pub async fn handle_archive(
 
     debug!(%upstream_url, "proxying archive request to upstream forge");
 
-    let upstream_resp = state
-        .http_client
-        .get(&upstream_url)
-        .header(header::AUTHORIZATION, &auth_header)
+    let mut req = state.http_client.get(&upstream_url);
+    if let Some(header) = auth_header.as_deref() {
+        req = req.header(header::AUTHORIZATION, header);
+    }
+    let upstream_resp = req
         .send()
         .await
         .context("failed to reach upstream forge for archive")?;

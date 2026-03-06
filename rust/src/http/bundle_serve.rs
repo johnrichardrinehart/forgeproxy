@@ -69,7 +69,7 @@ pub async fn handle_bundle_list(
     state: &AppState,
     owner: &str,
     repo: &str,
-    auth_token: &str,
+    auth_token: Option<&str>,
 ) -> Result<Response> {
     // 1. Validate that the caller has at least read access.
     crate::auth::http_validator::validate_http_auth(state, auth_token, owner, repo)

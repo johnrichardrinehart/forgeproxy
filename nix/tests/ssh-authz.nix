@@ -357,6 +357,24 @@ pkgs.testers.runNixOSTest {
             f""" -d '{{"name": "repo-uncached", "private": true, "auto_init": false}}'"""
         )
 
+        # Create private repo: octocat/repo-stream (uncached full-clone regression)
+        ghe.succeed(
+            f"curl -sf"
+            f" -X POST http://localhost:3000/api/v1/user/repos"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"name": "repo-stream", "private": true, "auto_init": false}}'"""
+        )
+
+        # Create public repo used to validate anonymous HTTP clone behaviour.
+        ghe.succeed(
+            f"curl -sf"
+            f" -X POST http://localhost:3000/api/v1/user/repos"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"name": "repo-public-http", "private": false, "auto_init": false}}'"""
+        )
+
         # Push initial content to repo-cached
         ghe.succeed(
             "set -e && "
@@ -387,10 +405,49 @@ pkgs.testers.runNixOSTest {
             "git push -u origin main"
         )
 
+        # Push pack-heavy content to repo-stream to exercise uncached upload-pack streaming.
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "for i in $(seq 1 24); do "
+            "  head -c 262144 /dev/urandom > blob-$i.bin && "
+            "  git add blob-$i.bin && "
+            "  git commit -m \"blob-$i\"; "
+            "done && "
+            "git remote add origin http://octocat:secret123@localhost:3000/octocat/repo-stream.git && "
+            "git push -u origin main"
+        )
+
+        # Push initial content to public repo for anonymous HTTP clone checks.
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo 'public repo' > README.md && "
+            "git add README.md && "
+            "git commit -m 'Initial commit' && "
+            "git remote add origin http://octocat:secret123@localhost:3000/octocat/repo-public-http.git && "
+            "git push -u origin main"
+        )
+
         # Add alice as collaborator on both repos (read permission)
         ghe.succeed(
             f"curl -sf"
             f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-cached/collaborators/alice"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"permission": "read"}}'"""
+        )
+        ghe.succeed(
+            f"curl -sf"
+            f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-stream/collaborators/alice"
             f" -H 'Content-Type: application/json'"
             f" -H 'Authorization: token {TOKEN}'"
             f""" -d '{{"permission": "read"}}'"""
@@ -442,6 +499,24 @@ pkgs.testers.runNixOSTest {
         )
         client.succeed(
             "cp ${testSshKeys}/bob /tmp/bob_key && chmod 600 /tmp/bob_key"
+        )
+
+    # ── HTTP anonymous authz parity ─────────────────────────────────────
+    with subtest("Anonymous HTTP clone allows public repo and denies private repo"):
+        proxy.succeed("rm -rf /tmp/http-public")
+        proxy.succeed(
+            "GIT_TERMINAL_PROMPT=0 "
+            "git clone http://localhost:8080/octocat/repo-public-http.git /tmp/http-public"
+        )
+        proxy.succeed("test -f /tmp/http-public/README.md")
+        proxy.succeed(
+            "sh -c 'GIT_TERMINAL_PROMPT=0 "
+            "git ls-remote http://localhost:8080/octocat/repo-uncached.git "
+            "> /tmp/http-private.log 2>&1; test $? -ne 0'"
+        )
+        proxy.succeed(
+            "grep -E 'Access denied|could not read Username|Authentication failed|401' "
+            "/tmp/http-private.log"
         )
 
     # ── Subtest 1: Privileged user, uncached repo ────────────────────────
@@ -505,5 +580,33 @@ pkgs.testers.runNixOSTest {
         )
         assert "Access denied" in result, \
             f"Bob should be denied access to repo-uncached, got: {result}"
+
+    # ── Subtest 5: Uncached full clone via upstream proxy stream ─────────
+    with subtest("Uncached full clone succeeds via upstream proxy stream"):
+        # Force the uncached proxy path: repo dir exists but is not a valid bare repo
+        # (missing HEAD), so pre-clone is skipped and local serving is impossible.
+        proxy.succeed(
+            "rm -rf /var/cache/forgeproxy/repos/octocat/repo-stream.git && "
+            "mkdir -p /var/cache/forgeproxy/repos/octocat/repo-stream.git"
+        )
+        client.succeed("rm -rf /tmp/repo-stream")
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone git@proxy:octocat/repo-stream.git /tmp/repo-stream"
+        )
+        client.succeed("test -f /tmp/repo-stream/blob-24.bin")
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --no-pager | "
+            "grep -F 'repository not in local cache; proxying upstream' | "
+            "grep -F 'octocat/repo-stream'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --no-pager | "
+            "grep -F 'upstream proxy pack stream complete' | "
+            "grep -F 'octocat/repo-stream'"
+        )
   '';
 }

@@ -67,7 +67,7 @@ impl ForgeBackend for GiteaBackend {
     async fn validate_http_auth(
         &self,
         http_client: &reqwest::Client,
-        auth_header: &str,
+        auth_header: Option<&str>,
         owner: &str,
         repo: &str,
         rate_limit: &RateLimitState,
@@ -75,13 +75,13 @@ impl ForgeBackend for GiteaBackend {
         // Gitea uses the same GitHub-compatible repo endpoint.
         let url = format!("{}/repos/{owner}/{repo}", self.api_url);
 
-        let resp = http_client
-            .get(&url)
-            .header("Authorization", auth_header)
-            .header("Accept", self.accept)
-            .send()
-            .await
-            .context("upstream API request failed")?;
+        let mut req = http_client.get(&url).header("Accept", self.accept);
+        if let Some(header) = auth_header
+            && !header.trim().is_empty()
+        {
+            req = req.header("Authorization", header);
+        }
+        let resp = req.send().await.context("upstream API request failed")?;
 
         rate_limit.update_from_headers(resp.headers());
 
@@ -96,7 +96,18 @@ impl ForgeBackend for GiteaBackend {
             .await
             .context("failed to parse Gitea API response")?;
 
-        Ok(crate::forge::extract_permission(&body))
+        let perm = crate::forge::extract_permission(&body);
+        if perm.has_read() {
+            return Ok(perm);
+        }
+        if body
+            .get("private")
+            .and_then(|v| v.as_bool())
+            .is_some_and(|is_private| !is_private)
+        {
+            return Ok(Permission::Read);
+        }
+        Ok(Permission::None)
     }
 
     async fn resolve_ssh_user(
@@ -246,16 +257,19 @@ impl ForgeBackend for GiteaBackend {
         owner: &str,
         repo: &str,
         git_ref: &str,
-        auth_header: &str,
+        auth_header: Option<&str>,
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>> {
         // Gitea uses the same endpoint as GitHub.
         let url = format!("{}/repos/{owner}/{repo}/commits/{git_ref}", self.api_url);
 
-        let resp = http_client
-            .get(&url)
-            .header("Authorization", auth_header)
-            .header("Accept", self.accept)
+        let mut req = http_client.get(&url).header("Accept", self.accept);
+        if let Some(header) = auth_header
+            && !header.trim().is_empty()
+        {
+            req = req.header("Authorization", header);
+        }
+        let resp = req
             .send()
             .await
             .context("upstream API request failed for ref resolution")?;

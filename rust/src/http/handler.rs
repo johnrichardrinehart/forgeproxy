@@ -88,9 +88,9 @@ async fn handle_info_refs(
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
 
-    // 2. Extract and validate the Authorization header.
-    let auth_header = extract_auth_header(&headers)?;
-    crate::auth::http_validator::validate_http_auth(&state, &auth_header, &owner, &repo)
+    // 2. Validate auth (optional for public repos).
+    let auth_header = extract_optional_auth_header(&headers);
+    crate::auth::http_validator::validate_http_auth(&state, auth_header.as_deref(), &owner, &repo)
         .await
         .map_err(|e| {
             // If rate-limited, return 503 with Retry-After.
@@ -133,11 +133,14 @@ async fn handle_info_refs(
 
     debug!(%upstream_url, "proxying info/refs to upstream forge");
 
-    let upstream_resp = state
+    let mut upstream_req = state
         .http_client
         .get(&upstream_url)
-        .header(header::AUTHORIZATION, &auth_header)
-        .header("Git-Protocol", "version=2")
+        .header("Git-Protocol", "version=2");
+    if let Some(header) = auth_header.as_deref() {
+        upstream_req = upstream_req.header(header::AUTHORIZATION, header);
+    }
+    let upstream_resp = upstream_req
         .send()
         .await
         .context("failed to reach upstream forge")?;
@@ -198,9 +201,9 @@ async fn handle_upload_pack(
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
 
-    // 2. Validate auth.
-    let auth_header = extract_auth_header(&headers)?;
-    crate::auth::http_validator::validate_http_auth(&state, &auth_header, &owner, &repo)
+    // 2. Validate auth (optional for public repos).
+    let auth_header = extract_optional_auth_header(&headers);
+    crate::auth::http_validator::validate_http_auth(&state, auth_header.as_deref(), &owner, &repo)
         .await
         .map_err(|e| AppError::Unauthorized(e.to_string()))?;
 
@@ -217,7 +220,8 @@ async fn handle_upload_pack(
 
     // Proxy to upstream forge.
     info!("proxying upload-pack to upstream forge");
-    let response = proxy_upload_pack_to_upstream(&state, &owner, &repo, &auth_header, body).await?;
+    let response =
+        proxy_upload_pack_to_upstream(&state, &owner, &repo, auth_header.as_deref(), body).await?;
 
     // 4. Spawn background clone so future requests can be served locally.
     {
@@ -226,9 +230,13 @@ async fn handle_upload_pack(
         let repo = repo.clone();
         let auth = auth_header.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                crate::coordination::registry::ensure_repo_cloned(&state, &owner, &repo, &auth)
-                    .await
+            if let Err(e) = crate::coordination::registry::ensure_repo_cloned(
+                &state,
+                &owner,
+                &repo,
+                auth.as_deref(),
+            )
+            .await
             {
                 warn!(
                     error = %e,
@@ -278,8 +286,8 @@ async fn handle_bundle_list(
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
 
-    let auth_header = extract_auth_header(&headers)?;
-    crate::http::bundle_serve::handle_bundle_list(&state, &owner, &repo, &auth_header)
+    let auth_header = extract_optional_auth_header(&headers);
+    crate::http::bundle_serve::handle_bundle_list(&state, &owner, &repo, auth_header.as_deref())
         .await
         .map_err(AppError::Internal)
 }
@@ -354,13 +362,12 @@ pub(crate) fn validate_path_segment(segment: &str, label: &str) -> Result<(), Ap
     Ok(())
 }
 
-/// Extract the `Authorization` header value, returning an error if absent.
-pub(crate) fn extract_auth_header(headers: &HeaderMap) -> Result<String, AppError> {
+/// Extract the `Authorization` header value when present.
+pub(crate) fn extract_optional_auth_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
-        .ok_or_else(|| AppError::Unauthorized("missing Authorization header".into()))
+        .map(ToOwned::to_owned)
 }
 
 /// Run a local `git upload-pack` process and stream its output as the HTTP
@@ -425,7 +432,7 @@ async fn proxy_upload_pack_to_upstream(
     state: &AppState,
     owner: &str,
     repo: &str,
-    auth_header: &str,
+    auth_header: Option<&str>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     let upstream_url = format!(
@@ -433,14 +440,14 @@ async fn proxy_upload_pack_to_upstream(
         state.config.upstream.hostname, owner, repo,
     );
 
-    let upstream_resp = state
-        .http_client
-        .post(&upstream_url)
-        .header(header::AUTHORIZATION, auth_header)
-        .header(
-            header::CONTENT_TYPE,
-            "application/x-git-upload-pack-request",
-        )
+    let mut req = state.http_client.post(&upstream_url).header(
+        header::CONTENT_TYPE,
+        "application/x-git-upload-pack-request",
+    );
+    if let Some(header) = auth_header {
+        req = req.header(header::AUTHORIZATION, header);
+    }
+    let upstream_resp = req
         .header("Git-Protocol", "version=2")
         .body(body)
         .send()
