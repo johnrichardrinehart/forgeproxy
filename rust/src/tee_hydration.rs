@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -18,6 +19,9 @@ impl TeeCapture {
         tokio::fs::create_dir_all(&dir)
             .await
             .with_context(|| format!("create tee capture dir {}", dir.display()))?;
+        tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
+            .await
+            .with_context(|| format!("chmod tee capture dir {}", dir.display()))?;
 
         let meta_path = dir.join("meta.json");
         let metadata = serde_json::json!({
@@ -28,6 +32,9 @@ impl TeeCapture {
         tokio::fs::write(&meta_path, serde_json::to_vec_pretty(&metadata)?)
             .await
             .with_context(|| format!("write tee metadata {}", meta_path.display()))?;
+        tokio::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o666))
+            .await
+            .with_context(|| format!("chmod tee metadata {}", meta_path.display()))?;
 
         let request_path = dir.join("request.bin");
         let response_path = dir.join("response.bin");
@@ -37,6 +44,12 @@ impl TeeCapture {
         let response_file = File::create(&response_path)
             .await
             .with_context(|| format!("create response capture {}", response_path.display()))?;
+        tokio::fs::set_permissions(&request_path, std::fs::Permissions::from_mode(0o666))
+            .await
+            .with_context(|| format!("chmod tee request capture {}", request_path.display()))?;
+        tokio::fs::set_permissions(&response_path, std::fs::Permissions::from_mode(0o666))
+            .await
+            .with_context(|| format!("chmod tee response capture {}", response_path.display()))?;
 
         Ok(Self {
             dir,
@@ -82,6 +95,9 @@ impl TeeCapture {
         tokio::fs::write(&status_path, serde_json::to_vec_pretty(&status)?)
             .await
             .with_context(|| format!("write tee status {}", status_path.display()))?;
+        tokio::fs::set_permissions(&status_path, std::fs::Permissions::from_mode(0o666))
+            .await
+            .with_context(|| format!("chmod tee status {}", status_path.display()))?;
         Ok(())
     }
 }
@@ -99,6 +115,9 @@ pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<Path
     let mut pack_file = File::create(&pack_path)
         .await
         .with_context(|| format!("create extracted pack {}", pack_path.display()))?;
+    tokio::fs::set_permissions(&pack_path, std::fs::Permissions::from_mode(0o666))
+        .await
+        .with_context(|| format!("chmod extracted pack {}", pack_path.display()))?;
     let mut wrote_pack = false;
     let mut header = [0u8; 4];
 

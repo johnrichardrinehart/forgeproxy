@@ -21,6 +21,8 @@ let
       set -euo pipefail
 
       cache_root=${lib.escapeShellArg "${cfg.cacheDir}/repos"}
+      tee_root="$cache_root/_tee"
+      tee_max_age_minutes=15
 
       if [[ ! -d "$cache_root" ]]; then
         exit 0
@@ -55,6 +57,25 @@ let
       repo_is_active() {
         local repo_path=$1
         lsof +D "$repo_path" >/dev/null 2>&1
+      }
+
+      scrub_stale_tee_capture() {
+        local capture_dir=$1
+
+        if repo_is_active "$capture_dir"; then
+          echo "forgeproxy-cache-scrub: skipping active tee capture $capture_dir" >&2
+          return 0
+        fi
+
+        if find "$capture_dir" -type f -mmin "-$tee_max_age_minutes" -print -quit | grep -q .; then
+          echo "forgeproxy-cache-scrub: skipping fresh tee capture $capture_dir" >&2
+          return 0
+        fi
+
+        echo "forgeproxy-cache-scrub: removing stale tee capture $capture_dir" >&2
+        if ! rm -rf "$capture_dir"; then
+          echo "forgeproxy-cache-scrub: warning: failed to remove stale tee capture $capture_dir" >&2
+        fi
       }
 
       while IFS= read -r repo_path; do
@@ -95,6 +116,12 @@ let
           remove_repo_family "$repo_path"
         fi
       done < <(find "$cache_root" -mindepth 2 -maxdepth 2 \( -type d -o -type l \) -name '*.git' -print)
+
+      if [[ -d "$tee_root" ]]; then
+        while IFS= read -r capture_dir; do
+          scrub_stale_tee_capture "$capture_dir"
+        done < <(find "$tee_root" -mindepth 3 -maxdepth 3 -type d -print)
+      fi
     '';
   };
 in
