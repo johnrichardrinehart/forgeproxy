@@ -1,4 +1,5 @@
 mod auth;
+mod build_info;
 mod bundleuri;
 mod cache;
 mod config;
@@ -34,7 +35,12 @@ use crate::metrics::MetricsRegistry;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "forgeproxy", about = "Git Caching Reverse Proxy")]
+#[command(
+    name = "forgeproxy",
+    about = "Git Caching Reverse Proxy",
+    version = crate::build_info::VERSION,
+    long_version = crate::build_info::LONG_VERSION
+)]
 struct Cli {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "/run/forgeproxy/config.yaml")]
@@ -267,7 +273,12 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().json())
         .init();
 
-    tracing::info!(config_path = %cli.config, "starting forgeproxy");
+    tracing::info!(
+        config_path = %cli.config,
+        version = crate::build_info::VERSION,
+        git_revision = crate::build_info::GIT_REVISION,
+        "starting forgeproxy"
+    );
     let state = build_app_state(Arc::clone(&config)).await?;
 
     // ---- Telemetry buffer ----

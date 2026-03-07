@@ -19,6 +19,15 @@
 
   outputs =
     inputs@{ self, flake-parts, ... }:
+    let
+      gitRevision =
+        if self ? shortRev then
+          self.shortRev
+        else if self ? dirtyShortRev then
+          self.dirtyShortRev
+        else
+          "dirty";
+    in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" ];
 
@@ -193,8 +202,11 @@
           legacyPackages = pkgs;
 
           packages = {
-            forgeproxy = pkgs.callPackage ./nix/package.nix { };
-            forgeproxy-fips = pkgs.callPackage ./nix/package.nix { fipsEnabled = true; };
+            forgeproxy = pkgs.callPackage ./nix/package.nix { inherit gitRevision; };
+            forgeproxy-fips = pkgs.callPackage ./nix/package.nix {
+              inherit gitRevision;
+              fipsEnabled = true;
+            };
             default = config.packages.forgeproxy;
             ghe-key-lookup = pkgs.callPackage ./nix/ghe-key-lookup/package.nix { };
             ghe-key-lookup-oci = pkgs.callPackage ./nix/ghe-key-lookup/oci.nix { };
@@ -214,8 +226,11 @@
           valkey = prev.valkey.override {
             jemalloc = final.jemalloc-valkey-rtree-fix;
           };
-          forgeproxy = final.callPackage ./nix/package.nix { };
-          forgeproxy-fips = final.callPackage ./nix/package.nix { fipsEnabled = true; };
+          forgeproxy = final.callPackage ./nix/package.nix { inherit gitRevision; };
+          forgeproxy-fips = final.callPackage ./nix/package.nix {
+            inherit gitRevision;
+            fipsEnabled = true;
+          };
           ghe-key-lookup = final.callPackage ./nix/ghe-key-lookup/package.nix { };
         };
 

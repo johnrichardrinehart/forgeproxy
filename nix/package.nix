@@ -7,6 +7,7 @@
   go,
   perl,
   fipsEnabled ? false,
+  gitRevision ? "unknown",
 }:
 
 rustPlatform.buildRustPackage {
@@ -31,6 +32,7 @@ rustPlatform.buildRustPackage {
   ];
 
   buildFeatures = lib.optionals fipsEnabled [ "fips" ];
+  FORGEPROXY_GIT_REVISION = gitRevision;
 
   # Ensure openssl-sys can find headers and libraries.
   OPENSSL_NO_VENDOR = 1;
