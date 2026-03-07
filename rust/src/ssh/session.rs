@@ -495,7 +495,7 @@ impl Handler for SshSession {
         let post_action = if let Some((ref repo, ref mut buf, authenticated, ref git_protocol)) =
             self.upstream_proxy_buf
         {
-            info!(
+            debug!(
                 repo = %repo,
                 incoming_bytes = data.len(),
                 total_buffered = buf.len() + data.len(),
@@ -614,7 +614,7 @@ impl Handler for SshSession {
         // Cached path: dropping ChildStdin closes the pipe → child exits.
         self.child_stdin.take();
 
-        info!(
+        debug!(
             channel = ?channel_id,
             has_upstream_buf = self.upstream_proxy_buf.is_some(),
             "DIAG: channel_eof fired"
@@ -679,7 +679,7 @@ impl Handler for SshSession {
         }
 
         if let Some(state) = close_state {
-            info!(
+            debug!(
                 channel = ?channel_id,
                 stream_finished = state.stream_finished,
                 exit_status_sent = state.exit_status_sent,
@@ -1050,13 +1050,13 @@ impl Handler for SshSession {
                             Ok(advert) => {
                                 // Forward ref advertisement; channel stays open
                                 // for want/have — `channel_eof` will POST.
-                                info!(repo = %repo_bg, bytes = advert.len(), "DIAG: sending ref advertisement via handle.data");
+                                debug!(repo = %repo_bg, bytes = advert.len(), "DIAG: sending ref advertisement via handle.data");
                                 match handle
                                     .data(channel_id, CryptoVec::from_slice(&advert))
                                     .await
                                 {
                                     Ok(()) => {
-                                        info!(repo = %repo_bg, "DIAG: handle.data returned Ok")
+                                        debug!(repo = %repo_bg, "DIAG: handle.data returned Ok")
                                     }
                                     Err(_) => {
                                         warn!(repo = %repo_bg, "DIAG: handle.data returned Err — session receiver dropped")
