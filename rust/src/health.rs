@@ -15,6 +15,8 @@ use crate::config::Config;
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: HealthStatus,
+    pub version: &'static str,
+    pub git_revision: &'static str,
     pub checks: HealthChecks,
 }
 
@@ -179,7 +181,12 @@ pub async fn health_handler(State(state): State<HealthState>) -> impl IntoRespon
 
     let checks = HealthChecks { valkey, ghe, disk };
     let status = aggregate_status(&checks);
-    let body = HealthResponse { status, checks };
+    let body = HealthResponse {
+        status,
+        version: crate::build_info::VERSION,
+        git_revision: crate::build_info::GIT_REVISION,
+        checks,
+    };
 
     let http_status = match status {
         HealthStatus::Ok | HealthStatus::Degraded => StatusCode::OK,
