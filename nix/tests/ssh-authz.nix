@@ -366,6 +366,15 @@ pkgs.testers.runNixOSTest {
             f""" -d '{{"name": "repo-stream", "private": true, "auto_init": false}}'"""
         )
 
+        # Create private repo: octocat/repo-generations (generation publish/GC regression)
+        ghe.succeed(
+            f"curl -sf"
+            f" -X POST http://localhost:3000/api/v1/user/repos"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"name": "repo-generations", "private": true, "auto_init": false}}'"""
+        )
+
         # Create public repo used to validate anonymous HTTP clone behaviour.
         ghe.succeed(
             f"curl -sf"
@@ -422,6 +431,23 @@ pkgs.testers.runNixOSTest {
             "git push -u origin main"
         )
 
+        # Push initial content to repo-generations to exercise published generation swaps.
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "for i in $(seq 1 3); do "
+            "  echo generation-$i > file-$i.txt && "
+            "  git add file-$i.txt && "
+            "  git commit -m \"generation-$i\"; "
+            "done && "
+            "git remote add origin http://octocat:secret123@localhost:3000/octocat/repo-generations.git && "
+            "git push -u origin main"
+        )
+
         # Push initial content to public repo for anonymous HTTP clone checks.
         ghe.succeed(
             "set -e && "
@@ -448,6 +474,13 @@ pkgs.testers.runNixOSTest {
         ghe.succeed(
             f"curl -sf"
             f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-stream/collaborators/alice"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"permission": "read"}}'"""
+        )
+        ghe.succeed(
+            f"curl -sf"
+            f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-generations/collaborators/alice"
             f" -H 'Content-Type: application/json'"
             f" -H 'Authorization: token {TOKEN}'"
             f""" -d '{{"permission": "read"}}'"""
@@ -635,5 +668,78 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-stream-second/blob-24.bin")
         client.succeed("git -C /tmp/repo-stream-second rev-parse HEAD")
         client.succeed("git -C /tmp/repo-stream-second fsck --no-dangling")
+
+    # ── Subtest 5d: Generations publish atomically and prune stale entries ──
+    with subtest("Generation publish keeps current and previous generations only"):
+        generation_repo = "/var/cache/forgeproxy/repos/octocat/repo-generations.git"
+        generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-generations.git"
+
+        proxy.succeed(
+            f"rm -rf {generation_repo} {generation_dir}"
+        )
+
+        client.succeed("rm -rf /tmp/repo-generations-1 /tmp/repo-generations-2 /tmp/repo-generations-3")
+
+        def clone_generation_repo(dest):
+            client.succeed(
+                "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+                " -o StrictHostKeyChecking=no"
+                " -o UserKnownHostsFile=/dev/null"
+                " -p 2222'"
+                f" git clone --depth 1 git@proxy:octocat/repo-generations.git {dest}"
+            )
+
+        clone_generation_repo("/tmp/repo-generations-1")
+        proxy.wait_until_succeeds(
+            f"test -L {generation_repo} && test -f $(readlink -f {generation_repo})/HEAD"
+        )
+        first_target = proxy.succeed(f"readlink -f {generation_repo}").strip()
+        proxy.succeed(f"test -d {first_target}")
+
+        proxy.succeed(f"rm -f {generation_repo}")
+        clone_generation_repo("/tmp/repo-generations-2")
+        proxy.wait_until_succeeds(
+            f"test -L {generation_repo} && test -f $(readlink -f {generation_repo})/HEAD"
+        )
+        second_target = proxy.succeed(f"readlink -f {generation_repo}").strip()
+        assert second_target != first_target, (first_target, second_target)
+        proxy.succeed(f"test -d {first_target}")
+        proxy.succeed(f"test -d {second_target}")
+
+        proxy.succeed(f"rm -f {generation_repo}")
+        clone_generation_repo("/tmp/repo-generations-3")
+        proxy.wait_until_succeeds(
+            f"test -L {generation_repo} && test -f $(readlink -f {generation_repo})/HEAD"
+        )
+        third_target = proxy.succeed(f"readlink -f {generation_repo}").strip()
+        assert third_target not in (first_target, second_target), (
+            first_target,
+            second_target,
+            third_target,
+        )
+        proxy.succeed(f"test -d {second_target}")
+        proxy.succeed(f"test -d {third_target}")
+        proxy.succeed(f"! test -e {first_target}")
+        proxy.succeed(
+            f"find {generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 2"
+        )
+
+    # ── Subtest 5e: External scrubber handles published generation layout ──
+    with subtest("External scrubber succeeds with generation-backed repos"):
+        proxy.succeed("systemctl start forgeproxy-cache-scrub.service")
+        proxy.succeed(
+            "systemctl show forgeproxy-cache-scrub.service"
+            " -p Result --value | grep -qx success"
+        )
+        proxy.succeed("systemctl is-active forgeproxy-cache-scrub.timer | grep -qx active")
+        client.succeed("rm -rf /tmp/repo-generations-scrubbed")
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-scrubbed"
+        )
+        client.succeed("test -f /tmp/repo-generations-scrubbed/file-3.txt")
   '';
 }

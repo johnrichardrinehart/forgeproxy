@@ -14,17 +14,14 @@ mod storage;
 mod tee_hydration;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use fred::clients::Pool;
 use fred::interfaces::ClientLike;
 use fred::types::config::{Config as FredConfig, ReconnectPolicy, ServerConfig, TlsConnector};
 use tokio::signal;
 use tokio::sync::Semaphore;
-use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -42,15 +39,6 @@ struct Cli {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "/run/forgeproxy/config.yaml")]
     config: String,
-
-    #[command(subcommand)]
-    command: Option<CliCommand>,
-}
-
-#[derive(Subcommand, Debug)]
-enum CliCommand {
-    /// Validate on-disk cached repos and remove invalid local copies.
-    ScrubCache,
 }
 
 // ---------------------------------------------------------------------------
@@ -227,101 +215,6 @@ async fn run_node_heartbeat(state: AppState) -> Result<()> {
     Ok(())
 }
 
-async fn scrub_cached_repos(state: &AppState) -> Result<()> {
-    let repos = state.cache_manager.list_repo_dirs()?;
-    let mut checked = 0usize;
-    let mut removed = 0usize;
-
-    for (owner_repo, repo_path) in repos {
-        checked += 1;
-        if !state.cache_manager.has_repo(&owner_repo) {
-            warn!(
-                repo = %owner_repo,
-                path = %repo_path.display(),
-                "removing invalid cached repo that failed the bare-repo usability check"
-            );
-            tokio::fs::remove_dir_all(&repo_path)
-                .await
-                .with_context(|| {
-                    format!("failed to remove invalid repo at {}", repo_path.display())
-                })?;
-            let _ = coordination::registry::update_repo_field(
-                &state.valkey,
-                &owner_repo,
-                "local_cached",
-                "false",
-            )
-            .await;
-            removed += 1;
-            continue;
-        }
-
-        if let Err(error) = crate::git::commands::git_fsck_full(&repo_path).await {
-            warn!(
-                repo = %owner_repo,
-                path = %repo_path.display(),
-                error = %error,
-                "removing invalid cached repo after full validation failure"
-            );
-            tokio::fs::remove_dir_all(&repo_path)
-                .await
-                .with_context(|| {
-                    format!("failed to remove invalid repo at {}", repo_path.display())
-                })?;
-            let _ = coordination::registry::update_repo_field(
-                &state.valkey,
-                &owner_repo,
-                "local_cached",
-                "false",
-            )
-            .await;
-            removed += 1;
-        }
-    }
-
-    info!(checked, removed, "cache scrub completed");
-    Ok(())
-}
-
-fn periodic_full_fsck_interval() -> Result<Option<Duration>> {
-    let raw = match std::env::var("FORGEPROXY_PERIODIC_FULL_FSCK_INTERVAL_SECS") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "failed reading FORGEPROXY_PERIODIC_FULL_FSCK_INTERVAL_SECS: {error}"
-            ));
-        }
-    };
-
-    if raw.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let secs: u64 = raw.parse().with_context(|| {
-        format!("invalid FORGEPROXY_PERIODIC_FULL_FSCK_INTERVAL_SECS value: {raw}")
-    })?;
-
-    if secs == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(Duration::from_secs(secs)))
-}
-
-async fn run_periodic_cache_scrubber(state: AppState, interval: Duration) -> Result<()> {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker.tick().await;
-
-    loop {
-        ticker.tick().await;
-        if let Err(error) = scrub_cached_repos(&state).await {
-            warn!(error = %error, "periodic cache scrub failed");
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
@@ -377,14 +270,8 @@ async fn main() -> Result<()> {
     tracing::info!(config_path = %cli.config, "starting forgeproxy");
     let state = build_app_state(Arc::clone(&config)).await?;
 
-    if matches!(cli.command, Some(CliCommand::ScrubCache)) {
-        scrub_cached_repos(&state).await?;
-        return Ok(());
-    }
-
     // ---- Telemetry buffer ----
     let telemetry_buffer = cache::telemetry::TelemetryBuffer::new();
-    let periodic_scrub_interval = periodic_full_fsck_interval()?;
 
     // ---- Spawn services ----
     let telemetry_handle = tokio::spawn({
@@ -429,17 +316,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    let scrub_handle = periodic_scrub_interval.map(|interval| {
-        tokio::spawn({
-            let s = state.clone();
-            async move {
-                if let Err(error) = run_periodic_cache_scrubber(s, interval).await {
-                    tracing::error!(error = %error, "periodic cache scrubber failed");
-                }
-            }
-        })
-    });
-
     // ---- Await shutdown ----
     // Wait for a shutdown signal or for any task to exit unexpectedly.
     // On shutdown, abort all remaining tasks so the process exits promptly.
@@ -450,37 +326,22 @@ async fn main() -> Result<()> {
         heartbeat_handle.abort_handle(),
         telemetry_handle.abort_handle(),
     ];
-    let mut abort_handles = abort_handles.to_vec();
-    if let Some(handle) = &scrub_handle {
-        abort_handles.push(handle.abort_handle());
-    }
+    let abort_handles = abort_handles.to_vec();
     tokio::select! {
         _ = shutdown_signal() => {
             for h in &abort_handles { h.abort(); }
         }
         _ = async {
-            match scrub_handle {
-                Some(scrub_handle) => {
-                    let _ = tokio::try_join!(
-                        http_handle,
-                        ssh_handle,
-                        bundle_handle,
-                        heartbeat_handle,
-                        telemetry_handle,
-                        scrub_handle
-                    );
-                }
-                None => {
-                    let _ = tokio::try_join!(
-                        http_handle,
-                        ssh_handle,
-                        bundle_handle,
-                        heartbeat_handle,
-                        telemetry_handle
-                    );
-                }
-            }
-        } => {}
+            let _ = tokio::try_join!(
+                http_handle,
+                ssh_handle,
+                bundle_handle,
+                heartbeat_handle,
+                telemetry_handle
+            );
+        } => {
+            for h in &abort_handles { h.abort(); }
+        }
     }
 
     tracing::info!("forgeproxy shut down cleanly");

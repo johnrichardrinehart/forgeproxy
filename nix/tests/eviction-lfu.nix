@@ -356,8 +356,9 @@ pkgs.testers.runNixOSTest {
     # ── Verify repos are cached on disk ──────────────────────────────────
     with subtest("All repos present in local cache"):
         for repo in ["repo-a", "repo-b", "repo-c"]:
-            proxy.succeed(
-                f"test -d /var/cache/forgeproxy/repos/octocat/{repo}.git"
+            proxy.wait_until_succeeds(
+                f"test -L /var/cache/forgeproxy/repos/octocat/{repo}.git && "
+                f"test -f $(readlink -f /var/cache/forgeproxy/repos/octocat/{repo}.git)/HEAD"
             )
 
     # ── Seed Valkey with LFU-relevant metadata ────────────────────────────
