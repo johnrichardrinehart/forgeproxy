@@ -53,7 +53,11 @@ pub async fn fetch_ref_advertisement(
     match credential_mode(&state.config, owner) {
         CredentialMode::Pat => {
             let url = format!("{clone_url}/info/refs?service=git-upload-pack");
-            debug!(%url, "fetching ref advertisement via HTTP GET");
+            let redacted_url = crate::git::commands::redact_url_secret(
+                &url,
+                state.config.upstream.log_secret_unmask_chars,
+            );
+            debug!(url = %redacted_url, "fetching ref advertisement via HTTP GET");
 
             let mut req = state
                 .http_client
@@ -115,7 +119,15 @@ pub async fn post_upload_pack_stream(
     match credential_mode(&state.config, owner) {
         CredentialMode::Pat => {
             let url = format!("{clone_url}/git-upload-pack");
-            debug!(%url, input_bytes = want_have.len(), "posting want/have to upstream");
+            let redacted_url = crate::git::commands::redact_url_secret(
+                &url,
+                state.config.upstream.log_secret_unmask_chars,
+            );
+            debug!(
+                url = %redacted_url,
+                input_bytes = want_have.len(),
+                "posting want/have to upstream"
+            );
 
             let mut req = state
                 .http_client
