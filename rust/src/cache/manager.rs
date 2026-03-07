@@ -795,4 +795,34 @@ deadbeef refs/heads/main\n",
         assert!(second.exists());
         assert!(third.exists());
     }
+
+    #[test]
+    fn publish_staged_repo_keeps_most_recent_previous_when_symlink_is_missing() {
+        let tmp = tempdir().unwrap();
+        let mgr = test_manager(tmp.path());
+        let owner_repo = "acme/widgets";
+
+        let first = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&first);
+        mgr.publish_staged_repo(owner_repo, &first).unwrap();
+
+        fs::remove_file(mgr.repo_path(owner_repo)).unwrap();
+
+        let second = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&second);
+        mgr.publish_staged_repo(owner_repo, &second).unwrap();
+
+        assert!(first.exists());
+        assert!(second.exists());
+
+        fs::remove_file(mgr.repo_path(owner_repo)).unwrap();
+
+        let third = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&third);
+        mgr.publish_staged_repo(owner_repo, &third).unwrap();
+
+        assert!(!first.exists());
+        assert!(second.exists());
+        assert!(third.exists());
+    }
 }
