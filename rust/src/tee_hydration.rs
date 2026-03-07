@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 pub struct TeeCapture {
@@ -92,20 +92,52 @@ pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<Path
         return Ok(None);
     }
 
-    let data = tokio::fs::read(&response_path)
+    let mut response_file = File::open(&response_path)
         .await
-        .with_context(|| format!("read tee response {}", response_path.display()))?;
-    let packets = crate::http::protocolv2::decode_pkt_lines(&data);
+        .with_context(|| format!("open tee response {}", response_path.display()))?;
     let pack_path = capture_dir.join("pack.bin");
     let mut pack_file = File::create(&pack_path)
         .await
         .with_context(|| format!("create extracted pack {}", pack_path.display()))?;
     let mut wrote_pack = false;
+    let mut header = [0u8; 4];
 
-    for pkt in packets {
-        let crate::http::protocolv2::PktLine::Data(payload) = pkt else {
-            continue;
+    loop {
+        match response_file.read_exact(&mut header).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("read pkt-line header from {}", response_path.display())
+                });
+            }
+        }
+
+        let Some(len) = std::str::from_utf8(&header)
+            .ok()
+            .and_then(|text| usize::from_str_radix(text, 16).ok())
+        else {
+            anyhow::bail!("invalid pkt-line header in {}", response_path.display());
         };
+
+        if len == 0 || len == 1 || len == 2 {
+            continue;
+        }
+
+        if len < 4 {
+            anyhow::bail!(
+                "invalid pkt-line length {len} in {}",
+                response_path.display()
+            );
+        }
+
+        let payload_len = len - 4;
+        let mut payload = vec![0u8; payload_len];
+        response_file
+            .read_exact(&mut payload)
+            .await
+            .with_context(|| format!("read pkt-line payload from {}", response_path.display()))?;
+
         if let Some((band, rest)) = payload.split_first()
             && *band == 1
         {

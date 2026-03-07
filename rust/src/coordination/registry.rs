@@ -294,6 +294,17 @@ pub async fn try_ensure_repo_cloned(
     try_ensure_repo_cloned_inner(state, owner, repo, auth_header, None, false).await
 }
 
+async fn cleanup_tee_capture_dir(capture_dir: &Path) -> Result<()> {
+    if capture_dir.exists() {
+        tokio::fs::remove_dir_all(capture_dir)
+            .await
+            .with_context(|| {
+                format!("failed to remove tee capture at {}", capture_dir.display())
+            })?;
+    }
+    Ok(())
+}
+
 async fn try_ensure_repo_cloned_inner(
     state: &crate::AppState,
     owner: &str,
@@ -331,6 +342,9 @@ async fn try_ensure_repo_cloned_inner(
             .await;
         }
 
+        if let Some(capture_dir) = tee_capture_dir.as_ref() {
+            cleanup_tee_capture_dir(capture_dir).await?;
+        }
         debug!(%owner_repo, "hydrate already in progress; skipping duplicate background clone");
         return Ok(());
     }
@@ -486,6 +500,15 @@ async fn try_ensure_repo_cloned_inner(
     // Always release the lock.
     let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
 
+    if let Some(capture_dir) = tee_capture_dir.as_ref() {
+        let cleanup_result = cleanup_tee_capture_dir(capture_dir).await;
+        if result.is_ok() {
+            cleanup_result?;
+        } else if let Err(cleanup_error) = cleanup_result {
+            debug!(%owner_repo, error = %cleanup_error, "failed to clean tee capture after hydration error");
+        }
+    }
+
     result
 }
 
@@ -583,7 +606,7 @@ async fn hydrate_repo_from_tee_capture(
     };
 
     crate::git::commands::git_init_bare(repo_path).await?;
-    crate::git::commands::git_unpack_objects(repo_path, &pack_path).await?;
+    crate::git::commands::git_index_pack(repo_path, &pack_path).await?;
     crate::git::commands::git_fetch(repo_path, clone_url, &[]).await?;
 
     Ok(state.cache_manager.has_repo(owner_repo))
