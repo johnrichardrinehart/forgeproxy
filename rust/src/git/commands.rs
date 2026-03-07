@@ -234,6 +234,133 @@ pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Run `git fsck --connectivity-only` in a bare repo.
+#[instrument(fields(repo = %repo_path.display()))]
+pub async fn git_fsck_connectivity_only(repo_path: &Path) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("fsck")
+        .arg("--connectivity-only");
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git fsck --connectivity-only");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git fsck --connectivity-only")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git fsck --connectivity-only failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git fsck --connectivity-only succeeded");
+    Ok(())
+}
+
+/// Run `git fsck --full` in a bare repo.
+#[instrument(fields(repo = %repo_path.display()))]
+pub async fn git_fsck_full(repo_path: &Path) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(repo_path).arg("fsck").arg("--full");
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git fsck --full");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git fsck --full")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git fsck --full failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git fsck --full succeeded");
+    Ok(())
+}
+
+/// Run `git symbolic-ref HEAD <target>` in a bare repo.
+#[instrument(fields(repo = %repo_path.display(), %target))]
+pub async fn git_set_head_symbolic_ref(repo_path: &Path, target: &str) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("symbolic-ref")
+        .arg("HEAD")
+        .arg(target);
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git symbolic-ref HEAD");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git symbolic-ref HEAD")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git symbolic-ref HEAD failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git symbolic-ref HEAD succeeded");
+    Ok(())
+}
+
+/// Run `git bundle verify <bundle_path>`.
+#[instrument(fields(bundle = %bundle_path.display()))]
+pub async fn git_bundle_verify(bundle_path: &Path) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("bundle").arg("verify").arg(bundle_path);
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git bundle verify");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git bundle verify")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git bundle verify failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git bundle verify succeeded");
+    Ok(())
+}
+
 /// Count the number of ref-update lines in `git fetch` stderr.
 ///
 /// Lines matching patterns like ` -> ` or `[new branch]` are counted.

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use fred::interfaces::{ClientLike, HashesInterface, SortedSetsInterface};
 use fred::types::CustomCommand;
@@ -366,6 +366,9 @@ async fn try_ensure_repo_cloned_inner(
 
         match try_restore_repo_from_s3(state, &owner_repo, &repo_path).await {
             Ok(true) => {
+                ensure_bare_head_ref(&repo_path).await?;
+                validate_ready_repo(state, &owner_repo, &repo_path, "S3 restore").await?;
+
                 let now = chrono::Utc::now().timestamp();
                 let mut info = get_repo_info(&state.valkey, &owner_repo)
                     .await?
@@ -426,6 +429,19 @@ async fn try_ensure_repo_cloned_inner(
         if !hydrated_from_tee {
             crate::git::commands::git_clone_bare(&clone_url, &repo_path, &env_vars).await?;
         }
+
+        ensure_bare_head_ref(&repo_path).await?;
+        validate_ready_repo(
+            state,
+            &owner_repo,
+            &repo_path,
+            if hydrated_from_tee {
+                "tee hydration"
+            } else {
+                "upstream clone"
+            },
+        )
+        .await?;
 
         let bundle =
             crate::bundleuri::generator::generate_full_bundle(state, &repo_path, &owner_repo)
@@ -610,6 +626,70 @@ async fn hydrate_repo_from_tee_capture(
     crate::git::commands::git_fetch(repo_path, clone_url, &[]).await?;
 
     Ok(state.cache_manager.has_repo(owner_repo))
+}
+
+async fn validate_ready_repo(
+    state: &crate::AppState,
+    owner_repo: &str,
+    repo_path: &Path,
+    source: &str,
+) -> Result<()> {
+    let validation_result = async {
+        if !state.cache_manager.has_repo(owner_repo) {
+            bail!("repo is missing required bare-repo refs after {source}");
+        }
+
+        crate::git::commands::git_fsck_connectivity_only(repo_path)
+            .await
+            .with_context(|| {
+                format!("connectivity validation failed for {owner_repo} after {source}")
+            })?;
+
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(error) = validation_result {
+        if repo_path.exists() {
+            tokio::fs::remove_dir_all(repo_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to remove invalid repo at {} after {}",
+                        repo_path.display(),
+                        source
+                    )
+                })?;
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn ensure_bare_head_ref(repo_path: &Path) -> Result<()> {
+    let refs = crate::git::commands::git_for_each_ref(repo_path).await?;
+    let branch_refs: Vec<&str> = refs
+        .keys()
+        .map(String::as_str)
+        .filter(|refname| refname.starts_with("refs/heads/"))
+        .collect();
+
+    let head_ref = if branch_refs.contains(&"refs/heads/main") {
+        Some("refs/heads/main")
+    } else if branch_refs.contains(&"refs/heads/master") {
+        Some("refs/heads/master")
+    } else if branch_refs.len() == 1 {
+        branch_refs.first().copied()
+    } else {
+        None
+    };
+
+    let Some(head_ref) = head_ref else {
+        return Ok(());
+    };
+
+    crate::git::commands::git_set_head_symbolic_ref(repo_path, head_ref).await
 }
 
 async fn register_bundle_in_valkey(

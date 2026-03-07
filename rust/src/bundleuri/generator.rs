@@ -99,6 +99,9 @@ pub async fn generate_incremental_bundle(
     )
     .await
     .with_context(|| format!("git bundle create failed for {owner_repo}"))?;
+    commands::git_bundle_verify(&bundle_path)
+        .await
+        .with_context(|| format!("git bundle verify failed for {owner_repo}"))?;
 
     let metadata = tokio::fs::metadata(&bundle_path)
         .await
@@ -140,6 +143,9 @@ pub async fn generate_full_bundle(
     commands::git_bundle_create(repo_path, &bundle_path, None, None)
         .await
         .with_context(|| format!("git bundle create (full) failed for {owner_repo}"))?;
+    commands::git_bundle_verify(&bundle_path)
+        .await
+        .with_context(|| format!("git bundle verify failed for {owner_repo}"))?;
 
     let metadata = tokio::fs::metadata(&bundle_path)
         .await
@@ -178,6 +184,9 @@ pub async fn generate_filtered_bundle(
     commands::git_bundle_create_filtered(repo_path, &bundle_path, "blob:none")
         .await
         .with_context(|| format!("filtered bundle create failed for {owner_repo}"))?;
+    commands::git_bundle_verify(&bundle_path)
+        .await
+        .with_context(|| format!("filtered bundle verify failed for {owner_repo}"))?;
 
     let metadata = tokio::fs::metadata(&bundle_path)
         .await
