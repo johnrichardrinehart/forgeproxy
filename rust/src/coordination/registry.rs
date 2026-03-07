@@ -589,8 +589,8 @@ fn clone_url(
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .unwrap_or_default();
         format!(
-            "https://{decoded}@{}/{owner}/{repo_clean}.git",
-            state.config.upstream.hostname,
+            "{}/{owner}/{repo_clean}.git",
+            authenticated_git_base_url(state, &decoded),
         )
     } else if let Some(header) = auth_header.filter(|h| !h.trim().is_empty()) {
         let token = header
@@ -598,15 +598,71 @@ fn clone_url(
             .or_else(|| header.strip_prefix("token "))
             .unwrap_or(header);
         format!(
-            "https://x-access-token:{token}@{}/{owner}/{repo_clean}.git",
-            state.config.upstream.hostname,
+            "{}/{owner}/{repo_clean}.git",
+            authenticated_git_base_url(state, &format!("x-access-token:{token}")),
         )
     } else {
         format!(
-            "https://{}/{owner}/{repo_clean}.git",
-            state.config.upstream.hostname,
+            "{}/{owner}/{repo_clean}.git",
+            state.config.upstream.git_url_base(),
         )
     }
+}
+
+fn authenticated_git_base_url(state: &crate::AppState, userinfo: &str) -> String {
+    let base = state.config.upstream.git_url_base();
+    if let Ok(mut parsed) = url::Url::parse(&base) {
+        if let Some((username, password)) = userinfo.split_once(':') {
+            let _ = parsed.set_username(username);
+            let _ = parsed.set_password(Some(password));
+        } else {
+            let _ = parsed.set_username(userinfo);
+        }
+        parsed.to_string().trim_end_matches('/').to_string()
+    } else {
+        base
+    }
+}
+
+fn redacted_clone_url(state: &crate::AppState, clone_url: &str) -> String {
+    crate::git::commands::redact_url_secret(
+        clone_url,
+        state.config.upstream.log_secret_unmask_chars,
+    )
+}
+
+async fn seed_temp_want_refs(repo_path: &Path, wants: &[String]) -> Result<Option<PathBuf>> {
+    if wants.is_empty() {
+        return Ok(None);
+    }
+
+    let seed_root = repo_path.join("refs/forgeproxy/tee-wants");
+    tokio::fs::create_dir_all(&seed_root)
+        .await
+        .with_context(|| format!("create temp want-ref dir {}", seed_root.display()))?;
+
+    for (idx, oid) in wants.iter().enumerate() {
+        let ref_path = seed_root.join(idx.to_string());
+        tokio::fs::write(&ref_path, format!("{oid}\n"))
+            .await
+            .with_context(|| format!("write temp want ref {}", ref_path.display()))?;
+    }
+
+    Ok(Some(seed_root))
+}
+
+async fn cleanup_temp_want_refs(seed_root: Option<&Path>) -> Result<()> {
+    let Some(seed_root) = seed_root else {
+        return Ok(());
+    };
+
+    if seed_root.exists() {
+        tokio::fs::remove_dir_all(seed_root)
+            .await
+            .with_context(|| format!("remove temp want-ref dir {}", seed_root.display()))?;
+    }
+
+    Ok(())
 }
 
 async fn clear_hydration_state(
@@ -841,6 +897,7 @@ async fn hydrate_repo_from_tee_capture(
         );
         return Ok(false);
     };
+    let captured_wants = crate::tee_hydration::extract_want_oids_from_capture(capture_dir).await?;
 
     let extracted_pack_size = tokio::fs::metadata(&pack_path)
         .await
@@ -869,17 +926,30 @@ async fn hydrate_repo_from_tee_capture(
         destination = %repo_path.display(),
         "tee hydration index-pack finished"
     );
+    let seeded_want_ref_dir = seed_temp_want_refs(repo_path, &captured_wants).await?;
+    if !captured_wants.is_empty() {
+        info!(
+            repo = %owner_repo,
+            destination = %repo_path.display(),
+            seeded_wants = captured_wants.len(),
+            "seeded temporary want refs before tee hydration follow-on git fetch"
+        );
+    }
+    let redacted_clone_url = redacted_clone_url(state, clone_url);
     info!(
         repo = %owner_repo,
         destination = %repo_path.display(),
-        clone_url,
+        clone_url = %redacted_clone_url,
         "starting tee hydration follow-on git fetch"
     );
-    crate::git::commands::git_fetch(repo_path, clone_url, &[]).await?;
+    let fetch_result = crate::git::commands::git_fetch(repo_path, clone_url, &[]).await;
+    let cleanup_result = cleanup_temp_want_refs(seeded_want_ref_dir.as_deref()).await;
+    fetch_result?;
+    cleanup_result?;
     info!(
         repo = %owner_repo,
         destination = %repo_path.display(),
-        clone_url,
+        clone_url = %redacted_clone_url,
         "tee hydration follow-on git fetch finished"
     );
 

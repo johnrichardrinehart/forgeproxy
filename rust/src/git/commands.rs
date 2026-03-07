@@ -64,7 +64,7 @@ pub async fn git_init_bare(dest: &Path) -> Result<()> {
 }
 
 /// Run `git clone --bare <url> <dest>` with the supplied environment variables.
-#[instrument(skip(env_vars), fields(%url, dest = %dest.display()))]
+#[instrument(skip(env_vars), fields(dest = %dest.display()))]
 pub async fn git_clone_bare(url: &str, dest: &Path, env_vars: &[(String, String)]) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("clone")
@@ -143,7 +143,7 @@ pub async fn git_clone_bare_local(source: &Path, dest: &Path) -> Result<()> {
 /// Run `git fetch <remote_url> +refs/*:refs/*` inside an existing bare repo.
 ///
 /// Returns a [`FetchResult`] summarising the update.
-#[instrument(skip(env_vars), fields(repo = %repo_path.display(), %remote_url))]
+#[instrument(skip(env_vars), fields(repo = %repo_path.display()))]
 pub async fn git_fetch(
     repo_path: &Path,
     remote_url: &str,
@@ -194,6 +194,45 @@ pub async fn git_fetch(
         refs_updated,
         bytes_received,
     })
+}
+
+pub fn redact_url_secret(url: &str, unmask_chars: usize) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+
+    let Some(password) = parsed.password() else {
+        return url.to_string();
+    };
+
+    let masked = redact_secret(password, unmask_chars);
+    let _ = parsed.set_password(Some(&masked));
+    parsed.to_string()
+}
+
+fn redact_secret(secret: &str, unmask_chars: usize) -> String {
+    if secret.is_empty() {
+        return String::new();
+    }
+
+    let chars: Vec<char> = secret.chars().collect();
+    if unmask_chars == 0 || chars.len() <= unmask_chars.saturating_mul(2) {
+        return "*".repeat(chars.len());
+    }
+
+    let prefix: String = chars.iter().take(unmask_chars).collect();
+    let suffix: String = chars
+        .iter()
+        .rev()
+        .take(unmask_chars)
+        .copied()
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let masked_len = chars.len().saturating_sub(unmask_chars * 2);
+
+    format!("{prefix}{}{suffix}", "*".repeat(masked_len))
 }
 
 /// Run `git fetch <bundle_path> +refs/*:refs/*` inside an existing bare repo.
@@ -671,5 +710,28 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
     #[test]
     fn parse_bytes_received_missing() {
         assert_eq!(parse_bytes_received("nothing here"), 0);
+    }
+
+    #[test]
+    fn redact_url_secret_masks_password_with_visible_edges() {
+        let redacted = redact_url_secret(
+            "https://x-access-token:ghp_abcdefghijklmnopqrstuvwxyz@ghe.example.com/org/repo.git",
+            4,
+        );
+        assert!(redacted.starts_with("https://x-access-token:ghp_"));
+        assert!(redacted.ends_with("wxyz@ghe.example.com/org/repo.git"));
+        assert!(!redacted.contains("abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn redact_url_secret_masks_entire_short_secret() {
+        let redacted = redact_url_secret(
+            "https://x-access-token:abcd@ghe.example.com/org/repo.git",
+            4,
+        );
+        assert_eq!(
+            redacted,
+            "https://x-access-token:****@ghe.example.com/org/repo.git"
+        );
     }
 }
