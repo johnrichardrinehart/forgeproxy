@@ -12,8 +12,9 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -236,35 +237,102 @@ pub async fn git_fetch_bundle(repo_path: &Path, bundle_path: &Path) -> Result<()
 pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
     let pack_file = std::fs::File::open(pack_path)
         .with_context(|| format!("open pack file {}", pack_path.display()))?;
+    let input_pack_size = pack_file.metadata().map(|m| m.len()).unwrap_or_default();
 
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo_path)
         .arg("index-pack")
         .arg("--stdin")
+        .arg("-v")
         .arg("--fix-thin");
 
     cmd.stdin(Stdio::from(pack_file));
-    cmd.stdout(Stdio::piped());
+    cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
     debug!("spawning git index-pack");
 
-    let output = cmd
-        .output()
-        .await
-        .context("failed to spawn git index-pack")?;
+    let mut child = cmd.spawn().context("failed to spawn git index-pack")?;
+    let pid = child.id().unwrap_or_default();
+    let started_at = std::time::Instant::now();
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture git index-pack stderr")?;
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut stderr_buf = String::new();
+    let mut progress_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    info!(
+        repo = %repo_path.display(),
+        pack = %pack_path.display(),
+        pid,
+        input_pack_size,
+        "git index-pack started"
+    );
+
+    let wait_fut = child.wait();
+    tokio::pin!(wait_fut);
+    let status = loop {
+        tokio::select! {
+            status = &mut wait_fut => {
+                break status.context("failed to wait on git index-pack")?;
+            }
+            line = stderr_lines.next_line() => {
+                if let Some(line) = line.context("failed to read git index-pack stderr")? {
+                    if !stderr_buf.is_empty() {
+                        stderr_buf.push('\n');
+                    }
+                    stderr_buf.push_str(&line);
+                    debug!(
+                        repo = %repo_path.display(),
+                        pid,
+                        progress = %line,
+                        "git index-pack progress"
+                    );
+                }
+            }
+            _ = progress_interval.tick() => {
+                let pack_dir = repo_path.join("objects").join("pack");
+                let pack_dir_bytes = std::fs::read_dir(&pack_dir)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|entries| entries.filter_map(|e| e.ok()))
+                    .filter_map(|entry| entry.metadata().ok())
+                    .filter(|meta| meta.is_file())
+                    .map(|meta| meta.len())
+                    .sum::<u64>();
+                info!(
+                    repo = %repo_path.display(),
+                    pack = %pack_path.display(),
+                    pid,
+                    elapsed_secs = started_at.elapsed().as_secs(),
+                    input_pack_size,
+                    pack_dir_bytes,
+                    "git index-pack still running"
+                );
+            }
+        }
+    };
+
+    if !status.success() {
         bail!(
             "git index-pack failed (status {}): {}",
-            output.status,
-            stderr.trim(),
+            status,
+            stderr_buf.trim(),
         );
     }
 
-    debug!("git index-pack succeeded");
+    info!(
+        repo = %repo_path.display(),
+        pack = %pack_path.display(),
+        pid,
+        elapsed_secs = started_at.elapsed().as_secs(),
+        input_pack_size,
+        "git index-pack finished"
+    );
     Ok(())
 }
 
