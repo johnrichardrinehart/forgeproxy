@@ -285,15 +285,6 @@ pub async fn try_ensure_repo_cloned_from_tee(
     try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir), false).await
 }
 
-pub async fn try_ensure_repo_cloned(
-    state: &crate::AppState,
-    owner: &str,
-    repo: &str,
-    auth_header: Option<&str>,
-) -> Result<()> {
-    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, None, false).await
-}
-
 async fn cleanup_tee_capture_dir(capture_dir: &Path) -> Result<()> {
     if capture_dir.exists() {
         tokio::fs::remove_dir_all(capture_dir)
