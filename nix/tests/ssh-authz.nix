@@ -712,19 +712,16 @@ pkgs.testers.runNixOSTest {
         proxy.succeed(f"rm -rf {live_repo} {live_generation_dir} {live_tee_dir}")
         client.succeed("rm -rf /tmp/repo-stream-live /tmp/repo-stream-live.log /tmp/repo-stream-live.pid")
         client.succeed(
-            "sh -c '"
-            "set -e; "
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key "
+            "env GIT_SSH_COMMAND=\"ssh -i /tmp/alice_key "
             "-o StrictHostKeyChecking=no "
             "-o UserKnownHostsFile=/dev/null "
-            "-p 2222' "
+            "-p 2222\" "
+            "sh -c '"
+            "set -e; "
             "git clone --progress git@proxy:octocat/repo-stream-live.git /tmp/repo-stream-live "
             "> /tmp/repo-stream-live.log 2>&1 & "
             "pid=$!; "
-            "echo $pid > /tmp/repo-stream-live.pid'"
-        )
-        proxy.wait_until_succeeds(
-            f"find {live_tee_dir} -mindepth 1 -maxdepth 1 -type d | grep -q ."
+            "echo \"$pid\" > /tmp/repo-stream-live.pid'"
         )
         client.wait_until_succeeds(
             "grep -E 'Receiving objects:|Resolving deltas:|remote: Enumerating objects:' "
@@ -734,6 +731,11 @@ pkgs.testers.runNixOSTest {
         client.succeed("kill -0 $(cat /tmp/repo-stream-live.pid)")
         client.succeed("wait $(cat /tmp/repo-stream-live.pid)")
         client.succeed("test -f /tmp/repo-stream-live/blob-32.bin")
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service --no-pager "
+            "| grep -F '\"repo\":\"octocat/repo-stream-live\"' "
+            "| grep -F 'starting tee hydration from captured pack'"
+        )
         proxy.wait_until_succeeds(
             f"test -L {live_repo} && test -f $(readlink -f {live_repo})/HEAD"
         )
