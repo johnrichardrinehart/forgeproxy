@@ -164,7 +164,10 @@ fn is_single_round_fetch_request(buf: &[u8]) -> bool {
 
 #[cfg(test)]
 fn is_complete_v2_fetch_request(buf: &[u8]) -> bool {
-    matches!(complete_v2_request_kind(buf), Some(V2RequestKind::Fetch))
+    matches!(
+        split_next_complete_v2_request(buf),
+        Some((V2RequestKind::Fetch, len)) if len == buf.len()
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,27 +176,22 @@ enum V2RequestKind {
     Fetch,
 }
 
-fn complete_v2_request_kind(buf: &[u8]) -> Option<V2RequestKind> {
+fn split_next_complete_v2_request(buf: &[u8]) -> Option<(V2RequestKind, usize)> {
     let mut request_kind = None;
     let mut offset = 0usize;
-    let mut last_was_flush = false;
 
     while offset + 4 <= buf.len() {
         let len = parse_pkt_line_len(&buf[offset..offset + 4])?;
 
         if len == 0 {
-            last_was_flush = true;
             offset += 4;
-            continue;
+            return request_kind.map(|kind| (kind, offset));
         }
 
         if len == 1 || len == 2 {
-            last_was_flush = false;
             offset += 4;
             continue;
         }
-
-        last_was_flush = false;
 
         if len < 4 || offset + len > buf.len() {
             return None;
@@ -210,11 +208,15 @@ fn complete_v2_request_kind(buf: &[u8]) -> Option<V2RequestKind> {
         offset += len;
     }
 
-    if offset != buf.len() || !last_was_flush {
-        return None;
-    }
+    None
+}
 
-    request_kind
+#[cfg(test)]
+fn complete_v2_request_kind(buf: &[u8]) -> Option<V2RequestKind> {
+    match split_next_complete_v2_request(buf) {
+        Some((kind, len)) if len == buf.len() => Some(kind),
+        _ => None,
+    }
 }
 
 fn summarize_pkt_lines(buf: &[u8]) -> String {
@@ -492,6 +494,7 @@ impl Handler for SshSession {
         //   2. Flush "0000" after wants (no haves) — shallow/single-round fetch
         //      (e.g. `git clone --depth 1`).  The client never sends "done" in
         //      this case; the flush IS the signal.
+        let mut request_batch = Vec::new();
         let post_action = if let Some((ref repo, ref mut buf, authenticated, ref git_protocol)) =
             self.upstream_proxy_buf
         {
@@ -513,16 +516,29 @@ impl Handler for SshSession {
             } else {
                 None
             };
-            let v2_request_kind = if self.git_protocol.as_deref() == Some("version=2") {
-                complete_v2_request_kind(buf)
-            } else {
-                None
-            };
             let has_flush_after_wants = if self.git_protocol.as_deref() == Some("version=2") {
-                v2_request_kind == Some(V2RequestKind::Fetch)
+                false
             } else {
                 is_single_round_fetch_request(buf)
             };
+            let mut v2_request_kind = None;
+            if self.git_protocol.as_deref() == Some("version=2") {
+                while let Some((kind, req_len)) = split_next_complete_v2_request(buf) {
+                    let remaining = buf.split_off(req_len);
+                    let request_bytes = std::mem::replace(buf, remaining);
+                    request_batch.push((
+                        repo.clone(),
+                        kind,
+                        request_bytes,
+                        authenticated,
+                        git_protocol.clone(),
+                    ));
+                    v2_request_kind = Some(kind);
+                    if kind == V2RequestKind::Fetch {
+                        break;
+                    }
+                }
+            }
             debug!(
                 repo = %repo,
                 git_protocol = ?self.git_protocol,
@@ -534,12 +550,12 @@ impl Handler for SshSession {
                 "DIAG: upstream proxy request completion check"
             );
             if self.git_protocol.as_deref() == Some("version=2") {
-                v2_request_kind
-                    .map(|kind| (repo.clone(), kind, authenticated, git_protocol.clone()))
+                None
             } else if has_done || has_flush_after_wants {
                 Some((
                     repo.clone(),
                     V2RequestKind::Fetch,
+                    std::mem::take(buf),
                     authenticated,
                     git_protocol.clone(),
                 ))
@@ -550,23 +566,72 @@ impl Handler for SshSession {
             None
         };
 
-        if let Some((owner_repo, request_kind, authenticated, git_protocol)) = post_action {
+        if !request_batch.is_empty() {
+            let fetch_in_batch = request_batch
+                .iter()
+                .any(|(_, kind, _, _, _)| *kind == V2RequestKind::Fetch);
+            let fetch_stream_channel = if fetch_in_batch {
+                self.channels.remove(&channel_id)
+            } else {
+                None
+            };
+            if fetch_in_batch {
+                self.upstream_proxy_buf = None;
+            }
+
+            let state = Arc::clone(&self.state);
+            let channel_states = Arc::clone(&self.upstream_proxy_channels);
+            let handle = session.handle();
+            tokio::spawn(async move {
+                let mut fetch_stream_channel = fetch_stream_channel;
+                for (owner_repo, request_kind, want_have, authenticated, git_protocol) in
+                    request_batch
+                {
+                    info!(
+                        repo = %owner_repo,
+                        request_kind = ?request_kind,
+                        want_have_bytes = want_have.len(),
+                        authenticated,
+                        "upstream proxy: request complete, POSTing to upstream"
+                    );
+                    proxy_upstream_upload_pack(
+                        Arc::clone(&state),
+                        Arc::clone(&channel_states),
+                        handle.clone(),
+                        channel_id,
+                        if request_kind == V2RequestKind::Fetch {
+                            fetch_stream_channel.take()
+                        } else {
+                            None
+                        },
+                        UpstreamUploadPackRequest {
+                            owner_repo,
+                            want_have,
+                            authenticated,
+                            git_protocol,
+                        },
+                        UpstreamUploadPackBehavior {
+                            warn_on_disconnect: true,
+                            should_close_channel: request_kind == V2RequestKind::Fetch,
+                            capture_for_hydration: request_kind == V2RequestKind::Fetch,
+                        },
+                    )
+                    .await;
+                }
+            });
+        }
+
+        if let Some((owner_repo, request_kind, want_have, authenticated, git_protocol)) =
+            post_action
+        {
             let stream_channel = if request_kind == V2RequestKind::Fetch {
                 self.channels.remove(&channel_id)
             } else {
                 None
             };
-            let want_have = if request_kind == V2RequestKind::LsRefs {
-                if let Some((_, buf, _, _)) = self.upstream_proxy_buf.as_mut() {
-                    std::mem::take(buf)
-                } else {
-                    Vec::new()
-                }
-            } else if let Some((_, want_have, _, _)) = self.upstream_proxy_buf.take() {
-                want_have
-            } else {
-                Vec::new()
-            };
+            if request_kind == V2RequestKind::Fetch {
+                self.upstream_proxy_buf = None;
+            }
             info!(
                 repo = %owner_repo,
                 request_kind = ?request_kind,
@@ -839,43 +904,6 @@ impl Handler for SshSession {
                     exists = repo_path.exists(),
                     "handling git-upload-pack"
                 );
-
-                if !self.cache_manager.has_repo(&repo)
-                    && let Some(auth_header) =
-                        build_clone_auth_header_for_repo(&self.state, &repo).await
-                {
-                    let (owner, repo_name) = match super::upstream::split_owner_repo(&repo) {
-                        Ok(parts) => parts,
-                        Err(e) => {
-                            error!(repo = %repo, error = %e, "invalid repo slug for pre-clone");
-                            session.extended_data(
-                                channel_id,
-                                1,
-                                CryptoVec::from_slice(
-                                    b"Invalid repository path. Expected owner/repo.\n",
-                                ),
-                            );
-                            finish_channel(session, channel_id, 1);
-                            return Ok(());
-                        }
-                    };
-
-                    info!(repo = %repo, "repository not cached; cloning once before serving SSH");
-                    if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned(
-                        &self.state,
-                        owner,
-                        repo_name,
-                        Some(auth_header.as_str()),
-                    )
-                    .await
-                    {
-                        warn!(
-                            repo = %repo,
-                            error = %e,
-                            "pre-clone failed; falling back to direct upstream proxy"
-                        );
-                    }
-                }
 
                 if self.cache_manager.has_repo(&repo) {
                     // ── Serve from local cache via bidirectional upload-pack ──
@@ -1528,6 +1556,117 @@ mod tests {
             complete_v2_request_kind(req.as_bytes()),
             Some(V2RequestKind::LsRefs),
             "{req:?}"
+        );
+    }
+
+    #[test]
+    fn split_next_complete_v2_request_extracts_front_request_only() {
+        let req = format!(
+            "{}{}0001{}0000{}{}0001{}{}0000",
+            pkt_line("command=ls-refs\n"),
+            pkt_line("agent=git/2.52.0-Linux\n"),
+            pkt_line("peel\n"),
+            pkt_line("command=fetch\n"),
+            pkt_line("agent=git/2.52.0-Linux\n"),
+            pkt_line("thin-pack\n"),
+            pkt_line("done\n"),
+        );
+
+        let (kind, len) = split_next_complete_v2_request(req.as_bytes()).unwrap();
+        assert_eq!(kind, V2RequestKind::LsRefs);
+        assert_eq!(
+            complete_v2_request_kind(&req.as_bytes()[..len]),
+            Some(V2RequestKind::LsRefs)
+        );
+        assert_eq!(
+            complete_v2_request_kind(&req.as_bytes()[len..]),
+            Some(V2RequestKind::Fetch)
+        );
+    }
+
+    #[test]
+    fn split_next_complete_v2_request_waits_for_full_fetch_when_chunked() {
+        let fetch = format!(
+            "{}{}0001{}{}0000",
+            pkt_line("command=fetch\n"),
+            pkt_line("agent=git/2.52.0-Linux\n"),
+            pkt_line("thin-pack\n"),
+            pkt_line("done\n"),
+        );
+
+        for split_at in 1..fetch.len() {
+            let prefix = &fetch.as_bytes()[..split_at];
+            let suffix = &fetch.as_bytes()[split_at..];
+            assert!(
+                split_next_complete_v2_request(prefix).is_none(),
+                "prefix unexpectedly parsed as complete at split {split_at}"
+            );
+
+            let mut combined = prefix.to_vec();
+            combined.extend_from_slice(suffix);
+            assert_eq!(
+                split_next_complete_v2_request(&combined),
+                Some((V2RequestKind::Fetch, fetch.len())),
+                "combined buffer should parse after split {split_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_next_complete_v2_request_handles_back_to_back_requests_across_chunks() {
+        let ls_refs = format!(
+            "{}{}0001{}{}0000",
+            pkt_line("command=ls-refs\n"),
+            pkt_line("agent=git/2.52.0-Linux\n"),
+            pkt_line("peel\n"),
+            pkt_line("symrefs\n"),
+        );
+        let fetch = format!(
+            "{}{}0001{}{}0000",
+            pkt_line("command=fetch\n"),
+            pkt_line("agent=git/2.52.0-Linux\n"),
+            pkt_line("thin-pack\n"),
+            pkt_line("done\n"),
+        );
+        let req = format!("{ls_refs}{fetch}");
+
+        let boundary = ls_refs.len() + 7;
+        let prefix = &req.as_bytes()[..boundary];
+        let suffix = &req.as_bytes()[boundary..];
+
+        let (kind, len) = split_next_complete_v2_request(prefix).unwrap();
+        assert_eq!(kind, V2RequestKind::LsRefs);
+        assert_eq!(len, ls_refs.len());
+
+        let mut remaining = prefix[len..].to_vec();
+        remaining.extend_from_slice(suffix);
+        assert_eq!(
+            split_next_complete_v2_request(&remaining),
+            Some((V2RequestKind::Fetch, fetch.len()))
+        );
+    }
+
+    #[test]
+    fn split_next_complete_v2_request_leaves_trailing_fetch_bytes_buffered() {
+        let ls_refs = format!(
+            "{}{}0001{}0000",
+            pkt_line("command=ls-refs\n"),
+            pkt_line("agent=git/2.52.0-Linux\n"),
+            pkt_line("peel\n"),
+        );
+        let fetch_prefix = format!(
+            "{}{}0001",
+            pkt_line("command=fetch\n"),
+            pkt_line("agent=git/2.52.0-Linux\n"),
+        );
+        let buf = format!("{ls_refs}{fetch_prefix}");
+
+        let (kind, len) = split_next_complete_v2_request(buf.as_bytes()).unwrap();
+        assert_eq!(kind, V2RequestKind::LsRefs);
+        assert_eq!(len, ls_refs.len());
+        assert!(
+            split_next_complete_v2_request(&buf.as_bytes()[len..]).is_none(),
+            "partial trailing fetch should remain buffered"
         );
     }
 
