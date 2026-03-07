@@ -827,19 +827,61 @@ async fn try_restore_repo_from_s3(
 
 async fn hydrate_repo_from_tee_capture(
     state: &crate::AppState,
-    _owner_repo: &str,
+    owner_repo: &str,
     repo_path: &Path,
     clone_url: &str,
     capture_dir: &Path,
 ) -> Result<bool> {
     let Some(pack_path) = crate::tee_hydration::extract_pack_from_capture(capture_dir).await?
     else {
+        info!(
+            repo = %owner_repo,
+            capture_dir = %capture_dir.display(),
+            "tee hydration skipped because no pack payload was extracted"
+        );
         return Ok(false);
     };
 
+    let extracted_pack_size = tokio::fs::metadata(&pack_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or_default();
+    info!(
+        repo = %owner_repo,
+        capture_dir = %capture_dir.display(),
+        pack = %pack_path.display(),
+        extracted_pack_size,
+        destination = %repo_path.display(),
+        "starting tee hydration from captured pack"
+    );
+
     crate::git::commands::git_init_bare(repo_path).await?;
+    info!(
+        repo = %owner_repo,
+        pack = %pack_path.display(),
+        destination = %repo_path.display(),
+        "starting tee hydration index-pack"
+    );
     crate::git::commands::git_index_pack(repo_path, &pack_path).await?;
+    info!(
+        repo = %owner_repo,
+        pack = %pack_path.display(),
+        destination = %repo_path.display(),
+        "tee hydration index-pack finished"
+    );
+    info!(
+        repo = %owner_repo,
+        destination = %repo_path.display(),
+        clone_url,
+        "starting tee hydration follow-on git fetch"
+    );
     crate::git::commands::git_fetch(repo_path, clone_url, &[]).await?;
+    info!(
+        repo = %owner_repo,
+        destination = %repo_path.display(),
+        clone_url,
+        "tee hydration follow-on git fetch finished"
+    );
 
     Ok(state.cache_manager.has_repo_at(repo_path))
 }
