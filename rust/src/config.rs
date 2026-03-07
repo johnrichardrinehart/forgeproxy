@@ -107,6 +107,10 @@ pub struct UpstreamConfig {
     /// Minimum number of API calls to keep in reserve before self-throttling.
     #[serde(default = "default_api_rate_limit_buffer")]
     pub api_rate_limit_buffer: u32,
+    /// Number of leading and trailing secret characters to leave visible when
+    /// logging authenticated upstream URLs.
+    #[serde(default = "default_log_secret_unmask_chars")]
+    pub log_secret_unmask_chars: usize,
     /// Base URL of a `ghe-key-lookup` sidecar for SSH fingerprint → username
     /// resolution (e.g. `http://ghe-key-lookup:3000`).
     ///
@@ -125,6 +129,10 @@ fn default_admin_token_env() -> String {
 
 fn default_api_rate_limit_buffer() -> u32 {
     100
+}
+
+fn default_log_secret_unmask_chars() -> usize {
+    4
 }
 
 // ---------------------------------------------------------------------------

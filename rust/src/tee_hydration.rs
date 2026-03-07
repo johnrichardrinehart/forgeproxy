@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::collections::BTreeSet;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
@@ -180,6 +181,56 @@ pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<Path
     }
 }
 
+pub async fn extract_want_oids_from_capture(capture_dir: &Path) -> Result<Vec<String>> {
+    let request_path = capture_dir.join("request.bin");
+    if !request_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let request = tokio::fs::read(&request_path)
+        .await
+        .with_context(|| format!("read tee request {}", request_path.display()))?;
+    let mut wants = BTreeSet::new();
+    let mut offset = 0usize;
+
+    while offset + 4 <= request.len() {
+        let Some(len) = std::str::from_utf8(&request[offset..offset + 4])
+            .ok()
+            .and_then(|text| usize::from_str_radix(text, 16).ok())
+        else {
+            anyhow::bail!("invalid pkt-line header in {}", request_path.display());
+        };
+
+        if len == 0 || len == 1 || len == 2 {
+            offset += 4;
+            continue;
+        }
+
+        if len < 4 || offset + len > request.len() {
+            anyhow::bail!(
+                "invalid pkt-line length {len} in {}",
+                request_path.display()
+            );
+        }
+
+        let payload = &request[offset + 4..offset + len];
+        let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
+        if let Some(rest) = payload.strip_prefix(b"want ") {
+            let mut fields = rest.split(|b| *b == b' ');
+            if let Some(oid) = fields.next()
+                && oid.len() == 40
+                && oid.iter().all(u8::is_ascii_hexdigit)
+            {
+                wants.insert(String::from_utf8_lossy(oid).into_owned());
+            }
+        }
+
+        offset += len;
+    }
+
+    Ok(wants.into_iter().collect())
+}
+
 fn capture_dir(base_path: &Path, owner_repo: &str) -> PathBuf {
     let mut parts = owner_repo.splitn(2, '/');
     let owner = parts.next().unwrap_or("_unknown");
@@ -234,5 +285,35 @@ mod tests {
             .unwrap();
         let pack = tokio::fs::read(pack_path).await.unwrap();
         assert_eq!(pack, b"PACKabcd");
+    }
+
+    #[tokio::test]
+    async fn extract_want_oids_from_capture_dedupes_and_ignores_capabilities() {
+        let tmp = tempdir().unwrap();
+        let mut capture = TeeCapture::start(tmp.path(), "acme/widgets", "ssh")
+            .await
+            .unwrap();
+        let mut request = Vec::new();
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want 0123456789abcdef0123456789abcdef01234567 thin-pack ofs-delta\n",
+        ));
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want 89abcdef0123456789abcdef0123456789abcdef\n",
+        ));
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want 0123456789abcdef0123456789abcdef01234567\n",
+        ));
+        capture.write_request(&request).await.unwrap();
+        let capture_dir = capture.dir().to_path_buf();
+        capture.finish(true).await.unwrap();
+
+        let wants = extract_want_oids_from_capture(&capture_dir).await.unwrap();
+        assert_eq!(
+            wants,
+            vec![
+                "0123456789abcdef0123456789abcdef01234567".to_string(),
+                "89abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ]
+        );
     }
 }
