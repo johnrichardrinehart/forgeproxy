@@ -233,6 +233,21 @@ impl CacheManager {
     /// Scans `{base_path}/{owner}/{repo}.git` directories.
     pub fn list_repos(&self) -> Result<Vec<String>> {
         let mut repos = Vec::new();
+        for (owner_repo, repo_path) in self.list_repo_dirs()? {
+            if is_usable_bare_repo(&repo_path) {
+                repos.push(owner_repo);
+            }
+        }
+
+        Ok(repos)
+    }
+
+    /// List all on-disk bare repo directory candidates, including partial repos.
+    ///
+    /// Scans `{base_path}/{owner}/{repo}.git` directories and returns any repo
+    /// directory with a `.git` suffix, regardless of current validity.
+    pub fn list_repo_dirs(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mut repos = Vec::new();
 
         if !self.base_path.exists() {
             return Ok(repos);
@@ -261,13 +276,13 @@ impl CacheManager {
                 }
                 let repo_name = repo_entry.file_name();
                 let repo_str = repo_name.to_string_lossy();
+                if !repo_str.ends_with(".git") {
+                    continue;
+                }
 
                 // Strip the `.git` suffix if present.
                 let repo_clean = repo_str.strip_suffix(".git").unwrap_or(&repo_str);
-
-                if is_usable_bare_repo(&repo_entry.path()) {
-                    repos.push(format!("{}/{}", owner_str, repo_clean));
-                }
+                repos.push((format!("{}/{}", owner_str, repo_clean), repo_entry.path()));
             }
         }
 

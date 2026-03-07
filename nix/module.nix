@@ -46,6 +46,18 @@ in
         dev closures may set true for convenience.
       '';
     };
+
+    validation.periodicFullFsckIntervalSec = lib.mkOption {
+      type = lib.types.nullOr lib.types.int;
+      default = null;
+      example = 86400;
+      description = ''
+        When set, forgeproxy runs a periodic in-process `git fsck --full`
+        scrub over on-disk cached bare repos at this interval in seconds.
+        Invalid local repos are removed so the next request rehydrates them
+        from upstream or S3 instead of serving broken state.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -59,6 +71,11 @@ in
       environment = {
         RUST_LOG = cfg.logLevel;
         FORGEPROXY_ALLOW_ENV_SECRET_FALLBACK = if cfg.allowEnvSecretFallback then "true" else "false";
+        FORGEPROXY_PERIODIC_FULL_FSCK_INTERVAL_SECS =
+          if cfg.validation.periodicFullFsckIntervalSec == null then
+            ""
+          else
+            toString cfg.validation.periodicFullFsckIntervalSec;
       };
 
       path = [
