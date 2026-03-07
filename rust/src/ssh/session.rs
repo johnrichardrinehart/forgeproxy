@@ -877,7 +877,7 @@ impl Handler for SshSession {
                     }
                 }
 
-                if repo_path.exists() && repo_path.join("HEAD").is_file() {
+                if self.cache_manager.has_repo(&repo) {
                     // ── Serve from local cache via bidirectional upload-pack ──
                     info!(repo = %repo, "serving git-upload-pack from local cache");
                     let Some(channel) = self.channels.remove(&channel_id) else {

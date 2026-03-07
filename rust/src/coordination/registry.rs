@@ -353,6 +353,14 @@ async fn try_ensure_repo_cloned_inner(
     let mut info = get_repo_info(&state.valkey, &owner_repo)
         .await?
         .unwrap_or_default();
+    if !info.hydrating_node_id.is_empty() && info.hydrating_node_id != node_id {
+        warn!(
+            repo = %owner_repo,
+            previous_node = %info.hydrating_node_id,
+            previous_started_at = info.hydrating_since_ts,
+            "claiming hydration after previous worker state was left behind"
+        );
+    }
     info.status = "hydrating".to_string();
     info.hydrating_node_id = node_id.clone();
     info.hydrating_since_ts = hydrate_started_at;
@@ -365,13 +373,17 @@ async fn try_ensure_repo_cloned_inner(
 
     // We hold the lock — perform the clone.
     let result = async {
+        info!(repo = %owner_repo, path = %staged_repo_path.display(), "starting staged repo hydration");
         match try_restore_repo_from_s3(state, &owner_repo, &staged_repo_path).await {
             Ok(true) => {
-                ensure_bare_head_ref(&staged_repo_path).await?;
-                validate_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore").await?;
-                state
-                    .cache_manager
-                    .publish_staged_repo(&owner_repo, &staged_repo_path)?;
+                info!(repo = %owner_repo, path = %staged_repo_path.display(), "restored repo from S3 bundle");
+                ensure_bare_head_ref(&staged_repo_path)
+                    .await
+                    .with_context(|| format!("failed to set bare HEAD after S3 restore for {owner_repo}"))?;
+                validate_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore")
+                    .await
+                    .with_context(|| format!("S3-restored repo validation failed for {owner_repo}"))?;
+                publish_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore").await?;
 
                 let now = chrono::Utc::now().timestamp();
                 let mut info = get_repo_info(&state.valkey, &owner_repo)
@@ -424,6 +436,11 @@ async fn try_ensure_repo_cloned_inner(
             vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
 
         let hydrated_from_tee = if let Some(capture_dir) = tee_capture_dir.as_ref() {
+            info!(
+                repo = %owner_repo,
+                capture_dir = %capture_dir.display(),
+                "attempting tee-based hydration from captured upstream stream"
+            );
             hydrate_repo_from_tee_capture(
                 state,
                 &owner_repo,
@@ -437,10 +454,16 @@ async fn try_ensure_repo_cloned_inner(
         };
 
         if !hydrated_from_tee {
-            crate::git::commands::git_clone_bare(&clone_url, &staged_repo_path, &env_vars).await?;
+            info!(repo = %owner_repo, path = %staged_repo_path.display(), "starting upstream bare clone");
+            crate::git::commands::git_clone_bare(&clone_url, &staged_repo_path, &env_vars)
+                .await
+                .with_context(|| format!("upstream bare clone failed for {owner_repo}"))?;
+            info!(repo = %owner_repo, path = %staged_repo_path.display(), "upstream bare clone completed");
         }
 
-        ensure_bare_head_ref(&staged_repo_path).await?;
+        ensure_bare_head_ref(&staged_repo_path)
+            .await
+            .with_context(|| format!("failed to set bare HEAD after hydration for {owner_repo}"))?;
         validate_ready_repo(
             state,
             &owner_repo,
@@ -451,11 +474,20 @@ async fn try_ensure_repo_cloned_inner(
                 "upstream clone"
             },
         )
-        .await?;
+        .await
+        .with_context(|| format!("ready-repo validation failed for {owner_repo}"))?;
 
-        state
-            .cache_manager
-            .publish_staged_repo(&owner_repo, &staged_repo_path)?;
+        publish_ready_repo(
+            state,
+            &owner_repo,
+            &staged_repo_path,
+            if hydrated_from_tee {
+                "tee hydration"
+            } else {
+                "upstream clone"
+            },
+        )
+        .await?;
 
         let now = chrono::Utc::now().timestamp();
         let mut info = RepoInfo {
@@ -519,15 +551,8 @@ async fn try_ensure_repo_cloned_inner(
     .await;
 
     if let Err(error) = &result {
-        let mut info = get_repo_info(&state.valkey, &owner_repo)
-            .await?
-            .unwrap_or_default();
-        info.status = "failed".to_string();
-        info.hydrating_node_id.clear();
-        info.hydrating_since_ts = 0;
-        info.bootstrap_bundle_pending = false;
-        set_repo_info(&state.valkey, &owner_repo, &info).await?;
-        info!(%owner_repo, error = %error, "repo hydration failed");
+        clear_hydration_state(state, &owner_repo, "failed").await?;
+        warn!(repo = %owner_repo, error = %error, "repo hydration failed");
         if staged_repo_path.exists() {
             tokio::fs::remove_dir_all(&staged_repo_path)
                 .await
@@ -548,7 +573,12 @@ async fn try_ensure_repo_cloned_inner(
         if result.is_ok() {
             cleanup_result?;
         } else if let Err(cleanup_error) = cleanup_result {
-            debug!(%owner_repo, error = %cleanup_error, "failed to clean tee capture after hydration error");
+            warn!(
+                repo = %owner_repo,
+                capture_dir = %capture_dir.display(),
+                error = %cleanup_error,
+                "tee capture cleanup failed after hydration error; stale capture directory remains"
+            );
         }
     }
 
@@ -586,6 +616,160 @@ fn clone_url(
             state.config.upstream.hostname,
         )
     }
+}
+
+async fn clear_hydration_state(
+    state: &crate::AppState,
+    owner_repo: &str,
+    fallback_status: &str,
+) -> Result<()> {
+    let has_local_repo = state.cache_manager.has_repo(owner_repo);
+    let mut info = get_repo_info(&state.valkey, owner_repo)
+        .await?
+        .unwrap_or_default();
+    info.status = if has_local_repo {
+        "ready".to_string()
+    } else {
+        fallback_status.to_string()
+    };
+    if !has_local_repo {
+        info.node_ids.clear();
+    }
+    info.hydrating_node_id.clear();
+    info.hydrating_since_ts = 0;
+    info.bootstrap_bundle_pending = false;
+    set_repo_info(&state.valkey, owner_repo, &info).await?;
+    Ok(())
+}
+
+async fn publish_ready_repo(
+    state: &crate::AppState,
+    owner_repo: &str,
+    staged_repo_path: &Path,
+    source: &str,
+) -> Result<()> {
+    let final_repo_path =
+        fold_overlapping_generations(state, owner_repo, staged_repo_path, source).await?;
+
+    info!(
+        repo = %owner_repo,
+        path = %final_repo_path.display(),
+        source,
+        "publishing ready repo generation"
+    );
+    state
+        .cache_manager
+        .publish_staged_repo(owner_repo, &final_repo_path)
+        .with_context(|| {
+            format!(
+                "failed to publish ready repo generation {} for {}",
+                final_repo_path.display(),
+                owner_repo,
+            )
+        })?;
+    state
+        .cache_manager
+        .prune_generations_except(owner_repo, std::slice::from_ref(&final_repo_path))?;
+    info!(
+        repo = %owner_repo,
+        path = %final_repo_path.display(),
+        published = %state.cache_manager.repo_path(owner_repo).display(),
+        "published repo generation and pruned superseded generations"
+    );
+    Ok(())
+}
+
+async fn fold_overlapping_generations(
+    state: &crate::AppState,
+    owner_repo: &str,
+    staged_repo_path: &Path,
+    source: &str,
+) -> Result<PathBuf> {
+    let other_generations: Vec<PathBuf> = state
+        .cache_manager
+        .list_generation_dirs(owner_repo)?
+        .into_iter()
+        .filter(|path| path != staged_repo_path)
+        .filter(|path| state.cache_manager.has_repo_at(path))
+        .collect();
+
+    if other_generations.is_empty() {
+        return Ok(staged_repo_path.to_path_buf());
+    }
+
+    let consolidation_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
+    info!(
+        repo = %owner_repo,
+        source,
+        seed = %staged_repo_path.display(),
+        destination = %consolidation_path.display(),
+        generations_to_fold = other_generations.len(),
+        "folding overlapping staged generations into a single published repo"
+    );
+
+    let consolidation_result = async {
+        crate::git::commands::git_clone_bare_local(staged_repo_path, &consolidation_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to seed consolidated generation {} from {}",
+                    consolidation_path.display(),
+                    staged_repo_path.display()
+                )
+            })?;
+
+        for generation_path in &other_generations {
+            info!(
+                repo = %owner_repo,
+                source_generation = %generation_path.display(),
+                destination = %consolidation_path.display(),
+                "folding staged generation into consolidated repo"
+            );
+            let generation_remote = generation_path.to_string_lossy().to_string();
+            crate::git::commands::git_fetch(&consolidation_path, &generation_remote, &[])
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to fold generation {} into {}",
+                        generation_path.display(),
+                        consolidation_path.display()
+                    )
+                })?;
+        }
+
+        ensure_bare_head_ref(&consolidation_path)
+            .await
+            .with_context(|| {
+                format!("failed to set bare HEAD after generation fold for {owner_repo}")
+            })?;
+        validate_ready_repo(state, owner_repo, &consolidation_path, "generation fold")
+            .await
+            .with_context(|| format!("generation fold validation failed for {owner_repo}"))?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(error) = consolidation_result {
+        if consolidation_path.exists() {
+            tokio::fs::remove_dir_all(&consolidation_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to remove unsuccessful consolidated generation at {}",
+                        consolidation_path.display()
+                    )
+                })?;
+        }
+        warn!(
+            repo = %owner_repo,
+            path = %staged_repo_path.display(),
+            error = %error,
+            "generation fold failed; publishing the validated staged generation directly"
+        );
+        return Ok(staged_repo_path.to_path_buf());
+    }
+
+    Ok(consolidation_path)
 }
 
 async fn reset_partial_repo_if_needed(

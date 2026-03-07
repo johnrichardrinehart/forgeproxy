@@ -669,69 +669,88 @@ pkgs.testers.runNixOSTest {
         client.succeed("git -C /tmp/repo-stream-second rev-parse HEAD")
         client.succeed("git -C /tmp/repo-stream-second fsck --no-dangling")
 
-    # ── Subtest 5d: Generations publish atomically and prune stale entries ──
-    with subtest("Generation publish keeps current and previous generations only"):
+    # ── Subtest 5d: Uncached clone publishes a symlinked generation cleanly ──
+    with subtest("Uncached clone publishes a generation symlink and cleans tee capture"):
+        stream_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream.git"
+        stream_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream.git"
+        stream_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream"
+
+        proxy.succeed(f"rm -rf {stream_repo} {stream_generation_dir} {stream_tee_dir}")
+        client.succeed("rm -rf /tmp/repo-stream-published")
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone --depth 1 git@proxy:octocat/repo-stream.git /tmp/repo-stream-published"
+        )
+        proxy.wait_until_succeeds(
+            f"test -L {stream_repo} && test -f $(readlink -f {stream_repo})/HEAD"
+        )
+        proxy.wait_until_succeeds(
+            f"find {stream_generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 1"
+        )
+        proxy.wait_until_succeeds(
+            f"! test -d {stream_tee_dir} || "
+            f"find {stream_tee_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
+        )
+
+    # ── Subtest 5e: Generations converge after concurrent uncached clones ──
+    with subtest("Concurrent uncached clones fold into one published generation"):
         generation_repo = "/var/cache/forgeproxy/repos/octocat/repo-generations.git"
         generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-generations.git"
+        generation_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-generations"
 
         proxy.succeed(
-            f"rm -rf {generation_repo} {generation_dir}"
+            f"rm -rf {generation_repo} {generation_dir} {generation_tee_dir}"
         )
 
         client.succeed("rm -rf /tmp/repo-generations-1 /tmp/repo-generations-2 /tmp/repo-generations-3")
 
-        def clone_generation_repo(dest):
-            client.succeed(
-                "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-                " -o StrictHostKeyChecking=no"
-                " -o UserKnownHostsFile=/dev/null"
-                " -p 2222'"
-                f" git clone --depth 1 git@proxy:octocat/repo-generations.git {dest}"
-            )
+        client.succeed(
+            "set -euo pipefail; "
+            "export GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'; "
+            "git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-1 >/tmp/repo-generations-1.log 2>&1 & "
+            "pid1=$!; "
+            "git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-2 >/tmp/repo-generations-2.log 2>&1 & "
+            "pid2=$!; "
+            "git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-3 >/tmp/repo-generations-3.log 2>&1 & "
+            "pid3=$!; "
+            "wait $pid1 $pid2 $pid3"
+        )
 
-        clone_generation_repo("/tmp/repo-generations-1")
         proxy.wait_until_succeeds(
             f"test -L {generation_repo} && test -f $(readlink -f {generation_repo})/HEAD"
         )
-        first_target = proxy.succeed(f"readlink -f {generation_repo}").strip()
-        proxy.succeed(f"test -d {first_target}")
-
-        proxy.succeed(f"rm -f {generation_repo}")
-        clone_generation_repo("/tmp/repo-generations-2")
-        proxy.wait_until_succeeds(
-            f"test -L {generation_repo} && test -f $(readlink -f {generation_repo})/HEAD"
-        )
-        second_target = proxy.succeed(f"readlink -f {generation_repo}").strip()
-        assert second_target != first_target, (first_target, second_target)
-        proxy.succeed(f"test -d {first_target}")
-        proxy.succeed(f"test -d {second_target}")
-
-        proxy.succeed(f"rm -f {generation_repo}")
-        clone_generation_repo("/tmp/repo-generations-3")
-        proxy.wait_until_succeeds(
-            f"test -L {generation_repo} && test -f $(readlink -f {generation_repo})/HEAD"
-        )
-        third_target = proxy.succeed(f"readlink -f {generation_repo}").strip()
-        assert third_target not in (first_target, second_target), (
-            first_target,
-            second_target,
-            third_target,
-        )
-        proxy.succeed(f"test -d {second_target}")
-        proxy.succeed(f"test -d {third_target}")
-        proxy.succeed(f"! test -e {first_target}")
         proxy.succeed(
-            f"find {generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 2"
+            f"find {generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 1"
         )
+        proxy.wait_until_succeeds(
+            f"! test -d {generation_tee_dir} || "
+            f"find {generation_tee_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
+        )
+        client.succeed("test -f /tmp/repo-generations-1/file-3.txt")
+        client.succeed("test -f /tmp/repo-generations-2/file-3.txt")
+        client.succeed("test -f /tmp/repo-generations-3/file-3.txt")
 
-    # ── Subtest 5e: External scrubber handles published generation layout ──
-    with subtest("External scrubber succeeds with generation-backed repos"):
+    # ── Subtest 5f: External scrubber handles published generation layout ──
+    with subtest("External scrubber removes stale tee captures and keeps generation-backed repos"):
+        proxy.succeed(
+            "mkdir -p /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture && "
+            "touch -d '20 minutes ago' /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture/meta.json && "
+            "chmod 0777 /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture && "
+            "chmod 0666 /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture/meta.json"
+        )
         proxy.succeed("systemctl start forgeproxy-cache-scrub.service")
         proxy.succeed(
             "systemctl show forgeproxy-cache-scrub.service"
             " -p Result --value | grep -qx success"
         )
         proxy.succeed("systemctl is-active forgeproxy-cache-scrub.timer | grep -qx active")
+        proxy.succeed("! test -e /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture")
         client.succeed("rm -rf /tmp/repo-generations-scrubbed")
         client.succeed(
             "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"

@@ -100,6 +100,31 @@ impl CacheManager {
         Ok(generations_dir.join(format!("gen-{now}-{}.git", std::process::id())))
     }
 
+    /// List immutable generation directories for a repository.
+    pub fn list_generation_dirs(&self, owner_repo: &str) -> Result<Vec<PathBuf>> {
+        let generations_dir = self.repo_generations_dir(owner_repo);
+        if !generations_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&generations_dir).with_context(|| {
+            format!(
+                "failed to read repo generations directory: {}",
+                generations_dir.display()
+            )
+        })? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                paths.push(path);
+            }
+        }
+
+        paths.sort();
+        Ok(paths)
+    }
+
     /// Atomically publish a staged generation as the current repo entry.
     pub fn publish_staged_repo(&self, owner_repo: &str, staged_repo_path: &Path) -> Result<()> {
         let published_path = self.repo_path(owner_repo);
@@ -175,6 +200,29 @@ impl CacheManager {
             staged_repo_path,
             previous_target.as_deref(),
         )?;
+
+        Ok(())
+    }
+
+    /// Remove every generation except the explicitly retained paths.
+    pub fn prune_generations_except(&self, owner_repo: &str, retain: &[PathBuf]) -> Result<()> {
+        let generations_dir = self.repo_generations_dir(owner_repo);
+        if !generations_dir.exists() {
+            return Ok(());
+        }
+
+        for path in self.list_generation_dirs(owner_repo)? {
+            if retain.iter().any(|keep| keep == &path) {
+                continue;
+            }
+
+            std::fs::remove_dir_all(&path).with_context(|| {
+                format!(
+                    "failed to remove stale repo generation at {}",
+                    path.display()
+                )
+            })?;
+        }
 
         Ok(())
     }
