@@ -494,6 +494,7 @@ pub async fn run_daily_consolidation(state: Arc<AppState>) {
 /// Perform one round of daily consolidation across all repos.
 async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
     let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
+    let lock_ttl = state.config.bundles.bundle_lock_ttl;
 
     for owner_repo in &repos {
         // Check if bundles are disabled for this repo.
@@ -511,85 +512,113 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
             continue;
         }
 
+        let lock_key = format!("forgeproxy:lock:daily-consolidation:{owner_repo}");
+        let node_id = crate::coordination::node::node_id();
+        let lock_acquired =
+            crate::coordination::locks::acquire_lock(&state.valkey, &lock_key, &node_id, lock_ttl)
+                .await?;
+
+        if !lock_acquired {
+            debug!(
+                repo = %owner_repo,
+                "another node holds the daily consolidation lock; skipping"
+            );
+            continue;
+        }
+
         // Generate a new full bundle that replaces the hourly incrementals.
-        match crate::bundleuri::generator::generate_full_bundle(state, &repo_path, owner_repo).await
-        {
-            Ok(bundle) => {
-                info!(
-                    repo = %owner_repo,
-                    creation_token = bundle.creation_token,
-                    size_bytes = bundle.size_bytes,
-                    "daily consolidation bundle generated"
-                );
-
-                // Update registry with new bundle info.
-                let repo_key = crate::coordination::registry::repo_key(owner_repo);
-                let s3_key = format!(
-                    "{}{}/bundles/daily-{}.bundle",
-                    state.config.storage.s3.prefix,
-                    owner_repo,
-                    Utc::now().format("%Y%m%d"),
-                );
-                HashesInterface::hset::<(), _, _>(
-                    &state.valkey,
-                    &repo_key,
-                    [
-                        ("latest_daily_bundle_s3_key", s3_key.as_str()),
-                        (
-                            "latest_daily_bundle_token",
-                            &bundle.creation_token.to_string(),
-                        ),
-                    ],
-                )
+        let result =
+            match crate::bundleuri::generator::generate_full_bundle(state, &repo_path, owner_repo)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(bundle) => {
+                    info!(
+                        repo = %owner_repo,
+                        creation_token = bundle.creation_token,
+                        size_bytes = bundle.size_bytes,
+                        "daily consolidation bundle generated"
+                    );
 
-                // Generate filtered (blobless) bundle variant if configured.
-                if state.config.bundles.generate_filtered_bundles {
-                    match crate::bundleuri::generator::generate_filtered_bundle(
-                        state, &repo_path, owner_repo,
+                    // Update registry with new bundle info.
+                    let repo_key = crate::coordination::registry::repo_key(owner_repo);
+                    let s3_key = format!(
+                        "{}{}/bundles/daily-{}.bundle",
+                        state.config.storage.s3.prefix,
+                        owner_repo,
+                        Utc::now().format("%Y%m%d"),
+                    );
+                    HashesInterface::hset::<(), _, _>(
+                        &state.valkey,
+                        &repo_key,
+                        [
+                            ("latest_daily_bundle_s3_key", s3_key.as_str()),
+                            (
+                                "latest_daily_bundle_token",
+                                &bundle.creation_token.to_string(),
+                            ),
+                        ],
                     )
                     .await
-                    {
-                        Ok(filtered) => {
-                            let filtered_s3_key = format!(
-                                "{}{}/bundles/daily-{}.filtered.bundle",
-                                state.config.storage.s3.prefix,
-                                owner_repo,
-                                Utc::now().format("%Y%m%d"),
-                            );
-                            crate::storage::s3::upload_bundle(
-                                &state.s3_client,
-                                &state.config.storage.s3.bucket,
-                                &filtered_s3_key,
-                                &filtered.bundle_path,
-                            )
-                            .await
-                            .unwrap_or_else(|e| {
+                    .unwrap_or_default();
+
+                    // Generate filtered (blobless) bundle variant if configured.
+                    if state.config.bundles.generate_filtered_bundles {
+                        match crate::bundleuri::generator::generate_filtered_bundle(
+                            state, &repo_path, owner_repo,
+                        )
+                        .await
+                        {
+                            Ok(filtered) => {
+                                let filtered_s3_key = format!(
+                                    "{}{}/bundles/daily-{}.filtered.bundle",
+                                    state.config.storage.s3.prefix,
+                                    owner_repo,
+                                    Utc::now().format("%Y%m%d"),
+                                );
+                                crate::storage::s3::upload_bundle(
+                                    &state.s3_client,
+                                    &state.config.storage.s3.bucket,
+                                    &filtered_s3_key,
+                                    &filtered.bundle_path,
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
+                                    warn!(
+                                        repo = %owner_repo,
+                                        error = %e,
+                                        "failed to upload filtered daily bundle to S3"
+                                    );
+                                });
+                            }
+                            Err(e) => {
                                 warn!(
                                     repo = %owner_repo,
                                     error = %e,
-                                    "failed to upload filtered daily bundle to S3"
+                                    "filtered bundle generation failed during daily consolidation"
                                 );
-                            });
-                        }
-                        Err(e) => {
-                            warn!(
-                                repo = %owner_repo,
-                                error = %e,
-                                "filtered bundle generation failed during daily consolidation"
-                            );
+                            }
                         }
                     }
+                    Ok(())
                 }
-            }
-            Err(e) => {
-                warn!(
-                    repo = %owner_repo,
-                    error = %e,
-                    "daily consolidation bundle generation failed"
-                );
-            }
+                Err(e) => {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %e,
+                        "daily consolidation bundle generation failed"
+                    );
+                    Err(e)
+                }
+            };
+
+        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
+
+        if let Err(e) = result {
+            debug!(
+                repo = %owner_repo,
+                error = %e,
+                "daily consolidation finished with repo-level error"
+            );
         }
     }
 
@@ -642,6 +671,7 @@ pub async fn run_weekly_consolidation(state: Arc<AppState>) {
 /// Perform one round of weekly consolidation across all repos.
 async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
     let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
+    let lock_ttl = state.config.bundles.bundle_lock_ttl;
 
     for owner_repo in &repos {
         if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo.as_str())
@@ -656,42 +686,70 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
             continue;
         }
 
-        // Generate a new base (full) bundle.
-        match crate::bundleuri::generator::generate_full_bundle(state, &repo_path, owner_repo).await
-        {
-            Ok(bundle) => {
-                info!(
-                    repo = %owner_repo,
-                    creation_token = bundle.creation_token,
-                    size_bytes = bundle.size_bytes,
-                    "weekly consolidation (base) bundle generated"
-                );
+        let lock_key = format!("forgeproxy:lock:weekly-consolidation:{owner_repo}");
+        let node_id = crate::coordination::node::node_id();
+        let lock_acquired =
+            crate::coordination::locks::acquire_lock(&state.valkey, &lock_key, &node_id, lock_ttl)
+                .await?;
 
-                let repo_key = crate::coordination::registry::repo_key(owner_repo);
-                let s3_key = format!(
-                    "{}{}/bundles/base-{}.bundle",
-                    state.config.storage.s3.prefix,
-                    owner_repo,
-                    Utc::now().format("%Y%m%d"),
-                );
-                HashesInterface::hset::<(), _, _>(
-                    &state.valkey,
-                    &repo_key,
-                    [
-                        ("base_bundle_s3_key", s3_key.as_str()),
-                        ("base_bundle_token", &bundle.creation_token.to_string()),
-                    ],
-                )
+        if !lock_acquired {
+            debug!(
+                repo = %owner_repo,
+                "another node holds the weekly consolidation lock; skipping"
+            );
+            continue;
+        }
+
+        // Generate a new base (full) bundle.
+        let result =
+            match crate::bundleuri::generator::generate_full_bundle(state, &repo_path, owner_repo)
                 .await
-                .unwrap_or_default();
-            }
-            Err(e) => {
-                warn!(
-                    repo = %owner_repo,
-                    error = %e,
-                    "weekly consolidation bundle generation failed"
-                );
-            }
+            {
+                Ok(bundle) => {
+                    info!(
+                        repo = %owner_repo,
+                        creation_token = bundle.creation_token,
+                        size_bytes = bundle.size_bytes,
+                        "weekly consolidation (base) bundle generated"
+                    );
+
+                    let repo_key = crate::coordination::registry::repo_key(owner_repo);
+                    let s3_key = format!(
+                        "{}{}/bundles/base-{}.bundle",
+                        state.config.storage.s3.prefix,
+                        owner_repo,
+                        Utc::now().format("%Y%m%d"),
+                    );
+                    HashesInterface::hset::<(), _, _>(
+                        &state.valkey,
+                        &repo_key,
+                        [
+                            ("base_bundle_s3_key", s3_key.as_str()),
+                            ("base_bundle_token", &bundle.creation_token.to_string()),
+                        ],
+                    )
+                    .await
+                    .unwrap_or_default();
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %e,
+                        "weekly consolidation bundle generation failed"
+                    );
+                    Err(e)
+                }
+            };
+
+        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
+
+        if let Err(e) = result {
+            debug!(
+                repo = %owner_repo,
+                error = %e,
+                "weekly consolidation finished with repo-level error"
+            );
         }
     }
 
