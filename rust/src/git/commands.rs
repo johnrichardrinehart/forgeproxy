@@ -101,6 +101,40 @@ pub async fn git_clone_bare(url: &str, dest: &Path, env_vars: &[(String, String)
     Ok(())
 }
 
+/// Run `git clone --bare --no-local <source> <dest>` for a local bare repo.
+#[instrument(fields(source = %source.display(), dest = %dest.display()))]
+pub async fn git_clone_bare_local(source: &Path, dest: &Path) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("clone")
+        .arg("--bare")
+        .arg("--no-local")
+        .arg(source)
+        .arg(dest);
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git clone --bare --no-local");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git clone --bare --no-local")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git clone --bare --no-local failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git clone --bare --no-local succeeded");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Fetch
 // ---------------------------------------------------------------------------
@@ -264,36 +298,6 @@ pub async fn git_fsck_connectivity_only(repo_path: &Path) -> Result<()> {
     }
 
     debug!("git fsck --connectivity-only succeeded");
-    Ok(())
-}
-
-/// Run `git fsck --full` in a bare repo.
-#[instrument(fields(repo = %repo_path.display()))]
-pub async fn git_fsck_full(repo_path: &Path) -> Result<()> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo_path).arg("fsck").arg("--full");
-
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    debug!("spawning git fsck --full");
-
-    let output = cmd
-        .output()
-        .await
-        .context("failed to spawn git fsck --full")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "git fsck --full failed (status {}): {}",
-            output.status,
-            stderr.trim(),
-        );
-    }
-
-    debug!("git fsck --full succeeded");
     Ok(())
 }
 

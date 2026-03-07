@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike, Utc};
 use fred::interfaces::HashesInterface;
 use tracing::{debug, error, info, instrument, warn};
@@ -131,6 +131,8 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     info!(repo = %owner_repo, "starting background fetch for bundle generation");
 
     let repo_path = state.cache_manager.repo_path(owner_repo);
+    let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
+    let mut published = false;
 
     let fetch_result = if state.cache_manager.has_repo(owner_repo) {
         // Repo is locally cached -- do an incremental fetch.
@@ -160,7 +162,8 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             )
         };
 
-        crate::git::commands::git_fetch(&repo_path, &url_with_token, &env_with_auth).await
+        crate::git::commands::git_clone_bare_local(&repo_path, &staged_repo_path).await?;
+        crate::git::commands::git_fetch(&staged_repo_path, &url_with_token, &env_with_auth).await
     } else {
         debug!(
             repo = %owner_repo,
@@ -205,7 +208,10 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                 .unwrap_or_default();
 
             let bundle_result = crate::bundleuri::generator::generate_incremental_bundle(
-                state, &repo_path, owner_repo, &prev_refs,
+                state,
+                &staged_repo_path,
+                owner_repo,
+                &prev_refs,
             )
             .await;
 
@@ -242,7 +248,8 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                     });
 
                     // Record the current refs snapshot for the next incremental.
-                    let current_refs = crate::bundleuri::generator::get_refs(&repo_path).await?;
+                    let current_refs =
+                        crate::bundleuri::generator::get_refs(&staged_repo_path).await?;
                     let refs_json = serde_json::to_string(&current_refs)?;
                     HashesInterface::hset::<(), _, _>(
                         &state.valkey,
@@ -254,11 +261,17 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                         ],
                     )
                     .await?;
+                    state
+                        .cache_manager
+                        .publish_staged_repo(owner_repo, &staged_repo_path)?;
+                    published = true;
 
                     // Generate filtered (blobless) bundle variant if configured.
                     if state.config.bundles.generate_filtered_bundles {
                         match crate::bundleuri::generator::generate_filtered_bundle(
-                            state, &repo_path, owner_repo,
+                            state,
+                            &staged_repo_path,
+                            owner_repo,
                         )
                         .await
                         {
@@ -314,6 +327,17 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
     // Release the distributed lock.
     let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
+
+    if !published && staged_repo_path.exists() {
+        tokio::fs::remove_dir_all(&staged_repo_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to remove unpublished staged repo generation at {}",
+                    staged_repo_path.display()
+                )
+            })?;
+    }
 
     Ok(())
 }

@@ -7,6 +7,96 @@
 
 let
   cfg = config.services.forgeproxy;
+  cacheScrubScript = pkgs.writeShellApplication {
+    name = "forgeproxy-cache-scrub";
+    runtimeInputs = with pkgs; [
+      coreutils
+      findutils
+      git
+      gnugrep
+      lsof
+    ];
+    text = ''
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      cache_root=${lib.escapeShellArg "${cfg.cacheDir}/repos"}
+
+      if [[ ! -d "$cache_root" ]]; then
+        exit 0
+      fi
+
+      is_usable_bare_repo() {
+        local repo_path=$1
+
+        [[ -d "$repo_path" ]] || return 1
+        [[ -f "$repo_path/HEAD" ]] || return 1
+
+        if [[ -f "$repo_path/packed-refs" ]] && grep -Eq '^[^#^[:space:]]' "$repo_path/packed-refs"; then
+          return 0
+        fi
+
+        [[ -d "$repo_path/refs" ]] || return 1
+        find "$repo_path/refs" -type f -print -quit | grep -q .
+      }
+
+      remove_repo_family() {
+        local repo_entry=$1
+        local repo_name owner_name generations_dir
+
+        repo_name=$(basename "$repo_entry" .git)
+        owner_name=$(basename "$(dirname "$repo_entry")")
+        generations_dir="$cache_root/.generations/$owner_name/$repo_name.git"
+
+        rm -rf "$repo_entry"
+        rm -rf "$generations_dir"
+      }
+
+      repo_is_active() {
+        local repo_path=$1
+        lsof +D "$repo_path" >/dev/null 2>&1
+      }
+
+      while IFS= read -r repo_path; do
+        repo_target=$repo_path
+        if [[ -L "$repo_path" ]]; then
+          repo_target=$(readlink -f "$repo_path" || true)
+        fi
+
+        if [[ -z "$repo_target" || ! -d "$repo_target" ]]; then
+          echo "forgeproxy-cache-scrub: removing broken repo entry $repo_path" >&2
+          remove_repo_family "$repo_path"
+          continue
+        fi
+
+        if repo_is_active "$repo_target"; then
+          echo "forgeproxy-cache-scrub: skipping active repo $repo_path" >&2
+          continue
+        fi
+
+        if ! is_usable_bare_repo "$repo_target"; then
+          echo "forgeproxy-cache-scrub: removing unusable bare repo $repo_path" >&2
+          remove_repo_family "$repo_path"
+          continue
+        fi
+
+        if ! git -C "$repo_target" rev-parse --is-bare-repository >/dev/null 2>&1; then
+          echo "forgeproxy-cache-scrub: removing non-bare repo $repo_path" >&2
+          remove_repo_family "$repo_path"
+          continue
+        fi
+
+        if ! git -C "$repo_target" fsck --full >/dev/null 2>&1; then
+          if repo_is_active "$repo_target"; then
+            echo "forgeproxy-cache-scrub: skipping invalid-but-active repo $repo_path" >&2
+            continue
+          fi
+          echo "forgeproxy-cache-scrub: removing invalid repo $repo_path" >&2
+          remove_repo_family "$repo_path"
+        fi
+      done < <(find "$cache_root" -mindepth 2 -maxdepth 2 \( -type d -o -type l \) -name '*.git' -print)
+    '';
+  };
 in
 {
   options.services.forgeproxy = {
@@ -49,13 +139,13 @@ in
 
     validation.periodicFullFsckIntervalSec = lib.mkOption {
       type = lib.types.nullOr lib.types.int;
-      default = null;
+      default = 86400;
       example = 86400;
       description = ''
-        When set, forgeproxy runs a periodic in-process `git fsck --full`
-        scrub over on-disk cached bare repos at this interval in seconds.
-        Invalid local repos are removed so the next request rehydrates them
-        from upstream or S3 instead of serving broken state.
+        When set, a separate systemd timer runs a `git fsck --full` scrub over
+        on-disk cached bare repos at this interval in seconds. Invalid local
+        repos are removed so the next request rehydrates them from upstream or
+        S3 instead of serving broken state. Set to `null` to disable the timer.
       '';
     };
   };
@@ -71,11 +161,6 @@ in
       environment = {
         RUST_LOG = cfg.logLevel;
         FORGEPROXY_ALLOW_ENV_SECRET_FALLBACK = if cfg.allowEnvSecretFallback then "true" else "false";
-        FORGEPROXY_PERIODIC_FULL_FSCK_INTERVAL_SECS =
-          if cfg.validation.periodicFullFsckIntervalSec == null then
-            ""
-          else
-            toString cfg.validation.periodicFullFsckIntervalSec;
       };
 
       path = [
@@ -122,6 +207,43 @@ in
         RestrictRealtime = true;
       };
     };
+
+    systemd.services.forgeproxy-cache-scrub =
+      lib.mkIf (cfg.validation.periodicFullFsckIntervalSec != null)
+        {
+          description = "Validate and scrub invalid forgeproxy cached repos";
+          after = [ "local-fs.target" ];
+          wants = [ "local-fs.target" ];
+
+          serviceConfig = {
+            Type = "oneshot";
+            DynamicUser = true;
+            CacheDirectory = "forgeproxy";
+            ProtectKernelTunables = true;
+            ProtectKernelModules = true;
+            ProtectControlGroups = true;
+            RestrictNamespaces = true;
+            LockPersonality = true;
+            RestrictRealtime = true;
+          };
+
+          script = ''
+            exec ${cacheScrubScript}/bin/forgeproxy-cache-scrub
+          '';
+        };
+
+    systemd.timers.forgeproxy-cache-scrub =
+      lib.mkIf (cfg.validation.periodicFullFsckIntervalSec != null)
+        {
+          description = "Periodic forgeproxy cache scrub";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnBootSec = "15m";
+            OnUnitActiveSec = "${toString cfg.validation.periodicFullFsckIntervalSec}s";
+            Persistent = true;
+            Unit = "forgeproxy-cache-scrub.service";
+          };
+        };
 
     # ── System packages required at runtime ────────────────────────────
     environment.systemPackages = with pkgs; [

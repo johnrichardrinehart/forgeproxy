@@ -6,6 +6,7 @@
 //! backup) are evicted until usage drops below the low-water mark.
 
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use fred::interfaces::HashesInterface;
@@ -49,7 +50,9 @@ impl CacheManager {
 
     /// Return the on-disk path for a repository identified by `owner/repo`.
     ///
-    /// The resulting path is `{base_path}/{owner}/{repo}.git`.
+    /// This is the published entry path exposed to readers. In the
+    /// generation-based layout it is typically a symlink to an immutable
+    /// generation directory under `.generations/`.
     pub fn repo_path(&self, owner_repo: &str) -> PathBuf {
         let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
         if parts.len() == 2 {
@@ -63,6 +66,226 @@ impl CacheManager {
         }
     }
 
+    /// Return the directory under which immutable generations are stored for a repo.
+    pub fn repo_generations_dir(&self, owner_repo: &str) -> PathBuf {
+        let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+            self.base_path
+                .join(".generations")
+                .join(parts[0])
+                .join(format!("{repo}.git"))
+        } else {
+            let name = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+            self.base_path
+                .join(".generations")
+                .join(format!("{name}.git"))
+        }
+    }
+
+    /// Create a fresh staging path for a new immutable generation.
+    pub fn create_staging_repo_path(&self, owner_repo: &str) -> Result<PathBuf> {
+        let generations_dir = self.repo_generations_dir(owner_repo);
+        std::fs::create_dir_all(&generations_dir).with_context(|| {
+            format!(
+                "failed to create repo generations directory: {}",
+                generations_dir.display()
+            )
+        })?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Ok(generations_dir.join(format!("gen-{now}-{}.git", std::process::id())))
+    }
+
+    /// Atomically publish a staged generation as the current repo entry.
+    pub fn publish_staged_repo(&self, owner_repo: &str, staged_repo_path: &Path) -> Result<()> {
+        let published_path = self.repo_path(owner_repo);
+        let mut previous_target: Option<PathBuf> = None;
+        if let Some(parent) = published_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create published repo parent directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        if published_path.exists() {
+            let metadata = std::fs::symlink_metadata(&published_path).with_context(|| {
+                format!(
+                    "failed to stat published repo path: {}",
+                    published_path.display()
+                )
+            })?;
+
+            if metadata.file_type().is_symlink() {
+                previous_target = std::fs::read_link(&published_path).ok();
+                std::fs::remove_file(&published_path).with_context(|| {
+                    format!(
+                        "failed to remove previous published repo symlink: {}",
+                        published_path.display()
+                    )
+                })?;
+            } else if is_usable_bare_repo(&published_path) {
+                let legacy_target = self.create_staging_repo_path(owner_repo)?;
+                std::fs::rename(&published_path, &legacy_target).with_context(|| {
+                    format!(
+                        "failed to migrate legacy published repo {} to {}",
+                        published_path.display(),
+                        legacy_target.display()
+                    )
+                })?;
+                previous_target = Some(legacy_target);
+            } else {
+                std::fs::remove_dir_all(&published_path).with_context(|| {
+                    format!(
+                        "failed to remove invalid published repo at {}",
+                        published_path.display()
+                    )
+                })?;
+            }
+        }
+
+        let temp_link = published_path.with_extension(format!(
+            "git.tmp-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::os::unix::fs::symlink(staged_repo_path, &temp_link).with_context(|| {
+            format!(
+                "failed to create temporary published repo symlink {} -> {}",
+                temp_link.display(),
+                staged_repo_path.display()
+            )
+        })?;
+        std::fs::rename(&temp_link, &published_path).with_context(|| {
+            format!(
+                "failed to publish staged repo {} at {}",
+                staged_repo_path.display(),
+                published_path.display()
+            )
+        })?;
+        self.prune_unpublished_generations(
+            owner_repo,
+            staged_repo_path,
+            previous_target.as_deref(),
+        )?;
+
+        Ok(())
+    }
+
+    fn prune_unpublished_generations(
+        &self,
+        owner_repo: &str,
+        current_target: &Path,
+        previous_target: Option<&Path>,
+    ) -> Result<()> {
+        let generations_dir = self.repo_generations_dir(owner_repo);
+        if !generations_dir.exists() {
+            return Ok(());
+        }
+
+        let fallback_previous = if previous_target.is_none() {
+            std::fs::read_dir(&generations_dir)
+                .with_context(|| {
+                    format!(
+                        "failed to read repo generations directory: {}",
+                        generations_dir.display()
+                    )
+                })?
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path != current_target)
+                .max_by_key(|path| path.file_name().map(|name| name.to_os_string()))
+        } else {
+            None
+        };
+        let retained_previous = previous_target.or(fallback_previous.as_deref());
+
+        for entry in std::fs::read_dir(&generations_dir).with_context(|| {
+            format!(
+                "failed to read repo generations directory: {}",
+                generations_dir.display()
+            )
+        })? {
+            let entry = entry?;
+            let path = entry.path();
+            if path == current_target || retained_previous.is_some_and(|prev| path == prev) {
+                continue;
+            }
+
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).with_context(|| {
+                    format!(
+                        "failed to remove stale repo generation at {}",
+                        path.display()
+                    )
+                })?;
+            } else {
+                std::fs::remove_file(&path).with_context(|| {
+                    format!(
+                        "failed to remove stale repo generation at {}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove the published repo entry and all stored generations.
+    pub async fn remove_repo_all(&self, owner_repo: &str) -> Result<()> {
+        let published_path = self.repo_path(owner_repo);
+        if published_path.exists() {
+            let metadata = tokio::fs::symlink_metadata(&published_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to stat published repo path for removal: {}",
+                        published_path.display()
+                    )
+                })?;
+            if metadata.file_type().is_symlink() {
+                tokio::fs::remove_file(&published_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove published repo symlink: {}",
+                            published_path.display()
+                        )
+                    })?;
+            } else {
+                tokio::fs::remove_dir_all(&published_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove published repo directory: {}",
+                            published_path.display()
+                        )
+                    })?;
+            }
+        }
+
+        let generations_dir = self.repo_generations_dir(owner_repo);
+        if generations_dir.exists() {
+            tokio::fs::remove_dir_all(&generations_dir)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to remove repo generations directory: {}",
+                        generations_dir.display()
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
     /// Check whether a cached bare repo exists for `owner/repo` and looks
     /// like a usable bare Git repository.
     ///
@@ -71,6 +294,11 @@ impl CacheManager {
     /// can actually serve.
     pub fn has_repo(&self, owner_repo: &str) -> bool {
         is_usable_bare_repo(&self.repo_path(owner_repo))
+    }
+
+    /// Check whether an arbitrary on-disk bare repo path looks usable.
+    pub fn has_repo_at(&self, repo_path: &Path) -> bool {
+        is_usable_bare_repo(repo_path)
     }
 
     /// Walk [`base_path`] and return the total size of all files in bytes.
@@ -178,12 +406,8 @@ impl CacheManager {
 
             // Remove the repo directory.
             let path = self.repo_path(owner_repo);
-            if path.exists() {
-                tokio::fs::remove_dir_all(&path).await.with_context(|| {
-                    format!("failed to remove cached repo at {}", path.display())
-                })?;
-                debug!(repo = %owner_repo, path = %path.display(), "evicted repo from local cache");
-            }
+            self.remove_repo_all(owner_repo).await?;
+            debug!(repo = %owner_repo, path = %path.display(), "evicted repo from local cache");
 
             // Update Valkey registry: mark repo as not locally cached.
             let registry_key = format!("forgeproxy:repo:{owner_repo}");
@@ -271,7 +495,8 @@ impl CacheManager {
             let repo_entries = std::fs::read_dir(owner_entry.path())?;
             for repo_entry in repo_entries {
                 let repo_entry = repo_entry?;
-                if !repo_entry.file_type()?.is_dir() {
+                let repo_path = repo_entry.path();
+                if !repo_path.is_dir() {
                     continue;
                 }
                 let repo_name = repo_entry.file_name();
@@ -282,7 +507,7 @@ impl CacheManager {
 
                 // Strip the `.git` suffix if present.
                 let repo_clean = repo_str.strip_suffix(".git").unwrap_or(&repo_str);
-                repos.push((format!("{}/{}", owner_str, repo_clean), repo_entry.path()));
+                repos.push((format!("{}/{}", owner_str, repo_clean), repo_path));
             }
         }
 
@@ -454,20 +679,31 @@ fn has_loose_refs(refs_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use tempfile::tempdir;
 
     use super::*;
 
-    #[test]
-    fn repo_path_splits_owner_and_repo() {
-        let mgr = CacheManager {
-            base_path: PathBuf::from("/var/cache/forgeproxy/repos"),
+    fn test_manager(base_path: &Path) -> CacheManager {
+        CacheManager {
+            base_path: base_path.to_path_buf(),
             max_bytes: 100_000_000_000,
             high_water: 0.90,
             low_water: 0.75,
             eviction_policy: EvictionPolicy::Lfu,
-        };
+        }
+    }
+
+    fn create_minimal_bare_repo(path: &Path) {
+        fs::create_dir_all(path.join("refs").join("heads")).unwrap();
+        fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(path.join("refs").join("heads").join("main"), "deadbeef\n").unwrap();
+    }
+
+    #[test]
+    fn repo_path_splits_owner_and_repo() {
+        let mgr = test_manager(Path::new("/var/cache/forgeproxy/repos"));
 
         let path = mgr.repo_path("acme-corp/my-service");
         assert_eq!(
@@ -478,13 +714,7 @@ mod tests {
 
     #[test]
     fn repo_path_normalizes_git_suffix() {
-        let mgr = CacheManager {
-            base_path: PathBuf::from("/var/cache/forgeproxy/repos"),
-            max_bytes: 100_000_000_000,
-            high_water: 0.90,
-            low_water: 0.75,
-            eviction_policy: EvictionPolicy::Lfu,
-        };
+        let mgr = test_manager(Path::new("/var/cache/forgeproxy/repos"));
 
         // With and without .git should resolve to the same path.
         let without = mgr.repo_path("acme-corp/my-service");
@@ -533,5 +763,36 @@ deadbeef refs/heads/main\n",
         .unwrap();
 
         assert!(is_usable_bare_repo(&repo));
+    }
+
+    #[test]
+    fn publish_staged_repo_prunes_older_unpublished_generations() {
+        let tmp = tempdir().unwrap();
+        let mgr = test_manager(tmp.path());
+        let owner_repo = "acme/widgets";
+
+        let first = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&first);
+        mgr.publish_staged_repo(owner_repo, &first).unwrap();
+
+        let second = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&second);
+        mgr.publish_staged_repo(owner_repo, &second).unwrap();
+
+        let third = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&third);
+        mgr.publish_staged_repo(owner_repo, &third).unwrap();
+
+        let published = mgr.repo_path(owner_repo);
+        assert!(
+            fs::symlink_metadata(&published)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&published).unwrap(), third);
+        assert!(!first.exists());
+        assert!(second.exists());
+        assert!(third.exists());
     }
 }

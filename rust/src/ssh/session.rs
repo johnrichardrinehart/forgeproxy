@@ -217,46 +217,88 @@ fn complete_v2_request_kind(buf: &[u8]) -> Option<V2RequestKind> {
     request_kind
 }
 
-fn summarize_pkt_lines(buf: &[u8]) -> Vec<String> {
+fn summarize_pkt_lines(buf: &[u8]) -> String {
+    const MAX_SUMMARY_LINES: usize = 12;
+    const MAX_TOTAL_CHARS: usize = 512;
+
     let mut out = Vec::new();
     let mut offset = 0usize;
+    let mut total_lines = 0usize;
+    let mut want_lines = 0usize;
+    let mut hidden_lines = 0usize;
 
     while offset + 4 <= buf.len() {
+        total_lines += 1;
         let len = match parse_pkt_line_len(&buf[offset..offset + 4]) {
             Some(len) => len,
             None => {
-                out.push(format!("invalid-len@{offset}"));
+                let summary = format!("invalid-len@{offset}");
+                if out.len() < MAX_SUMMARY_LINES {
+                    out.push(summary);
+                } else {
+                    hidden_lines += 1;
+                }
                 break;
             }
         };
 
-        match len {
+        let summary = match len {
             0 => {
-                out.push("flush".to_string());
                 offset += 4;
+                "flush".to_string()
             }
             1 => {
-                out.push("delimiter".to_string());
                 offset += 4;
+                "delimiter".to_string()
             }
             2 => {
-                out.push("response-end".to_string());
                 offset += 4;
+                "response-end".to_string()
             }
             n => {
                 if n < 4 || offset + n > buf.len() {
-                    out.push(format!("truncated@{offset}:{n}"));
+                    let summary = format!("truncated@{offset}:{n}");
+                    if out.len() < MAX_SUMMARY_LINES {
+                        out.push(summary);
+                    } else {
+                        hidden_lines += 1;
+                    }
                     break;
                 }
                 let payload =
                     String::from_utf8_lossy(&buf[offset + 4..offset + n]).replace('\n', "\\n");
-                out.push(payload);
                 offset += n;
+                if payload.starts_with("want ") {
+                    want_lines += 1;
+                    continue;
+                }
+                payload
             }
+        };
+
+        if out.len() < MAX_SUMMARY_LINES {
+            out.push(summary);
+        } else {
+            hidden_lines += 1;
         }
     }
 
-    out
+    if want_lines > 0 {
+        out.push(format!("want_count={want_lines}"));
+    }
+    if total_lines > out.len() {
+        out.push(format!("pkt_line_count={total_lines}"));
+    }
+    if hidden_lines > 0 {
+        out.push(format!("truncated_lines={hidden_lines}"));
+    }
+
+    let mut summary = out.join(" | ");
+    if summary.len() > MAX_TOTAL_CHARS {
+        summary.truncate(MAX_TOTAL_CHARS.saturating_sub("...".len()));
+        summary.push_str("...");
+    }
+    summary
 }
 
 // ---------------------------------------------------------------------------
@@ -481,7 +523,7 @@ impl Handler for SshSession {
             } else {
                 is_single_round_fetch_request(buf)
             };
-            info!(
+            debug!(
                 repo = %repo,
                 git_protocol = ?self.git_protocol,
                 has_done,
@@ -1486,6 +1528,36 @@ mod tests {
             complete_v2_request_kind(req.as_bytes()),
             Some(V2RequestKind::LsRefs),
             "{req:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_pkt_lines_bounds_large_want_lists() {
+        let mut req = String::new();
+        req.push_str(&pkt_line("command=fetch\n"));
+        req.push_str("0001");
+        for idx in 0..20 {
+            req.push_str(&pkt_line(&format!("want {:040x}\n", idx)));
+        }
+        req.push_str("0000");
+
+        let summary = summarize_pkt_lines(req.as_bytes());
+        assert!(
+            !summary.contains("want 0000000000000000000000000000000000000000"),
+            "summary should not dump raw want lines: {summary:?}"
+        );
+        assert!(
+            summary.contains("want_count=20"),
+            "summary should report total want count: {summary:?}"
+        );
+        assert!(
+            summary.contains("pkt_line_count="),
+            "summary should report total pkt-line count: {summary:?}"
+        );
+        assert!(
+            summary.len() <= 512,
+            "summary should remain bounded: {} chars",
+            summary.len()
         );
     }
 
