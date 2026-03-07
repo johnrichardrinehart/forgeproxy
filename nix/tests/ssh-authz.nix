@@ -366,6 +366,15 @@ pkgs.testers.runNixOSTest {
             f""" -d '{{"name": "repo-stream", "private": true, "auto_init": false}}'"""
         )
 
+        # Create private repo: octocat/repo-stream-live (stream-before-hydration regression)
+        ghe.succeed(
+            f"curl -sf"
+            f" -X POST http://localhost:3000/api/v1/user/repos"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"name": "repo-stream-live", "private": true, "auto_init": false}}'"""
+        )
+
         # Create private repo: octocat/repo-generations (generation publish/GC regression)
         ghe.succeed(
             f"curl -sf"
@@ -431,6 +440,24 @@ pkgs.testers.runNixOSTest {
             "git push -u origin main"
         )
 
+        # Push a larger history to repo-stream-live so the test can observe
+        # client-side progress before hydration publishes the local cache.
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "for i in $(seq 1 32); do "
+            "  head -c 1048576 /dev/urandom > blob-$i.bin && "
+            "  git add blob-$i.bin && "
+            "  git commit -m \"live-$i\"; "
+            "done && "
+            "git remote add origin http://octocat:secret123@localhost:3000/octocat/repo-stream-live.git && "
+            "git push -u origin main"
+        )
+
         # Push initial content to repo-generations to exercise published generation swaps.
         ghe.succeed(
             "set -e && "
@@ -474,6 +501,13 @@ pkgs.testers.runNixOSTest {
         ghe.succeed(
             f"curl -sf"
             f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-stream/collaborators/alice"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"permission": "read"}}'"""
+        )
+        ghe.succeed(
+            f"curl -sf"
+            f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-stream-live/collaborators/alice"
             f" -H 'Content-Type: application/json'"
             f" -H 'Authorization: token {TOKEN}'"
             f""" -d '{{"permission": "read"}}'"""
@@ -668,6 +702,45 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-stream-second/blob-24.bin")
         client.succeed("git -C /tmp/repo-stream-second rev-parse HEAD")
         client.succeed("git -C /tmp/repo-stream-second fsck --no-dangling")
+
+    # ── Subtest 5d: Client receives streamed data before hydration publishes ──
+    with subtest("Cache-miss clone streams to client before local hydration publishes"):
+        live_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
+        live_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
+        live_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream-live"
+
+        proxy.succeed(f"rm -rf {live_repo} {live_generation_dir} {live_tee_dir}")
+        client.succeed("rm -rf /tmp/repo-stream-live /tmp/repo-stream-live.log /tmp/repo-stream-live.pid")
+        client.succeed(
+            "sh -c '"
+            "set -e; "
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key "
+            "-o StrictHostKeyChecking=no "
+            "-o UserKnownHostsFile=/dev/null "
+            "-p 2222' "
+            "git clone --progress git@proxy:octocat/repo-stream-live.git /tmp/repo-stream-live "
+            "> /tmp/repo-stream-live.log 2>&1 & "
+            "pid=$!; "
+            "echo $pid > /tmp/repo-stream-live.pid'"
+        )
+        proxy.wait_until_succeeds(
+            f"find {live_tee_dir} -mindepth 1 -maxdepth 1 -type d | grep -q ."
+        )
+        client.wait_until_succeeds(
+            "grep -E 'Receiving objects:|Resolving deltas:|remote: Enumerating objects:' "
+            "/tmp/repo-stream-live.log"
+        )
+        proxy.succeed(f"! test -e {live_repo}")
+        client.succeed("kill -0 $(cat /tmp/repo-stream-live.pid)")
+        client.succeed("wait $(cat /tmp/repo-stream-live.pid)")
+        client.succeed("test -f /tmp/repo-stream-live/blob-32.bin")
+        proxy.wait_until_succeeds(
+            f"test -L {live_repo} && test -f $(readlink -f {live_repo})/HEAD"
+        )
+        proxy.wait_until_succeeds(
+            f"! test -d {live_tee_dir} || "
+            f"find {live_tee_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
+        )
 
     # ── Subtest 5d: Uncached clone publishes a symlinked generation cleanly ──
     with subtest("Uncached clone publishes a generation symlink and cleans tee capture"):
