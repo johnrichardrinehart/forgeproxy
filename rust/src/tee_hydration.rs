@@ -1,5 +1,6 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -11,6 +12,8 @@ use uuid::Uuid;
 const INFO_REFS_ADVERTISEMENT_FILE: &str = "info_refs_advertisement.bin";
 const LS_REFS_REQUEST_FILE: &str = "ls_refs_request.bin";
 const LS_REFS_RESPONSE_FILE: &str = "ls_refs_response.bin";
+const SHARED_DIR_MODE: u32 = 0o775;
+const SHARED_FILE_MODE: u32 = 0o664;
 
 pub struct TeeCapture {
     dir: PathBuf,
@@ -21,12 +24,7 @@ pub struct TeeCapture {
 impl TeeCapture {
     pub async fn start(base_path: &Path, owner_repo: &str, protocol: &str) -> Result<Self> {
         let dir = capture_dir(base_path, owner_repo);
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .with_context(|| format!("create tee capture dir {}", dir.display()))?;
-        tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
-            .await
-            .with_context(|| format!("chmod tee capture dir {}", dir.display()))?;
+        ensure_capture_tree(&dir).await?;
 
         let meta_path = dir.join("meta.json");
         let metadata = serde_json::json!({
@@ -37,9 +35,7 @@ impl TeeCapture {
         tokio::fs::write(&meta_path, serde_json::to_vec_pretty(&metadata)?)
             .await
             .with_context(|| format!("write tee metadata {}", meta_path.display()))?;
-        tokio::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o666))
-            .await
-            .with_context(|| format!("chmod tee metadata {}", meta_path.display()))?;
+        ensure_shared_file(&meta_path, "tee metadata").await?;
 
         let request_path = dir.join("request.bin");
         let response_path = dir.join("response.bin");
@@ -49,12 +45,8 @@ impl TeeCapture {
         let response_file = File::create(&response_path)
             .await
             .with_context(|| format!("create response capture {}", response_path.display()))?;
-        tokio::fs::set_permissions(&request_path, std::fs::Permissions::from_mode(0o666))
-            .await
-            .with_context(|| format!("chmod tee request capture {}", request_path.display()))?;
-        tokio::fs::set_permissions(&response_path, std::fs::Permissions::from_mode(0o666))
-            .await
-            .with_context(|| format!("chmod tee response capture {}", response_path.display()))?;
+        ensure_shared_file(&request_path, "tee request capture").await?;
+        ensure_shared_file(&response_path, "tee response capture").await?;
 
         Ok(Self {
             dir,
@@ -127,9 +119,7 @@ impl TeeCapture {
         tokio::fs::write(&status_path, serde_json::to_vec_pretty(&status)?)
             .await
             .with_context(|| format!("write tee status {}", status_path.display()))?;
-        tokio::fs::set_permissions(&status_path, std::fs::Permissions::from_mode(0o666))
-            .await
-            .with_context(|| format!("chmod tee status {}", status_path.display()))?;
+        ensure_shared_file(&status_path, "tee status").await?;
         Ok(())
     }
 }
@@ -150,9 +140,7 @@ async fn write_capture_artifact(path: &Path, bytes: &[u8], label: &str) -> Resul
     tokio::fs::write(path, bytes)
         .await
         .with_context(|| format!("write {label} {}", path.display()))?;
-    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
-        .await
-        .with_context(|| format!("chmod {label} {}", path.display()))?;
+    ensure_shared_file(path, label).await?;
     Ok(())
 }
 
@@ -169,9 +157,7 @@ pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<Path
     let mut pack_file = File::create(&pack_path)
         .await
         .with_context(|| format!("create extracted pack {}", pack_path.display()))?;
-    tokio::fs::set_permissions(&pack_path, std::fs::Permissions::from_mode(0o666))
-        .await
-        .with_context(|| format!("chmod extracted pack {}", pack_path.display()))?;
+    ensure_shared_file(&pack_path, "extracted pack").await?;
     let mut wrote_pack = false;
     let mut header = [0u8; 4];
 
@@ -388,6 +374,10 @@ fn parse_captured_fetch_request(bytes: &[u8]) -> Result<CapturedFetchMetadata> {
     })
 }
 
+pub fn parse_fetch_request_metadata(bytes: &[u8]) -> Result<CapturedFetchMetadata> {
+    parse_captured_fetch_request(bytes)
+}
+
 fn parse_response_mentions_shallow(bytes: &[u8]) -> Result<bool> {
     let mut uses_shallow = false;
 
@@ -440,6 +430,146 @@ fn capture_dir(base_path: &Path, owner_repo: &str) -> PathBuf {
         .join(owner)
         .join(repo.strip_suffix(".git").unwrap_or(repo))
         .join(stamp)
+}
+
+async fn ensure_capture_tree(capture_dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(capture_dir)
+        .await
+        .with_context(|| format!("create tee capture dir {}", capture_dir.display()))?;
+
+    let repo_dir = capture_dir
+        .parent()
+        .context("tee capture dir missing repo parent")?;
+    let owner_dir = repo_dir
+        .parent()
+        .context("tee capture dir missing owner parent")?;
+    let tee_root = owner_dir
+        .parent()
+        .context("tee capture dir missing _tee parent")?;
+
+    for dir in [tee_root, owner_dir, repo_dir, capture_dir] {
+        ensure_shared_dir(dir, "tee capture dir").await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_shared_dir(path: &Path, label: &str) -> Result<()> {
+    let existing_mode = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("stat {label} {}", path.display()))?
+        .permissions()
+        .mode();
+    let mode = (existing_mode & 0o2000) | SHARED_DIR_MODE;
+
+    match tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await {
+        Ok(()) => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                && existing_mode & SHARED_DIR_MODE == SHARED_DIR_MODE =>
+        {
+            // tmpfiles-managed shared roots can already have the desired mode
+            // but still be owned by root, so a DynamicUser service cannot chmod
+            // them again. If the directory is already group-shareable, keep
+            // using it.
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("chmod {label} {}", path.display()));
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_shared_file(path: &Path, label: &str) -> Result<()> {
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(SHARED_FILE_MODE))
+        .await
+        .with_context(|| format!("chmod {label} {}", path.display()))?;
+    Ok(())
+}
+
+pub async fn run_tee_cleanup_loop(
+    base_path: PathBuf,
+    interval: Duration,
+    retention: Duration,
+) -> Result<()> {
+    loop {
+        if let Err(error) = cleanup_stale_captures(&base_path, retention) {
+            tracing::warn!(
+                base_path = %base_path.display(),
+                error = %format!("{error:#}"),
+                error_debug = ?error,
+                "tee capture cleanup sweep failed"
+            );
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+pub fn cleanup_stale_captures(base_path: &Path, retention: Duration) -> Result<usize> {
+    let tee_root = base_path.join("_tee");
+    if !tee_root.exists() {
+        return Ok(0);
+    }
+
+    let now = SystemTime::now();
+    let mut stale_capture_paths = Vec::new();
+
+    for owner_entry in std::fs::read_dir(&tee_root)
+        .with_context(|| format!("read tee root {}", tee_root.display()))?
+    {
+        let owner_entry = owner_entry?;
+        if !owner_entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        for repo_entry in std::fs::read_dir(owner_entry.path())
+            .with_context(|| format!("read tee owner dir {}", owner_entry.path().display()))?
+        {
+            let repo_entry = repo_entry?;
+            if !repo_entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            for capture_entry in std::fs::read_dir(repo_entry.path())
+                .with_context(|| format!("read tee repo dir {}", repo_entry.path().display()))?
+            {
+                let capture_entry = capture_entry?;
+                let capture_path = capture_entry.path();
+                if !capture_entry.file_type()?.is_dir() {
+                    continue;
+                }
+
+                let modified = capture_entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(now);
+                let age = now.duration_since(modified).unwrap_or_default();
+                if age < retention {
+                    continue;
+                }
+
+                stale_capture_paths.push(capture_path);
+            }
+        }
+    }
+
+    let mut removed = 0usize;
+    for capture_path in stale_capture_paths {
+        match std::fs::remove_dir_all(&capture_path) {
+            Ok(()) => {
+                removed += 1;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("remove stale tee capture {}", capture_path.display())
+                });
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -515,6 +645,30 @@ mod tests {
             ]
         );
         assert!(!metadata.uses_shallow);
+    }
+
+    #[test]
+    fn cleanup_stale_captures_prunes_old_capture_dirs() {
+        let tmp = tempdir().unwrap();
+        let capture_dir = tmp
+            .path()
+            .join("_tee")
+            .join("acme")
+            .join("widgets")
+            .join("old-capture");
+        std::fs::create_dir_all(&capture_dir).unwrap();
+        std::fs::write(capture_dir.join("meta.json"), b"{}").unwrap();
+        std::process::Command::new("touch")
+            .arg("-d")
+            .arg("2000-01-01 00:00:00 UTC")
+            .arg(&capture_dir)
+            .status()
+            .unwrap();
+
+        let removed = cleanup_stale_captures(tmp.path(), Duration::from_secs(1)).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!capture_dir.exists());
     }
 
     #[tokio::test]

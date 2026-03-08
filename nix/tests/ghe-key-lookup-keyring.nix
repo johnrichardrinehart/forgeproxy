@@ -42,7 +42,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "ghe-key-lookup-keyring";
-  globalTimeout = 600;
+  globalTimeout = 180;
 
   nodes.vm =
     {

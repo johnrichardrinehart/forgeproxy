@@ -101,7 +101,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-filtered-bundles";
-  globalTimeout = 600;
+  globalTimeout = 180;
 
   # ---------------------------------------------------------------------------
   # Node definitions

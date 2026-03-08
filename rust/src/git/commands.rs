@@ -408,6 +408,41 @@ pub async fn git_fsck_connectivity_only(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Check whether a bare repo already contains the requested object ID.
+#[instrument(fields(repo = %repo_path.display(), %oid))]
+pub async fn git_has_object(repo_path: &Path, oid: &str) -> Result<bool> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("cat-file")
+        .arg("-e")
+        .arg(format!("{oid}^{{object}}"));
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git cat-file -e")?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!(
+        "git cat-file -e failed (status {}): {}",
+        output.status,
+        stderr.trim(),
+    );
+}
+
 /// Run `git symbolic-ref HEAD <target>` in a bare repo.
 #[instrument(fields(repo = %repo_path.display(), %target))]
 pub async fn git_set_head_symbolic_ref(repo_path: &Path, target: &str) -> Result<()> {

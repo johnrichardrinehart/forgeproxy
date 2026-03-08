@@ -248,34 +248,6 @@ pub async fn set_fetch_schedule(
     Ok(())
 }
 
-/// Check whether a repository is cached locally and still within its freshness
-/// threshold.  Returns `true` if a local clone exists AND the last fetch
-/// timestamp is within the configured (or per-repo override) window.
-pub async fn is_repo_cached_and_fresh(state: &crate::AppState, owner_repo: &str) -> Result<bool> {
-    // Check local presence first.
-    if !state.cache_manager.has_repo(owner_repo) {
-        return Ok(false);
-    }
-
-    // Look up the last fetch timestamp in Valkey.
-    let info = get_repo_info(&state.valkey, owner_repo).await?;
-    let last_fetch_ts = match info {
-        Some(ref ri) => ri.last_fetch_ts as u64,
-        None => return Ok(false),
-    };
-
-    // Determine the freshness threshold (per-repo override or global).
-    let threshold = state
-        .config
-        .repo_overrides
-        .get(owner_repo)
-        .and_then(|o| o.freshness_threshold)
-        .unwrap_or(state.config.clone.freshness_threshold);
-
-    let now = chrono::Utc::now().timestamp() as u64;
-    Ok(last_fetch_ts + threshold > now)
-}
-
 pub async fn try_ensure_repo_cloned_from_tee(
     state: &crate::AppState,
     owner: &str,
@@ -283,7 +255,77 @@ pub async fn try_ensure_repo_cloned_from_tee(
     auth_header: Option<&str>,
     capture_dir: PathBuf,
 ) -> Result<()> {
-    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir)).await
+    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir), None).await
+}
+
+pub struct CloneHydrationPermits {
+    _global_clone_permit: OwnedSemaphorePermit,
+    _local_repo_permit: OwnedSemaphorePermit,
+    distributed_repo_permit: crate::coordination::locks::SemaphoreLease,
+}
+
+pub async fn try_acquire_clone_hydration_permits(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<Option<CloneHydrationPermits>> {
+    let global_clone_permit = state
+        .clone_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow::anyhow!("clone semaphore closed: {e}"))?;
+    let local_repo_permit = acquire_local_repo_clone_permit(state, owner_repo).await?;
+    let distributed_permit_key = format!("forgeproxy:semaphore:clone:{owner_repo}");
+    let Some(distributed_repo_permit) = crate::coordination::locks::acquire_semaphore_lease(
+        &state.valkey,
+        &distributed_permit_key,
+        &state.node_id,
+        state
+            .config
+            .clone
+            .max_concurrent_upstream_clones_per_repo_across_instances,
+        state.config.clone.lock_ttl,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(CloneHydrationPermits {
+        _global_clone_permit: global_clone_permit,
+        _local_repo_permit: local_repo_permit,
+        distributed_repo_permit,
+    }))
+}
+
+pub async fn release_clone_hydration_permits(
+    state: &crate::AppState,
+    permits: CloneHydrationPermits,
+) -> Result<()> {
+    crate::coordination::locks::release_semaphore_lease(
+        &state.valkey,
+        &permits.distributed_repo_permit,
+    )
+    .await
+}
+
+pub async fn try_ensure_repo_cloned_from_tee_with_permits(
+    state: &crate::AppState,
+    owner: &str,
+    repo: &str,
+    auth_header: Option<&str>,
+    capture_dir: PathBuf,
+    permits: CloneHydrationPermits,
+) -> Result<()> {
+    try_ensure_repo_cloned_inner(
+        state,
+        owner,
+        repo,
+        auth_header,
+        Some(capture_dir),
+        Some(permits),
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,100 +386,148 @@ async fn acquire_local_repo_publish_guard(
     mutex.lock_owned().await
 }
 
+async fn register_active_generation(
+    state: &crate::AppState,
+    owner_repo: &str,
+    staged_repo_path: &Path,
+) {
+    let mut active_generations = state.active_repo_generations.lock().await;
+    active_generations
+        .entry(owner_repo.to_string())
+        .or_default()
+        .insert(staged_repo_path.to_path_buf());
+}
+
+async fn unregister_active_generation(
+    state: &crate::AppState,
+    owner_repo: &str,
+    staged_repo_path: &Path,
+) {
+    let mut active_generations = state.active_repo_generations.lock().await;
+    if let Some(paths) = active_generations.get_mut(owner_repo) {
+        paths.remove(staged_repo_path);
+        if paths.is_empty() {
+            active_generations.remove(owner_repo);
+        }
+    }
+}
+
+async fn active_generation_paths(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> std::collections::HashSet<PathBuf> {
+    state
+        .active_repo_generations
+        .lock()
+        .await
+        .get(owner_repo)
+        .cloned()
+        .unwrap_or_default()
+}
+
 async fn try_ensure_repo_cloned_inner(
     state: &crate::AppState,
     owner: &str,
     repo: &str,
     auth_header: Option<&str>,
     tee_capture_dir: Option<PathBuf>,
+    preacquired_permits: Option<CloneHydrationPermits>,
 ) -> Result<()> {
     // Strip trailing ".git" from repo if present to avoid double-suffixing
     // (the URL path extractor preserves it, and we append ".git" below).
     let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
     let owner_repo = format!("{owner}/{repo_clean}");
     let node_id = state.node_id.clone();
+    let had_local_repo_at_start = state.cache_manager.has_repo(&owner_repo);
 
     let published_repo_path = state.cache_manager.ensure_repo_dir(&owner_repo)?;
     reset_partial_repo_if_needed(&state.cache_manager, &owner_repo, &published_repo_path).await?;
     let staged_repo_path = state.cache_manager.create_staging_repo_path(&owner_repo)?;
+    register_active_generation(state, &owner_repo, &staged_repo_path).await;
+    let mut clone_hydration_permits = preacquired_permits;
 
-    // We hold the lock — perform the clone.
     let result = async {
         info!(repo = %owner_repo, path = %staged_repo_path.display(), "starting staged repo hydration");
-        match try_restore_repo_from_s3(state, &owner_repo, &staged_repo_path).await {
-            Ok(true) => {
-                info!(repo = %owner_repo, path = %staged_repo_path.display(), "restored repo from S3 bundle");
-                let _publish_guard = acquire_local_repo_publish_guard(state, &owner_repo).await;
-                ensure_bare_head_ref(&staged_repo_path)
-                    .await
-                    .with_context(|| format!("failed to set bare HEAD after S3 restore for {owner_repo}"))?;
-                validate_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore")
-                    .await
-                    .with_context(|| format!("S3-restored repo validation failed for {owner_repo}"))?;
-                let published_repo_path =
-                    publish_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore")
-                        .await?;
-
-                let now = chrono::Utc::now().timestamp();
-                let mut info = get_repo_info(&state.valkey, &owner_repo)
-                    .await?
-                    .unwrap_or_default();
-                info.status = "ready".to_string();
-                info.node_ids = node_id.clone();
-                info.hydrating_node_id.clear();
-                info.hydrating_since_ts = 0;
-                info.bootstrap_bundle_pending = false;
-                if info.last_fetch_ts == 0 {
-                    info.last_fetch_ts = now;
-                }
-                set_repo_info(&state.valkey, &owner_repo, &info).await?;
-                crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
-                    .await?;
-                info!(%owner_repo, published = %published_repo_path.display(), "repo hydrated from S3 bundle");
-                return Ok::<(), anyhow::Error>(());
-            }
-            Ok(false) => {}
-            Err(error) => {
-                info!(
-                    %owner_repo,
-                    error = %error,
-                    "S3 hydration unavailable; falling back to upstream clone"
-                );
-                if staged_repo_path.exists() {
-                    tokio::fs::remove_dir_all(&staged_repo_path)
+        if !(had_local_repo_at_start && tee_capture_dir.is_some()) {
+            match try_restore_repo_from_s3(state, &owner_repo, &staged_repo_path).await {
+                Ok(true) => {
+                    info!(repo = %owner_repo, path = %staged_repo_path.display(), "restored repo from S3 bundle");
+                    let _repo_generation_guard =
+                        acquire_local_repo_publish_guard(state, &owner_repo).await;
+                    if state.cache_manager.has_repo(&owner_repo) {
+                        info!(
+                            repo = %owner_repo,
+                            published = %state.cache_manager.repo_path(&owner_repo).display(),
+                            path = %staged_repo_path.display(),
+                            "repo was published by another hydration; skipping redundant finalize/publish work"
+                        );
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    ensure_bare_head_ref(&staged_repo_path)
                         .await
-                        .with_context(|| {
-                            format!(
-                                "failed to remove failed S3 hydration repo at {}",
-                                staged_repo_path.display()
-                            )
-                        })?;
+                        .with_context(|| format!("failed to set bare HEAD after S3 restore for {owner_repo}"))?;
+                    validate_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore")
+                        .await
+                        .with_context(|| format!("S3-restored repo validation failed for {owner_repo}"))?;
+                    let published_repo_path =
+                        publish_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore")
+                            .await?;
+
+                    let now = chrono::Utc::now().timestamp();
+                    let mut info = get_repo_info(&state.valkey, &owner_repo)
+                        .await?
+                        .unwrap_or_default();
+                    info.status = "ready".to_string();
+                    info.node_ids = node_id.clone();
+                    info.hydrating_node_id.clear();
+                    info.hydrating_since_ts = 0;
+                    info.bootstrap_bundle_pending = false;
+                    if info.last_fetch_ts == 0 {
+                        info.last_fetch_ts = now;
+                    }
+                    set_repo_info(&state.valkey, &owner_repo, &info).await?;
+                    crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
+                        .await?;
+                    info!(%owner_repo, published = %published_repo_path.display(), "repo hydrated from S3 bundle");
+                    return Ok::<(), anyhow::Error>(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    info!(
+                        %owner_repo,
+                        error = %error,
+                        "S3 hydration unavailable; falling back to upstream clone"
+                    );
+                    if staged_repo_path.exists() {
+                        tokio::fs::remove_dir_all(&staged_repo_path)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to remove failed S3 hydration repo at {}",
+                                    staged_repo_path.display()
+                                )
+                            })?;
+                    }
                 }
             }
         }
 
         let clone_url = clone_url(state, owner, repo_clean, auth_header);
+        let update_existing_repo = had_local_repo_at_start && tee_capture_dir.is_some();
 
-        // Acquire the clone semaphore to respect concurrency limits.
-        let _permit = state
-            .clone_semaphore
-            .acquire()
-            .await
-            .map_err(|e| anyhow::anyhow!("clone semaphore closed: {e}"))?;
-        let _local_repo_permit = acquire_local_repo_clone_permit(state, &owner_repo).await?;
-        let distributed_permit_key = format!("forgeproxy:semaphore:clone:{owner_repo}");
-        let Some(distributed_repo_permit) = crate::coordination::locks::acquire_semaphore_lease(
-            &state.valkey,
-            &distributed_permit_key,
-            &node_id,
-            state
-                .config
-                .clone
-                .max_concurrent_upstream_clones_per_repo_across_instances,
-            state.config.clone.lock_ttl,
-        )
-        .await?
-        else {
+        if had_local_repo_at_start && !update_existing_repo {
+            info!(
+                repo = %owner_repo,
+                published = %state.cache_manager.repo_path(&owner_repo).display(),
+                "repo became locally available before hydration started; skipping redundant upstream hydration"
+            );
+            return Ok::<(), anyhow::Error>(());
+        }
+
+        if clone_hydration_permits.is_none() {
+            clone_hydration_permits = try_acquire_clone_hydration_permits(state, &owner_repo).await?;
+        }
+        if clone_hydration_permits.is_none() {
             if let Some(capture_dir) = tee_capture_dir.as_ref() {
                 cleanup_tee_capture_dir(capture_dir).await?;
             }
@@ -449,7 +539,7 @@ async fn try_ensure_repo_cloned_inner(
                 "skipping upstream hydration because the repo clone semaphore is saturated"
             );
             return Ok(());
-        };
+        }
         let hydrate_started_at = chrono::Utc::now().timestamp();
         let mut info = get_repo_info(&state.valkey, &owner_repo)
             .await?
@@ -471,15 +561,6 @@ async fn try_ensure_repo_cloned_inner(
         let env_vars: Vec<(String, String)> =
             vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
 
-        if state.cache_manager.has_repo(&owner_repo) {
-            info!(
-                repo = %owner_repo,
-                published = %state.cache_manager.repo_path(&owner_repo).display(),
-                "repo became locally available before hydration started; skipping redundant upstream hydration"
-            );
-            return Ok::<(), anyhow::Error>(());
-        }
-
         let hydrate_result = async {
             let tee_outcome = if let Some(capture_dir) = tee_capture_dir.as_ref() {
                 info!(
@@ -493,6 +574,7 @@ async fn try_ensure_repo_cloned_inner(
                     &staged_repo_path,
                     &clone_url,
                     capture_dir,
+                    update_existing_repo,
                 )
                 .await?
             } else {
@@ -510,15 +592,16 @@ async fn try_ensure_repo_cloned_inner(
             Ok::<TeeHydrationOutcome, anyhow::Error>(tee_outcome)
         }
         .await;
-        let release_result =
-            crate::coordination::locks::release_semaphore_lease(&state.valkey, &distributed_repo_permit)
-                .await;
+        let release_result = if let Some(permits) = clone_hydration_permits.take() {
+            release_clone_hydration_permits(state, permits).await
+        } else {
+            Ok(())
+        };
         let tee_outcome = hydrate_result?;
         release_result?;
 
-        let _publish_guard = acquire_local_repo_publish_guard(state, &owner_repo).await;
-
-        if state.cache_manager.has_repo(&owner_repo) {
+        let _repo_generation_guard = acquire_local_repo_publish_guard(state, &owner_repo).await;
+        if state.cache_manager.has_repo(&owner_repo) && !update_existing_repo {
             info!(
                 repo = %owner_repo,
                 published = %state.cache_manager.repo_path(&owner_repo).display(),
@@ -557,15 +640,15 @@ async fn try_ensure_repo_cloned_inner(
         let published_repo_path = state.cache_manager.repo_path(&owner_repo);
 
         let now = chrono::Utc::now().timestamp();
-        let mut info = RepoInfo {
-            status: "ready".to_string(),
-            node_ids: node_id.clone(),
-            hydrating_node_id: String::new(),
-            hydrating_since_ts: 0,
-            bootstrap_bundle_pending: false,
-            last_fetch_ts: now,
-            ..Default::default()
-        };
+        let mut info = get_repo_info(&state.valkey, &owner_repo)
+            .await?
+            .unwrap_or_default();
+        info.status = "ready".to_string();
+        info.node_ids = node_id.clone();
+        info.hydrating_node_id.clear();
+        info.hydrating_since_ts = 0;
+        info.bootstrap_bundle_pending = false;
+        info.last_fetch_ts = now;
         set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
         crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id).await?;
@@ -578,48 +661,7 @@ async fn try_ensure_repo_cloned_inner(
                 auth_header.map(ToOwned::to_owned),
             );
         } else {
-            match crate::bundleuri::generator::generate_full_bundle(
-                state,
-                &published_repo_path,
-                &owner_repo,
-            )
-            .await
-            {
-                Ok(bundle) => {
-                    let s3_key = format!(
-                        "{}{}/bundles/{}.bundle",
-                        state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
-                    );
-                    crate::storage::s3::upload_bundle(
-                        &state.s3_client,
-                        &state.config.storage.s3.bucket,
-                        &s3_key,
-                        &bundle.bundle_path,
-                    )
-                    .await
-                    .with_context(|| format!("failed to upload bootstrap bundle for {owner_repo}"))?;
-
-                    register_bundle_in_valkey(
-                        state,
-                        &owner_repo,
-                        &published_repo_path,
-                        &s3_key,
-                        bundle.creation_token,
-                    )
-                    .await?;
-
-                    info.last_bundle_ts = now;
-                    info.latest_creation_token = bundle.creation_token;
-                    set_repo_info(&state.valkey, &owner_repo, &info).await?;
-                }
-                Err(error) => {
-                    warn!(
-                        %owner_repo,
-                        error = %error,
-                        "bootstrap bundle generation failed; keeping locally cached repo"
-                    );
-                }
-            }
+            publish_bootstrap_bundle(state, &owner_repo, &published_repo_path).await?;
         }
 
         debug!(
@@ -632,6 +674,10 @@ async fn try_ensure_repo_cloned_inner(
         Ok::<(), anyhow::Error>(())
     }
     .await;
+
+    if let Some(permits) = clone_hydration_permits.take() {
+        release_clone_hydration_permits(state, permits).await?;
+    }
 
     if let Err(error) = &result {
         clear_hydration_state(state, &owner_repo, "failed").await?;
@@ -661,6 +707,8 @@ async fn try_ensure_repo_cloned_inner(
             );
         }
     }
+
+    unregister_active_generation(state, &owner_repo, &staged_repo_path).await;
 
     result
 }
@@ -786,6 +834,16 @@ async fn publish_ready_repo(
 ) -> Result<PathBuf> {
     let final_repo_path =
         fold_overlapping_generations(state, owner_repo, staged_repo_path, source).await?;
+    let mut retained_generations: Vec<PathBuf> = active_generation_paths(state, owner_repo)
+        .await
+        .into_iter()
+        .collect();
+    if !retained_generations
+        .iter()
+        .any(|path| path == &final_repo_path)
+    {
+        retained_generations.push(final_repo_path.clone());
+    }
 
     info!(
         repo = %owner_repo,
@@ -805,7 +863,7 @@ async fn publish_ready_repo(
         })?;
     state
         .cache_manager
-        .prune_generations_except(owner_repo, std::slice::from_ref(&final_repo_path))?;
+        .prune_generations_except(owner_repo, &retained_generations)?;
     info!(
         repo = %owner_repo,
         path = %final_repo_path.display(),
@@ -821,11 +879,13 @@ async fn fold_overlapping_generations(
     staged_repo_path: &Path,
     source: &str,
 ) -> Result<PathBuf> {
+    let active_generations = active_generation_paths(state, owner_repo).await;
     let other_generations: Vec<PathBuf> = state
         .cache_manager
         .list_generation_dirs(owner_repo)?
         .into_iter()
         .filter(|path| path != staged_repo_path)
+        .filter(|path| !active_generations.contains(path))
         .filter(|path| state.cache_manager.has_repo_at(path))
         .collect();
 
@@ -844,17 +904,31 @@ async fn fold_overlapping_generations(
     );
 
     let consolidation_result = async {
-        crate::git::commands::git_clone_bare_local(staged_repo_path, &consolidation_path)
+        let mut sorted_generations = other_generations.clone();
+        sorted_generations.sort();
+        let seed_generation = sorted_generations
+            .first()
+            .cloned()
+            .unwrap_or_else(|| staged_repo_path.to_path_buf());
+
+        crate::git::commands::git_clone_bare_local(&seed_generation, &consolidation_path)
             .await
             .with_context(|| {
                 format!(
                     "failed to seed consolidated generation {} from {}",
                     consolidation_path.display(),
-                    staged_repo_path.display()
+                    seed_generation.display()
                 )
             })?;
 
-        for generation_path in &other_generations {
+        let mut generations_to_fetch: Vec<PathBuf> = sorted_generations
+            .iter()
+            .filter(|path| *path != &seed_generation)
+            .cloned()
+            .collect();
+        generations_to_fetch.push(staged_repo_path.to_path_buf());
+
+        for generation_path in &generations_to_fetch {
             info!(
                 repo = %owner_repo,
                 source_generation = %generation_path.display(),
@@ -1026,6 +1100,7 @@ async fn converge_published_repo_generation(
     }
 
     let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
+    register_active_generation(state, owner_repo, &staged_repo_path).await;
     crate::git::commands::git_clone_bare_local(&published_repo_path, &staged_repo_path)
         .await
         .with_context(|| {
@@ -1043,19 +1118,25 @@ async fn converge_published_repo_generation(
         clone_url = %redacted_clone_url,
         "starting capture convergence follow-on git fetch"
     );
-    crate::git::commands::git_fetch(&staged_repo_path, clone_url, &[]).await?;
-    let _publish_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
-    ensure_bare_head_ref(&staged_repo_path).await?;
-    validate_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
-    let published_repo_path =
-        publish_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
-    info!(
-        repo = %owner_repo,
-        destination = %published_repo_path.display(),
-        clone_url = %redacted_clone_url,
-        "capture convergence follow-on git fetch finished"
-    );
-    Ok(())
+    let result = async {
+        crate::git::commands::git_fetch(&staged_repo_path, clone_url, &[]).await?;
+        let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+        ensure_bare_head_ref(&staged_repo_path).await?;
+        validate_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
+        let published_repo_path =
+            publish_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
+        publish_bootstrap_bundle(state, owner_repo, &published_repo_path).await?;
+        info!(
+            repo = %owner_repo,
+            destination = %published_repo_path.display(),
+            clone_url = %redacted_clone_url,
+            "capture convergence follow-on git fetch finished"
+        );
+        Ok(())
+    }
+    .await;
+    unregister_active_generation(state, owner_repo, &staged_repo_path).await;
+    result
 }
 
 async fn hydrate_repo_from_tee_capture(
@@ -1064,6 +1145,7 @@ async fn hydrate_repo_from_tee_capture(
     repo_path: &Path,
     clone_url: &str,
     capture_dir: &Path,
+    allow_existing_repo_publish: bool,
 ) -> Result<TeeHydrationOutcome> {
     let Some(pack_path) = crate::tee_hydration::extract_pack_from_capture(capture_dir).await?
     else {
@@ -1102,7 +1184,7 @@ async fn hydrate_repo_from_tee_capture(
         "starting tee hydration from captured pack"
     );
 
-    if state.cache_manager.has_repo(owner_repo) {
+    if state.cache_manager.has_repo(owner_repo) && !allow_existing_repo_publish {
         info!(
             repo = %owner_repo,
             capture_dir = %capture_dir.display(),
@@ -1113,7 +1195,7 @@ async fn hydrate_repo_from_tee_capture(
     }
 
     crate::git::commands::git_init_bare(repo_path).await?;
-    if state.cache_manager.has_repo(owner_repo) {
+    if state.cache_manager.has_repo(owner_repo) && !allow_existing_repo_publish {
         info!(
             repo = %owner_repo,
             capture_dir = %capture_dir.display(),
@@ -1130,7 +1212,7 @@ async fn hydrate_repo_from_tee_capture(
         "starting tee hydration index-pack"
     );
     crate::git::commands::git_index_pack(repo_path, &pack_path).await?;
-    if state.cache_manager.has_repo(owner_repo) {
+    if state.cache_manager.has_repo(owner_repo) && !allow_existing_repo_publish {
         info!(
             repo = %owner_repo,
             capture_dir = %capture_dir.display(),
@@ -1336,6 +1418,162 @@ async fn register_bundle_in_valkey(
     .await?;
 
     Ok(())
+}
+
+async fn publish_bootstrap_bundle(
+    state: &crate::AppState,
+    owner_repo: &str,
+    published_repo_path: &Path,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    match crate::bundleuri::generator::generate_full_bundle(state, published_repo_path, owner_repo)
+        .await
+    {
+        Ok(bundle) => {
+            let s3_key = format!(
+                "{}{}/bundles/{}.bundle",
+                state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
+            );
+            crate::storage::s3::upload_bundle(
+                &state.s3_client,
+                &state.config.storage.s3.bucket,
+                &s3_key,
+                &bundle.bundle_path,
+            )
+            .await
+            .with_context(|| format!("failed to upload bootstrap bundle for {owner_repo}"))?;
+
+            register_bundle_in_valkey(
+                state,
+                owner_repo,
+                published_repo_path,
+                &s3_key,
+                bundle.creation_token,
+            )
+            .await?;
+
+            let mut info = get_repo_info(&state.valkey, owner_repo)
+                .await?
+                .unwrap_or_default();
+            info.last_bundle_ts = now;
+            info.latest_creation_token = bundle.creation_token;
+            set_repo_info(&state.valkey, owner_repo, &info).await?;
+        }
+        Err(error) => {
+            warn!(
+                %owner_repo,
+                error = %error,
+                "bootstrap bundle generation failed; keeping locally cached repo"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn ensure_repo_available_locally(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<bool> {
+    if state.cache_manager.has_repo(owner_repo) {
+        return Ok(true);
+    }
+
+    let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+    let published_repo_path = state.cache_manager.ensure_repo_dir(owner_repo)?;
+    reset_partial_repo_if_needed(&state.cache_manager, owner_repo, &published_repo_path).await?;
+    let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
+    let restore_result = try_restore_repo_from_s3(state, owner_repo, &staged_repo_path).await;
+
+    let available = match restore_result {
+        Ok(true) => {
+            if state.cache_manager.has_repo(owner_repo) {
+                true
+            } else {
+                ensure_bare_head_ref(&staged_repo_path)
+                    .await
+                    .with_context(|| {
+                        format!("failed to set bare HEAD after S3 restore for {owner_repo}")
+                    })?;
+                validate_ready_repo(
+                    state,
+                    owner_repo,
+                    &staged_repo_path,
+                    "S3 restore for request",
+                )
+                .await
+                .with_context(|| format!("S3-restored repo validation failed for {owner_repo}"))?;
+                publish_ready_repo(
+                    state,
+                    owner_repo,
+                    &staged_repo_path,
+                    "S3 restore for request",
+                )
+                .await?;
+
+                let mut info = get_repo_info(&state.valkey, owner_repo)
+                    .await?
+                    .unwrap_or_default();
+                info.status = "ready".to_string();
+                info.node_ids = state.node_id.clone();
+                info.hydrating_node_id.clear();
+                info.hydrating_since_ts = 0;
+                info.bootstrap_bundle_pending = false;
+                set_repo_info(&state.valkey, owner_repo, &info).await?;
+                true
+            }
+        }
+        Ok(false) => false,
+        Err(error) => {
+            if staged_repo_path.exists() {
+                tokio::fs::remove_dir_all(&staged_repo_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove failed request-time S3 restore at {}",
+                            staged_repo_path.display()
+                        )
+                    })?;
+            }
+            return Err(error);
+        }
+    };
+
+    if !available && staged_repo_path.exists() {
+        tokio::fs::remove_dir_all(&staged_repo_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to remove unused request-time S3 restore at {}",
+                    staged_repo_path.display()
+                )
+            })?;
+    }
+
+    Ok(available)
+}
+
+pub async fn repo_can_satisfy_wants(
+    state: &crate::AppState,
+    owner_repo: &str,
+    wants: &[String],
+) -> Result<bool> {
+    if wants.is_empty() {
+        return Ok(false);
+    }
+
+    if !ensure_repo_available_locally(state, owner_repo).await? {
+        return Ok(false);
+    }
+
+    let repo_path = state.cache_manager.repo_path(owner_repo);
+    for want in wants {
+        if !crate::git::commands::git_has_object(&repo_path, want).await? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 /// List all tracked repository names by scanning for `forgeproxy:repo:*` keys

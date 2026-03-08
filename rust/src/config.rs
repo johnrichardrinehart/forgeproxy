@@ -275,8 +275,8 @@ fn default_webhook_secret_env() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloneConfig {
-    /// Maximum age (seconds) of the local bare clone before a re-fetch is
-    /// required to serve it.
+    /// Deprecated compatibility knob. Serving and generation decisions are
+    /// content-based, not age-based.
     #[serde(default = "default_freshness_threshold")]
     pub freshness_threshold: u64,
     /// TTL (seconds) of the distributed per-repo hydration semaphore lease in
@@ -311,6 +311,13 @@ pub struct CloneConfig {
     /// pack into a staging generation.
     #[serde(default)]
     pub hydration_mode: HydrationMode,
+    /// How often to scan `_tee` for abandoned captures.
+    #[serde(default = "default_tee_cleanup_interval_secs")]
+    pub tee_cleanup_interval_secs: u64,
+    /// Maximum age of a tee capture before it is treated as abandoned and
+    /// removed by the background janitor.
+    #[serde(default = "default_tee_retention_secs")]
+    pub tee_retention_secs: u64,
 }
 
 impl Default for CloneConfig {
@@ -326,6 +333,8 @@ impl Default for CloneConfig {
             max_concurrent_upstream_clones_per_repo_per_instance:
                 default_max_concurrent_upstream_clones_per_repo_per_instance(),
             hydration_mode: HydrationMode::default(),
+            tee_cleanup_interval_secs: default_tee_cleanup_interval_secs(),
+            tee_retention_secs: default_tee_retention_secs(),
         }
     }
 }
@@ -348,6 +357,14 @@ fn default_lock_ttl() -> u64 {
 
 fn default_lock_wait_timeout() -> u64 {
     90
+}
+
+fn default_tee_cleanup_interval_secs() -> u64 {
+    60
+}
+
+fn default_tee_retention_secs() -> u64 {
+    900
 }
 
 fn default_max_concurrent_upstream_clones() -> usize {
@@ -549,7 +566,8 @@ fn default_presigned_url_ttl() -> u64 {
 pub struct RepoOverride {
     /// Override fetch interval (seconds) for this repo.
     pub fetch_interval: Option<u64>,
-    /// Override freshness threshold (seconds) for this repo.
+    /// Deprecated compatibility knob. Serving and generation decisions are
+    /// content-based, not age-based.
     pub freshness_threshold: Option<u64>,
     /// Force-disable bundle generation for this repo.
     pub disable_bundles: Option<bool>,
