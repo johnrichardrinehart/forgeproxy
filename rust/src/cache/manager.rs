@@ -148,12 +148,6 @@ impl CacheManager {
 
             if metadata.file_type().is_symlink() {
                 previous_target = std::fs::read_link(&published_path).ok();
-                std::fs::remove_file(&published_path).with_context(|| {
-                    format!(
-                        "failed to remove previous published repo symlink: {}",
-                        published_path.display()
-                    )
-                })?;
             } else if is_usable_bare_repo(&published_path) {
                 let legacy_target = self.create_staging_repo_path(owner_repo)?;
                 std::fs::rename(&published_path, &legacy_target).with_context(|| {

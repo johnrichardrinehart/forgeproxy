@@ -140,6 +140,12 @@ pub struct CapturedRefMetadata {
     pub head_symref_target: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapturedFetchMetadata {
+    pub want_oids: Vec<String>,
+    pub uses_shallow: bool,
+}
+
 async fn write_capture_artifact(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     tokio::fs::write(path, bytes)
         .await
@@ -228,54 +234,28 @@ pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<Path
     }
 }
 
-pub async fn extract_want_oids_from_capture(capture_dir: &Path) -> Result<Vec<String>> {
+pub async fn extract_captured_fetch_metadata(capture_dir: &Path) -> Result<CapturedFetchMetadata> {
     let request_path = capture_dir.join("request.bin");
-    if !request_path.is_file() {
-        return Ok(Vec::new());
+    let response_path = capture_dir.join("response.bin");
+    let mut metadata = CapturedFetchMetadata::default();
+
+    if request_path.is_file() {
+        let request = tokio::fs::read(&request_path)
+            .await
+            .with_context(|| format!("read tee request {}", request_path.display()))?;
+        metadata = parse_captured_fetch_request(&request)
+            .with_context(|| format!("parse tee request {}", request_path.display()))?;
     }
 
-    let request = tokio::fs::read(&request_path)
-        .await
-        .with_context(|| format!("read tee request {}", request_path.display()))?;
-    let mut wants = BTreeSet::new();
-    let mut offset = 0usize;
-
-    while offset + 4 <= request.len() {
-        let Some(len) = std::str::from_utf8(&request[offset..offset + 4])
-            .ok()
-            .and_then(|text| usize::from_str_radix(text, 16).ok())
-        else {
-            anyhow::bail!("invalid pkt-line header in {}", request_path.display());
-        };
-
-        if len == 0 || len == 1 || len == 2 {
-            offset += 4;
-            continue;
-        }
-
-        if len < 4 || offset + len > request.len() {
-            anyhow::bail!(
-                "invalid pkt-line length {len} in {}",
-                request_path.display()
-            );
-        }
-
-        let payload = &request[offset + 4..offset + len];
-        let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
-        if let Some(rest) = payload.strip_prefix(b"want ") {
-            let mut fields = rest.split(|b| *b == b' ');
-            if let Some(oid) = fields.next()
-                && oid.len() == 40
-                && oid.iter().all(u8::is_ascii_hexdigit)
-            {
-                wants.insert(String::from_utf8_lossy(oid).into_owned());
-            }
-        }
-
-        offset += len;
+    if response_path.is_file() {
+        let response = tokio::fs::read(&response_path)
+            .await
+            .with_context(|| format!("read tee response {}", response_path.display()))?;
+        metadata.uses_shallow |= parse_response_mentions_shallow(&response)
+            .with_context(|| format!("parse tee response {}", response_path.display()))?;
     }
 
-    Ok(wants.into_iter().collect())
+    Ok(metadata)
 }
 
 pub async fn extract_captured_ref_metadata(capture_dir: &Path) -> Result<CapturedRefMetadata> {
@@ -376,6 +356,80 @@ fn looks_like_oid(text: &str) -> bool {
     text.len() == 40 && text.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
+fn parse_captured_fetch_request(bytes: &[u8]) -> Result<CapturedFetchMetadata> {
+    let mut wants = BTreeSet::new();
+    let mut uses_shallow = false;
+
+    for_each_pkt_line(bytes, |payload| {
+        let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
+        if let Some(rest) = payload.strip_prefix(b"want ") {
+            let mut fields = rest.split(|b| *b == b' ');
+            if let Some(oid) = fields.next()
+                && oid.len() == 40
+                && oid.iter().all(u8::is_ascii_hexdigit)
+            {
+                wants.insert(String::from_utf8_lossy(oid).into_owned());
+            }
+        }
+
+        if payload.starts_with(b"deepen ")
+            || payload.starts_with(b"deepen-not ")
+            || payload.starts_with(b"deepen-since ")
+            || payload == b"deepen-relative"
+            || payload.starts_with(b"shallow ")
+        {
+            uses_shallow = true;
+        }
+    })?;
+
+    Ok(CapturedFetchMetadata {
+        want_oids: wants.into_iter().collect(),
+        uses_shallow,
+    })
+}
+
+fn parse_response_mentions_shallow(bytes: &[u8]) -> Result<bool> {
+    let mut uses_shallow = false;
+
+    for_each_pkt_line(bytes, |payload| {
+        let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
+        if payload.starts_with(b"shallow ") || payload.starts_with(b"unshallow ") {
+            uses_shallow = true;
+        }
+    })?;
+
+    Ok(uses_shallow)
+}
+
+fn for_each_pkt_line(mut bytes: &[u8], mut f: impl FnMut(&[u8])) -> Result<()> {
+    while bytes.len() >= 4 {
+        let Some(len) = std::str::from_utf8(&bytes[..4])
+            .ok()
+            .and_then(|text| usize::from_str_radix(text, 16).ok())
+        else {
+            anyhow::bail!("invalid pkt-line header");
+        };
+
+        if len == 0 || len == 1 || len == 2 {
+            bytes = &bytes[4..];
+            continue;
+        }
+
+        if len < 4 || len > bytes.len() {
+            anyhow::bail!("invalid pkt-line length {len}");
+        }
+
+        f(&bytes[4..len]);
+        bytes = &bytes[len..];
+    }
+
+    if bytes.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("trailing partial pkt-line")
+    }
+}
+
 fn capture_dir(base_path: &Path, owner_repo: &str) -> PathBuf {
     let mut parts = owner_repo.splitn(2, '/');
     let owner = parts.next().unwrap_or("_unknown");
@@ -433,7 +487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn extract_want_oids_from_capture_dedupes_and_ignores_capabilities() {
+    async fn extract_captured_fetch_metadata_dedupes_wants_and_ignores_capabilities() {
         let tmp = tempdir().unwrap();
         let mut capture = TeeCapture::start(tmp.path(), "acme/widgets", "ssh")
             .await
@@ -452,14 +506,59 @@ mod tests {
         let capture_dir = capture.dir().to_path_buf();
         capture.finish(true).await.unwrap();
 
-        let wants = extract_want_oids_from_capture(&capture_dir).await.unwrap();
+        let metadata = extract_captured_fetch_metadata(&capture_dir).await.unwrap();
         assert_eq!(
-            wants,
+            metadata.want_oids,
             vec![
                 "0123456789abcdef0123456789abcdef01234567".to_string(),
                 "89abcdef0123456789abcdef0123456789abcdef".to_string(),
             ]
         );
+        assert!(!metadata.uses_shallow);
+    }
+
+    #[tokio::test]
+    async fn extract_captured_fetch_metadata_marks_shallow_requests() {
+        let tmp = tempdir().unwrap();
+        let mut capture = TeeCapture::start(tmp.path(), "acme/widgets", "ssh")
+            .await
+            .unwrap();
+        let mut request = Vec::new();
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want 0123456789abcdef0123456789abcdef01234567 thin-pack ofs-delta\n",
+        ));
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(b"deepen 1\n"));
+        request.extend_from_slice(b"0000");
+        capture.write_request(&request).await.unwrap();
+        let capture_dir = capture.dir().to_path_buf();
+        capture.finish(true).await.unwrap();
+
+        let metadata = extract_captured_fetch_metadata(&capture_dir).await.unwrap();
+        assert!(metadata.uses_shallow);
+        assert_eq!(
+            metadata.want_oids,
+            vec!["0123456789abcdef0123456789abcdef01234567".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_captured_fetch_metadata_marks_shallow_responses() {
+        let tmp = tempdir().unwrap();
+        let mut capture = TeeCapture::start(tmp.path(), "acme/widgets", "ssh")
+            .await
+            .unwrap();
+        capture
+            .write_response_chunk(&crate::http::protocolv2::encode_pkt_line(
+                b"shallow 0123456789abcdef0123456789abcdef01234567\n",
+            ))
+            .await
+            .unwrap();
+        let capture_dir = capture.dir().to_path_buf();
+        capture.finish(true).await.unwrap();
+
+        let metadata = extract_captured_fetch_metadata(&capture_dir).await.unwrap();
+        assert!(metadata.uses_shallow);
+        assert!(metadata.want_oids.is_empty());
     }
 
     #[tokio::test]
