@@ -47,6 +47,7 @@ struct UpstreamUploadPackRequest {
     want_have: Vec<u8>,
     authenticated: bool,
     git_protocol: Option<String>,
+    request_kind: V2RequestKind,
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +55,22 @@ struct UpstreamUploadPackBehavior {
     warn_on_disconnect: bool,
     should_close_channel: bool,
     capture_for_hydration: bool,
+}
+
+#[derive(Clone)]
+struct UpstreamUploadPackContext {
+    state: Arc<AppState>,
+    channel_states: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
+    capture_metadata: Arc<Mutex<HashMap<ChannelId, UpstreamCaptureMetadata>>>,
+    handle: russh::server::Handle,
+    channel_id: ChannelId,
+}
+
+#[derive(Debug, Default, Clone)]
+struct UpstreamCaptureMetadata {
+    info_refs_advertisement: Option<Vec<u8>>,
+    ls_refs_request: Option<Vec<u8>>,
+    ls_refs_response: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +101,9 @@ pub struct SshSession {
     upstream_proxy_buf: Option<(String, Vec<u8>, bool, Option<String>)>,
     /// Per-channel lifecycle state for the uncached upstream proxy path.
     upstream_proxy_channels: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
+    /// Metadata from the uncached SSH negotiation that can later be used to
+    /// publish a capture-derived generation before full convergence.
+    upstream_capture_metadata: Arc<Mutex<HashMap<ChannelId, UpstreamCaptureMetadata>>>,
 }
 
 impl SshSession {
@@ -101,6 +121,7 @@ impl SshSession {
             git_protocol: None,
             upstream_proxy_buf: None,
             upstream_proxy_channels: Arc::new(Mutex::new(HashMap::new())),
+            upstream_capture_metadata: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -581,6 +602,7 @@ impl Handler for SshSession {
 
             let state = Arc::clone(&self.state);
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
+            let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
             tokio::spawn(async move {
                 let mut fetch_stream_channel = fetch_stream_channel;
@@ -595,10 +617,13 @@ impl Handler for SshSession {
                         "upstream proxy: request complete, POSTing to upstream"
                     );
                     proxy_upstream_upload_pack(
-                        Arc::clone(&state),
-                        Arc::clone(&channel_states),
-                        handle.clone(),
-                        channel_id,
+                        UpstreamUploadPackContext {
+                            state: Arc::clone(&state),
+                            channel_states: Arc::clone(&channel_states),
+                            capture_metadata: Arc::clone(&capture_metadata),
+                            handle: handle.clone(),
+                            channel_id,
+                        },
                         if request_kind == V2RequestKind::Fetch {
                             fetch_stream_channel.take()
                         } else {
@@ -609,6 +634,7 @@ impl Handler for SshSession {
                             want_have,
                             authenticated,
                             git_protocol,
+                            request_kind,
                         },
                         UpstreamUploadPackBehavior {
                             warn_on_disconnect: true,
@@ -641,19 +667,24 @@ impl Handler for SshSession {
             );
             let state = Arc::clone(&self.state);
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
+            let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
             tokio::spawn(async move {
                 proxy_upstream_upload_pack(
-                    state,
-                    channel_states,
-                    handle,
-                    channel_id,
+                    UpstreamUploadPackContext {
+                        state,
+                        channel_states,
+                        capture_metadata,
+                        handle,
+                        channel_id,
+                    },
                     stream_channel,
                     UpstreamUploadPackRequest {
                         owner_repo,
                         want_have,
                         authenticated,
                         git_protocol,
+                        request_kind,
                     },
                     UpstreamUploadPackBehavior {
                         warn_on_disconnect: true,
@@ -702,19 +733,24 @@ impl Handler for SshSession {
             debug!(repo = %owner_repo, want_have_bytes = want_have.len(), authenticated, "upstream proxy: channel_eof received, POSTing to upstream");
             let state = Arc::clone(&self.state);
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
+            let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
             tokio::spawn(async move {
                 proxy_upstream_upload_pack(
-                    state,
-                    channel_states,
-                    handle,
-                    channel_id,
+                    UpstreamUploadPackContext {
+                        state,
+                        channel_states,
+                        capture_metadata,
+                        handle,
+                        channel_id,
+                    },
                     stream_channel,
                     UpstreamUploadPackRequest {
                         owner_repo,
                         want_have,
                         authenticated,
                         git_protocol,
+                        request_kind: V2RequestKind::Fetch,
                     },
                     UpstreamUploadPackBehavior {
                         warn_on_disconnect: false,
@@ -757,6 +793,10 @@ impl Handler for SshSession {
         }
 
         self.upstream_proxy_channels
+            .lock()
+            .await
+            .remove(&channel_id);
+        self.upstream_capture_metadata
             .lock()
             .await
             .remove(&channel_id);
@@ -1063,6 +1103,7 @@ impl Handler for SshSession {
 
                     let state = Arc::clone(&self.state);
                     let channel_states = Arc::clone(&self.upstream_proxy_channels);
+                    let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
                     let handle = session.handle();
                     let repo_bg = repo.clone();
                     let git_protocol = self.git_protocol.clone();
@@ -1076,6 +1117,12 @@ impl Handler for SshSession {
                         .await
                         {
                             Ok(advert) => {
+                                capture_metadata
+                                    .lock()
+                                    .await
+                                    .entry(channel_id)
+                                    .or_default()
+                                    .info_refs_advertisement = Some(advert.clone());
                                 // Forward ref advertisement; channel stays open
                                 // for want/have — `channel_eof` will POST.
                                 debug!(repo = %repo_bg, bytes = advert.len(), "DIAG: sending ref advertisement via handle.data");
@@ -1148,19 +1195,24 @@ impl Handler for SshSession {
 /// to the SSH client. Channel close is coordinated by the main SSH handler
 /// after the client acknowledges teardown.
 async fn proxy_upstream_upload_pack(
-    state: Arc<AppState>,
-    channel_states: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
-    handle: russh::server::Handle,
-    channel_id: ChannelId,
+    context: UpstreamUploadPackContext,
     stream_channel: Option<Channel<Msg>>,
     request: UpstreamUploadPackRequest,
     behavior: UpstreamUploadPackBehavior,
 ) {
+    let UpstreamUploadPackContext {
+        state,
+        channel_states,
+        capture_metadata,
+        handle,
+        channel_id,
+    } = context;
     let UpstreamUploadPackRequest {
         owner_repo,
         want_have,
         authenticated,
         git_protocol,
+        request_kind,
     } = request;
     match super::upstream::post_upload_pack_stream(
         &state,
@@ -1178,6 +1230,7 @@ async fn proxy_upstream_upload_pack(
             let mut channel_writer = stream_channel.map(|channel| channel.make_writer());
             let mut total_bytes: u64 = 0;
             let mut had_error = false;
+            let mut response_buf = Vec::new();
             let auth_header = if authenticated {
                 build_clone_auth_header_for_repo(&state, &owner_repo).await
             } else {
@@ -1192,6 +1245,27 @@ async fn proxy_upstream_upload_pack(
                 .await
                 {
                     Ok(mut capture) => {
+                        if let Some(metadata) =
+                            capture_metadata.lock().await.get(&channel_id).cloned()
+                        {
+                            if let Some(advertisement) = metadata.info_refs_advertisement.as_deref()
+                                && let Err(e) =
+                                    capture.write_info_refs_advertisement(advertisement).await
+                            {
+                                warn!(repo = %owner_repo, error = %e, "failed to record SSH info/refs advertisement");
+                            }
+                            if let Some(ls_refs_request) = metadata.ls_refs_request.as_deref()
+                                && let Err(e) = capture.write_ls_refs_request(ls_refs_request).await
+                            {
+                                warn!(repo = %owner_repo, error = %e, "failed to record SSH ls-refs request");
+                            }
+                            if let Some(ls_refs_response) = metadata.ls_refs_response.as_deref()
+                                && let Err(e) =
+                                    capture.write_ls_refs_response(ls_refs_response).await
+                            {
+                                warn!(repo = %owner_repo, error = %e, "failed to record SSH ls-refs response");
+                            }
+                        }
                         if let Err(e) = capture.write_request(&want_have).await {
                             warn!(
                                 repo = %owner_repo,
@@ -1221,6 +1295,9 @@ async fn proxy_upstream_upload_pack(
                 match chunk_result {
                     Ok(chunk) => {
                         total_bytes += chunk.len() as u64;
+                        if request_kind == V2RequestKind::LsRefs {
+                            response_buf.extend_from_slice(&chunk);
+                        }
                         if let Some(active_capture) = capture.as_mut()
                             && let Err(e) = active_capture.write_response_chunk(&chunk).await
                         {
@@ -1274,6 +1351,12 @@ async fn proxy_upstream_upload_pack(
                         break;
                     }
                 }
+            }
+            if !had_error && request_kind == V2RequestKind::LsRefs {
+                let mut metadata = capture_metadata.lock().await;
+                let entry = metadata.entry(channel_id).or_default();
+                entry.ls_refs_request = Some(want_have.clone());
+                entry.ls_refs_response = Some(response_buf);
             }
             if had_error {
                 if let Some(active_capture) = capture.take() {

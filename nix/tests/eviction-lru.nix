@@ -86,7 +86,7 @@ let
     storage:
       local:
         path: "/var/cache/forgeproxy/repos"
-        max_bytes: 1024
+        max_bytes: 10485760
         high_water_mark: 0.50
         low_water_mark: 0.25
         eviction_policy: "lru"

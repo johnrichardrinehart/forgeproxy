@@ -176,6 +176,14 @@ async fn handle_info_refs(
     let modified_body =
         crate::http::protocolv2::inject_bundle_uri(&upstream_bytes, &bundle_list_url);
 
+    state.recent_info_refs_advertisements.lock().await.insert(
+        format!("{owner}/{repo}"),
+        crate::RecentInfoRefsAdvertisement {
+            captured_at: std::time::Instant::now(),
+            payload: upstream_bytes.to_vec(),
+        },
+    );
+
     // 5. Return the modified response.
     Ok((
         StatusCode::OK,
@@ -461,6 +469,27 @@ async fn proxy_upload_pack_to_upstream(
             None
         }
     };
+
+    if let Some(active_capture) = capture.as_ref() {
+        let recent_info_refs = state
+            .recent_info_refs_advertisements
+            .lock()
+            .await
+            .get(&owner_repo)
+            .cloned();
+        if let Some(recent_info_refs) = recent_info_refs
+            && recent_info_refs.captured_at.elapsed() <= std::time::Duration::from_secs(60)
+            && let Err(e) = active_capture
+                .write_info_refs_advertisement(&recent_info_refs.payload)
+                .await
+        {
+            warn!(
+                repo = %owner_repo,
+                error = %e,
+                "failed to record recent HTTP info/refs advertisement in tee capture"
+            );
+        }
+    }
 
     let request_capture_failed = if let Some(active_capture) = capture.as_mut() {
         if let Err(e) = active_capture.write_request(&capture_body).await {
