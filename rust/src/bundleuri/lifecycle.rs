@@ -79,20 +79,21 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
         .unwrap_or_default();
 
     // 2. Check if the repo is due for a fetch.
-    // Use the repo info's last_fetch_ts to determine timing.
+    // Use the repo info's last successful bundle/publication timestamp rather
+    // than the removed fetch-freshness timestamp.
     let now = Utc::now().timestamp() as u64;
     let repo_info = crate::coordination::registry::get_repo_info(&state.valkey, owner_repo).await?;
-    let last_fetch = repo_info
+    let last_bundle = repo_info
         .as_ref()
-        .map(|r| r.last_fetch_ts as u64)
+        .map(|r| r.last_bundle_ts as u64)
         .unwrap_or(0);
     let interval = effective_interval(state, owner_repo, schedule.current_interval);
     // ^ uses the current_interval from FetchSchedule
 
-    if last_fetch + interval > now {
+    if last_bundle + interval > now {
         debug!(
             repo = %owner_repo,
-            next_in_secs = (last_fetch + interval).saturating_sub(now),
+            next_in_secs = (last_bundle + interval).saturating_sub(now),
             "repo not yet due for fetch"
         );
         return Ok(());
@@ -174,15 +175,6 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             .await;
         return Ok(());
     };
-
-    // 6. Record fetch timestamp in repo info.
-    crate::coordination::registry::update_repo_field(
-        &state.valkey,
-        owner_repo,
-        "last_fetch_ts",
-        &now.to_string(),
-    )
-    .await?;
 
     match fetch_result {
         Ok(result) => {

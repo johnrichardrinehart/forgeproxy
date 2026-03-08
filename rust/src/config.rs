@@ -275,10 +275,6 @@ fn default_webhook_secret_env() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CloneConfig {
-    /// Deprecated compatibility knob. Serving and generation decisions are
-    /// content-based, not age-based.
-    #[serde(default = "default_freshness_threshold")]
-    pub freshness_threshold: u64,
     /// TTL (seconds) of the distributed per-repo hydration semaphore lease in
     /// Valkey.
     #[serde(default = "default_lock_ttl")]
@@ -323,7 +319,6 @@ pub struct CloneConfig {
 impl Default for CloneConfig {
     fn default() -> Self {
         Self {
-            freshness_threshold: default_freshness_threshold(),
             lock_ttl: default_lock_ttl(),
             lock_wait_timeout: default_lock_wait_timeout(),
             max_concurrent_upstream_clones: default_max_concurrent_upstream_clones(),
@@ -345,10 +340,6 @@ pub enum HydrationMode {
     FollowOnFetch,
     #[default]
     PublishFromCapture,
-}
-
-fn default_freshness_threshold() -> u64 {
-    600
 }
 
 fn default_lock_ttl() -> u64 {
@@ -566,9 +557,6 @@ fn default_presigned_url_ttl() -> u64 {
 pub struct RepoOverride {
     /// Override fetch interval (seconds) for this repo.
     pub fetch_interval: Option<u64>,
-    /// Deprecated compatibility knob. Serving and generation decisions are
-    /// content-based, not age-based.
-    pub freshness_threshold: Option<u64>,
     /// Force-disable bundle generation for this repo.
     pub disable_bundles: Option<bool>,
 }

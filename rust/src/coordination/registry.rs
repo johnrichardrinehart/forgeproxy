@@ -24,8 +24,6 @@ pub struct RepoInfo {
     pub bootstrap_bundle_pending: bool,
     /// S3 key where the bundle-list manifest is stored.
     pub s3_bundle_list_key: String,
-    /// Unix timestamp of the last successful fetch from the origin.
-    pub last_fetch_ts: i64,
     /// Unix timestamp of the last bundle creation.
     pub last_bundle_ts: i64,
     /// Monotonically increasing creation token for bundle URI protocol.
@@ -82,7 +80,6 @@ fn repo_info_to_pairs(info: &RepoInfo) -> Vec<(String, String)> {
             info.bootstrap_bundle_pending.to_string(),
         ),
         ("s3_bundle_list_key".into(), info.s3_bundle_list_key.clone()),
-        ("last_fetch_ts".into(), info.last_fetch_ts.to_string()),
         ("last_bundle_ts".into(), info.last_bundle_ts.to_string()),
         (
             "latest_creation_token".into(),
@@ -108,10 +105,6 @@ fn repo_info_from_map(map: HashMap<String, String>) -> RepoInfo {
             .and_then(|v| v.parse().ok())
             .unwrap_or(false),
         s3_bundle_list_key: map.get("s3_bundle_list_key").cloned().unwrap_or_default(),
-        last_fetch_ts: map
-            .get("last_fetch_ts")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
         last_bundle_ts: map
             .get("last_bundle_ts")
             .and_then(|v| v.parse().ok())
@@ -160,22 +153,6 @@ pub async fn set_repo_info(
     let pairs = repo_info_to_pairs(info);
     let _: () = pool.hset(&key, pairs).await.context("HSET repo info")?;
     debug!(%owner_repo, "repo info written");
-    Ok(())
-}
-
-/// Update a single field of repo metadata.
-pub async fn update_repo_field(
-    pool: &fred::clients::Pool,
-    owner_repo: &str,
-    field: &str,
-    value: &str,
-) -> Result<()> {
-    let key = repo_key(owner_repo);
-    let _: () = pool
-        .hset(&key, vec![(field.to_string(), value.to_string())])
-        .await
-        .context("HSET single field")?;
-    trace!(%owner_repo, %field, %value, "repo field updated");
     Ok(())
 }
 
@@ -473,7 +450,6 @@ async fn try_ensure_repo_cloned_inner(
                         publish_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore")
                             .await?;
 
-                    let now = chrono::Utc::now().timestamp();
                     let mut info = get_repo_info(&state.valkey, &owner_repo)
                         .await?
                         .unwrap_or_default();
@@ -482,9 +458,6 @@ async fn try_ensure_repo_cloned_inner(
                     info.hydrating_node_id.clear();
                     info.hydrating_since_ts = 0;
                     info.bootstrap_bundle_pending = false;
-                    if info.last_fetch_ts == 0 {
-                        info.last_fetch_ts = now;
-                    }
                     set_repo_info(&state.valkey, &owner_repo, &info).await?;
                     crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
                         .await?;
@@ -639,7 +612,6 @@ async fn try_ensure_repo_cloned_inner(
         .await?;
         let published_repo_path = state.cache_manager.repo_path(&owner_repo);
 
-        let now = chrono::Utc::now().timestamp();
         let mut info = get_repo_info(&state.valkey, &owner_repo)
             .await?
             .unwrap_or_default();
@@ -648,7 +620,6 @@ async fn try_ensure_repo_cloned_inner(
         info.hydrating_node_id.clear();
         info.hydrating_since_ts = 0;
         info.bootstrap_bundle_pending = false;
-        info.last_fetch_ts = now;
         set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
         crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id).await?;
@@ -1119,7 +1090,8 @@ async fn converge_published_repo_generation(
         "starting capture convergence follow-on git fetch"
     );
     let result = async {
-        crate::git::commands::git_fetch(&staged_repo_path, clone_url, &[]).await?;
+        let fetch_result =
+            crate::git::commands::git_fetch(&staged_repo_path, clone_url, &[]).await?;
         let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
         ensure_bare_head_ref(&staged_repo_path).await?;
         validate_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
@@ -1130,6 +1102,8 @@ async fn converge_published_repo_generation(
             repo = %owner_repo,
             destination = %published_repo_path.display(),
             clone_url = %redacted_clone_url,
+            refs_updated = fetch_result.refs_updated,
+            bytes_received = fetch_result.bytes_received,
             "capture convergence follow-on git fetch finished"
         );
         Ok(())
@@ -1288,12 +1262,14 @@ async fn hydrate_repo_from_tee_capture(
     );
     let fetch_result = crate::git::commands::git_fetch(repo_path, clone_url, &[]).await;
     let cleanup_result = cleanup_temp_want_refs(seeded_want_ref_dir.as_deref()).await;
-    fetch_result?;
+    let fetch_result = fetch_result?;
     cleanup_result?;
     info!(
         repo = %owner_repo,
         destination = %repo_path.display(),
         clone_url = %redacted_clone_url,
+        refs_updated = fetch_result.refs_updated,
+        bytes_received = fetch_result.bytes_received,
         "tee hydration follow-on git fetch finished"
     );
 
@@ -1624,12 +1600,11 @@ mod tests {
             hydrating_since_ts: 1234,
             bootstrap_bundle_pending: true,
             s3_bundle_list_key: "bundle-list".to_string(),
-            last_fetch_ts: 10,
-            last_bundle_ts: 11,
-            latest_creation_token: 12,
+            last_bundle_ts: 10,
+            latest_creation_token: 11,
             refs_hash: "abc".to_string(),
-            size_bytes: 13,
-            clone_count: 14,
+            size_bytes: 12,
+            clone_count: 13,
         };
 
         let round_trip = repo_info_from_map(repo_info_to_pairs(&info).into_iter().collect());

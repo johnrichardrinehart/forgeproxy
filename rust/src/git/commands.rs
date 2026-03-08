@@ -142,7 +142,8 @@ pub async fn git_clone_bare_local(source: &Path, dest: &Path) -> Result<()> {
 
 /// Run `git fetch <remote_url> +refs/*:refs/*` inside an existing bare repo.
 ///
-/// Returns a [`FetchResult`] summarising the update.
+/// Emits start/progress/finish logs for long-running fetches and returns a
+/// [`FetchResult`] summarising the update.
 #[instrument(skip(env_vars), fields(repo = %repo_path.display()))]
 pub async fn git_fetch(
     repo_path: &Path,
@@ -164,29 +165,78 @@ pub async fn git_fetch(
     }
 
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
+    cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
     debug!("spawning git fetch");
 
-    let output = cmd.output().await.context("failed to spawn git fetch")?;
+    let mut child = cmd.spawn().context("failed to spawn git fetch")?;
+    let pid = child.id().unwrap_or_default();
+    let started_at = std::time::Instant::now();
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture git fetch stderr")?;
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let mut stderr_buf = String::new();
+    let mut progress_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    info!(
+        repo = %repo_path.display(),
+        pid,
+        remote = %redact_url_secret(remote_url, 4),
+        "git fetch started"
+    );
+
+    let wait_fut = child.wait();
+    tokio::pin!(wait_fut);
+    let status = loop {
+        tokio::select! {
+            status = &mut wait_fut => {
+                break status.context("failed to wait on git fetch")?;
+            }
+            line = stderr_lines.next_line() => {
+                if let Some(line) = line.context("failed to read git fetch stderr")? {
+                    if !stderr_buf.is_empty() {
+                        stderr_buf.push('\n');
+                    }
+                    stderr_buf.push_str(&line);
+                    debug!(
+                        repo = %repo_path.display(),
+                        pid,
+                        progress = %line,
+                        "git fetch progress"
+                    );
+                }
+            }
+            _ = progress_interval.tick() => {
+                info!(
+                    repo = %repo_path.display(),
+                    pid,
+                    elapsed_secs = started_at.elapsed().as_secs(),
+                    "git fetch still running"
+                );
+            }
+        }
+    };
+
+    if !status.success() {
         bail!(
             "git fetch failed (status {}): {}",
-            output.status,
-            stderr.trim(),
+            status,
+            stderr_buf.trim()
         );
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let refs_updated = count_updated_refs(&stderr);
-    let bytes_received = parse_bytes_received(&stderr);
+    let refs_updated = count_updated_refs(&stderr_buf);
+    let bytes_received = parse_bytes_received(&stderr_buf);
 
-    debug!(
+    info!(
         refs_updated = refs_updated,
         bytes_received = bytes_received,
+        elapsed_secs = started_at.elapsed().as_secs(),
+        pid,
         "git fetch complete"
     );
 

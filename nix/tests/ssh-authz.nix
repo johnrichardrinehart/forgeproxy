@@ -89,7 +89,6 @@ let
       negative_cache_ttl: 60
 
     clone:
-      freshness_threshold: 60
       lock_ttl: 60
       lock_wait_timeout: 120
       max_concurrent_upstream_clones: 5
@@ -603,12 +602,10 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 1b: Uncached SSH access populates local cache ──────────────
     with subtest("Uncached SSH access triggers background cache clone"):
+        proxy.wait_until_succeeds("test -L /var/cache/forgeproxy/repos/octocat/repo-uncached.git")
         proxy.wait_until_succeeds(
-            "test -d /var/cache/forgeproxy/repos/octocat/repo-uncached.git"
-        )
-        proxy.wait_until_succeeds(
-            "redis-cli -h valkey HEXISTS 'forgeproxy:repo:octocat/repo-uncached' last_fetch_ts"
-            " | grep -qx 1"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-uncached' status"
+            " | grep -qx ready"
         )
 
     # ── Subtest 2: Privileged user, cached repo ──────────────────────────

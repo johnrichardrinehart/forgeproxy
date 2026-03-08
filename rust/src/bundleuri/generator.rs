@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::git::commands;
 
@@ -99,9 +99,14 @@ pub async fn generate_incremental_bundle(
     )
     .await
     .with_context(|| format!("git bundle create failed for {owner_repo}"))?;
-    commands::git_bundle_verify(&bundle_path)
-        .await
-        .with_context(|| format!("git bundle verify failed for {owner_repo}"))?;
+    verify_bundle_or_log(
+        &bundle_path,
+        owner_repo,
+        "incremental",
+        Some(&new_refs),
+        not_refs.len(),
+    )
+    .await?;
 
     let metadata = tokio::fs::metadata(&bundle_path)
         .await
@@ -143,9 +148,8 @@ pub async fn generate_full_bundle(
     commands::git_bundle_create(repo_path, &bundle_path, None, None)
         .await
         .with_context(|| format!("git bundle create (full) failed for {owner_repo}"))?;
-    commands::git_bundle_verify(&bundle_path)
-        .await
-        .with_context(|| format!("git bundle verify failed for {owner_repo}"))?;
+    let included_refs: Vec<String> = current_refs.keys().cloned().collect();
+    verify_bundle_or_log(&bundle_path, owner_repo, "full", Some(&included_refs), 0).await?;
 
     let metadata = tokio::fs::metadata(&bundle_path)
         .await
@@ -174,6 +178,7 @@ pub async fn generate_filtered_bundle(
     repo_path: &Path,
     owner_repo: &str,
 ) -> Result<BundleResult> {
+    let current_refs = get_refs(repo_path).await?;
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for filtered bundle")?;
     let bundle_path = tmp_dir
         .path()
@@ -184,9 +189,15 @@ pub async fn generate_filtered_bundle(
     commands::git_bundle_create_filtered(repo_path, &bundle_path, "blob:none")
         .await
         .with_context(|| format!("filtered bundle create failed for {owner_repo}"))?;
-    commands::git_bundle_verify(&bundle_path)
-        .await
-        .with_context(|| format!("filtered bundle verify failed for {owner_repo}"))?;
+    let included_refs: Vec<String> = current_refs.keys().cloned().collect();
+    verify_bundle_or_log(
+        &bundle_path,
+        owner_repo,
+        "filtered",
+        Some(&included_refs),
+        0,
+    )
+    .await?;
 
     let metadata = tokio::fs::metadata(&bundle_path)
         .await
@@ -215,4 +226,45 @@ pub async fn generate_filtered_bundle(
 #[instrument]
 pub async fn get_refs(repo_path: &Path) -> Result<HashMap<String, String>> {
     commands::git_for_each_ref(repo_path).await
+}
+
+async fn verify_bundle_or_log(
+    bundle_path: &Path,
+    owner_repo: &str,
+    bundle_kind: &str,
+    included_refs: Option<&[String]>,
+    excluded_object_count: usize,
+) -> Result<()> {
+    match commands::git_bundle_verify(bundle_path).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let bundle_size = tokio::fs::metadata(bundle_path)
+                .await
+                .map(|meta| meta.len())
+                .unwrap_or_default();
+            let included_ref_count = included_refs.map_or(0, <[String]>::len);
+            let included_ref_sample = included_refs
+                .map(|refs| {
+                    refs.iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<String>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            warn!(
+                owner_repo,
+                bundle_kind,
+                bundle_path = %bundle_path.display(),
+                bundle_size,
+                included_ref_count,
+                excluded_object_count,
+                included_ref_sample,
+                error = %error,
+                error_debug = ?error,
+                "git bundle verify failed"
+            );
+            Err(error).with_context(|| format!("git bundle verify failed for {owner_repo}"))
+        }
+    }
 }

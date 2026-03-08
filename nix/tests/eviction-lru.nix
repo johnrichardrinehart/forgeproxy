@@ -63,7 +63,6 @@ let
       negative_cache_ttl: 60
 
     clone:
-      freshness_threshold: 60
       lock_ttl: 60
       lock_wait_timeout: 120
       max_concurrent_upstream_clones: 5
@@ -354,7 +353,7 @@ pkgs.testers.runNixOSTest {
                 f"README.md content mismatch for {repo}: {output}"
 
     # ── Seed Valkey with LRU-relevant metadata ────────────────────────────
-    with subtest("Seed Valkey with last_fetch_ts and bundle_list_key"):
+    with subtest("Seed Valkey with last_bundle_ts and bundle-list metadata"):
         # Wait for clone hydration to settle, then stop forgeproxy before
         # seeding test metadata so post-clone RepoInfo writes cannot clobber
         # the values this test is trying to assert.
@@ -364,20 +363,20 @@ pkgs.testers.runNixOSTest {
             )
         proxy.succeed("systemctl stop forgeproxy")
 
-        # repo-a: fetched long ago (least recently used)
+        # repo-a: bundled long ago (least recently refreshed)
         proxy.succeed(
             "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-a'"
-            " last_fetch_ts 1000000"
+            " last_bundle_ts 1000000"
         )
-        # repo-b: fetched recently
+        # repo-b: bundled recently
         proxy.succeed(
             "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-b'"
-            " last_fetch_ts 1700000000"
+            " last_bundle_ts 1700000000"
         )
-        # repo-c: fetched very recently (most recently used)
+        # repo-c: bundled very recently (most recently refreshed)
         proxy.succeed(
             "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-c'"
-            " last_fetch_ts 1700000999"
+            " last_bundle_ts 1700000999"
         )
 
         # Set bundle_list_key for all repos (required for eviction eligibility)
@@ -388,22 +387,22 @@ pkgs.testers.runNixOSTest {
             )
 
     # ── Verify Valkey state is correct ─────────────────────────────────────
-    with subtest("Verify Valkey last_fetch_ts values are set correctly"):
+    with subtest("Verify Valkey last_bundle_ts values are set correctly"):
         ts_a = proxy.succeed(
-            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-a' last_fetch_ts"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-a' last_bundle_ts"
         ).strip()
         ts_b = proxy.succeed(
-            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-b' last_fetch_ts"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-b' last_bundle_ts"
         ).strip()
         ts_c = proxy.succeed(
-            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-c' last_fetch_ts"
+            "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-c' last_bundle_ts"
         ).strip()
 
-        assert ts_a == "1000000", f"Expected repo-a last_fetch_ts=1000000, got {ts_a}"
-        assert ts_b == "1700000000", f"Expected repo-b last_fetch_ts=1700000000, got {ts_b}"
-        assert ts_c == "1700000999", f"Expected repo-c last_fetch_ts=1700000999, got {ts_c}"
+        assert ts_a == "1000000", f"Expected repo-a last_bundle_ts=1000000, got {ts_a}"
+        assert ts_b == "1700000000", f"Expected repo-b last_bundle_ts=1700000000, got {ts_b}"
+        assert ts_c == "1700000999", f"Expected repo-c last_bundle_ts=1700000999, got {ts_c}"
 
-        # Under LRU, repo-a (oldest ts) should be the first eviction candidate
+        # Under LRU, repo-a (oldest bundle ts) should be the first eviction candidate
         assert int(ts_a) < int(ts_b) < int(ts_c), \
             f"Expected ts_a < ts_b < ts_c for LRU ordering, got {ts_a}, {ts_b}, {ts_c}"
 
