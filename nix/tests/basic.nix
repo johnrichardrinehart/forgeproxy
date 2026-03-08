@@ -71,7 +71,6 @@ let
       negative_cache_ttl: 60
 
     clone:
-      freshness_threshold: 60
       lock_ttl: 60
       lock_wait_timeout: 120
       max_concurrent_upstream_clones: 5
@@ -109,7 +108,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-basic";
-  globalTimeout = 600;
+  globalTimeout = 180;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -339,6 +338,13 @@ pkgs.testers.runNixOSTest {
             " -u octocat:secret123"
             ' -d \'{"name": "hello-world", "auto_init": false}\'''
         )
+        ghe.succeed(
+            "curl -sf"
+            " -X POST http://localhost:3000/api/v1/user/repos"
+            " -H 'Content-Type: application/json'"
+            " -u octocat:secret123"
+            ' -d \'{"name": "shallow-only", "auto_init": false}\'''
+        )
 
         # Push initial content
         ghe.succeed(
@@ -352,6 +358,19 @@ pkgs.testers.runNixOSTest {
             "git add README.md && "
             "git commit -m 'Initial commit' && "
             "git remote add origin http://octocat:secret123@localhost:3000/octocat/hello-world.git && "
+            "git push -u origin main"
+        )
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo 'Shallow repo' > README.md && "
+            "git add README.md && "
+            "git commit -m 'Initial commit' && "
+            "git remote add origin http://octocat:secret123@localhost:3000/octocat/shallow-only.git && "
             "git push -u origin main"
         )
 
@@ -412,5 +431,64 @@ pkgs.testers.runNixOSTest {
         )
         output = client.succeed("cat /tmp/repo/README.md")
         assert "Hello World" in output, f"README.md content mismatch: {output}"
+
+    with subtest("Initial clone publishes a generation"):
+        proxy.wait_until_succeeds(
+            "test -L /var/cache/forgeproxy/repos/octocat/hello-world.git"
+        )
+        proxy.wait_until_succeeds(
+            "find /var/cache/forgeproxy/repos/.generations/octocat/hello-world.git -mindepth 1 -maxdepth 1 -type d | grep -q ."
+        )
+
+    with subtest("Pinned fetch still uses cache after waiting"):
+        client.succeed("sleep 6")
+        client.succeed(
+            "rm -rf /tmp/pinnedfetch && "
+            "git init /tmp/pinnedfetch && "
+            "git -C /tmp/pinnedfetch remote add origin https://octocat:secret123@proxy/octocat/hello-world.git && "
+            "git -C /tmp/pinnedfetch fetch origin main"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack from local cache'"
+        )
+
+    with subtest("Mutable ref updates converge a new generation asynchronously"):
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "git clone http://octocat:secret123@localhost:3000/octocat/hello-world.git $tmp && "
+            "cd $tmp && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo 'Second commit' >> README.md && "
+            "git add README.md && "
+            "git commit -m 'Second commit' && "
+            "git push origin main"
+        )
+        updated_rev = ghe.succeed(
+            "git ls-remote http://octocat:secret123@localhost:3000/octocat/hello-world.git refs/heads/main | cut -f1"
+        ).strip()
+        client.succeed("git -C /tmp/repo fetch origin main")
+        proxy.wait_until_succeeds(
+            f"git --git-dir /var/cache/forgeproxy/repos/octocat/hello-world.git rev-parse refs/heads/main | grep -Fx '{updated_rev}'"
+        )
+
+    with subtest("Shallow-first clone still results in a stored generation"):
+        client.succeed(
+            "rm -rf /tmp/shallow-only && "
+            "git clone --depth=1 https://octocat:secret123@proxy/octocat/shallow-only.git /tmp/shallow-only"
+        )
+        proxy.wait_until_succeeds(
+            "test -L /var/cache/forgeproxy/repos/octocat/shallow-only.git"
+        )
+        proxy.wait_until_succeeds(
+            "find /var/cache/forgeproxy/repos/.generations/octocat/shallow-only.git -mindepth 1 -maxdepth 1 -type d | grep -q ."
+        )
+
+    with subtest("Successful clone cleans tee capture"):
+        proxy.wait_until_succeeds(
+            "! test -d /var/cache/forgeproxy/repos/_tee/octocat/hello-world || "
+            "find /var/cache/forgeproxy/repos/_tee/octocat/hello-world -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
+        )
   '';
 }

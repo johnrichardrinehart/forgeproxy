@@ -178,6 +178,8 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    users.groups.forgeproxy-cache = { };
+
     # ── systemd service ────────────────────────────────────────────────
     systemd.services.forgeproxy = {
       description = "Git Caching Reverse Proxy";
@@ -202,6 +204,8 @@ in
         # Secrets in the user keyring (@u) are scoped to this UID, so only
         # processes inside forgeproxy.service can access them.
         DynamicUser = true;
+        SupplementaryGroups = [ "forgeproxy-cache" ];
+        UMask = "0002";
 
         # Links the user keyring (@u) into each process's session keyring.
         # Without this, keys in @u are addressable but not "possessed" by
@@ -214,10 +218,11 @@ in
         Restart = "on-failure";
         RestartSec = 5;
 
-        # Directories managed by systemd (created automatically).
+        # RuntimeDirectory is per-service. The shared cache tree is managed
+        # separately via tmpfiles plus forgeproxy-cache group permissions.
         StateDirectory = "forgeproxy";
-        CacheDirectory = "forgeproxy";
         RuntimeDirectory = "forgeproxy";
+        ReadWritePaths = [ cfg.cacheDir ];
 
         # ── Hardening ────────────────────────────────────────────────
         # DynamicUser=true already implies: ProtectSystem=strict,
@@ -245,7 +250,9 @@ in
           serviceConfig = {
             Type = "oneshot";
             DynamicUser = true;
-            CacheDirectory = "forgeproxy";
+            SupplementaryGroups = [ "forgeproxy-cache" ];
+            UMask = "0002";
+            ReadWritePaths = [ cfg.cacheDir ];
             ProtectKernelTunables = true;
             ProtectKernelModules = true;
             ProtectControlGroups = true;
@@ -271,6 +278,12 @@ in
             Unit = "forgeproxy-cache-scrub.service";
           };
         };
+
+    systemd.tmpfiles.rules = [
+      "d ${cfg.cacheDir} 2775 root forgeproxy-cache - -"
+      "d ${cfg.cacheDir}/repos 2775 root forgeproxy-cache - -"
+      "d ${cfg.cacheDir}/repos/_tee 2775 root forgeproxy-cache - -"
+    ];
 
     # ── System packages required at runtime ────────────────────────────
     environment.systemPackages = with pkgs; [

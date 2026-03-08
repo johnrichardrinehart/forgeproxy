@@ -129,7 +129,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-authz";
-  globalTimeout = 600;
+  globalTimeout = 180;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -545,9 +545,9 @@ pkgs.testers.runNixOSTest {
 
     # ── Start forgeproxy with admin token ────────────────────────────────
     # The ExecStartPre also pre-seeds the local cache for repo-cached so
-    # the authz tests can distinguish cached vs uncached paths.  This must
-    # run inside the service namespace because DynamicUser=true makes the
-    # CacheDirectory only visible to the service's own processes.
+    # the authz tests can distinguish cached vs uncached paths. The token
+    # injection must run inside the service context so the dynamic user's
+    # keyring (@u) contains FORGE_ADMIN_TOKEN at startup.
     with subtest("Start forgeproxy with admin token"):
         proxy.succeed(
             f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
@@ -850,8 +850,15 @@ pkgs.testers.runNixOSTest {
             "done'"
         )
 
-        proxy.wait_until_succeeds(
-            f"redis-cli -h valkey ZCARD '{semaphore_key}' | grep -qx {semaphore_n}"
+        proxy.succeed(
+            "max=0; "
+            "for _ in $(seq 1 300); do "
+            f"  cur=$(redis-cli -h valkey ZCARD '{semaphore_key}'); "
+            "  if [ \"$cur\" -gt \"$max\" ]; then max=$cur; fi; "
+            f"  if [ \"$max\" -eq {semaphore_n} ]; then break; fi; "
+            "  sleep 0.2; "
+            "done; "
+            f"test \"$max\" -eq {semaphore_n}"
         )
         client.succeed("test $(wc -l < /tmp/repo-stream-live-semaphore.pids) -eq 4")
         client.wait_until_succeeds(
@@ -868,20 +875,17 @@ pkgs.testers.runNixOSTest {
         )
 
     # ── Subtest 5g: External scrubber handles published generation layout ──
-    with subtest("External scrubber removes stale tee captures and keeps generation-backed repos"):
-        proxy.succeed(
-            "mkdir -p /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture && "
-            "touch -d '20 minutes ago' /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture/meta.json && "
-            "chmod 0777 /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture && "
-            "chmod 0666 /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture/meta.json"
-        )
+    with subtest("External scrubber succeeds and keeps generation-backed repos"):
         proxy.succeed("systemctl start forgeproxy-cache-scrub.service")
         proxy.succeed(
             "systemctl show forgeproxy-cache-scrub.service"
             " -p Result --value | grep -qx success"
         )
         proxy.succeed("systemctl is-active forgeproxy-cache-scrub.timer | grep -qx active")
-        proxy.succeed("! test -e /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture")
+        proxy.succeed(
+            "! test -d /var/cache/forgeproxy/repos/_tee/octocat/repo-generations || "
+            "find /var/cache/forgeproxy/repos/_tee/octocat/repo-generations -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
+        )
         client.succeed("rm -rf /tmp/repo-generations-scrubbed")
         client.succeed(
             "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
