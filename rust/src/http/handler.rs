@@ -30,6 +30,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::AppState;
+use crate::coordination::registry::LocalServeDecision;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -227,19 +228,89 @@ async fn handle_upload_pack(
     let wants = crate::tee_hydration::parse_fetch_request_metadata(&body)
         .map(|meta| meta.want_oids)
         .unwrap_or_default();
-    let can_serve_locally =
-        crate::coordination::registry::repo_can_satisfy_wants(&state, &repo_slug, &wants)
-            .await
-            .unwrap_or(false);
+    let want_sample = wants
+        .iter()
+        .take(5)
+        .map(|want| want.chars().take(12).collect::<String>())
+        .collect::<Vec<String>>()
+        .join(",");
+    let local_decision = match crate::coordination::registry::classify_local_wants_satisfaction(
+        &state, &repo_slug, &wants,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+        Err(error) => {
+            warn!(
+                repo = %repo_slug,
+                wants = wants.len(),
+                want_sample,
+                error = %error,
+                "failed to classify local upload-pack serveability; proxying upstream"
+            );
+            LocalServeDecision::Unavailable {
+                had_local_repo_before_check: state.cache_manager.has_repo(&repo_slug),
+                restored_from_s3_for_request: false,
+            }
+        }
+    };
 
-    if can_serve_locally {
-        info!("serving upload-pack from local cache");
-        return serve_local_upload_pack(&state, &owner, &repo, &body, git_protocol.as_deref())
-            .await;
+    match &local_decision {
+        LocalServeDecision::SatisfiesWants {
+            restored_from_s3_for_request,
+            want_count,
+            ..
+        } => {
+            info!(
+                repo = %repo_slug,
+                wants = *want_count,
+                want_sample,
+                restored_from_s3_for_request = *restored_from_s3_for_request,
+                "serving upload-pack directly from local disk"
+            );
+            return serve_local_upload_pack(&state, &owner, &repo, &body, git_protocol.as_deref())
+                .await;
+        }
+        LocalServeDecision::Unavailable {
+            had_local_repo_before_check,
+            restored_from_s3_for_request,
+        } => {
+            info!(
+                repo = %repo_slug,
+                wants = wants.len(),
+                want_sample,
+                had_local_repo_before_check = *had_local_repo_before_check,
+                restored_from_s3_for_request = *restored_from_s3_for_request,
+                "cannot serve upload-pack from local disk; no local published repo or request-time S3 restore is available"
+            );
+        }
+        LocalServeDecision::MissingWantedObjects {
+            had_local_repo_before_check,
+            restored_from_s3_for_request,
+            want_count,
+            missing_wants,
+        } => {
+            let missing_sample = missing_wants
+                .iter()
+                .take(5)
+                .map(|want| want.chars().take(12).collect::<String>())
+                .collect::<Vec<String>>()
+                .join(",");
+            info!(
+                repo = %repo_slug,
+                wants = *want_count,
+                missing_wants = missing_wants.len(),
+                want_sample,
+                missing_sample,
+                had_local_repo_before_check = *had_local_repo_before_check,
+                restored_from_s3_for_request = *restored_from_s3_for_request,
+                "local disk can only partially satisfy upload-pack request; proxying upstream for missing objects or completeness"
+            );
+        }
     }
 
     // Proxy to upstream forge.
-    info!("proxying upload-pack to upstream forge");
+    info!(repo = %repo_slug, "proxying upload-pack to upstream forge");
     let response =
         proxy_upload_pack_to_upstream(&state, &owner, &repo, auth_header.as_deref(), body).await?;
 
@@ -474,6 +545,23 @@ async fn proxy_upload_pack_to_upstream(
             .text()
             .await
             .unwrap_or_else(|_| String::from("<unreadable>"));
+        let owner_repo = format!("{owner}/{repo}");
+        let wants = crate::tee_hydration::parse_fetch_request_metadata(&capture_body)
+            .map(|meta| meta.want_oids)
+            .unwrap_or_default();
+        let want_sample = wants
+            .iter()
+            .take(5)
+            .map(|want| want.chars().take(12).collect::<String>())
+            .collect::<Vec<String>>()
+            .join(",");
+        error!(
+            repo = %owner_repo,
+            status = %status,
+            wants = wants.len(),
+            want_sample,
+            "cannot satisfy HTTP upload-pack request from local disk and upstream upload-pack failed"
+        );
         return Ok((
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             text,
