@@ -307,6 +307,10 @@ pub struct CloneConfig {
     /// forgeproxy instance.
     #[serde(default = "default_max_concurrent_upstream_clones_per_repo_per_instance")]
     pub max_concurrent_upstream_clones_per_repo_per_instance: usize,
+    /// Strategy used after tee capture successfully materializes the cloned
+    /// pack into a staging generation.
+    #[serde(default)]
+    pub hydration_mode: HydrationMode,
 }
 
 impl Default for CloneConfig {
@@ -321,8 +325,17 @@ impl Default for CloneConfig {
                 default_max_concurrent_upstream_clones_per_repo_across_instances(),
             max_concurrent_upstream_clones_per_repo_per_instance:
                 default_max_concurrent_upstream_clones_per_repo_per_instance(),
+            hydration_mode: HydrationMode::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HydrationMode {
+    FollowOnFetch,
+    #[default]
+    PublishFromCapture,
 }
 
 fn default_freshness_threshold() -> u64 {
