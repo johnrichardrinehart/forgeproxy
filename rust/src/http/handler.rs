@@ -218,15 +218,23 @@ async fn handle_upload_pack(
         .await
         .map_err(|e| AppError::Unauthorized(e.to_string()))?;
 
-    // Check if repo is cached locally and fresh.
     let repo_slug = format!("{}/{}", owner, repo);
-    let cached = crate::coordination::registry::is_repo_cached_and_fresh(&state, &repo_slug)
-        .await
-        .unwrap_or(false);
+    let git_protocol = headers
+        .get("Git-Protocol")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let wants = crate::tee_hydration::parse_fetch_request_metadata(&body)
+        .map(|meta| meta.want_oids)
+        .unwrap_or_default();
+    let can_serve_locally =
+        crate::coordination::registry::repo_can_satisfy_wants(&state, &repo_slug, &wants)
+            .await
+            .unwrap_or(false);
 
-    if cached {
+    if can_serve_locally {
         info!("serving upload-pack from local cache");
-        return serve_local_upload_pack(&state, &owner, &repo, &body).await;
+        return serve_local_upload_pack(&state, &owner, &repo, &body, git_protocol.as_deref())
+            .await;
     }
 
     // Proxy to upstream forge.
@@ -364,18 +372,23 @@ async fn serve_local_upload_pack(
     owner: &str,
     repo: &str,
     request_body: &[u8],
+    git_protocol: Option<&str>,
 ) -> Result<Response, AppError> {
     let repo_path = state.cache_manager.repo_path(&format!("{owner}/{repo}"));
 
-    let mut child = Command::new("git")
-        .arg("upload-pack")
+    let mut cmd = Command::new("git");
+    cmd.arg("upload-pack")
         .arg("--stateless-rpc")
+        .arg("--strict")
         .arg(&repo_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn git upload-pack")?;
+        .stderr(std::process::Stdio::piped());
+    if let Some(proto) = git_protocol {
+        cmd.env("GIT_PROTOCOL", proto);
+    }
+
+    let mut child = cmd.spawn().context("failed to spawn git upload-pack")?;
 
     // Write the request body to stdin.
     if let Some(mut stdin) = child.stdin.take() {
@@ -388,6 +401,10 @@ async fn serve_local_upload_pack(
         .stdout
         .take()
         .context("failed to capture git upload-pack stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("failed to capture git upload-pack stderr")?;
 
     // Stream stdout as the response body.
     let stream = ReaderStream::new(stdout);
@@ -395,9 +412,17 @@ async fn serve_local_upload_pack(
 
     // Reap the child in the background so we don't leak processes.
     tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+
+        let mut stderr_buf = Vec::new();
+        let _ = stderr.read_to_end(&mut stderr_buf).await;
         match child.wait().await {
             Ok(status) if !status.success() => {
-                warn!(%status, "git upload-pack exited with non-zero status");
+                warn!(
+                    %status,
+                    stderr = %String::from_utf8_lossy(&stderr_buf),
+                    "git upload-pack exited with non-zero status"
+                );
             }
             Err(e) => {
                 error!(error = %e, "failed to wait on git upload-pack");
@@ -534,7 +559,9 @@ async fn proxy_upload_pack_to_upstream(
                 }
                 Err(e) => {
                     if let Some(active_capture) = capture.take() {
+                        let capture_dir = active_capture.dir().to_path_buf();
                         let _ = active_capture.finish(false).await;
+                        let _ = tokio::fs::remove_dir_all(capture_dir).await;
                     }
                     let _ = tx.send(Err(e)).await;
                     return;

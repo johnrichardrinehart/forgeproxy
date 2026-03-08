@@ -74,9 +74,14 @@ pub struct AppState {
     /// same repository within this instance.
     pub repo_clone_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
     /// Per-repo local mutex cache serializing publish/prune and immediate
-    /// post-publish work so concurrent hydrations cannot invalidate each
-    /// other's published target mid-flight.
+    /// generation mutation work while allowing clone/fetch hydration to run
+    /// concurrently up to the configured per-repo limits.
     pub repo_publish_mutexes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
+    /// In-flight staged generation directories per repo. This lets publish/prune
+    /// avoid deleting another request's active staging area.
+    pub active_repo_generations: Arc<
+        Mutex<std::collections::HashMap<String, std::collections::HashSet<std::path::PathBuf>>>,
+    >,
     /// Most recent upstream `info/refs` advertisement we proxied for a repo.
     /// HTTP clones do not give us a stable request-scoped handle across the
     /// advertisement and fetch POST, so we keep a short-lived in-memory copy.
@@ -337,6 +342,19 @@ async fn main() -> Result<()> {
         }
     });
 
+    let tee_cleanup_handle = tokio::spawn({
+        let base_path = state.cache_manager.base_path.clone();
+        let interval = std::time::Duration::from_secs(state.config.clone.tee_cleanup_interval_secs);
+        let retention = std::time::Duration::from_secs(state.config.clone.tee_retention_secs);
+        async move {
+            if let Err(e) =
+                crate::tee_hydration::run_tee_cleanup_loop(base_path, interval, retention).await
+            {
+                tracing::error!(error = %e, "tee cleanup janitor failed");
+            }
+        }
+    });
+
     let heartbeat_handle = tokio::spawn({
         let s = state.clone();
         async move {
@@ -353,6 +371,7 @@ async fn main() -> Result<()> {
         http_handle.abort_handle(),
         ssh_handle.abort_handle(),
         bundle_handle.abort_handle(),
+        tee_cleanup_handle.abort_handle(),
         heartbeat_handle.abort_handle(),
         telemetry_handle.abort_handle(),
     ];
@@ -426,6 +445,7 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
         repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_publish_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        active_repo_generations: Arc::new(Mutex::new(std::collections::HashMap::new())),
         recent_info_refs_advertisements: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }

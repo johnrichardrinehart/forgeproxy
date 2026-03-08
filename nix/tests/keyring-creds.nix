@@ -110,7 +110,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-keyring-creds";
-  globalTimeout = 600;
+  globalTimeout = 180;
 
   # ---------------------------------------------------------------------------
   # Node definitions

@@ -140,6 +140,140 @@ fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32
     session.close(channel_id);
 }
 
+struct LocalUploadPackResponseContext {
+    handle: russh::server::Handle,
+    channel_states: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
+    channel_id: ChannelId,
+    stream_channel: Option<Channel<Msg>>,
+    should_close_channel: bool,
+}
+
+async fn serve_local_upload_pack_once(
+    state: &AppState,
+    owner_repo: &str,
+    request_body: &[u8],
+    git_protocol: Option<&str>,
+    response: LocalUploadPackResponseContext,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let LocalUploadPackResponseContext {
+        handle,
+        channel_states,
+        channel_id,
+        stream_channel,
+        should_close_channel,
+    } = response;
+
+    let repo_path = state.cache_manager.repo_path(owner_repo);
+    let mut cmd = Command::new("git");
+    cmd.arg("upload-pack")
+        .arg("--stateless-rpc")
+        .arg("--strict")
+        .arg(&repo_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(proto) = git_protocol {
+        cmd.env("GIT_PROTOCOL", proto);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            error!(repo = %owner_repo, error = %error, "failed to spawn local git upload-pack");
+            if should_close_channel {
+                let _ = handle.exit_status_request(channel_id, 1).await;
+                let _ = handle.eof(channel_id).await;
+                if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+                    state.stream_finished = true;
+                    state.exit_status_sent = true;
+                    state.eof_sent = true;
+                    state.close_sent = true;
+                }
+                let _ = handle.close(channel_id).await;
+            }
+            return;
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(error) = stdin.write_all(request_body).await
+    {
+        error!(repo = %owner_repo, error = %error, "failed to write buffered request to local git upload-pack");
+    }
+
+    let Some(mut stdout) = child.stdout.take() else {
+        error!(repo = %owner_repo, "missing stdout from local git upload-pack");
+        return;
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        error!(repo = %owner_repo, "missing stderr from local git upload-pack");
+        return;
+    };
+
+    let mut writer = stream_channel.map(|channel| channel.make_writer());
+    let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
+    loop {
+        match stdout.read(&mut stdout_buf).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let chunk = &stdout_buf[..read];
+                if let Some(writer) = writer.as_mut() {
+                    if let Err(error) = writer.write_all(chunk).await {
+                        warn!(repo = %owner_repo, error = %error, "failed to stream local git upload-pack output via channel writer");
+                        break;
+                    }
+                } else if handle
+                    .data(channel_id, CryptoVec::from_slice(chunk))
+                    .await
+                    .is_err()
+                {
+                    warn!(repo = %owner_repo, "client disconnected during local git upload-pack response");
+                    break;
+                }
+            }
+            Err(error) => {
+                error!(repo = %owner_repo, error = %error, "failed to read local git upload-pack stdout");
+                break;
+            }
+        }
+    }
+
+    let mut stderr_buf = Vec::new();
+    let _ = stderr.read_to_end(&mut stderr_buf).await;
+    match child.wait().await {
+        Ok(status) if !status.success() => {
+            warn!(
+                repo = %owner_repo,
+                %status,
+                stderr = %String::from_utf8_lossy(&stderr_buf),
+                "local git upload-pack exited with non-zero status"
+            );
+        }
+        Err(error) => {
+            error!(repo = %owner_repo, error = %error, "failed to wait on local git upload-pack");
+        }
+        _ => {}
+    }
+
+    if should_close_channel {
+        if let Some(writer) = writer.as_mut() {
+            let _ = writer.shutdown().await;
+        } else {
+            let _ = handle.eof(channel_id).await;
+        }
+        let _ = handle.exit_status_request(channel_id, 0).await;
+        if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+            state.stream_finished = true;
+            state.exit_status_sent = true;
+            state.eof_sent = true;
+            state.close_sent = true;
+        }
+        let _ = handle.close(channel_id).await;
+    }
+}
+
 fn parse_pkt_line_len(header: &[u8]) -> Option<usize> {
     if header.len() != 4 {
         return None;
@@ -945,12 +1079,10 @@ impl Handler for SshSession {
                     "handling git-upload-pack"
                 );
 
-                let repo_cached_and_fresh =
-                    crate::coordination::registry::is_repo_cached_and_fresh(&self.state, &repo)
-                        .await
-                        .unwrap_or(false);
+                let repo_cached_locally = self.cache_manager.has_repo(&repo);
+                let route_v2_through_upstream = self.git_protocol.as_deref() == Some("version=2");
 
-                if repo_cached_and_fresh {
+                if repo_cached_locally && !route_v2_through_upstream {
                     // ── Serve from local cache via bidirectional upload-pack ──
                     info!(repo = %repo, "serving git-upload-pack from local cache");
                     let Some(channel) = self.channels.remove(&channel_id) else {
@@ -1219,6 +1351,34 @@ async fn proxy_upstream_upload_pack(
         git_protocol,
         request_kind,
     } = request;
+    if request_kind == V2RequestKind::Fetch {
+        let wants = crate::tee_hydration::parse_fetch_request_metadata(&want_have)
+            .map(|meta| meta.want_oids)
+            .unwrap_or_default();
+        let can_serve_locally =
+            crate::coordination::registry::repo_can_satisfy_wants(&state, &owner_repo, &wants)
+                .await
+                .unwrap_or(false);
+        if can_serve_locally {
+            info!(repo = %owner_repo, wants = wants.len(), "serving SSH fetch from local cache after upstream ref resolution");
+            serve_local_upload_pack_once(
+                &state,
+                &owner_repo,
+                &want_have,
+                git_protocol.as_deref(),
+                LocalUploadPackResponseContext {
+                    handle: handle.clone(),
+                    channel_states: Arc::clone(&channel_states),
+                    channel_id,
+                    stream_channel,
+                    should_close_channel: behavior.should_close_channel,
+                },
+            )
+            .await;
+            return;
+        }
+    }
+
     match super::upstream::post_upload_pack_stream(
         &state,
         &owner_repo,
@@ -1241,7 +1401,37 @@ async fn proxy_upstream_upload_pack(
             } else {
                 None
             };
-            let mut capture = if behavior.capture_for_hydration {
+            let mut hydration_permits = if behavior.capture_for_hydration {
+                match crate::coordination::registry::try_acquire_clone_hydration_permits(
+                    &state,
+                    &owner_repo,
+                )
+                .await
+                {
+                    Ok(Some(permits)) => Some(permits),
+                    Ok(None) => {
+                        info!(
+                            repo = %owner_repo,
+                            per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
+                            cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
+                            lease_ttl_secs = state.config.clone.lock_ttl,
+                            "skipping tee hydration because the repo clone semaphore is saturated"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            repo = %owner_repo,
+                            error = %e,
+                            "failed to acquire clone hydration permits for SSH miss"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let mut capture = if behavior.capture_for_hydration && hydration_permits.is_some() {
                 match crate::tee_hydration::TeeCapture::start(
                     &state.cache_manager.base_path,
                     &owner_repo,
@@ -1294,6 +1484,18 @@ async fn proxy_upstream_upload_pack(
             } else {
                 None
             };
+            if capture.is_none()
+                && let Some(permits) = hydration_permits.take()
+                && let Err(e) =
+                    crate::coordination::registry::release_clone_hydration_permits(&state, permits)
+                        .await
+            {
+                warn!(
+                    repo = %owner_repo,
+                    error = %e,
+                    "failed to release clone hydration permits after tee capture setup failure"
+                );
+            }
             while let Some(chunk_result) =
                 std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
             {
@@ -1365,7 +1567,21 @@ async fn proxy_upstream_upload_pack(
             }
             if had_error {
                 if let Some(active_capture) = capture.take() {
+                    let capture_dir = active_capture.dir().to_path_buf();
                     let _ = active_capture.finish(false).await;
+                    let _ = tokio::fs::remove_dir_all(capture_dir).await;
+                }
+                if let Some(permits) = hydration_permits.take()
+                    && let Err(e) = crate::coordination::registry::release_clone_hydration_permits(
+                        &state, permits,
+                    )
+                    .await
+                {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %e,
+                        "failed to release clone hydration permits after SSH proxy error"
+                    );
                 }
                 if behavior.should_close_channel {
                     let _ = handle.exit_status_request(channel_id, 1).await;
@@ -1389,25 +1605,71 @@ async fn proxy_upstream_upload_pack(
                         let repo_bg = repo.to_string();
                         let owner_repo_bg = owner_repo.clone();
                         let auth_bg = auth_header.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                        if let Some(permits) = hydration_permits.take() {
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned_from_tee_with_permits(
                                     &state_bg,
                                     &owner_bg,
                                     &repo_bg,
                                     auth_bg.as_deref(),
                                     capture_dir,
+                                    permits,
                                 )
                                 .await
-                            {
-                                warn!(
-                                    repo = %owner_repo_bg,
-                                    error = %e,
-                                    "tee hydration after SSH miss failed"
-                                );
-                            }
-                        });
+                                {
+                                    warn!(
+                                        repo = %owner_repo_bg,
+                                        error = %e,
+                                        "tee hydration after SSH miss failed"
+                                    );
+                                }
+                            });
+                        } else {
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                                        &state_bg,
+                                        &owner_bg,
+                                        &repo_bg,
+                                        auth_bg.as_deref(),
+                                        capture_dir,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        repo = %owner_repo_bg,
+                                        error = %e,
+                                        "tee hydration after SSH miss failed"
+                                    );
+                                }
+                            });
+                        }
+                    } else if let Some(permits) = hydration_permits.take()
+                        && let Err(e) =
+                            crate::coordination::registry::release_clone_hydration_permits(
+                                &state, permits,
+                            )
+                            .await
+                    {
+                        warn!(
+                            repo = %owner_repo,
+                            error = %e,
+                            "failed to release clone hydration permits after invalid owner/repo split"
+                        );
                     }
+                }
+                if capture.is_none()
+                    && let Some(permits) = hydration_permits.take()
+                    && let Err(e) = crate::coordination::registry::release_clone_hydration_permits(
+                        &state, permits,
+                    )
+                    .await
+                {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %e,
+                        "failed to release clone hydration permits after SSH miss completed without capture"
+                    );
                 }
                 if behavior.should_close_channel {
                     let _ = handle.exit_status_request(channel_id, 0).await;
