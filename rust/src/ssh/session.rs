@@ -25,6 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::AppState;
 use crate::cache::CacheManager;
+use crate::coordination::registry::LocalServeDecision;
 
 /// Upper bound for a single SSH channel data message payload.
 ///
@@ -1210,7 +1211,7 @@ impl Handler for SshSession {
 
                 if repo_cached_locally && !route_v2_through_upstream {
                     // ── Serve from local cache via bidirectional upload-pack ──
-                    info!(repo = %repo, "serving git-upload-pack from local cache");
+                    info!(repo = %repo, "serving git-upload-pack directly from local disk");
                     let Some(channel) = self.channels.remove(&channel_id) else {
                         error!(repo = %repo, channel = ?channel_id, "missing SSH channel handle for cached upload-pack");
                         session.extended_data(
@@ -1363,12 +1364,18 @@ impl Handler for SshSession {
                         }
                     }
                 } else {
-                    // Repository is not in local cache — proxy upstream via HTTP
-                    // smart protocol.  Phase 1: fetch ref advertisement (async,
-                    // via background task so we don't block the russh event
-                    // loop and match the same handle.data() pattern used by the
-                    // cached path).  Phase 2 happens in `channel_eof`.
-                    warn!(repo = %repo, "repository not in local cache; proxying upstream");
+                    if route_v2_through_upstream {
+                        info!(
+                            repo = %repo,
+                            has_local_repo = repo_cached_locally,
+                            "SSH protocol v2 requires upstream ref resolution before deciding whether local disk can satisfy the fetch"
+                        );
+                    } else {
+                        info!(
+                            repo = %repo,
+                            "cannot serve SSH upload-pack directly from local disk; proxying upstream"
+                        );
+                    }
 
                     // Capture whether this session has a resolved username.
                     // Auth is fail-closed, so this should be true in normal
@@ -1513,27 +1520,99 @@ async fn proxy_upstream_upload_pack(
         let wants = crate::tee_hydration::parse_fetch_request_metadata(&want_have)
             .map(|meta| meta.want_oids)
             .unwrap_or_default();
-        let can_serve_locally =
-            crate::coordination::registry::repo_can_satisfy_wants(&state, &owner_repo, &wants)
-                .await
-                .unwrap_or(false);
-        if can_serve_locally {
-            info!(repo = %owner_repo, wants = wants.len(), "serving SSH fetch from local cache after upstream ref resolution");
-            serve_local_upload_pack_once(
-                &state,
-                &owner_repo,
-                &want_have,
-                git_protocol.as_deref(),
-                LocalUploadPackResponseContext {
-                    handle: handle.clone(),
-                    channel_states: Arc::clone(&channel_states),
-                    channel_id,
-                    stream_channel,
-                    should_close_channel: behavior.should_close_channel,
-                },
-            )
-            .await;
-            return;
+        let want_sample = wants
+            .iter()
+            .take(5)
+            .map(|want| want.chars().take(12).collect::<String>())
+            .collect::<Vec<String>>()
+            .join(",");
+        let local_decision = match crate::coordination::registry::classify_local_wants_satisfaction(
+            &state,
+            &owner_repo,
+            &wants,
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    wants = wants.len(),
+                    want_sample,
+                    error = %error,
+                    "failed to classify local SSH fetch serveability; proxying upstream"
+                );
+                LocalServeDecision::Unavailable {
+                    had_local_repo_before_check: state.cache_manager.has_repo(&owner_repo),
+                    restored_from_s3_for_request: false,
+                }
+            }
+        };
+        match &local_decision {
+            LocalServeDecision::SatisfiesWants {
+                restored_from_s3_for_request,
+                want_count,
+                ..
+            } => {
+                info!(
+                    repo = %owner_repo,
+                    wants = *want_count,
+                    want_sample,
+                    restored_from_s3_for_request = *restored_from_s3_for_request,
+                    "serving SSH fetch directly from local disk after want resolution"
+                );
+                serve_local_upload_pack_once(
+                    &state,
+                    &owner_repo,
+                    &want_have,
+                    git_protocol.as_deref(),
+                    LocalUploadPackResponseContext {
+                        handle: handle.clone(),
+                        channel_states: Arc::clone(&channel_states),
+                        channel_id,
+                        stream_channel,
+                        should_close_channel: behavior.should_close_channel,
+                    },
+                )
+                .await;
+                return;
+            }
+            LocalServeDecision::Unavailable {
+                had_local_repo_before_check,
+                restored_from_s3_for_request,
+            } => {
+                info!(
+                    repo = %owner_repo,
+                    wants = wants.len(),
+                    want_sample,
+                    had_local_repo_before_check = *had_local_repo_before_check,
+                    restored_from_s3_for_request = *restored_from_s3_for_request,
+                    "cannot serve SSH fetch from local disk; no local published repo or request-time S3 restore is available"
+                );
+            }
+            LocalServeDecision::MissingWantedObjects {
+                had_local_repo_before_check,
+                restored_from_s3_for_request,
+                want_count,
+                missing_wants,
+            } => {
+                let missing_sample = missing_wants
+                    .iter()
+                    .take(5)
+                    .map(|want| want.chars().take(12).collect::<String>())
+                    .collect::<Vec<String>>()
+                    .join(",");
+                info!(
+                    repo = %owner_repo,
+                    wants = *want_count,
+                    missing_wants = missing_wants.len(),
+                    want_sample,
+                    missing_sample,
+                    had_local_repo_before_check = *had_local_repo_before_check,
+                    restored_from_s3_for_request = *restored_from_s3_for_request,
+                    "local disk can only partially satisfy SSH fetch; proxying upstream for missing objects or completeness"
+                );
+            }
         }
     }
 
@@ -1849,10 +1928,26 @@ async fn proxy_upstream_upload_pack(
             }
         }
         Err(e) => {
+            let wants = if request_kind == V2RequestKind::Fetch {
+                crate::tee_hydration::parse_fetch_request_metadata(&want_have)
+                    .map(|meta| meta.want_oids)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let want_sample = wants
+                .iter()
+                .take(5)
+                .map(|want| want.chars().take(12).collect::<String>())
+                .collect::<Vec<String>>()
+                .join(",");
             error!(
                 repo = %owner_repo,
+                request_kind = ?request_kind,
+                wants = wants.len(),
+                want_sample,
                 error = %format!("{e:#}"),
-                "upstream proxy POST failed"
+                "cannot satisfy SSH upload-pack request from local disk and upstream upload-pack failed"
             );
             let msg = format!(
                 "Repository '{}' upstream proxy failed: {}\n\
