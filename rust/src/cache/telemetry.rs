@@ -128,7 +128,8 @@ pub async fn flush_to_s3(state: &AppState, buffer: &TelemetryBuffer) -> Result<(
 
     // Always release the lock.
     let _ =
-        crate::coordination::locks::release_lock(&state.valkey, TELEMETRY_LOCK_KEY, node_id).await;
+        crate::coordination::locks::release_lock(&state.valkey, TELEMETRY_LOCK_KEY, node_id, true)
+            .await;
 
     result
 }
