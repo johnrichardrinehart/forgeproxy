@@ -38,7 +38,7 @@ pub struct EvictionEvent {
 pub struct RepoDetail {
     pub name: String,
     pub clone_count: u64,
-    pub last_fetch_ts: i64,
+    pub last_bundle_ts: i64,
     pub size_bytes: u64,
     pub evicted: bool,
 }

@@ -414,7 +414,7 @@ impl CacheManager {
                     repo_details.push(super::telemetry::RepoDetail {
                         name: owner_repo.clone(),
                         clone_count: info.as_ref().map_or(0, |i| i.clone_count),
-                        last_fetch_ts: info.as_ref().map_or(0, |i| i.last_fetch_ts),
+                        last_bundle_ts: info.as_ref().map_or(0, |i| i.last_bundle_ts),
                         size_bytes: info.as_ref().map_or(0, |i| i.size_bytes),
                         evicted: false,
                     });
@@ -438,7 +438,7 @@ impl CacheManager {
                     repo_details.push(super::telemetry::RepoDetail {
                         name: owner_repo.clone(),
                         clone_count: info.as_ref().map_or(0, |i| i.clone_count),
-                        last_fetch_ts: info.as_ref().map_or(0, |i| i.last_fetch_ts),
+                        last_bundle_ts: info.as_ref().map_or(0, |i| i.last_bundle_ts),
                         size_bytes: info.as_ref().map_or(0, |i| i.size_bytes),
                         evicted: false,
                     });
@@ -465,7 +465,7 @@ impl CacheManager {
                 repo_details.push(super::telemetry::RepoDetail {
                     name: owner_repo.clone(),
                     clone_count: info.as_ref().map_or(0, |i| i.clone_count),
-                    last_fetch_ts: info.as_ref().map_or(0, |i| i.last_fetch_ts),
+                    last_bundle_ts: info.as_ref().map_or(0, |i| i.last_bundle_ts),
                     size_bytes: info.as_ref().map_or(0, |i| i.size_bytes),
                     evicted: true,
                 });

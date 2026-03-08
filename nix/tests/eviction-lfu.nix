@@ -63,7 +63,6 @@ let
       negative_cache_ttl: 60
 
     clone:
-      freshness_threshold: 60
       lock_ttl: 60
       lock_wait_timeout: 120
       max_concurrent_upstream_clones: 5
