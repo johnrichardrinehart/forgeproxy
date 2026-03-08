@@ -1447,12 +1447,51 @@ async fn publish_bootstrap_bundle(
     Ok(())
 }
 
-pub async fn ensure_repo_available_locally(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalRepoAvailability {
+    pub had_local_repo_before_check: bool,
+    pub restored_from_s3_for_request: bool,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalServeDecision {
+    Unavailable {
+        had_local_repo_before_check: bool,
+        restored_from_s3_for_request: bool,
+    },
+    SatisfiesWants {
+        had_local_repo_before_check: bool,
+        restored_from_s3_for_request: bool,
+        want_count: usize,
+    },
+    MissingWantedObjects {
+        had_local_repo_before_check: bool,
+        restored_from_s3_for_request: bool,
+        want_count: usize,
+        missing_wants: Vec<String>,
+    },
+}
+
+async fn ensure_repo_available_locally_detailed(
     state: &crate::AppState,
     owner_repo: &str,
-) -> Result<bool> {
+) -> Result<LocalRepoAvailability> {
+    let had_local_repo_before_check = state.cache_manager.has_repo(owner_repo);
+    if had_local_repo_before_check {
+        return Ok(LocalRepoAvailability {
+            had_local_repo_before_check,
+            restored_from_s3_for_request: false,
+            available: true,
+        });
+    }
+
     if state.cache_manager.has_repo(owner_repo) {
-        return Ok(true);
+        return Ok(LocalRepoAvailability {
+            had_local_repo_before_check,
+            restored_from_s3_for_request: false,
+            available: true,
+        });
     }
 
     let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
@@ -1461,10 +1500,14 @@ pub async fn ensure_repo_available_locally(
     let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
     let restore_result = try_restore_repo_from_s3(state, owner_repo, &staged_repo_path).await;
 
-    let available = match restore_result {
+    let availability = match restore_result {
         Ok(true) => {
             if state.cache_manager.has_repo(owner_repo) {
-                true
+                LocalRepoAvailability {
+                    had_local_repo_before_check,
+                    restored_from_s3_for_request: false,
+                    available: true,
+                }
             } else {
                 ensure_bare_head_ref(&staged_repo_path)
                     .await
@@ -1496,10 +1539,18 @@ pub async fn ensure_repo_available_locally(
                 info.hydrating_since_ts = 0;
                 info.bootstrap_bundle_pending = false;
                 set_repo_info(&state.valkey, owner_repo, &info).await?;
-                true
+                LocalRepoAvailability {
+                    had_local_repo_before_check,
+                    restored_from_s3_for_request: true,
+                    available: true,
+                }
             }
         }
-        Ok(false) => false,
+        Ok(false) => LocalRepoAvailability {
+            had_local_repo_before_check,
+            restored_from_s3_for_request: false,
+            available: false,
+        },
         Err(error) => {
             if staged_repo_path.exists() {
                 tokio::fs::remove_dir_all(&staged_repo_path)
@@ -1515,7 +1566,7 @@ pub async fn ensure_repo_available_locally(
         }
     };
 
-    if !available && staged_repo_path.exists() {
+    if !availability.available && staged_repo_path.exists() {
         tokio::fs::remove_dir_all(&staged_repo_path)
             .await
             .with_context(|| {
@@ -1526,30 +1577,51 @@ pub async fn ensure_repo_available_locally(
             })?;
     }
 
-    Ok(available)
+    Ok(availability)
 }
 
-pub async fn repo_can_satisfy_wants(
+pub async fn classify_local_wants_satisfaction(
     state: &crate::AppState,
     owner_repo: &str,
     wants: &[String],
-) -> Result<bool> {
+) -> Result<LocalServeDecision> {
     if wants.is_empty() {
-        return Ok(false);
+        return Ok(LocalServeDecision::Unavailable {
+            had_local_repo_before_check: state.cache_manager.has_repo(owner_repo),
+            restored_from_s3_for_request: false,
+        });
     }
 
-    if !ensure_repo_available_locally(state, owner_repo).await? {
-        return Ok(false);
+    let availability = ensure_repo_available_locally_detailed(state, owner_repo).await?;
+    if !availability.available {
+        return Ok(LocalServeDecision::Unavailable {
+            had_local_repo_before_check: availability.had_local_repo_before_check,
+            restored_from_s3_for_request: availability.restored_from_s3_for_request,
+        });
     }
 
     let repo_path = state.cache_manager.repo_path(owner_repo);
+    let mut missing_wants = Vec::new();
     for want in wants {
         if !crate::git::commands::git_has_object(&repo_path, want).await? {
-            return Ok(false);
+            missing_wants.push(want.clone());
         }
     }
 
-    Ok(true)
+    if missing_wants.is_empty() {
+        Ok(LocalServeDecision::SatisfiesWants {
+            had_local_repo_before_check: availability.had_local_repo_before_check,
+            restored_from_s3_for_request: availability.restored_from_s3_for_request,
+            want_count: wants.len(),
+        })
+    } else {
+        Ok(LocalServeDecision::MissingWantedObjects {
+            had_local_repo_before_check: availability.had_local_repo_before_check,
+            restored_from_s3_for_request: availability.restored_from_s3_for_request,
+            want_count: wants.len(),
+            missing_wants,
+        })
+    }
 }
 
 /// List all tracked repository names by scanning for `forgeproxy:repo:*` keys
