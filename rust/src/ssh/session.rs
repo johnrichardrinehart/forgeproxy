@@ -140,6 +140,133 @@ fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32
     session.close(channel_id);
 }
 
+async fn finalize_upload_pack_channel<W>(
+    owner_repo: &str,
+    handle: &russh::server::Handle,
+    channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
+    channel_id: ChannelId,
+    writer: Option<&mut W>,
+    exit_status: u32,
+    total_bytes: u64,
+) where
+    W: AsyncWriteExt + Unpin,
+{
+    let writer_used = writer.is_some();
+    let writer_shutdown_ok = if let Some(writer) = writer {
+        match writer.shutdown().await {
+            Ok(()) => {
+                info!(
+                    repo = %owner_repo,
+                    ?channel_id,
+                    total_bytes,
+                    "SSH upload-pack channel writer shutdown complete"
+                );
+                Some(true)
+            }
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    ?channel_id,
+                    total_bytes,
+                    error = %error,
+                    "SSH upload-pack channel writer shutdown failed"
+                );
+                Some(false)
+            }
+        }
+    } else {
+        None
+    };
+
+    let exit_status_sent = match handle.exit_status_request(channel_id, exit_status).await {
+        Ok(()) => {
+            info!(
+                repo = %owner_repo,
+                ?channel_id,
+                total_bytes,
+                exit_status,
+                "SSH upload-pack exit-status sent"
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                ?channel_id,
+                total_bytes,
+                exit_status,
+                error = ?error,
+                "SSH upload-pack exit-status failed"
+            );
+            false
+        }
+    };
+
+    let eof_sent = match handle.eof(channel_id).await {
+        Ok(()) => {
+            info!(
+                repo = %owner_repo,
+                ?channel_id,
+                total_bytes,
+                "SSH upload-pack EOF sent"
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                ?channel_id,
+                total_bytes,
+                error = ?error,
+                "SSH upload-pack EOF failed"
+            );
+            false
+        }
+    };
+
+    let close_sent = match handle.close(channel_id).await {
+        Ok(()) => {
+            info!(
+                repo = %owner_repo,
+                ?channel_id,
+                total_bytes,
+                "SSH upload-pack close sent"
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                ?channel_id,
+                total_bytes,
+                error = ?error,
+                "SSH upload-pack close failed"
+            );
+            false
+        }
+    };
+
+    if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+        state.stream_finished = true;
+        state.exit_status_sent = exit_status_sent;
+        state.eof_sent = eof_sent;
+        state.close_sent = close_sent;
+    }
+
+    info!(
+        repo = %owner_repo,
+        ?channel_id,
+        total_bytes,
+        exit_status,
+        writer_used,
+        writer_shutdown_ok = ?writer_shutdown_ok,
+        eof_sent,
+        exit_status_sent,
+        close_sent,
+        "SSH upload-pack stream finalized"
+    );
+}
+
 struct LocalUploadPackResponseContext {
     handle: russh::server::Handle,
     channel_states: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
@@ -213,11 +340,13 @@ async fn serve_local_upload_pack_once(
     };
 
     let mut writer = stream_channel.map(|channel| channel.make_writer());
+    let mut total_bytes: u64 = 0;
     let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
     loop {
         match stdout.read(&mut stdout_buf).await {
             Ok(0) => break,
             Ok(read) => {
+                total_bytes += read as u64;
                 let chunk = &stdout_buf[..read];
                 if let Some(writer) = writer.as_mut() {
                     if let Err(error) = writer.write_all(chunk).await {
@@ -258,19 +387,16 @@ async fn serve_local_upload_pack_once(
     }
 
     if should_close_channel {
-        if let Some(writer) = writer.as_mut() {
-            let _ = writer.shutdown().await;
-        } else {
-            let _ = handle.eof(channel_id).await;
-        }
-        let _ = handle.exit_status_request(channel_id, 0).await;
-        if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
-            state.stream_finished = true;
-            state.exit_status_sent = true;
-            state.eof_sent = true;
-            state.close_sent = true;
-        }
-        let _ = handle.close(channel_id).await;
+        finalize_upload_pack_channel(
+            owner_repo,
+            &handle,
+            &channel_states,
+            channel_id,
+            writer.as_mut(),
+            0,
+            total_bytes,
+        )
+        .await;
     }
 }
 
@@ -1133,6 +1259,8 @@ impl Handler for SshSession {
                             // background task (the sync Session methods cannot
                             // be used outside the handler call).
                             let handle = session.handle();
+                            let channel_states = Arc::clone(&self.upstream_proxy_channels);
+                            let repo_for_stream = repo.clone();
 
                             // Spawn a task that streams upload-pack stdout to
                             // the SSH channel using russh's channel writer so
@@ -1142,15 +1270,40 @@ impl Handler for SshSession {
                                 let mut stderr = stderr;
                                 let mut channel_writer = channel.make_writer();
                                 let mut disconnected = false;
+                                let mut total_bytes: u64 = 0;
 
-                                if let Err(e) =
-                                    tokio::io::copy(&mut stdout, &mut channel_writer).await
-                                {
-                                    debug!(
-                                        error = %e,
-                                        "error streaming upload-pack stdout to SSH channel"
-                                    );
-                                    disconnected = true;
+                                let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
+                                loop {
+                                    match stdout.read(&mut stdout_buf).await {
+                                        Ok(0) => break,
+                                        Ok(read) => {
+                                            total_bytes += read as u64;
+                                            if let Err(error) =
+                                                channel_writer.write_all(&stdout_buf[..read]).await
+                                            {
+                                                debug!(
+                                                    repo = %repo_for_stream,
+                                                    ?channel_id,
+                                                    total_bytes,
+                                                    error = %error,
+                                                    "error streaming upload-pack stdout to SSH channel"
+                                                );
+                                                disconnected = true;
+                                                break;
+                                            }
+                                        }
+                                        Err(error) => {
+                                            error!(
+                                                repo = %repo_for_stream,
+                                                ?channel_id,
+                                                total_bytes,
+                                                error = %error,
+                                                "failed to read local git upload-pack stdout"
+                                            );
+                                            disconnected = true;
+                                            break;
+                                        }
+                                    }
                                 }
 
                                 // Wait for the child to exit.
@@ -1178,10 +1331,16 @@ impl Handler for SshSession {
 
                                 // RFC 4254: exit-status → EOF → close.
                                 if !disconnected {
-                                    let _ = handle.exit_status_request(channel_id, exit_code).await;
-                                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut channel_writer)
-                                        .await;
-                                    let _ = handle.close(channel_id).await;
+                                    finalize_upload_pack_channel(
+                                        &repo_for_stream,
+                                        &handle,
+                                        &channel_states,
+                                        channel_id,
+                                        Some(&mut channel_writer),
+                                        exit_code,
+                                        total_bytes,
+                                    )
+                                    .await;
                                 }
                             });
 
@@ -1293,17 +1452,16 @@ impl Handler for SshSession {
                                         CryptoVec::from_slice(msg.as_bytes()),
                                     )
                                     .await;
-                                let _ = handle.exit_status_request(channel_id, 1).await;
-                                let _ = handle.eof(channel_id).await;
-                                if let Some(state) =
-                                    channel_states.lock().await.get_mut(&channel_id)
-                                {
-                                    state.stream_finished = true;
-                                    state.exit_status_sent = true;
-                                    state.eof_sent = true;
-                                    state.close_sent = true;
-                                }
-                                let _ = handle.close(channel_id).await;
+                                finalize_upload_pack_channel(
+                                    &repo_bg,
+                                    &handle,
+                                    &channel_states,
+                                    channel_id,
+                                    Option::<&mut tokio::io::Sink>::None,
+                                    1,
+                                    0,
+                                )
+                                .await;
                             }
                         }
                     });
@@ -1584,11 +1742,16 @@ async fn proxy_upstream_upload_pack(
                     );
                 }
                 if behavior.should_close_channel {
-                    let _ = handle.exit_status_request(channel_id, 1).await;
-                    if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
-                        state.stream_finished = true;
-                        state.exit_status_sent = true;
-                    }
+                    finalize_upload_pack_channel(
+                        &owner_repo,
+                        &handle,
+                        &channel_states,
+                        channel_id,
+                        channel_writer.as_mut(),
+                        1,
+                        total_bytes,
+                    )
+                    .await;
                 }
             } else {
                 info!(
@@ -1672,24 +1835,17 @@ async fn proxy_upstream_upload_pack(
                     );
                 }
                 if behavior.should_close_channel {
-                    let _ = handle.exit_status_request(channel_id, 0).await;
-                    if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
-                        state.stream_finished = true;
-                        state.exit_status_sent = true;
-                    }
+                    finalize_upload_pack_channel(
+                        &owner_repo,
+                        &handle,
+                        &channel_states,
+                        channel_id,
+                        channel_writer.as_mut(),
+                        0,
+                        total_bytes,
+                    )
+                    .await;
                 }
-            }
-            if behavior.should_close_channel {
-                if let Some(writer) = channel_writer.as_mut() {
-                    let _ = writer.shutdown().await;
-                } else {
-                    let _ = handle.eof(channel_id).await;
-                }
-                if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
-                    state.eof_sent = true;
-                    state.close_sent = true;
-                }
-                let _ = handle.close(channel_id).await;
             }
         }
         Err(e) => {
@@ -1707,15 +1863,16 @@ async fn proxy_upstream_upload_pack(
                 .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
                 .await;
             if behavior.should_close_channel {
-                let _ = handle.exit_status_request(channel_id, 1).await;
-                let _ = handle.eof(channel_id).await;
-                if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
-                    state.stream_finished = true;
-                    state.exit_status_sent = true;
-                    state.eof_sent = true;
-                    state.close_sent = true;
-                }
-                let _ = handle.close(channel_id).await;
+                finalize_upload_pack_channel(
+                    &owner_repo,
+                    &handle,
+                    &channel_states,
+                    channel_id,
+                    Option::<&mut tokio::io::Sink>::None,
+                    1,
+                    0,
+                )
+                .await;
             }
         }
     }
