@@ -945,7 +945,12 @@ impl Handler for SshSession {
                     "handling git-upload-pack"
                 );
 
-                if self.cache_manager.has_repo(&repo) {
+                let repo_cached_and_fresh =
+                    crate::coordination::registry::is_repo_cached_and_fresh(&self.state, &repo)
+                        .await
+                        .unwrap_or(false);
+
+                if repo_cached_and_fresh {
                     // ── Serve from local cache via bidirectional upload-pack ──
                     info!(repo = %repo, "serving git-upload-pack from local cache");
                     let Some(channel) = self.channels.remove(&channel_id) else {

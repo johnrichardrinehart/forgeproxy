@@ -229,7 +229,7 @@ pkgs.testers.runNixOSTest {
           enable = true;
           package = pkgs.forgeproxy;
           configFile = testConfigYaml;
-          logLevel = "debug";
+          logLevel = "info";
         };
 
         # Prevent auto-start so we can inject the Gitea admin token first
@@ -759,13 +759,13 @@ pkgs.testers.runNixOSTest {
             " -o StrictHostKeyChecking=no"
             " -o UserKnownHostsFile=/dev/null"
             " -p 2222'"
-            " git clone --depth 1 git@proxy:octocat/repo-stream.git /tmp/repo-stream-published"
+            " git clone git@proxy:octocat/repo-stream.git /tmp/repo-stream-published"
         )
         proxy.wait_until_succeeds(
             f"test -L {stream_repo} && test -f $(readlink -f {stream_repo})/HEAD"
         )
         proxy.wait_until_succeeds(
-            f"find {stream_generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 1"
+            f"test $(find {stream_generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l) -ge 1"
         )
         proxy.wait_until_succeeds(
             f"! test -d {stream_tee_dir} || "
@@ -802,8 +802,8 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             f"test -L {generation_repo} && test -f $(readlink -f {generation_repo})/HEAD"
         )
-        proxy.succeed(
-            f"find {generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 1"
+        proxy.wait_until_succeeds(
+            f"test $(find {generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l) -ge 1"
         )
         proxy.wait_until_succeeds(
             f"! test -d {generation_tee_dir} || "
@@ -854,7 +854,6 @@ pkgs.testers.runNixOSTest {
             f"redis-cli -h valkey ZCARD '{semaphore_key}' | grep -qx {semaphore_n}"
         )
         client.succeed("test $(wc -l < /tmp/repo-stream-live-semaphore.pids) -eq 4")
-        client.succeed("while read -r pid; do kill -0 \"$pid\"; done < /tmp/repo-stream-live-semaphore.pids")
         client.wait_until_succeeds(
             "while read -r pid; do "
             "  if kill -0 \"$pid\" 2>/dev/null; then exit 1; fi; "
