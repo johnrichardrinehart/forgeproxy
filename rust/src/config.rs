@@ -264,10 +264,12 @@ pub struct CloneConfig {
     /// required to serve it.
     #[serde(default = "default_freshness_threshold")]
     pub freshness_threshold: u64,
-    /// TTL (seconds) of the distributed clone/fetch lock in Valkey.
+    /// TTL (seconds) of the distributed per-repo hydration semaphore lease in
+    /// Valkey.
     #[serde(default = "default_lock_ttl")]
     pub lock_ttl: u64,
-    /// How long (seconds) a waiter will block for the lock before giving up.
+    /// Deprecated for initial clone coordination; retained for configuration
+    /// compatibility.
     #[serde(default = "default_lock_wait_timeout")]
     pub lock_wait_timeout: u64,
     /// Semaphore limit for concurrent full clones against upstream.
@@ -282,6 +284,14 @@ pub struct CloneConfig {
         alias = "max_concurrent_ghe_fetches"
     )]
     pub max_concurrent_upstream_fetches: usize,
+    /// Maximum concurrent upstream hydrations for a single repo across all
+    /// forgeproxy instances.
+    #[serde(default = "default_max_concurrent_upstream_clones_per_repo_across_instances")]
+    pub max_concurrent_upstream_clones_per_repo_across_instances: usize,
+    /// Maximum concurrent upstream hydrations for a single repo within one
+    /// forgeproxy instance.
+    #[serde(default = "default_max_concurrent_upstream_clones_per_repo_per_instance")]
+    pub max_concurrent_upstream_clones_per_repo_per_instance: usize,
 }
 
 impl Default for CloneConfig {
@@ -292,6 +302,10 @@ impl Default for CloneConfig {
             lock_wait_timeout: default_lock_wait_timeout(),
             max_concurrent_upstream_clones: default_max_concurrent_upstream_clones(),
             max_concurrent_upstream_fetches: default_max_concurrent_upstream_fetches(),
+            max_concurrent_upstream_clones_per_repo_across_instances:
+                default_max_concurrent_upstream_clones_per_repo_across_instances(),
+            max_concurrent_upstream_clones_per_repo_per_instance:
+                default_max_concurrent_upstream_clones_per_repo_per_instance(),
         }
     }
 }
@@ -301,7 +315,7 @@ fn default_freshness_threshold() -> u64 {
 }
 
 fn default_lock_ttl() -> u64 {
-    120
+    900
 }
 
 fn default_lock_wait_timeout() -> u64 {
@@ -314,6 +328,14 @@ fn default_max_concurrent_upstream_clones() -> usize {
 
 fn default_max_concurrent_upstream_fetches() -> usize {
     8
+}
+
+fn default_max_concurrent_upstream_clones_per_repo_across_instances() -> usize {
+    10
+}
+
+fn default_max_concurrent_upstream_clones_per_repo_per_instance() -> usize {
+    3
 }
 
 // ---------------------------------------------------------------------------
