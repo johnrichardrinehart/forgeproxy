@@ -22,7 +22,7 @@ use fred::clients::Pool;
 use fred::interfaces::ClientLike;
 use fred::types::config::{Config as FredConfig, ReconnectPolicy, ServerConfig, TlsConnector};
 use tokio::signal;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -69,6 +69,9 @@ pub struct AppState {
     pub clone_semaphore: Arc<Semaphore>,
     /// Semaphore limiting concurrent fetches against upstream.
     pub fetch_semaphore: Arc<Semaphore>,
+    /// Per-repo local semaphore cache limiting concurrent hydrations for the
+    /// same repository within this instance.
+    pub repo_clone_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -405,5 +408,6 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         rate_limit,
         clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_clones)),
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
+        repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }

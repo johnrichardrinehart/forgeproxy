@@ -6,6 +6,7 @@ use base64::Engine;
 use fred::interfaces::{ClientLike, HashesInterface, SortedSetsInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, info, trace, warn};
 
 /// Metadata about a cached repository.
@@ -282,7 +283,7 @@ pub async fn try_ensure_repo_cloned_from_tee(
     auth_header: Option<&str>,
     capture_dir: PathBuf,
 ) -> Result<()> {
-    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir), false).await
+    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir)).await
 }
 
 async fn cleanup_tee_capture_dir(capture_dir: &Path) -> Result<()> {
@@ -296,67 +297,43 @@ async fn cleanup_tee_capture_dir(capture_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn acquire_local_repo_clone_permit(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<OwnedSemaphorePermit> {
+    let semaphore = {
+        let mut semaphores = state.repo_clone_semaphores.lock().await;
+        semaphores
+            .entry(owner_repo.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    state
+                        .config
+                        .clone
+                        .max_concurrent_upstream_clones_per_repo_per_instance,
+                ))
+            })
+            .clone()
+    };
+
+    semaphore
+        .acquire_owned()
+        .await
+        .map_err(|e| anyhow::anyhow!("repo clone semaphore closed: {e}"))
+}
+
 async fn try_ensure_repo_cloned_inner(
     state: &crate::AppState,
     owner: &str,
     repo: &str,
     auth_header: Option<&str>,
     tee_capture_dir: Option<PathBuf>,
-    waited_for_bootstrap: bool,
 ) -> Result<()> {
     // Strip trailing ".git" from repo if present to avoid double-suffixing
     // (the URL path extractor preserves it, and we append ".git" below).
     let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
     let owner_repo = format!("{owner}/{repo_clean}");
-    let lock_key = format!("forgeproxy:lock:clone:{owner_repo}");
     let node_id = crate::coordination::node::node_id();
-
-    // Try to acquire the distributed clone lock.
-    let lock_acquired = crate::coordination::locks::acquire_lock(
-        &state.valkey,
-        &lock_key,
-        &node_id,
-        state.config.clone.lock_ttl,
-    )
-    .await?;
-
-    if !lock_acquired {
-        if !waited_for_bootstrap && wait_for_bootstrap_bundle(state, &owner_repo, &node_id).await? {
-            return Box::pin(try_ensure_repo_cloned_inner(
-                state,
-                owner,
-                repo,
-                auth_header,
-                tee_capture_dir,
-                true,
-            ))
-            .await;
-        }
-
-        if let Some(capture_dir) = tee_capture_dir.as_ref() {
-            cleanup_tee_capture_dir(capture_dir).await?;
-        }
-        debug!(%owner_repo, "hydrate already in progress; skipping duplicate background clone");
-        return Ok(());
-    }
-
-    let hydrate_started_at = chrono::Utc::now().timestamp();
-    let mut info = get_repo_info(&state.valkey, &owner_repo)
-        .await?
-        .unwrap_or_default();
-    if !info.hydrating_node_id.is_empty() && info.hydrating_node_id != node_id {
-        warn!(
-            repo = %owner_repo,
-            previous_node = %info.hydrating_node_id,
-            previous_started_at = info.hydrating_since_ts,
-            "claiming hydration after previous worker state was left behind"
-        );
-    }
-    info.status = "hydrating".to_string();
-    info.hydrating_node_id = node_id.clone();
-    info.hydrating_since_ts = hydrate_started_at;
-    info.bootstrap_bundle_pending = false;
-    set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
     let published_repo_path = state.cache_manager.ensure_repo_dir(&owner_repo)?;
     reset_partial_repo_if_needed(&state.cache_manager, &owner_repo, &published_repo_path).await?;
@@ -422,35 +399,88 @@ async fn try_ensure_repo_cloned_inner(
             .acquire()
             .await
             .map_err(|e| anyhow::anyhow!("clone semaphore closed: {e}"))?;
+        let _local_repo_permit = acquire_local_repo_clone_permit(state, &owner_repo).await?;
+        let distributed_permit_key = format!("forgeproxy:semaphore:clone:{owner_repo}");
+        let Some(distributed_repo_permit) = crate::coordination::locks::acquire_semaphore_lease(
+            &state.valkey,
+            &distributed_permit_key,
+            &node_id,
+            state
+                .config
+                .clone
+                .max_concurrent_upstream_clones_per_repo_across_instances,
+            state.config.clone.lock_ttl,
+        )
+        .await?
+        else {
+            if let Some(capture_dir) = tee_capture_dir.as_ref() {
+                cleanup_tee_capture_dir(capture_dir).await?;
+            }
+            info!(
+                repo = %owner_repo,
+                per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
+                cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
+                lease_ttl_secs = state.config.clone.lock_ttl,
+                "skipping upstream hydration because the repo clone semaphore is saturated"
+            );
+            return Ok(());
+        };
+        let hydrate_started_at = chrono::Utc::now().timestamp();
+        let mut info = get_repo_info(&state.valkey, &owner_repo)
+            .await?
+            .unwrap_or_default();
+        if !info.hydrating_node_id.is_empty() && info.hydrating_node_id != node_id {
+            warn!(
+                repo = %owner_repo,
+                previous_node = %info.hydrating_node_id,
+                previous_started_at = info.hydrating_since_ts,
+                "recording hydration activity while another node is already marked as hydrator"
+            );
+        }
+        info.status = "hydrating".to_string();
+        info.hydrating_node_id = node_id.clone();
+        info.hydrating_since_ts = hydrate_started_at;
+        info.bootstrap_bundle_pending = false;
+        set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
         let env_vars: Vec<(String, String)> =
             vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
 
-        let hydrated_from_tee = if let Some(capture_dir) = tee_capture_dir.as_ref() {
-            info!(
-                repo = %owner_repo,
-                capture_dir = %capture_dir.display(),
-                "attempting tee-based hydration from captured upstream stream"
-            );
-            hydrate_repo_from_tee_capture(
-                state,
-                &owner_repo,
-                &staged_repo_path,
-                &clone_url,
-                capture_dir,
-            )
-            .await?
-        } else {
-            false
-        };
+        let hydrate_result = async {
+            let hydrated_from_tee = if let Some(capture_dir) = tee_capture_dir.as_ref() {
+                info!(
+                    repo = %owner_repo,
+                    capture_dir = %capture_dir.display(),
+                    "attempting tee-based hydration from captured upstream stream"
+                );
+                hydrate_repo_from_tee_capture(
+                    state,
+                    &owner_repo,
+                    &staged_repo_path,
+                    &clone_url,
+                    capture_dir,
+                )
+                .await?
+            } else {
+                false
+            };
 
-        if !hydrated_from_tee {
-            info!(repo = %owner_repo, path = %staged_repo_path.display(), "starting upstream bare clone");
-            crate::git::commands::git_clone_bare(&clone_url, &staged_repo_path, &env_vars)
-                .await
-                .with_context(|| format!("upstream bare clone failed for {owner_repo}"))?;
-            info!(repo = %owner_repo, path = %staged_repo_path.display(), "upstream bare clone completed");
+            if !hydrated_from_tee {
+                info!(repo = %owner_repo, path = %staged_repo_path.display(), "starting upstream bare clone");
+                crate::git::commands::git_clone_bare(&clone_url, &staged_repo_path, &env_vars)
+                    .await
+                    .with_context(|| format!("upstream bare clone failed for {owner_repo}"))?;
+                info!(repo = %owner_repo, path = %staged_repo_path.display(), "upstream bare clone completed");
+            }
+
+            Ok::<bool, anyhow::Error>(hydrated_from_tee)
         }
+        .await;
+        let release_result =
+            crate::coordination::locks::release_semaphore_lease(&state.valkey, &distributed_repo_permit)
+                .await;
+        let hydrated_from_tee = hydrate_result?;
+        release_result?;
 
         ensure_bare_head_ref(&staged_repo_path)
             .await
@@ -555,9 +585,6 @@ async fn try_ensure_repo_cloned_inner(
                 })?;
         }
     }
-
-    // Always release the lock.
-    let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
 
     if let Some(capture_dir) = tee_capture_dir.as_ref() {
         let cleanup_result = cleanup_tee_capture_dir(capture_dir).await;
@@ -1064,51 +1091,6 @@ async fn register_bundle_in_valkey(
     .await?;
 
     Ok(())
-}
-
-async fn wait_for_bootstrap_bundle(
-    state: &crate::AppState,
-    owner_repo: &str,
-    node_id: &str,
-) -> Result<bool> {
-    let Some(info) = get_repo_info(&state.valkey, owner_repo).await? else {
-        return Ok(false);
-    };
-
-    if info.hydrating_node_id.is_empty()
-        || info.hydrating_node_id == node_id
-        || !info.bootstrap_bundle_pending
-    {
-        return Ok(false);
-    }
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let poll_interval = std::time::Duration::from_millis(250);
-
-    loop {
-        let Some(info) = get_repo_info(&state.valkey, owner_repo).await? else {
-            return Ok(false);
-        };
-
-        if !info.bootstrap_bundle_pending {
-            let repo_key = repo_key(owner_repo);
-            let latest_bundle_s3_key: Option<String> =
-                HashesInterface::hget(&state.valkey, &repo_key, "latest_bundle_s3_key")
-                    .await
-                    .unwrap_or(None);
-            let base_bundle_s3_key: Option<String> =
-                HashesInterface::hget(&state.valkey, &repo_key, "base_bundle_s3_key")
-                    .await
-                    .unwrap_or(None);
-            return Ok(latest_bundle_s3_key.or(base_bundle_s3_key).is_some());
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
 }
 
 /// List all tracked repository names by scanning for `forgeproxy:repo:*` keys

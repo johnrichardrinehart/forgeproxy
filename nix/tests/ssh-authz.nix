@@ -94,6 +94,8 @@ let
       lock_wait_timeout: 120
       max_concurrent_upstream_clones: 5
       max_concurrent_upstream_fetches: 10
+      max_concurrent_upstream_clones_per_repo_across_instances: 4
+      max_concurrent_upstream_clones_per_repo_per_instance: 4
 
     fetch_schedule:
       default_interval: 1800
@@ -729,7 +731,7 @@ pkgs.testers.runNixOSTest {
         )
         proxy.succeed(f"! test -e {live_repo}")
         client.succeed("kill -0 $(cat /tmp/repo-stream-live.pid)")
-        client.succeed("wait $(cat /tmp/repo-stream-live.pid)")
+        client.wait_until_succeeds("! kill -0 $(cat /tmp/repo-stream-live.pid) 2>/dev/null")
         client.succeed("test -f /tmp/repo-stream-live/blob-32.bin")
         proxy.wait_until_succeeds(
             "journalctl -u forgeproxy.service --no-pager "
@@ -811,7 +813,62 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-generations-2/file-3.txt")
         client.succeed("test -f /tmp/repo-generations-3/file-3.txt")
 
-    # ── Subtest 5f: External scrubber handles published generation layout ──
+    # ── Subtest 5f: Repo semaphore reflects concurrent uncached hydrations ──
+    with subtest("Concurrent uncached clones drive repo semaphore count up and back down"):
+        semaphore_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
+        semaphore_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
+        semaphore_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream-live"
+        semaphore_key = "forgeproxy:semaphore:clone:octocat/repo-stream-live"
+        semaphore_n = 4
+
+        proxy.succeed(
+            f"rm -rf {semaphore_repo} {semaphore_generation_dir} {semaphore_tee_dir} && "
+            f"redis-cli -h valkey DEL '{semaphore_key}' >/dev/null"
+        )
+
+        client.succeed(
+            "rm -rf "
+            "/tmp/repo-stream-live-semaphore-1 /tmp/repo-stream-live-semaphore-2 "
+            "/tmp/repo-stream-live-semaphore-3 /tmp/repo-stream-live-semaphore-4 "
+            "/tmp/repo-stream-live-semaphore-1.log /tmp/repo-stream-live-semaphore-2.log "
+            "/tmp/repo-stream-live-semaphore-3.log /tmp/repo-stream-live-semaphore-4.log "
+            "/tmp/repo-stream-live-semaphore.pids"
+        )
+        client.succeed(
+            "env GIT_SSH_COMMAND=\"ssh -i /tmp/alice_key "
+            "-o StrictHostKeyChecking=no "
+            "-o UserKnownHostsFile=/dev/null "
+            "-p 2222\" "
+            "sh -c '"
+            "set -eu; "
+            ": > /tmp/repo-stream-live-semaphore.pids; "
+            "for i in 1 2 3 4; do "
+            "  git clone --progress git@proxy:octocat/repo-stream-live.git "
+            "    /tmp/repo-stream-live-semaphore-$i "
+            "    >/tmp/repo-stream-live-semaphore-$i.log 2>&1 & "
+            "  echo \"$!\" >> /tmp/repo-stream-live-semaphore.pids; "
+            "done'"
+        )
+
+        proxy.wait_until_succeeds(
+            f"redis-cli -h valkey ZCARD '{semaphore_key}' | grep -qx {semaphore_n}"
+        )
+        client.succeed("test $(wc -l < /tmp/repo-stream-live-semaphore.pids) -eq 4")
+        client.succeed("while read -r pid; do kill -0 \"$pid\"; done < /tmp/repo-stream-live-semaphore.pids")
+        client.wait_until_succeeds(
+            "while read -r pid; do "
+            "  if kill -0 \"$pid\" 2>/dev/null; then exit 1; fi; "
+            "done < /tmp/repo-stream-live-semaphore.pids"
+        )
+        client.succeed("test -f /tmp/repo-stream-live-semaphore-1/blob-32.bin")
+        client.succeed("test -f /tmp/repo-stream-live-semaphore-2/blob-32.bin")
+        client.succeed("test -f /tmp/repo-stream-live-semaphore-3/blob-32.bin")
+        client.succeed("test -f /tmp/repo-stream-live-semaphore-4/blob-32.bin")
+        proxy.wait_until_succeeds(
+            f"! redis-cli -h valkey EXISTS '{semaphore_key}' | grep -qx 1"
+        )
+
+    # ── Subtest 5g: External scrubber handles published generation layout ──
     with subtest("External scrubber removes stale tee captures and keeps generation-backed repos"):
         proxy.succeed(
             "mkdir -p /var/cache/forgeproxy/repos/_tee/octocat/repo-generations/stale-capture && "

@@ -170,7 +170,8 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             "repo not locally cached; skipping bundle generation"
         );
         // Release lock and return.
-        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
+        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true)
+            .await;
         return Ok(());
     };
 
@@ -326,7 +327,8 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     }
 
     // Release the distributed lock.
-    let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
+    let _ =
+        crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true).await;
 
     if !published && staged_repo_path.exists() {
         tokio::fs::remove_dir_all(&staged_repo_path)
@@ -611,7 +613,8 @@ async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
                 }
             };
 
-        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
+        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true)
+            .await;
 
         if let Err(e) = result {
             debug!(
@@ -742,7 +745,8 @@ async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
                 }
             };
 
-        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id).await;
+        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true)
+            .await;
 
         if let Err(e) = result {
             debug!(
