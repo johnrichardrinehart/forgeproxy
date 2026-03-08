@@ -73,6 +73,10 @@ pub struct AppState {
     /// Per-repo local semaphore cache limiting concurrent hydrations for the
     /// same repository within this instance.
     pub repo_clone_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
+    /// Per-repo local mutex cache serializing publish/prune and immediate
+    /// post-publish work so concurrent hydrations cannot invalidate each
+    /// other's published target mid-flight.
+    pub repo_publish_mutexes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
     /// Most recent upstream `info/refs` advertisement we proxied for a repo.
     /// HTTP clones do not give us a stable request-scoped handle across the
     /// advertisement and fetch POST, so we keep a short-lived in-memory copy.
@@ -421,6 +425,7 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_clones)),
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
         repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        repo_publish_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         recent_info_refs_advertisements: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }

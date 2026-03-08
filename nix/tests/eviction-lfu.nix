@@ -353,22 +353,17 @@ pkgs.testers.runNixOSTest {
             assert f"Content for {repo}" in output, \
                 f"README.md content mismatch for {repo}: {output}"
 
-    # ── Verify repos are cached on disk ──────────────────────────────────
-    with subtest("All repos present in local cache"):
-        for repo in ["repo-a", "repo-b", "repo-c"]:
-            proxy.wait_until_succeeds(
-                f"test -L /var/cache/forgeproxy/repos/octocat/{repo}.git && "
-                f"test -f $(readlink -f /var/cache/forgeproxy/repos/octocat/{repo}.git)/HEAD"
-            )
-
     # ── Seed Valkey with LFU-relevant metadata ────────────────────────────
     with subtest("Seed Valkey with clone_count and bundle_list_key"):
-        # Wait for forgeproxy's background clone tasks to finish writing repo
-        # info before we overwrite LFU-related fields.
+        # Wait for each repo to be durably published locally, then stop
+        # forgeproxy before seeding test metadata so post-clone RepoInfo
+        # writes cannot clobber the values this test is trying to assert.
         for r in ["repo-a", "repo-b", "repo-c"]:
             proxy.wait_until_succeeds(
-                f"redis-cli -h valkey HEXISTS 'forgeproxy:repo:octocat/{r}' last_fetch_ts | grep -qx 1"
+                f"test -L /var/cache/forgeproxy/repos/octocat/{r}.git && "
+                f"test -f $(readlink -f /var/cache/forgeproxy/repos/octocat/{r}.git)/HEAD"
             )
+        proxy.succeed("systemctl stop forgeproxy")
 
         # repo-a: most popular (clone_count = 100)
         proxy.succeed(
@@ -411,6 +406,8 @@ pkgs.testers.runNixOSTest {
 
     # ── Verify proxy is still healthy after seeding ───────────────────────
     with subtest("Proxy remains healthy after Valkey seeding"):
+        proxy.succeed("systemctl start forgeproxy")
+        proxy.wait_for_open_port(8080)
         result = proxy.succeed("curl -sf http://localhost:8080/healthz")
         health = json.loads(result)
         assert health["status"] in ("ok", "degraded"), \
