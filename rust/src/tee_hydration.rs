@@ -3,10 +3,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
+
+const INFO_REFS_ADVERTISEMENT_FILE: &str = "info_refs_advertisement.bin";
+const LS_REFS_REQUEST_FILE: &str = "ls_refs_request.bin";
+const LS_REFS_RESPONSE_FILE: &str = "ls_refs_response.bin";
 
 pub struct TeeCapture {
     dir: PathBuf,
@@ -83,6 +87,33 @@ impl TeeCapture {
         Ok(())
     }
 
+    pub async fn write_info_refs_advertisement(&self, bytes: &[u8]) -> Result<()> {
+        write_capture_artifact(
+            &self.dir.join(INFO_REFS_ADVERTISEMENT_FILE),
+            bytes,
+            "tee info/refs advertisement",
+        )
+        .await
+    }
+
+    pub async fn write_ls_refs_request(&self, bytes: &[u8]) -> Result<()> {
+        write_capture_artifact(
+            &self.dir.join(LS_REFS_REQUEST_FILE),
+            bytes,
+            "tee ls-refs request",
+        )
+        .await
+    }
+
+    pub async fn write_ls_refs_response(&self, bytes: &[u8]) -> Result<()> {
+        write_capture_artifact(
+            &self.dir.join(LS_REFS_RESPONSE_FILE),
+            bytes,
+            "tee ls-refs response",
+        )
+        .await
+    }
+
     pub async fn finish(mut self, success: bool) -> Result<()> {
         self.response_file
             .flush()
@@ -101,6 +132,22 @@ impl TeeCapture {
             .with_context(|| format!("chmod tee status {}", status_path.display()))?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapturedRefMetadata {
+    pub refs: BTreeMap<String, String>,
+    pub head_symref_target: Option<String>,
+}
+
+async fn write_capture_artifact(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    tokio::fs::write(path, bytes)
+        .await
+        .with_context(|| format!("write {label} {}", path.display()))?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
+        .await
+        .with_context(|| format!("chmod {label} {}", path.display()))?;
+    Ok(())
 }
 
 pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<PathBuf>> {
@@ -231,6 +278,104 @@ pub async fn extract_want_oids_from_capture(capture_dir: &Path) -> Result<Vec<St
     Ok(wants.into_iter().collect())
 }
 
+pub async fn extract_captured_ref_metadata(capture_dir: &Path) -> Result<CapturedRefMetadata> {
+    let mut metadata = CapturedRefMetadata::default();
+
+    let ls_refs_response_path = capture_dir.join(LS_REFS_RESPONSE_FILE);
+    if ls_refs_response_path.is_file() {
+        let response = tokio::fs::read(&ls_refs_response_path)
+            .await
+            .with_context(|| format!("read {}", ls_refs_response_path.display()))?;
+        metadata = parse_ls_refs_response(&response);
+    }
+
+    if metadata.refs.is_empty() {
+        let info_refs_path = capture_dir.join(INFO_REFS_ADVERTISEMENT_FILE);
+        if info_refs_path.is_file() {
+            let advert = tokio::fs::read(&info_refs_path)
+                .await
+                .with_context(|| format!("read {}", info_refs_path.display()))?;
+            metadata = parse_info_refs_advertisement(&advert);
+        }
+    }
+
+    Ok(metadata)
+}
+
+fn parse_ls_refs_response(bytes: &[u8]) -> CapturedRefMetadata {
+    let packets = crate::http::protocolv2::decode_pkt_lines(bytes);
+    let mut metadata = CapturedRefMetadata::default();
+
+    for packet in packets {
+        let crate::http::protocolv2::PktLine::Data(line) = packet else {
+            continue;
+        };
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let text = String::from_utf8_lossy(line);
+        let mut fields = text.split(' ');
+        let Some(oid) = fields.next() else {
+            continue;
+        };
+        let Some(refname) = fields.next() else {
+            continue;
+        };
+        if !looks_like_oid(oid) || !refname.starts_with("refs/") {
+            continue;
+        }
+        metadata.refs.insert(refname.to_string(), oid.to_string());
+        for extra in fields {
+            if let Some(target) = extra.strip_prefix("symref-target:")
+                && refname == "HEAD"
+            {
+                metadata.head_symref_target = Some(target.to_string());
+            }
+        }
+    }
+
+    metadata
+}
+
+fn parse_info_refs_advertisement(bytes: &[u8]) -> CapturedRefMetadata {
+    let mut metadata = CapturedRefMetadata::default();
+
+    for packet in crate::http::protocolv2::decode_pkt_lines(bytes) {
+        let crate::http::protocolv2::PktLine::Data(line) = packet else {
+            continue;
+        };
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let text = String::from_utf8_lossy(line);
+        if text.starts_with('#') || text.trim().is_empty() {
+            continue;
+        }
+        if let Some((oid, tail)) = text.split_once(' ')
+            && looks_like_oid(oid)
+        {
+            let mut fields = tail.split('\0');
+            let Some(refname) = fields.next() else {
+                continue;
+            };
+            if refname == "HEAD" {
+                if let Some(target) = fields
+                    .flat_map(|f| f.split(' '))
+                    .find_map(|field| field.strip_prefix("symref=HEAD:"))
+                {
+                    metadata.head_symref_target = Some(target.to_string());
+                }
+                continue;
+            }
+            if refname.starts_with("refs/") {
+                metadata.refs.insert(refname.to_string(), oid.to_string());
+            }
+        }
+    }
+
+    metadata
+}
+
+fn looks_like_oid(text: &str) -> bool {
+    text.len() == 40 && text.as_bytes().iter().all(u8::is_ascii_hexdigit)
+}
+
 fn capture_dir(base_path: &Path, owner_repo: &str) -> PathBuf {
     let mut parts = owner_repo.splitn(2, '/');
     let owner = parts.next().unwrap_or("_unknown");
@@ -314,6 +459,73 @@ mod tests {
                 "0123456789abcdef0123456789abcdef01234567".to_string(),
                 "89abcdef0123456789abcdef0123456789abcdef".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_captured_ref_metadata_prefers_ls_refs_response() {
+        let tmp = tempdir().unwrap();
+        let capture = TeeCapture::start(tmp.path(), "acme/widgets", "ssh")
+            .await
+            .unwrap();
+        capture
+            .write_ls_refs_response(
+                &[
+                    crate::http::protocolv2::encode_pkt_line(
+                        b"0123456789abcdef0123456789abcdef01234567 refs/heads/main\n",
+                    ),
+                    crate::http::protocolv2::encode_pkt_line(
+                        b"89abcdef0123456789abcdef0123456789abcdef refs/tags/v1.0.0\n",
+                    ),
+                    b"0000".to_vec(),
+                ]
+                .concat(),
+            )
+            .await
+            .unwrap();
+
+        let metadata = extract_captured_ref_metadata(capture.dir()).await.unwrap();
+        assert_eq!(
+            metadata.refs.get("refs/heads/main"),
+            Some(&"0123456789abcdef0123456789abcdef01234567".to_string())
+        );
+        assert_eq!(
+            metadata.refs.get("refs/tags/v1.0.0"),
+            Some(&"89abcdef0123456789abcdef0123456789abcdef".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_captured_ref_metadata_falls_back_to_info_refs() {
+        let tmp = tempdir().unwrap();
+        let capture = TeeCapture::start(tmp.path(), "acme/widgets", "https")
+            .await
+            .unwrap();
+        let mut advertisement = Vec::new();
+        advertisement.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"# service=git-upload-pack\n",
+        ));
+        advertisement.extend_from_slice(b"0000");
+        advertisement.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"0123456789abcdef0123456789abcdef01234567 HEAD\0symref=HEAD:refs/heads/main\n",
+        ));
+        advertisement.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"0123456789abcdef0123456789abcdef01234567 refs/heads/main\n",
+        ));
+        advertisement.extend_from_slice(b"0000");
+        capture
+            .write_info_refs_advertisement(&advertisement)
+            .await
+            .unwrap();
+
+        let metadata = extract_captured_ref_metadata(capture.dir()).await.unwrap();
+        assert_eq!(
+            metadata.head_symref_target,
+            Some("refs/heads/main".to_string())
+        );
+        assert_eq!(
+            metadata.refs.get("refs/heads/main"),
+            Some(&"0123456789abcdef0123456789abcdef01234567".to_string())
         );
     }
 }

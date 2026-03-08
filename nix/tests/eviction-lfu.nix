@@ -86,7 +86,7 @@ let
     storage:
       local:
         path: "/var/cache/forgeproxy/repos"
-        max_bytes: 1024
+        max_bytes: 10485760
         high_water_mark: 0.50
         low_water_mark: 0.25
         eviction_policy: "lfu"
@@ -363,6 +363,13 @@ pkgs.testers.runNixOSTest {
 
     # ── Seed Valkey with LFU-relevant metadata ────────────────────────────
     with subtest("Seed Valkey with clone_count and bundle_list_key"):
+        # Wait for forgeproxy's background clone tasks to finish writing repo
+        # info before we overwrite LFU-related fields.
+        for r in ["repo-a", "repo-b", "repo-c"]:
+            proxy.wait_until_succeeds(
+                f"redis-cli -h valkey HEXISTS 'forgeproxy:repo:octocat/{r}' last_fetch_ts | grep -qx 1"
+            )
+
         # repo-a: most popular (clone_count = 100)
         proxy.succeed(
             "redis-cli -h valkey HSET 'forgeproxy:repo:octocat/repo-a'"

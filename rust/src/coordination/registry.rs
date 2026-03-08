@@ -286,6 +286,13 @@ pub async fn try_ensure_repo_cloned_from_tee(
     try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir)).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeeHydrationOutcome {
+    NotHydrated,
+    HydratedWithFollowOnFetch,
+    PublishedFromCapture,
+}
+
 async fn cleanup_tee_capture_dir(capture_dir: &Path) -> Result<()> {
     if capture_dir.exists() {
         tokio::fs::remove_dir_all(capture_dir)
@@ -447,7 +454,7 @@ async fn try_ensure_repo_cloned_inner(
             vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
 
         let hydrate_result = async {
-            let hydrated_from_tee = if let Some(capture_dir) = tee_capture_dir.as_ref() {
+            let tee_outcome = if let Some(capture_dir) = tee_capture_dir.as_ref() {
                 info!(
                     repo = %owner_repo,
                     capture_dir = %capture_dir.display(),
@@ -462,10 +469,10 @@ async fn try_ensure_repo_cloned_inner(
                 )
                 .await?
             } else {
-                false
+                TeeHydrationOutcome::NotHydrated
             };
 
-            if !hydrated_from_tee {
+            if tee_outcome == TeeHydrationOutcome::NotHydrated {
                 info!(repo = %owner_repo, path = %staged_repo_path.display(), "starting upstream bare clone");
                 crate::git::commands::git_clone_bare(&clone_url, &staged_repo_path, &env_vars)
                     .await
@@ -473,13 +480,13 @@ async fn try_ensure_repo_cloned_inner(
                 info!(repo = %owner_repo, path = %staged_repo_path.display(), "upstream bare clone completed");
             }
 
-            Ok::<bool, anyhow::Error>(hydrated_from_tee)
+            Ok::<TeeHydrationOutcome, anyhow::Error>(tee_outcome)
         }
         .await;
         let release_result =
             crate::coordination::locks::release_semaphore_lease(&state.valkey, &distributed_repo_permit)
                 .await;
-        let hydrated_from_tee = hydrate_result?;
+        let tee_outcome = hydrate_result?;
         release_result?;
 
         ensure_bare_head_ref(&staged_repo_path)
@@ -489,10 +496,10 @@ async fn try_ensure_repo_cloned_inner(
             state,
             &owner_repo,
             &staged_repo_path,
-            if hydrated_from_tee {
-                "tee hydration"
-            } else {
-                "upstream clone"
+            match tee_outcome {
+                TeeHydrationOutcome::HydratedWithFollowOnFetch => "tee hydration",
+                TeeHydrationOutcome::PublishedFromCapture => "tee capture publish",
+                TeeHydrationOutcome::NotHydrated => "upstream clone",
             },
         )
         .await
@@ -502,10 +509,10 @@ async fn try_ensure_repo_cloned_inner(
             state,
             &owner_repo,
             &staged_repo_path,
-            if hydrated_from_tee {
-                "tee hydration"
-            } else {
-                "upstream clone"
+            match tee_outcome {
+                TeeHydrationOutcome::HydratedWithFollowOnFetch => "tee hydration",
+                TeeHydrationOutcome::PublishedFromCapture => "tee capture publish",
+                TeeHydrationOutcome::NotHydrated => "upstream clone",
             },
         )
         .await?;
@@ -524,46 +531,55 @@ async fn try_ensure_repo_cloned_inner(
 
         crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id).await?;
 
-        match crate::bundleuri::generator::generate_full_bundle(
-            state,
-            &staged_repo_path,
-            &owner_repo,
-        )
-        .await
-        {
-            Ok(bundle) => {
-                let s3_key = format!(
-                    "{}{}/bundles/{}.bundle",
-                    state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
-                );
-                crate::storage::s3::upload_bundle(
-                    &state.s3_client,
-                    &state.config.storage.s3.bucket,
-                    &s3_key,
-                    &bundle.bundle_path,
-                )
-                .await
-                .with_context(|| format!("failed to upload bootstrap bundle for {owner_repo}"))?;
+        if tee_outcome == TeeHydrationOutcome::PublishedFromCapture {
+            spawn_capture_convergence(
+                state.clone(),
+                owner_repo.clone(),
+                clone_url.clone(),
+                auth_header.map(ToOwned::to_owned),
+            );
+        } else {
+            match crate::bundleuri::generator::generate_full_bundle(
+                state,
+                &staged_repo_path,
+                &owner_repo,
+            )
+            .await
+            {
+                Ok(bundle) => {
+                    let s3_key = format!(
+                        "{}{}/bundles/{}.bundle",
+                        state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
+                    );
+                    crate::storage::s3::upload_bundle(
+                        &state.s3_client,
+                        &state.config.storage.s3.bucket,
+                        &s3_key,
+                        &bundle.bundle_path,
+                    )
+                    .await
+                    .with_context(|| format!("failed to upload bootstrap bundle for {owner_repo}"))?;
 
-                register_bundle_in_valkey(
-                    state,
-                    &owner_repo,
-                    &staged_repo_path,
-                    &s3_key,
-                    bundle.creation_token,
-                )
-                .await?;
+                    register_bundle_in_valkey(
+                        state,
+                        &owner_repo,
+                        &staged_repo_path,
+                        &s3_key,
+                        bundle.creation_token,
+                    )
+                    .await?;
 
-                info.last_bundle_ts = now;
-                info.latest_creation_token = bundle.creation_token;
-                set_repo_info(&state.valkey, &owner_repo, &info).await?;
-            }
-            Err(error) => {
-                warn!(
-                    %owner_repo,
-                    error = %error,
-                    "bootstrap bundle generation failed; keeping locally cached repo"
-                );
+                    info.last_bundle_ts = now;
+                    info.latest_creation_token = bundle.creation_token;
+                    set_repo_info(&state.valkey, &owner_repo, &info).await?;
+                }
+                Err(error) => {
+                    warn!(
+                        %owner_repo,
+                        error = %error,
+                        "bootstrap bundle generation failed; keeping locally cached repo"
+                    );
+                }
             }
         }
 
@@ -893,13 +909,99 @@ async fn try_restore_repo_from_s3(
     Ok(state.cache_manager.has_repo_at(repo_path))
 }
 
+async fn materialize_capture_refs(
+    repo_path: &Path,
+    capture_dir: &Path,
+) -> Result<crate::tee_hydration::CapturedRefMetadata> {
+    let metadata = crate::tee_hydration::extract_captured_ref_metadata(capture_dir).await?;
+    for (refname, oid) in &metadata.refs {
+        let ref_path = repo_path.join(refname);
+        if let Some(parent) = ref_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create captured ref parent {}", parent.display()))?;
+        }
+        tokio::fs::write(&ref_path, format!("{oid}\n"))
+            .await
+            .with_context(|| format!("write captured ref {}", ref_path.display()))?;
+    }
+
+    if let Some(head_target) = metadata.head_symref_target.as_deref()
+        && metadata.refs.contains_key(head_target)
+    {
+        crate::git::commands::git_set_head_symbolic_ref(repo_path, head_target).await?;
+    }
+
+    Ok(metadata)
+}
+
+fn spawn_capture_convergence(
+    state: crate::AppState,
+    owner_repo: String,
+    clone_url: String,
+    _auth_header: Option<String>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) =
+            converge_published_repo_generation(&state, &owner_repo, &clone_url).await
+        {
+            warn!(
+                repo = %owner_repo,
+                error = %error,
+                "capture convergence generation failed"
+            );
+        }
+    });
+}
+
+async fn converge_published_repo_generation(
+    state: &crate::AppState,
+    owner_repo: &str,
+    clone_url: &str,
+) -> Result<()> {
+    let published_repo_path = state.cache_manager.repo_path(owner_repo);
+    if !state.cache_manager.has_repo(owner_repo) {
+        bail!("published repo is not available for convergence");
+    }
+
+    let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
+    crate::git::commands::git_clone_bare_local(&published_repo_path, &staged_repo_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to seed convergence generation {} from {}",
+                staged_repo_path.display(),
+                published_repo_path.display()
+            )
+        })?;
+
+    let redacted_clone_url = redacted_clone_url(state, clone_url);
+    info!(
+        repo = %owner_repo,
+        destination = %staged_repo_path.display(),
+        clone_url = %redacted_clone_url,
+        "starting capture convergence follow-on git fetch"
+    );
+    crate::git::commands::git_fetch(&staged_repo_path, clone_url, &[]).await?;
+    ensure_bare_head_ref(&staged_repo_path).await?;
+    validate_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
+    publish_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
+    info!(
+        repo = %owner_repo,
+        destination = %staged_repo_path.display(),
+        clone_url = %redacted_clone_url,
+        "capture convergence follow-on git fetch finished"
+    );
+    Ok(())
+}
+
 async fn hydrate_repo_from_tee_capture(
     state: &crate::AppState,
     owner_repo: &str,
     repo_path: &Path,
     clone_url: &str,
     capture_dir: &Path,
-) -> Result<bool> {
+) -> Result<TeeHydrationOutcome> {
     let Some(pack_path) = crate::tee_hydration::extract_pack_from_capture(capture_dir).await?
     else {
         info!(
@@ -907,7 +1009,7 @@ async fn hydrate_repo_from_tee_capture(
             capture_dir = %capture_dir.display(),
             "tee hydration skipped because no pack payload was extracted"
         );
-        return Ok(false);
+        return Ok(TeeHydrationOutcome::NotHydrated);
     };
     let captured_wants = crate::tee_hydration::extract_want_oids_from_capture(capture_dir).await?;
 
@@ -938,6 +1040,25 @@ async fn hydrate_repo_from_tee_capture(
         destination = %repo_path.display(),
         "tee hydration index-pack finished"
     );
+    if state.config.clone.hydration_mode == crate::config::HydrationMode::PublishFromCapture {
+        let captured_ref_metadata = materialize_capture_refs(repo_path, capture_dir).await?;
+        if !captured_ref_metadata.refs.is_empty() && state.cache_manager.has_repo_at(repo_path) {
+            info!(
+                repo = %owner_repo,
+                destination = %repo_path.display(),
+                refs_materialized = captured_ref_metadata.refs.len(),
+                head = ?captured_ref_metadata.head_symref_target,
+                "publishing generation directly from tee capture metadata"
+            );
+            return Ok(TeeHydrationOutcome::PublishedFromCapture);
+        }
+        info!(
+            repo = %owner_repo,
+            destination = %repo_path.display(),
+            refs_materialized = captured_ref_metadata.refs.len(),
+            "capture metadata was insufficient for direct publish; falling back to follow-on fetch"
+        );
+    }
     let seeded_want_ref_dir = seed_temp_want_refs(repo_path, &captured_wants).await?;
     if !captured_wants.is_empty() {
         info!(
@@ -965,7 +1086,11 @@ async fn hydrate_repo_from_tee_capture(
         "tee hydration follow-on git fetch finished"
     );
 
-    Ok(state.cache_manager.has_repo_at(repo_path))
+    if state.cache_manager.has_repo_at(repo_path) {
+        Ok(TeeHydrationOutcome::HydratedWithFollowOnFetch)
+    } else {
+        Ok(TeeHydrationOutcome::NotHydrated)
+    }
 }
 
 async fn validate_ready_repo(

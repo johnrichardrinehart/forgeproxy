@@ -15,6 +15,7 @@ mod storage;
 mod tee_hydration;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -72,6 +73,17 @@ pub struct AppState {
     /// Per-repo local semaphore cache limiting concurrent hydrations for the
     /// same repository within this instance.
     pub repo_clone_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
+    /// Most recent upstream `info/refs` advertisement we proxied for a repo.
+    /// HTTP clones do not give us a stable request-scoped handle across the
+    /// advertisement and fetch POST, so we keep a short-lived in-memory copy.
+    pub recent_info_refs_advertisements:
+        Arc<Mutex<std::collections::HashMap<String, RecentInfoRefsAdvertisement>>>,
+}
+
+#[derive(Clone)]
+pub struct RecentInfoRefsAdvertisement {
+    pub captured_at: Instant,
+    pub payload: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -409,5 +421,6 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_clones)),
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
         repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        recent_info_refs_advertisements: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }
