@@ -119,10 +119,18 @@ resource "aws_iam_role_policy" "forgeproxy" {
         Effect = "Allow"
         Action = [
           "ssm:UpdateInstanceInformation",
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
           "ssmmessages:AcknowledgeMessage",
           "ssmmessages:GetEndpoint",
           "ssmmessages:GetMessages",
+          "ec2messages:AcknowledgeMessage",
+          "ec2messages:DeleteMessage",
+          "ec2messages:FailMessage",
           "ec2messages:GetMessages",
+          "ec2messages:SendReply",
         ]
         Resource = "*"
       },
@@ -193,10 +201,18 @@ resource "aws_iam_role_policy" "valkey" {
         Effect = "Allow"
         Action = [
           "ssm:UpdateInstanceInformation",
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
           "ssmmessages:AcknowledgeMessage",
           "ssmmessages:GetEndpoint",
           "ssmmessages:GetMessages",
+          "ec2messages:AcknowledgeMessage",
+          "ec2messages:DeleteMessage",
+          "ec2messages:FailMessage",
           "ec2messages:GetMessages",
+          "ec2messages:SendReply",
         ]
         Resource = "*"
       },
@@ -269,10 +285,18 @@ resource "aws_iam_role_policy" "ghe_key_lookup" {
         Effect = "Allow"
         Action = [
           "ssm:UpdateInstanceInformation",
+          "ssmmessages:CreateControlChannel",
+          "ssmmessages:CreateDataChannel",
+          "ssmmessages:OpenControlChannel",
+          "ssmmessages:OpenDataChannel",
           "ssmmessages:AcknowledgeMessage",
           "ssmmessages:GetEndpoint",
           "ssmmessages:GetMessages",
+          "ec2messages:AcknowledgeMessage",
+          "ec2messages:DeleteMessage",
+          "ec2messages:FailMessage",
           "ec2messages:GetMessages",
+          "ec2messages:SendReply",
         ]
         Resource = "*"
       },
