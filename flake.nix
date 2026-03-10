@@ -203,6 +203,10 @@
 
           packages = {
             forgeproxy = pkgs.callPackage ./nix/package.nix { inherit gitRevision; };
+            forgeproxy-dev = pkgs.callPackage ./nix/package.nix {
+              inherit gitRevision;
+              devEnabled = true;
+            };
             forgeproxy-fips = pkgs.callPackage ./nix/package.nix {
               inherit gitRevision;
               fipsEnabled = true;
@@ -227,6 +231,10 @@
             jemalloc = final.jemalloc-valkey-rtree-fix;
           };
           forgeproxy = final.callPackage ./nix/package.nix { inherit gitRevision; };
+          forgeproxy-dev = final.callPackage ./nix/package.nix {
+            inherit gitRevision;
+            devEnabled = true;
+          };
           forgeproxy-fips = final.callPackage ./nix/package.nix {
             inherit gitRevision;
             fipsEnabled = true;
@@ -603,9 +611,14 @@
         nixosConfigurations.forgeproxy = self.nixosConfigurations.forgeproxy-hardened.extendModules {
           modules = [
             self.nixosModules.dev
-            {
-              services.forgeproxy.allowEnvSecretFallback = true;
-            }
+            (
+              { pkgs, ... }:
+              {
+                services.forgeproxy.package = pkgs.forgeproxy-dev;
+                services.forgeproxy.allowEnvSecretFallback = true;
+                environment.systemPackages = [ pkgs.forgeproxy-dev ];
+              }
+            )
           ];
         };
 

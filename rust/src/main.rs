@@ -19,6 +19,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+#[cfg(feature = "dev")]
+use clap::Subcommand;
 use fred::clients::Pool;
 use fred::interfaces::ClientLike;
 use fred::types::config::{Config as FredConfig, ReconnectPolicy, ServerConfig, TlsConnector};
@@ -46,6 +48,21 @@ struct Cli {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "/run/forgeproxy/config.yaml")]
     config: String,
+
+    #[cfg(feature = "dev")]
+    #[command(subcommand)]
+    command: Option<DevCommand>,
+}
+
+#[cfg(feature = "dev")]
+#[derive(Subcommand, Debug)]
+enum DevCommand {
+    /// Run bundle lifecycle work on demand without waiting for the scheduler.
+    Bundle {
+        /// Suppress the final one-shot summary log.
+        #[arg(long)]
+        no_summary: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +262,39 @@ async fn run_node_heartbeat(state: AppState) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "dev")]
+async fn run_dev_command(state: AppState, command: DevCommand) -> Result<()> {
+    match command {
+        DevCommand::Bundle { no_summary } => {
+            let started_at = Instant::now();
+            tracing::info!("running dev bundle command");
+            let summary = crate::bundleuri::lifecycle::tick_with_summary(&state).await?;
+            if !no_summary {
+                tracing::info!(
+                    elapsed_secs = started_at.elapsed().as_secs_f64(),
+                    repos_scanned = summary.repos_scanned,
+                    repos_completed = summary.repos_completed,
+                    skipped_not_due = summary.skipped_not_due,
+                    skipped_below_min_clone_count = summary.skipped_below_min_clone_count,
+                    skipped_lock_held = summary.skipped_lock_held,
+                    skipped_not_cached = summary.skipped_not_cached,
+                    fetch_succeeded = summary.fetch_succeeded,
+                    fetch_failed = summary.fetch_failed,
+                    bundles_generated = summary.bundles_generated,
+                    bundle_generation_failed = summary.bundle_generation_failed,
+                    bundle_upload_failed = summary.bundle_upload_failed,
+                    filtered_bundles_generated = summary.filtered_bundles_generated,
+                    filtered_bundle_upload_failed = summary.filtered_bundle_upload_failed,
+                    repos_published = summary.repos_published,
+                    repo_errors = summary.repo_errors,
+                    "dev bundle command summary"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
@@ -304,6 +354,11 @@ async fn main() -> Result<()> {
         "starting forgeproxy"
     );
     let state = build_app_state(Arc::clone(&config)).await?;
+
+    #[cfg(feature = "dev")]
+    if let Some(command) = cli.command {
+        return run_dev_command(state, command).await;
+    }
 
     // ---- Telemetry buffer ----
     let telemetry_buffer = cache::telemetry::TelemetryBuffer::new();

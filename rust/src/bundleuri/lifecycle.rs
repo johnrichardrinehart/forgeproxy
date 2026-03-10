@@ -22,6 +22,101 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::AppState;
 
+#[derive(Debug, Default)]
+pub(crate) struct TickSummary {
+    pub(crate) repos_scanned: usize,
+    pub(crate) repos_completed: usize,
+    pub(crate) skipped_not_due: usize,
+    pub(crate) skipped_below_min_clone_count: usize,
+    pub(crate) skipped_lock_held: usize,
+    pub(crate) skipped_not_cached: usize,
+    pub(crate) fetch_succeeded: usize,
+    pub(crate) fetch_failed: usize,
+    pub(crate) bundles_generated: usize,
+    pub(crate) bundle_generation_failed: usize,
+    pub(crate) bundle_upload_failed: usize,
+    pub(crate) filtered_bundles_generated: usize,
+    pub(crate) filtered_bundle_upload_failed: usize,
+    pub(crate) repos_published: usize,
+    pub(crate) repo_errors: usize,
+}
+
+impl TickSummary {
+    fn record(&mut self, outcome: RepoTickOutcome) {
+        self.repos_scanned += 1;
+
+        match outcome.status {
+            RepoTickStatus::Completed => self.repos_completed += 1,
+            RepoTickStatus::SkippedNotDue => self.skipped_not_due += 1,
+            RepoTickStatus::SkippedBelowMinCloneCount => self.skipped_below_min_clone_count += 1,
+            RepoTickStatus::SkippedLockHeld => self.skipped_lock_held += 1,
+            RepoTickStatus::SkippedNotCached => self.skipped_not_cached += 1,
+            RepoTickStatus::FetchFailed => self.fetch_failed += 1,
+            RepoTickStatus::BundleGenerationFailed => self.bundle_generation_failed += 1,
+        }
+
+        if outcome.fetch_succeeded {
+            self.fetch_succeeded += 1;
+        }
+        if outcome.bundle_generated {
+            self.bundles_generated += 1;
+        }
+        if outcome.bundle_upload_failed {
+            self.bundle_upload_failed += 1;
+        }
+        if outcome.filtered_bundle_generated {
+            self.filtered_bundles_generated += 1;
+        }
+        if outcome.filtered_bundle_upload_failed {
+            self.filtered_bundle_upload_failed += 1;
+        }
+        if outcome.published {
+            self.repos_published += 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RepoTickStatus {
+    Completed,
+    SkippedNotDue,
+    SkippedBelowMinCloneCount,
+    SkippedLockHeld,
+    SkippedNotCached,
+    FetchFailed,
+    BundleGenerationFailed,
+}
+
+impl Default for RepoTickStatus {
+    fn default() -> Self {
+        Self::Completed
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct RepoTickOutcome {
+    status: RepoTickStatus,
+    fetch_succeeded: bool,
+    bundle_generated: bool,
+    bundle_upload_failed: bool,
+    filtered_bundle_generated: bool,
+    filtered_bundle_upload_failed: bool,
+    published: bool,
+}
+
+impl RepoTickOutcome {
+    fn with_status(status: RepoTickStatus) -> Self {
+        Self {
+            status,
+            ..Self::default()
+        }
+    }
+
+    fn completed() -> Self {
+        Self::with_status(RepoTickStatus::Completed)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main lifecycle loop
 // ---------------------------------------------------------------------------
@@ -52,27 +147,38 @@ pub async fn run_bundle_lifecycle(state: Arc<AppState>) {
 /// A single lifecycle tick: iterate over all registered repos and process
 /// those that are due for a fetch and bundle refresh.
 #[instrument(skip(state))]
-async fn tick(state: &AppState) -> Result<()> {
+pub(crate) async fn tick(state: &AppState) -> Result<()> {
+    let _ = tick_with_summary(state).await?;
+    Ok(())
+}
+
+#[instrument(skip(state))]
+pub(crate) async fn tick_with_summary(state: &AppState) -> Result<TickSummary> {
     let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
     debug!(repo_count = repos.len(), "lifecycle tick: scanning repos");
+    let mut summary = TickSummary::default();
 
     for owner_repo in &repos {
-        if let Err(e) = process_repo(state, owner_repo).await {
-            warn!(
-                repo = %owner_repo,
-                error = %e,
-                "failed to process repo in lifecycle tick"
-            );
+        match process_repo(state, owner_repo).await {
+            Ok(outcome) => summary.record(outcome),
+            Err(e) => {
+                summary.repo_errors += 1;
+                warn!(
+                    repo = %owner_repo,
+                    error = %e,
+                    "failed to process repo in lifecycle tick"
+                );
+            }
         }
     }
 
-    Ok(())
+    Ok(summary)
 }
 
 /// Process a single repo: check schedule, fetch if needed, generate bundle,
 /// upload to S3.
 #[instrument(skip(state), fields(%owner_repo))]
-async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
+async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutcome> {
     // 1. Read the dynamic fetch schedule for this repo.
     let schedule = crate::coordination::registry::get_fetch_schedule(&state.valkey, owner_repo)
         .await?
@@ -96,7 +202,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             next_in_secs = (last_bundle + interval).saturating_sub(now),
             "repo not yet due for fetch"
         );
-        return Ok(());
+        return Ok(RepoTickOutcome::with_status(RepoTickStatus::SkippedNotDue));
     }
 
     // 3. Check minimum clone count threshold before investing in bundles.
@@ -112,7 +218,9 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             min_clones = min_clones,
             "repo below minimum clone count for bundle generation"
         );
-        return Ok(());
+        return Ok(RepoTickOutcome::with_status(
+            RepoTickStatus::SkippedBelowMinCloneCount,
+        ));
     }
 
     // 4. Attempt to acquire the distributed fetch/bundle lock.
@@ -125,7 +233,9 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
     if !lock_acquired {
         debug!(repo = %owner_repo, "another node holds the bundle lock; skipping");
-        return Ok(());
+        return Ok(RepoTickOutcome::with_status(
+            RepoTickStatus::SkippedLockHeld,
+        ));
     }
 
     // 5. Perform the fetch.
@@ -134,6 +244,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
     let repo_path = state.cache_manager.repo_path(owner_repo);
     let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
     let mut published = false;
+    let mut outcome = RepoTickOutcome::completed();
 
     let fetch_result = if state.cache_manager.has_repo(owner_repo) {
         // Repo is locally cached -- do an incremental fetch.
@@ -173,11 +284,14 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
         // Release lock and return.
         let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true)
             .await;
-        return Ok(());
+        return Ok(RepoTickOutcome::with_status(
+            RepoTickStatus::SkippedNotCached,
+        ));
     };
 
     match fetch_result {
         Ok(result) => {
+            outcome.fetch_succeeded = true;
             info!(
                 repo = %owner_repo,
                 refs_updated = result.refs_updated,
@@ -210,6 +324,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
 
             match bundle_result {
                 Ok(bundle) => {
+                    outcome.bundle_generated = true;
                     info!(
                         repo = %owner_repo,
                         bundle_path = %bundle.bundle_path.display(),
@@ -224,21 +339,22 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                         state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
                     );
 
-                    crate::storage::s3::upload_bundle(
+                    if let Err(e) = crate::storage::s3::upload_bundle(
                         &state.s3_client,
                         &state.config.storage.s3.bucket,
                         &s3_key,
                         &bundle.bundle_path,
                     )
                     .await
-                    .unwrap_or_else(|e| {
+                    {
+                        outcome.bundle_upload_failed = true;
                         warn!(
                             repo = %owner_repo,
                             s3_key = %s3_key,
                             error = %e,
                             "failed to upload bundle to S3"
                         );
-                    });
+                    }
 
                     // Record the current refs snapshot for the next incremental.
                     let current_refs =
@@ -258,6 +374,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                         .cache_manager
                         .publish_staged_repo(owner_repo, &staged_repo_path)?;
                     published = true;
+                    outcome.published = true;
 
                     // Generate filtered (blobless) bundle variant if configured.
                     if state.config.bundles.generate_filtered_bundles {
@@ -269,26 +386,28 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                         .await
                         {
                             Ok(filtered) => {
+                                outcome.filtered_bundle_generated = true;
                                 let filtered_s3_key = format!(
                                     "{}{}/bundles/{}.filtered.bundle",
                                     state.config.storage.s3.prefix,
                                     owner_repo,
                                     filtered.creation_token,
                                 );
-                                crate::storage::s3::upload_bundle(
+                                if let Err(e) = crate::storage::s3::upload_bundle(
                                     &state.s3_client,
                                     &state.config.storage.s3.bucket,
                                     &filtered_s3_key,
                                     &filtered.bundle_path,
                                 )
                                 .await
-                                .unwrap_or_else(|e| {
+                                {
+                                    outcome.filtered_bundle_upload_failed = true;
                                     warn!(
                                         repo = %owner_repo,
                                         error = %e,
                                         "failed to upload filtered bundle to S3"
                                     );
-                                });
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -301,6 +420,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    outcome.status = RepoTickStatus::BundleGenerationFailed;
                     warn!(
                         repo = %owner_repo,
                         error = %e,
@@ -310,6 +430,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             }
         }
         Err(e) => {
+            outcome.status = RepoTickStatus::FetchFailed;
             warn!(
                 repo = %owner_repo,
                 error = %e,
@@ -333,7 +454,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<()> {
             })?;
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -486,7 +607,7 @@ pub async fn run_daily_consolidation(state: Arc<AppState>) {
 }
 
 /// Perform one round of daily consolidation across all repos.
-async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
+pub(crate) async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
     let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
     let lock_ttl = state.config.bundles.bundle_lock_ttl;
 
@@ -664,7 +785,7 @@ pub async fn run_weekly_consolidation(state: Arc<AppState>) {
 }
 
 /// Perform one round of weekly consolidation across all repos.
-async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
+pub(crate) async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
     let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
     let lock_ttl = state.config.bundles.bundle_lock_ttl;
 
