@@ -100,6 +100,7 @@ pub async fn generate_incremental_bundle(
     .await
     .with_context(|| format!("git bundle create failed for {owner_repo}"))?;
     verify_bundle_or_log(
+        repo_path,
         &bundle_path,
         owner_repo,
         "incremental",
@@ -149,7 +150,15 @@ pub async fn generate_full_bundle(
         .await
         .with_context(|| format!("git bundle create (full) failed for {owner_repo}"))?;
     let included_refs: Vec<String> = current_refs.keys().cloned().collect();
-    verify_bundle_or_log(&bundle_path, owner_repo, "full", Some(&included_refs), 0).await?;
+    verify_bundle_or_log(
+        repo_path,
+        &bundle_path,
+        owner_repo,
+        "full",
+        Some(&included_refs),
+        0,
+    )
+    .await?;
 
     let metadata = tokio::fs::metadata(&bundle_path)
         .await
@@ -191,6 +200,7 @@ pub async fn generate_filtered_bundle(
         .with_context(|| format!("filtered bundle create failed for {owner_repo}"))?;
     let included_refs: Vec<String> = current_refs.keys().cloned().collect();
     verify_bundle_or_log(
+        repo_path,
         &bundle_path,
         owner_repo,
         "filtered",
@@ -229,13 +239,14 @@ pub async fn get_refs(repo_path: &Path) -> Result<HashMap<String, String>> {
 }
 
 async fn verify_bundle_or_log(
+    repo_path: &Path,
     bundle_path: &Path,
     owner_repo: &str,
     bundle_kind: &str,
     included_refs: Option<&[String]>,
     excluded_object_count: usize,
 ) -> Result<()> {
-    match commands::git_bundle_verify(bundle_path).await {
+    match commands::git_bundle_verify(repo_path, bundle_path).await {
         Ok(()) => Ok(()),
         Err(error) => {
             let bundle_size = tokio::fs::metadata(bundle_path)

@@ -527,11 +527,15 @@ pub async fn git_set_head_symbolic_ref(repo_path: &Path, target: &str) -> Result
     Ok(())
 }
 
-/// Run `git bundle verify <bundle_path>`.
-#[instrument(fields(bundle = %bundle_path.display()))]
-pub async fn git_bundle_verify(bundle_path: &Path) -> Result<()> {
+/// Run `git -C <repo_path> bundle verify <bundle_path>`.
+#[instrument(fields(repo = %repo_path.display(), bundle = %bundle_path.display()))]
+pub async fn git_bundle_verify(repo_path: &Path, bundle_path: &Path) -> Result<()> {
     let mut cmd = Command::new("git");
-    cmd.arg("bundle").arg("verify").arg(bundle_path);
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("bundle")
+        .arg("verify")
+        .arg(bundle_path);
 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
