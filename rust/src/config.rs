@@ -435,12 +435,8 @@ pub struct BundleConfig {
     pub bundle_lock_ttl: u64,
     /// Maximum number of repositories whose bundle-generation work may run in
     /// parallel on this instance during the periodic lifecycle tick.
-    ///
-    /// When unset, forgeproxy derives a conservative default from the host's
-    /// CPU count so bundle creation can overlap without multiplying CPU load
-    /// unboundedly.
-    #[serde(default)]
-    pub max_concurrent_generations: Option<usize>,
+    #[serde(default = "default_max_concurrent_generations")]
+    pub max_concurrent_generations: usize,
     /// Number of `git pack-objects` threads to use for each generated bundle.
     ///
     /// When unset, forgeproxy derives a value from the host's CPU count and
@@ -466,7 +462,7 @@ impl Default for BundleConfig {
             weekly_consolidation_day: default_weekly_day(),
             min_clone_count_for_bundles: default_min_clone_count(),
             bundle_lock_ttl: default_bundle_lock_ttl(),
-            max_concurrent_generations: None,
+            max_concurrent_generations: default_max_concurrent_generations(),
             pack_threads: None,
             generate_filtered_bundles: false,
         }
@@ -485,9 +481,7 @@ impl BundleConfig {
         &self,
         available_parallelism: usize,
     ) -> BundleExecutionPolicy {
-        let max_concurrent_generations = self
-            .max_concurrent_generations
-            .unwrap_or_else(|| default_max_concurrent_generations(available_parallelism));
+        let max_concurrent_generations = self.max_concurrent_generations;
         let pack_threads = self.pack_threads.unwrap_or_else(|| {
             default_pack_threads(available_parallelism, max_concurrent_generations)
         });
@@ -515,13 +509,8 @@ fn default_bundle_lock_ttl() -> u64 {
     600
 }
 
-fn default_max_concurrent_generations(available_parallelism: usize) -> usize {
-    match available_parallelism {
-        0..=3 => 1,
-        4..=7 => 2,
-        8..=15 => 3,
-        _ => 4,
-    }
+fn default_max_concurrent_generations() -> usize {
+    2
 }
 
 fn default_pack_threads(available_parallelism: usize, max_concurrent_generations: usize) -> usize {
@@ -644,10 +633,7 @@ fn validate_config(config: &Config) -> Result<()> {
         "weekly_consolidation_day must be 1-7"
     );
     anyhow::ensure!(
-        config
-            .bundles
-            .max_concurrent_generations
-            .is_none_or(|value| value > 0),
+        config.bundles.max_concurrent_generations > 0,
         "max_concurrent_generations must be greater than 0"
     );
     anyhow::ensure!(
@@ -664,21 +650,21 @@ mod tests {
     #[test]
     fn bundle_execution_policy_defaults_single_core() {
         let policy = BundleConfig::default().execution_policy_for_parallelism(1);
-        assert_eq!(policy.max_concurrent_generations, 1);
+        assert_eq!(policy.max_concurrent_generations, 2);
         assert_eq!(policy.pack_threads, 1);
     }
 
     #[test]
     fn bundle_execution_policy_defaults_spread_multi_core_hosts() {
         let policy = BundleConfig::default().execution_policy_for_parallelism(8);
-        assert_eq!(policy.max_concurrent_generations, 3);
-        assert_eq!(policy.pack_threads, 2);
+        assert_eq!(policy.max_concurrent_generations, 2);
+        assert_eq!(policy.pack_threads, 4);
     }
 
     #[test]
     fn bundle_execution_policy_respects_explicit_overrides() {
         let policy = BundleConfig {
-            max_concurrent_generations: Some(2),
+            max_concurrent_generations: 2,
             pack_threads: Some(5),
             ..BundleConfig::default()
         }

@@ -19,6 +19,8 @@ use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike, Utc};
 use fred::interfaces::HashesInterface;
 use futures::{StreamExt, stream};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::AppState;
@@ -124,6 +126,79 @@ impl RepoTickOutcome {
     fn completed() -> Self {
         Self::with_status(RepoTickStatus::Completed)
     }
+}
+
+struct BundleLockHeartbeat {
+    lease: crate::coordination::locks::LockLease,
+    shutdown_tx: watch::Sender<bool>,
+    join_handle: JoinHandle<()>,
+}
+
+fn bundle_lock_heartbeat_interval(ttl_secs: u64) -> Duration {
+    Duration::from_secs(std::cmp::max(1, ttl_secs / 3))
+}
+
+fn spawn_bundle_lock_heartbeat(
+    state: &AppState,
+    lease: crate::coordination::locks::LockLease,
+    ttl_secs: u64,
+) -> BundleLockHeartbeat {
+    let interval = bundle_lock_heartbeat_interval(ttl_secs);
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let valkey = state.valkey.clone();
+    let heartbeat_lease = lease.clone();
+
+    let join_handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {
+                    match crate::coordination::locks::renew_lock_lease(&valkey, &heartbeat_lease, ttl_secs).await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            warn!(
+                                key = %heartbeat_lease.key,
+                                node_id = %heartbeat_lease.node_id,
+                                error = %error,
+                                error_chain = %format_error_chain(&error),
+                                "bundle lock heartbeat failed"
+                            );
+                            break;
+                        }
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    BundleLockHeartbeat {
+        lease,
+        shutdown_tx,
+        join_handle,
+    }
+}
+
+async fn stop_bundle_lock_heartbeat(
+    heartbeat: BundleLockHeartbeat,
+) -> crate::coordination::locks::LockLease {
+    let BundleLockHeartbeat {
+        lease,
+        shutdown_tx,
+        join_handle,
+    } = heartbeat;
+    let _ = shutdown_tx.send(true);
+    match join_handle.await {
+        Ok(()) => {}
+        Err(error) => {
+            warn!(key = %lease.key, node_id = %lease.node_id, error = %error, "bundle lock heartbeat task ended unexpectedly")
+        }
+    }
+    lease
 }
 
 // ---------------------------------------------------------------------------
@@ -247,16 +322,20 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
     let lock_key = format!("forgeproxy:lock:bundle:{owner_repo}");
     let lock_ttl = state.config.bundles.bundle_lock_ttl;
     let node_id = crate::coordination::node::node_id();
-    let lock_acquired =
-        crate::coordination::locks::acquire_lock(&state.valkey, &lock_key, &node_id, lock_ttl)
-            .await?;
-
-    if !lock_acquired {
+    let Some(lock_lease) = crate::coordination::locks::acquire_lock_lease(
+        &state.valkey,
+        &lock_key,
+        &node_id,
+        lock_ttl,
+    )
+    .await?
+    else {
         debug!(repo = %owner_repo, "another node holds the bundle lock; skipping");
         return Ok(RepoTickOutcome::with_status(
             RepoTickStatus::SkippedLockHeld,
         ));
-    }
+    };
+    let bundle_lock_heartbeat = spawn_bundle_lock_heartbeat(state, lock_lease, lock_ttl);
 
     // 5. Perform the fetch.
     info!(repo = %owner_repo, "starting background fetch for bundle generation");
@@ -302,8 +381,9 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
             "repo not locally cached; skipping bundle generation"
         );
         // Release lock and return.
-        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true)
-            .await;
+        let lock_lease = stop_bundle_lock_heartbeat(bundle_lock_heartbeat).await;
+        let _ =
+            crate::coordination::locks::release_lock_lease(&state.valkey, &lock_lease, true).await;
         return Ok(RepoTickOutcome::with_status(
             RepoTickStatus::SkippedNotCached,
         ));
@@ -462,8 +542,8 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
     }
 
     // Release the distributed lock.
-    let _ =
-        crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true).await;
+    let lock_lease = stop_bundle_lock_heartbeat(bundle_lock_heartbeat).await;
+    let _ = crate::coordination::locks::release_lock_lease(&state.valkey, &lock_lease, true).await;
 
     if !published && staged_repo_path.exists() {
         tokio::fs::remove_dir_all(&staged_repo_path)
