@@ -17,6 +17,13 @@ pub struct SemaphoreLease {
     pub token: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct LockLease {
+    pub key: String,
+    pub node_id: String,
+    pub token: String,
+}
+
 /// Attempt to acquire a distributed lock using SET NX EX.
 ///
 /// Returns `true` if the lock was successfully acquired, `false` if it is
@@ -40,6 +47,74 @@ pub async fn acquire_lock(
     let acquired = result.is_some();
     debug!(%key, %node_id, acquired, "acquire_lock");
     Ok(acquired)
+}
+
+/// Attempt to acquire a distributed lock backed by a renewable lease.
+///
+/// The stored value includes a random token so a holder can safely renew or
+/// release only the exact lease it acquired.
+pub async fn acquire_lock_lease(
+    pool: &fred::clients::Pool,
+    key: &str,
+    node_id: &str,
+    ttl_secs: u64,
+) -> Result<Option<LockLease>> {
+    let token = format!("{node_id}:{}", Uuid::new_v4());
+    let result: Option<String> = pool
+        .set(
+            key,
+            token.as_str(),
+            Some(fred::types::Expiration::EX(ttl_secs as i64)),
+            Some(fred::types::SetOptions::NX),
+            false,
+        )
+        .await?;
+    let acquired = result.is_some();
+    debug!(%key, %node_id, acquired, "acquire_lock_lease");
+    Ok(acquired.then(|| LockLease {
+        key: key.to_string(),
+        node_id: node_id.to_string(),
+        token,
+    }))
+}
+
+/// Renew a lock lease only if the exact lease token still owns the lock.
+pub async fn renew_lock_lease(
+    pool: &fred::clients::Pool,
+    lease: &LockLease,
+    ttl_secs: u64,
+) -> Result<bool> {
+    let script = r#"
+        local val = redis.call('GET', KEYS[1])
+        if not val then
+            return 0
+        end
+        if val == ARGV[1] then
+            redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+            return 1
+        end
+        return 0
+    "#;
+    let renewed: i64 = pool
+        .eval(
+            script,
+            vec![lease.key.clone()],
+            vec![lease.token.clone(), ttl_secs.to_string()],
+        )
+        .await
+        .context("lock renewal script failed")?;
+
+    if renewed == 1 {
+        debug!(key = %lease.key, node_id = %lease.node_id, ttl_secs, "lock lease renewed");
+        Ok(true)
+    } else {
+        warn!(
+            key = %lease.key,
+            node_id = %lease.node_id,
+            "lock lease could not be renewed because ownership was lost"
+        );
+        Ok(false)
+    }
 }
 
 /// Release a lock only if it is still owned by `node_id`.
@@ -90,6 +165,63 @@ pub async fn release_lock(
         }
         LockReleaseStatus::OwnedByAnotherNode => {
             warn!(%key, %node_id, "lock release skipped because key is owned by another node");
+        }
+    }
+
+    Ok(status)
+}
+
+/// Release a renewable lock lease only if the stored token still matches.
+pub async fn release_lock_lease(
+    pool: &fred::clients::Pool,
+    lease: &LockLease,
+    expected_owned: bool,
+) -> Result<LockReleaseStatus> {
+    let script = r#"
+        local val = redis.call('GET', KEYS[1])
+        if not val then
+            return 'missing'
+        end
+        if val == ARGV[1] then
+            redis.call('DEL', KEYS[1])
+            redis.call('PUBLISH', KEYS[1] .. ':notify', 'released')
+            return 'released'
+        end
+        return 'owned_by_another_node'
+    "#;
+    let result: String = pool
+        .eval(script, vec![lease.key.clone()], vec![lease.token.clone()])
+        .await
+        .context("lock lease release script failed")?;
+
+    let status = match result.as_str() {
+        "released" => LockReleaseStatus::Released,
+        "missing" if expected_owned => LockReleaseStatus::Expired,
+        "missing" => LockReleaseStatus::Missing,
+        "owned_by_another_node" => LockReleaseStatus::OwnedByAnotherNode,
+        other => bail!("unexpected lock release result {other:?}"),
+    };
+
+    match status {
+        LockReleaseStatus::Released => {
+            debug!(key = %lease.key, node_id = %lease.node_id, "lock lease released");
+        }
+        LockReleaseStatus::Expired => {
+            info!(key = %lease.key, node_id = %lease.node_id, "lock lease expired before release");
+        }
+        LockReleaseStatus::Missing => {
+            warn!(
+                key = %lease.key,
+                node_id = %lease.node_id,
+                "lock lease release skipped because key was missing"
+            );
+        }
+        LockReleaseStatus::OwnedByAnotherNode => {
+            warn!(
+                key = %lease.key,
+                node_id = %lease.node_id,
+                "lock lease release skipped because key is owned by another node"
+            );
         }
     }
 
