@@ -87,6 +87,18 @@ pub async fn generate_incremental_bundle(
         "creating incremental bundle"
     );
 
+    let _bundle_generation_permit = state
+        .bundle_generation_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .context("bundle generation semaphore closed")?;
+    debug!(
+        owner_repo,
+        pack_threads = state.bundle_pack_threads,
+        max_concurrent_generations = state.bundle_max_concurrency,
+        "acquired bundle generation permit"
+    );
     commands::git_bundle_create(
         repo_path,
         &bundle_path,
@@ -96,6 +108,7 @@ pub async fn generate_incremental_bundle(
         } else {
             Some(&not_refs)
         },
+        state.bundle_pack_threads,
     )
     .await
     .with_context(|| format!("git bundle create failed for {owner_repo}"))?;
@@ -146,9 +159,27 @@ pub async fn generate_full_bundle(
     );
 
     // --all includes every ref.
-    commands::git_bundle_create(repo_path, &bundle_path, None, None)
+    let _bundle_generation_permit = state
+        .bundle_generation_semaphore
+        .clone()
+        .acquire_owned()
         .await
-        .with_context(|| format!("git bundle create (full) failed for {owner_repo}"))?;
+        .context("bundle generation semaphore closed")?;
+    debug!(
+        owner_repo,
+        pack_threads = state.bundle_pack_threads,
+        max_concurrent_generations = state.bundle_max_concurrency,
+        "acquired bundle generation permit"
+    );
+    commands::git_bundle_create(
+        repo_path,
+        &bundle_path,
+        None,
+        None,
+        state.bundle_pack_threads,
+    )
+    .await
+    .with_context(|| format!("git bundle create (full) failed for {owner_repo}"))?;
     let included_refs: Vec<String> = current_refs.keys().cloned().collect();
     verify_bundle_or_log(
         repo_path,
@@ -195,9 +226,26 @@ pub async fn generate_filtered_bundle(
 
     info!(owner_repo, "creating filtered (blob:none) bundle");
 
-    commands::git_bundle_create_filtered(repo_path, &bundle_path, "blob:none")
+    let _bundle_generation_permit = state
+        .bundle_generation_semaphore
+        .clone()
+        .acquire_owned()
         .await
-        .with_context(|| format!("filtered bundle create failed for {owner_repo}"))?;
+        .context("bundle generation semaphore closed")?;
+    debug!(
+        owner_repo,
+        pack_threads = state.bundle_pack_threads,
+        max_concurrent_generations = state.bundle_max_concurrency,
+        "acquired bundle generation permit"
+    );
+    commands::git_bundle_create_filtered(
+        repo_path,
+        &bundle_path,
+        "blob:none",
+        state.bundle_pack_threads,
+    )
+    .await
+    .with_context(|| format!("filtered bundle create failed for {owner_repo}"))?;
     let included_refs: Vec<String> = current_refs.keys().cloned().collect();
     verify_bundle_or_log(
         repo_path,
