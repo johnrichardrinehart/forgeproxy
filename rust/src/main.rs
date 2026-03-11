@@ -87,6 +87,13 @@ pub struct AppState {
     pub clone_semaphore: Arc<Semaphore>,
     /// Semaphore limiting concurrent fetches against upstream.
     pub fetch_semaphore: Arc<Semaphore>,
+    /// Semaphore limiting concurrent CPU-heavy bundle-generation subprocesses.
+    pub bundle_generation_semaphore: Arc<Semaphore>,
+    /// Resolved maximum number of repos to process concurrently during the
+    /// bundle lifecycle tick.
+    pub bundle_max_concurrency: usize,
+    /// Resolved `git pack-objects` thread budget per bundle generation.
+    pub bundle_pack_threads: usize,
     /// Per-repo local semaphore cache limiting concurrent hydrations for the
     /// same repository within this instance.
     pub repo_clone_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
@@ -485,6 +492,12 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
     }
 
     let rate_limit = forge::rate_limit::RateLimitState::new();
+    let bundle_execution_policy = config.bundles.execution_policy();
+    tracing::info!(
+        max_concurrent_generations = bundle_execution_policy.max_concurrent_generations,
+        pack_threads = bundle_execution_policy.pack_threads,
+        "resolved bundle execution policy"
+    );
 
     Ok(AppState {
         config: Arc::clone(&config),
@@ -498,6 +511,11 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         rate_limit,
         clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_clones)),
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
+        bundle_generation_semaphore: Arc::new(Semaphore::new(
+            bundle_execution_policy.max_concurrent_generations,
+        )),
+        bundle_max_concurrency: bundle_execution_policy.max_concurrent_generations,
+        bundle_pack_threads: bundle_execution_policy.pack_threads,
         repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_publish_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         active_repo_generations: Arc::new(Mutex::new(std::collections::HashMap::new())),

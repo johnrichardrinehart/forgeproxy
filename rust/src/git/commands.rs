@@ -615,10 +615,13 @@ pub async fn git_bundle_create(
     output: &Path,
     refs: Option<&[String]>,
     not_refs: Option<&[String]>,
+    pack_threads: usize,
 ) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo_path)
+        .arg("-c")
+        .arg(format!("pack.threads={pack_threads}"))
         .arg("bundle")
         .arg("create")
         .arg(output);
@@ -674,10 +677,13 @@ pub async fn git_bundle_create_filtered(
     repo_path: &Path,
     output: &Path,
     filter: &str,
+    pack_threads: usize,
 ) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo_path)
+        .arg("-c")
+        .arg(format!("pack.threads={pack_threads}"))
         .arg("bundle")
         .arg("create")
         .arg(format!("--filter={filter}"))

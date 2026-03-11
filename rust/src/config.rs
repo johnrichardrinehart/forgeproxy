@@ -433,9 +433,30 @@ pub struct BundleConfig {
     /// TTL (seconds) of the distributed bundle-generation lock.
     #[serde(default = "default_bundle_lock_ttl")]
     pub bundle_lock_ttl: u64,
+    /// Maximum number of repositories whose bundle-generation work may run in
+    /// parallel on this instance during the periodic lifecycle tick.
+    ///
+    /// When unset, forgeproxy derives a conservative default from the host's
+    /// CPU count so bundle creation can overlap without multiplying CPU load
+    /// unboundedly.
+    #[serde(default)]
+    pub max_concurrent_generations: Option<usize>,
+    /// Number of `git pack-objects` threads to use for each generated bundle.
+    ///
+    /// When unset, forgeproxy derives a value from the host's CPU count and
+    /// the resolved bundle-generation concurrency so the total pack thread
+    /// budget stays roughly within the machine's parallelism.
+    #[serde(default)]
+    pub pack_threads: Option<usize>,
     /// Whether to produce filtered (blobless / treeless) bundle variants.
     #[serde(default)]
     pub generate_filtered_bundles: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleExecutionPolicy {
+    pub max_concurrent_generations: usize,
+    pub pack_threads: usize,
 }
 
 impl Default for BundleConfig {
@@ -445,7 +466,35 @@ impl Default for BundleConfig {
             weekly_consolidation_day: default_weekly_day(),
             min_clone_count_for_bundles: default_min_clone_count(),
             bundle_lock_ttl: default_bundle_lock_ttl(),
+            max_concurrent_generations: None,
+            pack_threads: None,
             generate_filtered_bundles: false,
+        }
+    }
+}
+
+impl BundleConfig {
+    pub fn execution_policy(&self) -> BundleExecutionPolicy {
+        let available_parallelism = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        self.execution_policy_for_parallelism(available_parallelism)
+    }
+
+    fn execution_policy_for_parallelism(
+        &self,
+        available_parallelism: usize,
+    ) -> BundleExecutionPolicy {
+        let max_concurrent_generations = self
+            .max_concurrent_generations
+            .unwrap_or_else(|| default_max_concurrent_generations(available_parallelism));
+        let pack_threads = self.pack_threads.unwrap_or_else(|| {
+            default_pack_threads(available_parallelism, max_concurrent_generations)
+        });
+
+        BundleExecutionPolicy {
+            max_concurrent_generations,
+            pack_threads,
         }
     }
 }
@@ -464,6 +513,21 @@ fn default_min_clone_count() -> u64 {
 
 fn default_bundle_lock_ttl() -> u64 {
     600
+}
+
+fn default_max_concurrent_generations(available_parallelism: usize) -> usize {
+    match available_parallelism {
+        0..=3 => 1,
+        4..=7 => 2,
+        8..=15 => 3,
+        _ => 4,
+    }
+}
+
+fn default_pack_threads(available_parallelism: usize, max_concurrent_generations: usize) -> usize {
+    let available_parallelism = available_parallelism.max(1);
+    let max_concurrent_generations = max_concurrent_generations.max(1);
+    std::cmp::max(1, available_parallelism / max_concurrent_generations)
 }
 
 // ---------------------------------------------------------------------------
@@ -579,5 +643,47 @@ fn validate_config(config: &Config) -> Result<()> {
         (1..=7).contains(&config.bundles.weekly_consolidation_day),
         "weekly_consolidation_day must be 1-7"
     );
+    anyhow::ensure!(
+        config
+            .bundles
+            .max_concurrent_generations
+            .is_none_or(|value| value > 0),
+        "max_concurrent_generations must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.bundles.pack_threads.is_none_or(|value| value > 0),
+        "pack_threads must be greater than 0"
+    );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BundleConfig;
+
+    #[test]
+    fn bundle_execution_policy_defaults_single_core() {
+        let policy = BundleConfig::default().execution_policy_for_parallelism(1);
+        assert_eq!(policy.max_concurrent_generations, 1);
+        assert_eq!(policy.pack_threads, 1);
+    }
+
+    #[test]
+    fn bundle_execution_policy_defaults_spread_multi_core_hosts() {
+        let policy = BundleConfig::default().execution_policy_for_parallelism(8);
+        assert_eq!(policy.max_concurrent_generations, 3);
+        assert_eq!(policy.pack_threads, 2);
+    }
+
+    #[test]
+    fn bundle_execution_policy_respects_explicit_overrides() {
+        let policy = BundleConfig {
+            max_concurrent_generations: Some(2),
+            pack_threads: Some(5),
+            ..BundleConfig::default()
+        }
+        .execution_policy_for_parallelism(8);
+        assert_eq!(policy.max_concurrent_generations, 2);
+        assert_eq!(policy.pack_threads, 5);
+    }
 }

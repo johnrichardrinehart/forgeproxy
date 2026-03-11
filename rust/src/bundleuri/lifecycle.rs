@@ -18,9 +18,18 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike, Utc};
 use fred::interfaces::HashesInterface;
+use futures::{StreamExt, stream};
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::AppState;
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct TickSummary {
@@ -155,17 +164,28 @@ pub(crate) async fn tick(state: &AppState) -> Result<()> {
 #[instrument(skip(state))]
 pub(crate) async fn tick_with_summary(state: &AppState) -> Result<TickSummary> {
     let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
-    debug!(repo_count = repos.len(), "lifecycle tick: scanning repos");
+    debug!(
+        repo_count = repos.len(),
+        concurrency = state.bundle_max_concurrency,
+        "lifecycle tick: scanning repos"
+    );
     let mut summary = TickSummary::default();
 
-    for owner_repo in &repos {
-        match process_repo(state, owner_repo).await {
+    let mut results = stream::iter(repos.into_iter().map(|owner_repo| async move {
+        let result = process_repo(state, &owner_repo).await;
+        (owner_repo, result)
+    }))
+    .buffer_unordered(state.bundle_max_concurrency);
+
+    while let Some((owner_repo, result)) = results.next().await {
+        match result {
             Ok(outcome) => summary.record(outcome),
             Err(e) => {
                 summary.repo_errors += 1;
                 warn!(
                     repo = %owner_repo,
                     error = %e,
+                    error_chain = %format_error_chain(&e),
                     "failed to process repo in lifecycle tick"
                 );
             }
@@ -424,6 +444,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
                     warn!(
                         repo = %owner_repo,
                         error = %e,
+                        error_chain = %format_error_chain(&e),
                         "bundle generation failed"
                     );
                 }
@@ -434,6 +455,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
             warn!(
                 repo = %owner_repo,
                 error = %e,
+                error_chain = %format_error_chain(&e),
                 "background fetch failed"
             );
         }
