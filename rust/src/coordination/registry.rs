@@ -652,7 +652,12 @@ async fn try_ensure_repo_cloned_inner(
 
     if let Err(error) = &result {
         clear_hydration_state(state, &owner_repo, "failed").await?;
-        warn!(repo = %owner_repo, error = %error, "repo hydration failed");
+        warn!(
+            repo = %owner_repo,
+            error = %error,
+            error_chain = %format!("{error:#}"),
+            "repo hydration failed"
+        );
         if staged_repo_path.exists() {
             tokio::fs::remove_dir_all(&staged_repo_path)
                 .await
@@ -674,6 +679,7 @@ async fn try_ensure_repo_cloned_inner(
                 repo = %owner_repo,
                 capture_dir = %capture_dir.display(),
                 error = %cleanup_error,
+                error_chain = %format!("{cleanup_error:#}"),
                 "tee capture cleanup failed after hydration error; stale capture directory remains"
             );
         }
@@ -1439,6 +1445,7 @@ async fn publish_bootstrap_bundle(
             warn!(
                 %owner_repo,
                 error = %error,
+                error_chain = %format!("{error:#}"),
                 "bootstrap bundle generation failed; keeping locally cached repo"
             );
         }

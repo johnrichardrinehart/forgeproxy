@@ -586,6 +586,8 @@ pub struct S3StorageConfig {
     #[serde(default = "default_s3_prefix")]
     pub prefix: String,
     pub region: String,
+    /// Optional custom S3-compatible endpoint URL for tests or non-AWS deployments.
+    pub endpoint: Option<String>,
     /// Use the FIPS endpoints for S3 operations.
     #[serde(default)]
     pub use_fips: bool,
