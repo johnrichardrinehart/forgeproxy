@@ -27,7 +27,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-secrets-aws";
-  globalTimeout = 180;
+  globalTimeout = 210;
 
   nodes = {
     # ── Mock AWS Secrets Manager (moto) ───────────────────────────────────

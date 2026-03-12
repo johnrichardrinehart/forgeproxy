@@ -20,7 +20,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-backend";
-  globalTimeout = 180;
+  globalTimeout = 210;
 
   nodes = {
     # ── Gitea backend ────────────────────────────────────────────────

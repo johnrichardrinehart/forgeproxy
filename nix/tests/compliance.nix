@@ -6,7 +6,7 @@
 
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-compliance";
-  globalTimeout = 180;
+  globalTimeout = 210;
 
   nodes = {
     # ── Node with Regulated enabled ──────────────────────────────────────

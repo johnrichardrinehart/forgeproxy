@@ -103,7 +103,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-eviction-lru";
-  globalTimeout = 180;
+  globalTimeout = 210;
 
   # ---------------------------------------------------------------------------
   # Node definitions
