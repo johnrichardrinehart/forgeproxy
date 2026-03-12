@@ -40,6 +40,16 @@ pub enum WebhookEvent {
 /// Abstraction over forge-specific API endpoints and webhook formats.
 #[async_trait::async_trait]
 pub trait ForgeBackend: Send + Sync {
+    /// Probe the upstream forge using the configured admin token.
+    ///
+    /// This is used during service startup to verify both reachability and
+    /// authenticated access before the process begins serving traffic.
+    async fn startup_probe(
+        &self,
+        http_client: &reqwest::Client,
+        rate_limit: &RateLimitState,
+    ) -> Result<()>;
+
     /// Validate an HTTP Authorization header by calling the upstream repo API.
     async fn validate_http_auth(
         &self,

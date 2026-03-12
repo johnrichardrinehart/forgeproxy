@@ -9,8 +9,21 @@ let
   minioRegion = "us-east-1";
   s3Port = 9000;
   valkeyPort = 6379;
+  giteaAdminUser = "octocat";
+  giteaAdminPassword = "secret123";
+  giteaAdminToken = "0123456789abcdef0123456789abcdef01234567";
+  giteaAdminTokenSalt = "forgeproxy";
+  giteaAdminTokenLastEight = "01234567";
+  giteaAdminTokenHash = "6aba73fa830d0e6a8b1706262d2eb52f9690616dc9f83390ca8d39353b2371fc1a30136add3bc07404ca1b8a299fc281e777";
+  giteaDbPath = "/var/lib/gitea/data/gitea.db";
 in
 {
+  inherit
+    giteaAdminPassword
+    giteaAdminToken
+    giteaAdminUser
+    ;
+
   mkValkeyNode =
     {
       extraSystemPackages ? [ ],
@@ -112,5 +125,23 @@ in
             "mc alias set local http://localhost:${toString s3Port} ${minioRootUser} ${minioRootPassword} && "
             "mc mb --ignore-existing local/test-bucket"
         )
+  '';
+
+  giteaSeedAdminTokenScript = ''
+    ghe.succeed(
+        "${pkgs.sqlite}/bin/sqlite3 ${giteaDbPath} "
+        "\"DELETE FROM access_token WHERE name = 'forgeproxy-test-admin';"
+        "INSERT INTO access_token (uid, name, token_hash, token_salt, token_last_eight, scope, created_unix, updated_unix) "
+        "VALUES ("
+        "(SELECT id FROM \"user\" WHERE name = '${giteaAdminUser}'), "
+        "'forgeproxy-test-admin', "
+        "'${giteaAdminTokenHash}', "
+        "'${giteaAdminTokenSalt}', "
+        "'${giteaAdminTokenLastEight}', "
+        "'all', "
+        "CAST(strftime('%s','now') AS INTEGER), "
+        "CAST(strftime('%s','now') AS INTEGER)"
+        ");\""
+    )
   '';
 }
