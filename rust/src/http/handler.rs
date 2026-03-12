@@ -736,6 +736,7 @@ async fn proxy_upload_pack_to_upstream(
                         warn!(
                             repo = %owner_repo_bg,
                             error = %e,
+                            error_chain = %format!("{e:#}"),
                             "tee hydration after HTTP miss failed"
                         );
                     }
@@ -754,6 +755,7 @@ async fn proxy_upload_pack_to_upstream(
                         warn!(
                             repo = %owner_repo_bg,
                             error = %e,
+                            error_chain = %format!("{e:#}"),
                             "tee hydration after HTTP miss failed"
                         );
                     }

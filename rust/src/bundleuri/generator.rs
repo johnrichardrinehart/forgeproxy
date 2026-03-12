@@ -18,8 +18,10 @@ use crate::git::commands;
 // ---------------------------------------------------------------------------
 
 /// Result of a bundle-creation operation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BundleResult {
+    /// Keep the temporary directory alive until upload/publish is complete.
+    _temp_dir: tempfile::TempDir,
     /// Path to the generated `.bundle` file on local disk.
     pub bundle_path: PathBuf,
     /// Monotonic creation token assigned to this bundle.
@@ -132,6 +134,7 @@ pub async fn generate_incremental_bundle(
     state.metrics.metrics.bundle_generation_total.inc();
 
     Ok(BundleResult {
+        _temp_dir: tmp_dir,
         bundle_path,
         creation_token,
         size_bytes: metadata.len(),
@@ -201,6 +204,7 @@ pub async fn generate_full_bundle(
     state.metrics.metrics.bundle_generation_total.inc();
 
     Ok(BundleResult {
+        _temp_dir: tmp_dir,
         bundle_path,
         creation_token,
         size_bytes: metadata.len(),
@@ -267,6 +271,7 @@ pub async fn generate_filtered_bundle(
     state.metrics.metrics.bundle_generation_total.inc();
 
     Ok(BundleResult {
+        _temp_dir: tmp_dir,
         bundle_path,
         creation_token,
         size_bytes: metadata.len(),

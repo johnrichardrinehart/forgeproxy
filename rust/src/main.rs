@@ -196,14 +196,24 @@ async fn build_s3_client(config: &Config) -> Result<aws_sdk_s3::Client> {
 
     let aws_config = aws_config_loader.load().await;
 
-    let s3_config = aws_sdk_s3::config::Builder::from(&aws_config)
-        .force_path_style(true)
-        .build();
+    let mut s3_config = aws_sdk_s3::config::Builder::from(&aws_config).force_path_style(true);
+
+    if let Some(endpoint) = &config.storage.s3.endpoint {
+        s3_config = s3_config.endpoint_url(endpoint);
+    }
+
+    let s3_config = s3_config.build();
 
     let client = aws_sdk_s3::Client::from_conf(s3_config);
     tracing::info!(
         bucket = %config.storage.s3.bucket,
         region = %config.storage.s3.region,
+        endpoint = config
+            .storage
+            .s3
+            .endpoint
+            .as_deref()
+            .unwrap_or("unprovided endpoint value - using AWS SDK default"),
         fips = config.storage.s3.use_fips,
         "S3 client initialised"
     );

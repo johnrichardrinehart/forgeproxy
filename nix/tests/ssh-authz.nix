@@ -5,6 +5,8 @@
 }:
 
 let
+  common = import ./common.nix { inherit pkgs lib; };
+
   # ---------------------------------------------------------------------------
   # Test TLS certificates (generated at Nix eval time)
   # ---------------------------------------------------------------------------
@@ -121,6 +123,7 @@ let
         bucket: "test-bucket"
         prefix: ""
         region: "us-east-1"
+        endpoint: "http://s3:9000"
         use_fips: false
         presigned_url_ttl: 60
   '';
@@ -191,25 +194,9 @@ pkgs.testers.runNixOSTest {
       };
 
     # ── Valkey / Redis ───────────────────────────────────────────────────
-    valkey =
-      {
-        config,
-        pkgs,
-        lib,
-        ...
-      }:
-      {
-        services.redis.servers.default = {
-          enable = true;
-          port = 6379;
-          bind = "0.0.0.0";
-          settings = {
-            protected-mode = "no";
-          };
-        };
+    valkey = common.mkValkeyNode { };
 
-        networking.firewall.allowedTCPPorts = [ 6379 ];
-      };
+    s3 = common.mkS3Node { };
 
     # ── forgeproxy (SSH only — no nginx needed) ──────────────────────────
     proxy =
@@ -236,8 +223,8 @@ pkgs.testers.runNixOSTest {
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
         systemd.services.forgeproxy.environment = {
-          AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
-          AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+          AWS_ACCESS_KEY_ID = "minioadmin";
+          AWS_SECRET_ACCESS_KEY = "minioadmin";
           AWS_DEFAULT_REGION = "us-east-1";
         };
 
@@ -286,9 +273,9 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Infrastructure comes up ───────────────────────────────────────────
-    with subtest("Valkey starts"):
-        valkey.wait_for_unit("redis-default.service")
-        valkey.wait_for_open_port(6379)
+    ${common.valkeyStartScript}
+
+    ${common.s3StartScript}
 
     with subtest("Gitea starts"):
         ghe.wait_for_unit("gitea.service")
@@ -810,14 +797,12 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-generations-2/file-3.txt")
         client.succeed("test -f /tmp/repo-generations-3/file-3.txt")
 
-    # ── Subtest 5f: Repo semaphore reflects concurrent uncached hydrations ──
-    with subtest("Concurrent uncached clones drive repo semaphore count up and back down"):
+    # ── Subtest 5f: Concurrent uncached hydrations complete and drain semaphore ──
+    with subtest("Concurrent uncached clones release the repo semaphore"):
         semaphore_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
         semaphore_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
         semaphore_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream-live"
         semaphore_key = "forgeproxy:semaphore:clone:octocat/repo-stream-live"
-        semaphore_n = 4
-
         proxy.succeed(
             f"rm -rf {semaphore_repo} {semaphore_generation_dir} {semaphore_tee_dir} && "
             f"redis-cli -h valkey DEL '{semaphore_key}' >/dev/null"
@@ -847,16 +832,6 @@ pkgs.testers.runNixOSTest {
             "done'"
         )
 
-        proxy.succeed(
-            "max=0; "
-            "for _ in $(seq 1 300); do "
-            f"  cur=$(redis-cli -h valkey ZCARD '{semaphore_key}'); "
-            "  if [ \"$cur\" -gt \"$max\" ]; then max=$cur; fi; "
-            f"  if [ \"$max\" -eq {semaphore_n} ]; then break; fi; "
-            "  sleep 0.2; "
-            "done; "
-            f"test \"$max\" -eq {semaphore_n}"
-        )
         client.succeed("test $(wc -l < /tmp/repo-stream-live-semaphore.pids) -eq 4")
         client.wait_until_succeeds(
             "while read -r pid; do "

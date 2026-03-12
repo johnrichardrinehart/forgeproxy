@@ -5,6 +5,8 @@
 }:
 
 let
+  common = import ./common.nix { inherit pkgs lib; };
+
   # ---------------------------------------------------------------------------
   # Test TLS certificates (generated at Nix eval time)
   # ---------------------------------------------------------------------------
@@ -93,6 +95,7 @@ let
         bucket: "test-bucket"
         prefix: ""
         region: "us-east-1"
+        endpoint: "http://s3:9000"
         use_fips: false
         presigned_url_ttl: 60
   '';
@@ -162,29 +165,9 @@ pkgs.testers.runNixOSTest {
       };
 
     # ── Valkey / Redis ───────────────────────────────────────────────────
-    valkey =
-      {
-        config,
-        pkgs,
-        lib,
-        ...
-      }:
-      {
-        services.redis.servers.default = {
-          enable = true;
-          port = 6379;
-          bind = "0.0.0.0";
-          settings = {
-            protected-mode = "no";
-          };
-        };
+    valkey = common.mkValkeyNode { };
 
-        environment.systemPackages = with pkgs; [
-          redis
-        ];
-
-        networking.firewall.allowedTCPPorts = [ 6379 ];
-      };
+    s3 = common.mkS3Node { };
 
     # ── forgeproxy proxy (HTTP only — no TLS) ────────────────────────────
     proxy =
@@ -211,8 +194,8 @@ pkgs.testers.runNixOSTest {
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
         systemd.services.forgeproxy.environment = {
-          AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
-          AWS_SECRET_ACCESS_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+          AWS_ACCESS_KEY_ID = "minioadmin";
+          AWS_SECRET_ACCESS_KEY = "minioadmin";
           AWS_DEFAULT_REGION = "us-east-1";
         };
 
@@ -261,9 +244,9 @@ pkgs.testers.runNixOSTest {
     start_all()
 
     # ── Infrastructure comes up ───────────────────────────────────────────
-    with subtest("Valkey starts"):
-        valkey.wait_for_unit("redis-default.service")
-        valkey.wait_for_open_port(6379)
+    ${common.valkeyStartScript}
+
+    ${common.s3StartScript}
 
     with subtest("Gitea starts"):
         ghe.wait_for_unit("gitea.service")
