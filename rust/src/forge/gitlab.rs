@@ -37,6 +37,44 @@ impl GitLabBackend {
 
 #[async_trait::async_trait]
 impl ForgeBackend for GitLabBackend {
+    async fn startup_probe(
+        &self,
+        http_client: &reqwest::Client,
+        rate_limit: &RateLimitState,
+    ) -> Result<()> {
+        let admin_token = crate::credentials::keyring::resolve_secret(&self.admin_token_env)
+            .await
+            .unwrap_or_default();
+        if admin_token.is_empty() {
+            anyhow::bail!(
+                "upstream admin token env '{}' is empty or unavailable",
+                self.admin_token_env
+            );
+        }
+
+        let url = format!("{}/user", self.api_url);
+        let resp = http_client
+            .get(&url)
+            .header("PRIVATE-TOKEN", &admin_token)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("upstream startup probe request failed")?;
+
+        rate_limit.update_from_headers(resp.headers());
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "upstream startup probe GET {url} returned {status}: {}",
+                body.trim()
+            );
+        }
+
+        Ok(())
+    }
+
     async fn validate_http_auth(
         &self,
         http_client: &reqwest::Client,

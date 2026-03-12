@@ -245,6 +245,8 @@ pkgs.testers.runNixOSTest {
           AWS_ACCESS_KEY_ID = "minioadmin";
           AWS_SECRET_ACCESS_KEY = "minioadmin";
           AWS_DEFAULT_REGION = "us-east-1";
+          FORGEPROXY_ALLOW_ENV_SECRET_FALLBACK = lib.mkForce "true";
+          FORGE_ADMIN_TOKEN = lib.mkForce common.giteaAdminToken;
         };
 
         # SSM agent is not available in test VMs
@@ -288,7 +290,9 @@ pkgs.testers.runNixOSTest {
   # Test script
   # ---------------------------------------------------------------------------
   testScript = ''
-    start_all()
+    ghe.start()
+    valkey.start()
+    s3.start()
 
     # ── Infrastructure comes up ───────────────────────────────────────────
     ${common.valkeyStartScript}
@@ -311,25 +315,27 @@ pkgs.testers.runNixOSTest {
             "GITEA_WORK_DIR=/var/lib/gitea"
             " gitea admin user create"
             " --admin"
-            " --username octocat"
-            " --password secret123"
-            " --email octocat@test.local"
+            " --username ${common.giteaAdminUser}"
+            " --password ${common.giteaAdminPassword}"
+            " --email ${common.giteaAdminUser}@test.local"
             "'"
         )
+
+        ${common.giteaSeedAdminTokenScript}
 
         # Create the hello-world repo via API
         ghe.succeed(
             "curl -sf"
             " -X POST http://localhost:3000/api/v1/user/repos"
             " -H 'Content-Type: application/json'"
-            " -u octocat:secret123"
+            " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
             ' -d \'{"name": "hello-world", "auto_init": false}\'''
         )
         ghe.succeed(
             "curl -sf"
             " -X POST http://localhost:3000/api/v1/user/repos"
             " -H 'Content-Type: application/json'"
-            " -u octocat:secret123"
+            " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
             ' -d \'{"name": "shallow-only", "auto_init": false}\'''
         )
 
@@ -344,7 +350,7 @@ pkgs.testers.runNixOSTest {
             "echo 'Hello World' > README.md && "
             "git add README.md && "
             "git commit -m 'Initial commit' && "
-            "git remote add origin http://octocat:secret123@localhost:3000/octocat/hello-world.git && "
+            "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/hello-world.git && "
             "git push -u origin main"
         )
         ghe.succeed(
@@ -357,19 +363,23 @@ pkgs.testers.runNixOSTest {
             "echo 'Shallow repo' > README.md && "
             "git add README.md && "
             "git commit -m 'Initial commit' && "
-            "git remote add origin http://octocat:secret123@localhost:3000/octocat/shallow-only.git && "
+            "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/shallow-only.git && "
             "git push -u origin main"
         )
 
         # Verify the repo is accessible via Gitea API
         ghe.succeed(
             "curl -sf"
-            " -u octocat:secret123"
-            " http://localhost:3000/api/v1/repos/octocat/hello-world"
+            " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
+            " http://localhost:3000/api/v1/repos/${common.giteaAdminUser}/hello-world"
             " | jq -e '.permissions.pull == true'"
         )
 
     # ── Proxy services come up ────────────────────────────────────────────
+    with subtest("Start proxy and client VMs after upstream is ready"):
+        proxy.start()
+        client.start()
+
     with subtest("forgeproxy service starts"):
         proxy.wait_for_unit("forgeproxy.service")
         proxy.wait_for_open_port(8080)

@@ -79,6 +79,9 @@
                   nixos-vm-test-filtered-bundles = pkgs.callPackage ./nix/tests/filtered-bundles.nix {
                     inherit self;
                   };
+                  nixos-vm-test-startup-init-failure = pkgs.callPackage ./nix/tests/startup-init-failure.nix {
+                    inherit self;
+                  };
                 };
 
                 # ── Formatting (consumed by git-hooks via treefmt hook) ──

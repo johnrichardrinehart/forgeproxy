@@ -23,6 +23,7 @@ use clap::Parser;
 use clap::Subcommand;
 use fred::clients::Pool;
 use fred::interfaces::ClientLike;
+use fred::interfaces::KeysInterface;
 use fred::types::config::{Config as FredConfig, ReconnectPolicy, ServerConfig, TlsConnector};
 use tokio::signal;
 use tokio::sync::{Mutex, Semaphore};
@@ -220,6 +221,158 @@ async fn build_s3_client(config: &Config) -> Result<aws_sdk_s3::Client> {
     Ok(client)
 }
 
+fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("forgeproxy/0.1")
+        .build()
+        .context("failed to build reqwest client")
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+fn join_s3_key(prefix: &str, suffix: &str) -> String {
+    if prefix.is_empty() {
+        suffix.to_string()
+    } else if prefix.ends_with('/') {
+        format!("{prefix}{suffix}")
+    } else {
+        format!("{prefix}/{suffix}")
+    }
+}
+
+async fn probe_valkey(config: &Config) -> Result<()> {
+    let pool = build_valkey_pool(config).await?;
+    let _: String = ClientLike::ping::<String>(&pool, None)
+        .await
+        .context("Valkey PING probe failed")?;
+
+    let key = format!("forgeproxy:init:{}", uuid::Uuid::new_v4());
+    let _: () = pool
+        .set(
+            &key,
+            "ok",
+            Some(fred::types::Expiration::EX(30)),
+            None,
+            false,
+        )
+        .await
+        .context("Valkey SET probe failed")?;
+    let _: () = pool.del(&key).await.context("Valkey DEL probe failed")?;
+
+    Ok(())
+}
+
+async fn probe_s3(config: &Config) -> Result<()> {
+    let client = build_s3_client(config).await?;
+    let key = join_s3_key(
+        &config.storage.s3.prefix,
+        &format!("init/{}.txt", uuid::Uuid::new_v4()),
+    );
+
+    client
+        .put_object()
+        .bucket(&config.storage.s3.bucket)
+        .key(&key)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"forgeproxy-startup-init",
+        ))
+        .send()
+        .await
+        .context("S3 PutObject startup probe failed")?;
+
+    client
+        .delete_object()
+        .bucket(&config.storage.s3.bucket)
+        .key(&key)
+        .send()
+        .await
+        .context("S3 DeleteObject startup probe failed")?;
+
+    Ok(())
+}
+
+async fn probe_upstream(config: &Config) -> Result<()> {
+    let http_client = build_http_client()?;
+    let forge = forge::build_backend(config);
+    let rate_limit = forge::rate_limit::RateLimitState::new();
+    forge
+        .startup_probe(&http_client, &rate_limit)
+        .await
+        .context("upstream startup probe failed")
+}
+
+async fn run_startup_init(config: &Config) -> usize {
+    tracing::info!(
+        backend = ?config.backend_type,
+        bucket = %config.storage.s3.bucket,
+        valkey_endpoint = %config.valkey.endpoint,
+        upstream_api_url = %config.upstream.api_url,
+        "starting startup dependency init probes"
+    );
+
+    let (valkey_result, upstream_result, s3_result) = tokio::join!(
+        probe_valkey(config),
+        probe_upstream(config),
+        probe_s3(config),
+    );
+
+    let mut error_count = 0usize;
+
+    match valkey_result {
+        Ok(()) => tracing::info!("startup init probe succeeded for Valkey"),
+        Err(error) => {
+            error_count += 1;
+            tracing::error!(
+                error = %error,
+                error_chain = %format_error_chain(&error),
+                "startup init probe failed for Valkey"
+            );
+        }
+    }
+
+    match upstream_result {
+        Ok(()) => tracing::info!("startup init probe succeeded for upstream"),
+        Err(error) => {
+            error_count += 1;
+            tracing::error!(
+                error = %error,
+                error_chain = %format_error_chain(&error),
+                "startup init probe failed for upstream"
+            );
+        }
+    }
+
+    match s3_result {
+        Ok(()) => tracing::info!("startup init probe succeeded for S3"),
+        Err(error) => {
+            error_count += 1;
+            tracing::error!(
+                error = %error,
+                error_chain = %format_error_chain(&error),
+                "startup init probe failed for S3"
+            );
+        }
+    }
+
+    if error_count == 0 {
+        tracing::info!("startup dependency init probes completed successfully");
+    } else {
+        tracing::error!(
+            error_count,
+            exit_code = error_count.min(u8::MAX as usize),
+            "startup dependency init probes failed"
+        );
+    }
+
+    error_count
+}
+
 // ---------------------------------------------------------------------------
 // HTTP server (axum)
 // ---------------------------------------------------------------------------
@@ -370,12 +523,19 @@ async fn main() -> Result<()> {
         git_revision = crate::build_info::GIT_REVISION,
         "starting forgeproxy"
     );
-    let state = build_app_state(Arc::clone(&config)).await?;
 
     #[cfg(feature = "dev")]
     if let Some(command) = cli.command {
+        let state = build_app_state(Arc::clone(&config)).await?;
         return run_dev_command(state, command).await;
     }
+
+    let startup_init_errors = run_startup_init(config.as_ref()).await;
+    if startup_init_errors > 0 {
+        std::process::exit(startup_init_errors.min(u8::MAX as usize) as i32);
+    }
+
+    let state = build_app_state(Arc::clone(&config)).await?;
 
     // ---- Telemetry buffer ----
     let telemetry_buffer = cache::telemetry::TelemetryBuffer::new();
@@ -481,10 +641,7 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
 
     let valkey = build_valkey_pool(&config).await?;
     let s3 = build_s3_client(&config).await?;
-    let http_client = reqwest::Client::builder()
-        .user_agent("forgeproxy/0.1")
-        .build()
-        .context("failed to build reqwest client")?;
+    let http_client = build_http_client()?;
     let metrics = MetricsRegistry::new();
     let cache_manager = cache::CacheManager::new(&config.storage.local);
     let node_id = coordination::node::node_id();
