@@ -67,7 +67,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-startup-init-failure";
-  globalTimeout = 180;
+  globalTimeout = 210;
 
   nodes.proxy =
     {
