@@ -1668,7 +1668,7 @@ async fn proxy_upstream_upload_pack(
             } else {
                 None
             };
-            let mut capture = if behavior.capture_for_hydration && hydration_permits.is_some() {
+            let capture = if behavior.capture_for_hydration && hydration_permits.is_some() {
                 match crate::tee_hydration::TeeCapture::start(
                     &state.cache_manager.base_path,
                     &owner_repo,
@@ -1721,6 +1721,7 @@ async fn proxy_upstream_upload_pack(
             } else {
                 None
             };
+            let mut capture = capture.map(crate::tee_hydration::BufferedTeeCapture::new);
             if capture.is_none()
                 && let Some(permits) = hydration_permits.take()
                 && let Err(e) =
@@ -1742,15 +1743,24 @@ async fn proxy_upstream_upload_pack(
                         if request_kind == V2RequestKind::LsRefs {
                             response_buf.extend_from_slice(&chunk);
                         }
-                        if let Some(active_capture) = capture.as_mut()
-                            && let Err(e) = active_capture.write_response_chunk(&chunk).await
-                        {
-                            warn!(
-                                repo = %owner_repo,
-                                error = %e,
-                                "failed to record SSH tee response chunk"
-                            );
-                            capture = None;
+                        if let Some(mut active_capture) = capture.take() {
+                            if let Err(e) = active_capture.try_write_response_chunk(chunk.clone()) {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %e,
+                                    buffer_bytes = crate::tee_hydration::CAPTURE_BUFFER_BYTES,
+                                    "dropping SSH tee capture because disk capture fell behind the client stream"
+                                );
+                                if let Err(cleanup_error) = active_capture.abort().await {
+                                    warn!(
+                                        repo = %owner_repo,
+                                        error = %cleanup_error,
+                                        "failed to clean up aborted SSH tee capture"
+                                    );
+                                }
+                            } else {
+                                capture = Some(active_capture);
+                            }
                         }
                         if let Some(writer) = channel_writer.as_mut() {
                             if let Err(e) = writer.write_all(&chunk).await {
@@ -1803,10 +1813,14 @@ async fn proxy_upstream_upload_pack(
                 entry.ls_refs_response = Some(response_buf);
             }
             if had_error {
-                if let Some(active_capture) = capture.take() {
-                    let capture_dir = active_capture.dir().to_path_buf();
-                    let _ = active_capture.finish(false).await;
-                    let _ = tokio::fs::remove_dir_all(capture_dir).await;
+                if let Some(active_capture) = capture.take()
+                    && let Err(cleanup_error) = active_capture.abort().await
+                {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %cleanup_error,
+                        "failed to clean up aborted SSH tee capture after proxy error"
+                    );
                 }
                 if let Some(permits) = hydration_permits.take()
                     && let Err(e) = crate::coordination::registry::release_clone_hydration_permits(
@@ -1839,65 +1853,104 @@ async fn proxy_upstream_upload_pack(
                     "upstream proxy pack stream complete"
                 );
                 if let Some(active_capture) = capture.take() {
-                    let capture_dir = active_capture.dir().to_path_buf();
-                    let _ = active_capture.finish(true).await;
-                    if let Ok((owner, repo)) = super::upstream::split_owner_repo(&owner_repo) {
-                        let state_bg = Arc::clone(&state);
-                        let owner_bg = owner.to_string();
-                        let repo_bg = repo.to_string();
-                        let owner_repo_bg = owner_repo.clone();
-                        let auth_bg = auth_header.clone();
-                        if let Some(permits) = hydration_permits.take() {
-                            tokio::spawn(async move {
-                                if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned_from_tee_with_permits(
-                                    &state_bg,
-                                    &owner_bg,
-                                    &repo_bg,
-                                    auth_bg.as_deref(),
-                                    capture_dir,
-                                    permits,
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        repo = %owner_repo_bg,
-                                        error = %e,
-                                        "tee hydration after SSH miss failed"
-                                    );
+                    match active_capture.finish_success().await {
+                        Ok(Some(capture_dir)) => {
+                            if let Ok((owner, repo)) =
+                                super::upstream::split_owner_repo(&owner_repo)
+                            {
+                                let state_bg = Arc::clone(&state);
+                                let owner_bg = owner.to_string();
+                                let repo_bg = repo.to_string();
+                                let owner_repo_bg = owner_repo.clone();
+                                let auth_bg = auth_header.clone();
+                                if let Some(permits) = hydration_permits.take() {
+                                    tokio::spawn(async move {
+                                        if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned_from_tee_with_permits(
+                                            &state_bg,
+                                            &owner_bg,
+                                            &repo_bg,
+                                            auth_bg.as_deref(),
+                                            capture_dir,
+                                            permits,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                repo = %owner_repo_bg,
+                                                error = %e,
+                                                "tee hydration after SSH miss failed"
+                                            );
+                                        }
+                                    });
+                                } else {
+                                    tokio::spawn(async move {
+                                        if let Err(e) =
+                                            crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                                                &state_bg,
+                                                &owner_bg,
+                                                &repo_bg,
+                                                auth_bg.as_deref(),
+                                                capture_dir,
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                repo = %owner_repo_bg,
+                                                error = %e,
+                                                "tee hydration after SSH miss failed"
+                                            );
+                                        }
+                                    });
                                 }
-                            });
-                        } else {
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    crate::coordination::registry::try_ensure_repo_cloned_from_tee(
-                                        &state_bg,
-                                        &owner_bg,
-                                        &repo_bg,
-                                        auth_bg.as_deref(),
-                                        capture_dir,
+                            } else if let Some(permits) = hydration_permits.take()
+                                && let Err(e) =
+                                    crate::coordination::registry::release_clone_hydration_permits(
+                                        &state, permits,
                                     )
                                     .await
-                                {
-                                    warn!(
-                                        repo = %owner_repo_bg,
-                                        error = %e,
-                                        "tee hydration after SSH miss failed"
-                                    );
-                                }
-                            });
+                            {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %e,
+                                    "failed to release clone hydration permits after invalid owner/repo split"
+                                );
+                            }
                         }
-                    } else if let Some(permits) = hydration_permits.take()
-                        && let Err(e) =
-                            crate::coordination::registry::release_clone_hydration_permits(
-                                &state, permits,
-                            )
-                            .await
-                    {
-                        warn!(
-                            repo = %owner_repo,
-                            error = %e,
-                            "failed to release clone hydration permits after invalid owner/repo split"
-                        );
+                        Ok(None) => {
+                            if let Some(permits) = hydration_permits.take()
+                                && let Err(e) =
+                                    crate::coordination::registry::release_clone_hydration_permits(
+                                        &state, permits,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %e,
+                                    "failed to release clone hydration permits after dropping SSH tee capture"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                repo = %owner_repo,
+                                error = %error,
+                                "failed to finalize buffered SSH tee capture"
+                            );
+                            if let Some(permits) = hydration_permits.take()
+                                && let Err(e) =
+                                    crate::coordination::registry::release_clone_hydration_permits(
+                                        &state, permits,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %e,
+                                    "failed to release clone hydration permits after SSH tee finalization failure"
+                                );
+                            }
+                        }
                     }
                 }
                 if capture.is_none()

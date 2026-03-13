@@ -87,8 +87,9 @@ impl TickSummary {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 enum RepoTickStatus {
+    #[default]
     Completed,
     SkippedNotDue,
     SkippedBelowMinCloneCount,
@@ -96,12 +97,6 @@ enum RepoTickStatus {
     SkippedNotCached,
     FetchFailed,
     BundleGenerationFailed,
-}
-
-impl Default for RepoTickStatus {
-    fn default() -> Self {
-        Self::Completed
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

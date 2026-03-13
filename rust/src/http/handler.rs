@@ -647,6 +647,7 @@ async fn proxy_upload_pack_to_upstream(
     if request_capture_failed {
         capture = None;
     }
+    let capture = capture.map(crate::tee_hydration::BufferedTeeCapture::new);
     if capture.is_none()
         && let Some(permits) = hydration_permits.take()
         && let Err(e) =
@@ -672,15 +673,24 @@ async fn proxy_upload_pack_to_upstream(
         while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
-                    if let Some(active_capture) = capture.as_mut()
-                        && let Err(e) = active_capture.write_response_chunk(&chunk).await
-                    {
-                        warn!(
-                            repo = %owner_repo,
-                            error = %e,
-                            "failed to record HTTP tee response chunk"
-                        );
-                        capture = None;
+                    if let Some(mut active_capture) = capture.take() {
+                        if let Err(e) = active_capture.try_write_response_chunk(chunk.clone()) {
+                            warn!(
+                                repo = %owner_repo,
+                                error = %e,
+                                buffer_bytes = crate::tee_hydration::CAPTURE_BUFFER_BYTES,
+                                "dropping HTTP tee capture because disk capture fell behind the client stream"
+                            );
+                            if let Err(cleanup_error) = active_capture.abort().await {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %cleanup_error,
+                                    "failed to clean up aborted HTTP tee capture"
+                                );
+                            }
+                        } else {
+                            capture = Some(active_capture);
+                        }
                     }
 
                     if tx.send(Ok(chunk)).await.is_err() {
@@ -688,10 +698,14 @@ async fn proxy_upload_pack_to_upstream(
                     }
                 }
                 Err(e) => {
-                    if let Some(active_capture) = capture.take() {
-                        let capture_dir = active_capture.dir().to_path_buf();
-                        let _ = active_capture.finish(false).await;
-                        let _ = tokio::fs::remove_dir_all(capture_dir).await;
+                    if let Some(active_capture) = capture.take()
+                        && let Err(cleanup_error) = active_capture.abort().await
+                    {
+                        warn!(
+                            repo = %owner_repo,
+                            error = %cleanup_error,
+                            "failed to clean up aborted HTTP tee capture after proxy error"
+                        );
                     }
                     if let Some(permits) = hydration_permits.take()
                         && let Err(release_error) =
@@ -713,53 +727,91 @@ async fn proxy_upload_pack_to_upstream(
         }
 
         if let Some(active_capture) = capture {
-            let capture_dir = active_capture.dir().to_path_buf();
-            let _ = active_capture.finish(true).await;
-            let state_bg = state.clone();
-            let owner_bg = owner.clone();
-            let repo_bg = repo.clone();
-            let owner_repo_bg = owner_repo.clone();
-            let auth_bg = auth_header.clone();
-            if let Some(permits) = hydration_permits.take() {
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::coordination::registry::try_ensure_repo_cloned_from_tee_with_permits(
-                            &state_bg,
-                            &owner_bg,
-                            &repo_bg,
-                            auth_bg.as_deref(),
-                            capture_dir,
-                            permits,
-                        )
-                        .await
+            match active_capture.finish_success().await {
+                Ok(Some(capture_dir)) => {
+                    let state_bg = state.clone();
+                    let owner_bg = owner.clone();
+                    let repo_bg = repo.clone();
+                    let owner_repo_bg = owner_repo.clone();
+                    let auth_bg = auth_header.clone();
+                    if let Some(permits) = hydration_permits.take() {
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::coordination::registry::try_ensure_repo_cloned_from_tee_with_permits(
+                                    &state_bg,
+                                    &owner_bg,
+                                    &repo_bg,
+                                    auth_bg.as_deref(),
+                                    capture_dir,
+                                    permits,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    repo = %owner_repo_bg,
+                                    error = %e,
+                                    error_chain = %format!("{e:#}"),
+                                    "tee hydration after HTTP miss failed"
+                                );
+                            }
+                        });
+                    } else {
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                                    &state_bg,
+                                    &owner_bg,
+                                    &repo_bg,
+                                    auth_bg.as_deref(),
+                                    capture_dir,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    repo = %owner_repo_bg,
+                                    error = %e,
+                                    error_chain = %format!("{e:#}"),
+                                    "tee hydration after HTTP miss failed"
+                                );
+                            }
+                        });
+                    }
+                }
+                Ok(None) => {
+                    if let Some(permits) = hydration_permits.take()
+                        && let Err(release_error) =
+                            crate::coordination::registry::release_clone_hydration_permits(
+                                &state, permits,
+                            )
+                            .await
                     {
                         warn!(
-                            repo = %owner_repo_bg,
-                            error = %e,
-                            error_chain = %format!("{e:#}"),
-                            "tee hydration after HTTP miss failed"
+                            repo = %owner_repo,
+                            error = %release_error,
+                            "failed to release clone hydration permits after dropping HTTP tee capture"
                         );
                     }
-                });
-            } else {
-                tokio::spawn(async move {
-                    if let Err(e) = crate::coordination::registry::try_ensure_repo_cloned_from_tee(
-                        &state_bg,
-                        &owner_bg,
-                        &repo_bg,
-                        auth_bg.as_deref(),
-                        capture_dir,
-                    )
-                    .await
+                }
+                Err(error) => {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %error,
+                        "failed to finalize buffered HTTP tee capture"
+                    );
+                    if let Some(permits) = hydration_permits.take()
+                        && let Err(release_error) =
+                            crate::coordination::registry::release_clone_hydration_permits(
+                                &state, permits,
+                            )
+                            .await
                     {
                         warn!(
-                            repo = %owner_repo_bg,
-                            error = %e,
-                            error_chain = %format!("{e:#}"),
-                            "tee hydration after HTTP miss failed"
+                            repo = %owner_repo,
+                            error = %release_error,
+                            "failed to release clone hydration permits after HTTP tee finalization failure"
                         );
                     }
-                });
+                }
             }
         }
     });
