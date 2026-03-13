@@ -34,6 +34,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::config::Config;
 use crate::metrics::MetricsRegistry;
 
+const CLONE_CAPTURE_MEMORY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -244,6 +246,59 @@ fn join_s3_key(prefix: &str, suffix: &str) -> String {
     } else {
         format!("{prefix}/{suffix}")
     }
+}
+
+fn detect_mem_available_bytes() -> Result<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").context("read /proc/meminfo")?;
+    let available_kib = meminfo
+        .lines()
+        .find_map(|line| {
+            let value = line.strip_prefix("MemAvailable:")?.trim();
+            let amount = value.split_whitespace().next()?.parse::<u64>().ok()?;
+            Some(amount)
+        })
+        .context("MemAvailable not found in /proc/meminfo")?;
+    Ok(available_kib * 1024)
+}
+
+fn resolve_clone_concurrency_limit(config: &Config) -> usize {
+    let configured = config.clone.max_concurrent_upstream_clones;
+    let available_bytes = match detect_mem_available_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                configured,
+                "failed to detect available memory; using configured clone concurrency"
+            );
+            return configured;
+        }
+    };
+
+    let memory_budget = available_bytes.saturating_sub(CLONE_CAPTURE_MEMORY_HEADROOM_BYTES);
+    let memory_limited =
+        (memory_budget / crate::tee_hydration::CAPTURE_BUFFER_BYTES as u64) as usize;
+    let resolved = configured.min(memory_limited);
+
+    tracing::info!(
+        configured,
+        available_bytes,
+        memory_headroom_bytes = CLONE_CAPTURE_MEMORY_HEADROOM_BYTES,
+        capture_buffer_bytes = crate::tee_hydration::CAPTURE_BUFFER_BYTES,
+        memory_limited,
+        resolved,
+        "resolved clone concurrency limit from startup memory snapshot"
+    );
+
+    if resolved == 0 {
+        tracing::warn!(
+            configured,
+            available_bytes,
+            "startup memory budget leaves no room for buffered tee hydration; upstream clone hydration will be disabled until restart"
+        );
+    }
+
+    resolved
 }
 
 async fn probe_valkey(config: &Config) -> Result<()> {
@@ -659,6 +714,7 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
     }
 
     let rate_limit = forge::rate_limit::RateLimitState::new();
+    let clone_concurrency_limit = resolve_clone_concurrency_limit(&config);
     let bundle_execution_policy = config.bundles.execution_policy();
     tracing::info!(
         max_concurrent_generations = bundle_execution_policy.max_concurrent_generations,
@@ -676,7 +732,7 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         node_id,
         forge,
         rate_limit,
-        clone_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_clones)),
+        clone_semaphore: Arc::new(Semaphore::new(clone_concurrency_limit)),
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
         bundle_generation_semaphore: Arc::new(Semaphore::new(
             bundle_execution_policy.max_concurrent_generations,

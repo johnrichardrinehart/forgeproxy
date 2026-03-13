@@ -1,12 +1,16 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use chrono::Utc;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use uuid::Uuid;
 
 const INFO_REFS_ADVERTISEMENT_FILE: &str = "info_refs_advertisement.bin";
@@ -14,11 +18,14 @@ const LS_REFS_REQUEST_FILE: &str = "ls_refs_request.bin";
 const LS_REFS_RESPONSE_FILE: &str = "ls_refs_response.bin";
 const SHARED_DIR_MODE: u32 = 0o775;
 const SHARED_FILE_MODE: u32 = 0o664;
+pub const CAPTURE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
+const CAPTURE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const CAPTURE_CHUNK_QUEUE_DEPTH: usize = 2048;
 
 pub struct TeeCapture {
     dir: PathBuf,
-    request_file: File,
-    response_file: File,
+    request_file: BufWriter<File>,
+    response_file: BufWriter<File>,
 }
 
 impl TeeCapture {
@@ -50,8 +57,8 @@ impl TeeCapture {
 
         Ok(Self {
             dir,
-            request_file,
-            response_file,
+            request_file: BufWriter::with_capacity(CAPTURE_WRITE_BUFFER_BYTES, request_file),
+            response_file: BufWriter::with_capacity(CAPTURE_WRITE_BUFFER_BYTES, response_file),
         })
     }
 
@@ -111,6 +118,10 @@ impl TeeCapture {
             .flush()
             .await
             .context("flush tee response")?;
+        self.request_file
+            .flush()
+            .await
+            .context("flush tee request")?;
         let status_path = self.dir.join("status.json");
         let status = serde_json::json!({
             "success": success,
@@ -120,6 +131,98 @@ impl TeeCapture {
             .await
             .with_context(|| format!("write tee status {}", status_path.display()))?;
         ensure_shared_file(&status_path, "tee status").await?;
+        Ok(())
+    }
+}
+
+struct CaptureChunk {
+    bytes: Bytes,
+    _buffer_permit: OwnedSemaphorePermit,
+}
+
+pub struct BufferedTeeCapture {
+    sender: Option<mpsc::Sender<CaptureChunk>>,
+    buffer_permits: Arc<Semaphore>,
+    success: Arc<AtomicBool>,
+    join_handle: tokio::task::JoinHandle<Result<Option<PathBuf>>>,
+}
+
+impl BufferedTeeCapture {
+    pub fn new(capture: TeeCapture) -> Self {
+        let (tx, mut rx) = mpsc::channel::<CaptureChunk>(CAPTURE_CHUNK_QUEUE_DEPTH);
+        let buffer_permits = Arc::new(Semaphore::new(CAPTURE_BUFFER_BYTES));
+        let success = Arc::new(AtomicBool::new(false));
+        let success_flag = Arc::clone(&success);
+        let join_handle = tokio::spawn(async move {
+            let mut capture = capture;
+            let capture_dir = capture.dir().to_path_buf();
+
+            while let Some(chunk) = rx.recv().await {
+                capture
+                    .write_response_chunk(&chunk.bytes)
+                    .await
+                    .context("write buffered tee response chunk")?;
+            }
+
+            let completed = success_flag.load(Ordering::Relaxed);
+            capture.finish(completed).await?;
+
+            if completed {
+                Ok(Some(capture_dir))
+            } else {
+                if capture_dir.exists() {
+                    tokio::fs::remove_dir_all(&capture_dir)
+                        .await
+                        .with_context(|| {
+                            format!("remove aborted tee capture {}", capture_dir.display())
+                        })?;
+                }
+                Ok(None)
+            }
+        });
+
+        Self {
+            sender: Some(tx),
+            buffer_permits,
+            success,
+            join_handle,
+        }
+    }
+
+    pub fn try_write_response_chunk(&mut self, bytes: Bytes) -> Result<()> {
+        let Some(sender) = self.sender.as_ref() else {
+            anyhow::bail!("tee capture writer already closed");
+        };
+
+        let permit = Arc::clone(&self.buffer_permits)
+            .try_acquire_many_owned(bytes.len() as u32)
+            .context("tee capture buffer is full")?;
+
+        sender
+            .try_send(CaptureChunk {
+                bytes,
+                _buffer_permit: permit,
+            })
+            .context("tee capture queue is full")?;
+
+        Ok(())
+    }
+
+    pub async fn finish_success(mut self) -> Result<Option<PathBuf>> {
+        self.success.store(true, Ordering::Relaxed);
+        self.sender.take();
+        self.join_handle
+            .await
+            .context("buffered tee capture task join failed")?
+    }
+
+    pub async fn abort(mut self) -> Result<()> {
+        self.success.store(false, Ordering::Relaxed);
+        self.sender.take();
+        let _ = self
+            .join_handle
+            .await
+            .context("buffered tee capture task join failed")??;
         Ok(())
     }
 }
