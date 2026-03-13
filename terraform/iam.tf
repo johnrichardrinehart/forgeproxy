@@ -105,15 +105,18 @@ resource "aws_iam_role_policy" "forgeproxy" {
         Resource = "*"
       },
       {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.bundle.arn
+      },
+      {
         Effect = "Allow"
         Action = [
           "s3:GetObject",
-          "s3:ListBucket",
+          "s3:PutObject",
+          "s3:DeleteObject",
         ]
-        Resource = [
-          aws_s3_bucket.bundle.arn,
-          "${aws_s3_bucket.bundle.arn}/*",
-        ]
+        Resource = "${aws_s3_bucket.bundle.arn}/*"
       },
       {
         Effect = "Allow"
