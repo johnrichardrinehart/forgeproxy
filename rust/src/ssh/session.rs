@@ -1566,27 +1566,65 @@ async fn proxy_upstream_upload_pack(
             .map(|want| want.chars().take(12).collect::<String>())
             .collect::<Vec<String>>()
             .join(",");
-        let local_decision = match crate::coordination::registry::classify_local_wants_satisfaction(
-            &state,
-            &owner_repo,
-            &wants,
-        )
-        .await
-        {
-            Ok(decision) => decision,
-            Err(error) => {
-                warn!(
-                    repo = %owner_repo,
-                    wants = wants.len(),
-                    want_sample,
-                    error = %error,
-                    "failed to classify local SSH fetch serveability; proxying upstream"
-                );
-                LocalServeDecision::Unavailable {
-                    had_local_repo_before_check: state.cache_manager.has_repo(&owner_repo),
-                    restored_from_s3_for_request: false,
+        let initial_local_decision =
+            match crate::coordination::registry::classify_local_wants_satisfaction(
+                &state,
+                &owner_repo,
+                &wants,
+            )
+            .await
+            {
+                Ok(decision) => decision,
+                Err(error) => {
+                    warn!(
+                        repo = %owner_repo,
+                        wants = wants.len(),
+                        want_sample,
+                        error = %error,
+                        "failed to classify local SSH fetch serveability; proxying upstream"
+                    );
+                    LocalServeDecision::Unavailable {
+                        had_local_repo_before_check: state.cache_manager.has_repo(&owner_repo),
+                        restored_from_s3_for_request: false,
+                    }
+                }
+            };
+        let local_decision = if matches!(
+            initial_local_decision,
+            LocalServeDecision::MissingWantedObjects { .. }
+        ) {
+            let (owner, repo) = owner_repo
+                .split_once('/')
+                .map(|(owner, repo)| (owner.to_string(), repo.to_string()))
+                .unwrap_or_else(|| (owner_repo.clone(), String::new()));
+            let auth_header = if authenticated {
+                build_clone_auth_header_for_repo(&state, &owner_repo).await
+            } else {
+                None
+            };
+            match crate::coordination::registry::wait_for_local_catch_up(
+                &state,
+                &owner,
+                &repo,
+                auth_header.as_deref(),
+                &wants,
+            )
+            .await
+            {
+                Ok(decision) => decision,
+                Err(error) => {
+                    warn!(
+                        repo = %owner_repo,
+                        wants = wants.len(),
+                        want_sample,
+                        error = %error,
+                        "failed while waiting for local SSH fetch catch-up; proxying upstream"
+                    );
+                    initial_local_decision
                 }
             }
+        } else {
+            initial_local_decision
         };
         match &local_decision {
             LocalServeDecision::SatisfiesWants {

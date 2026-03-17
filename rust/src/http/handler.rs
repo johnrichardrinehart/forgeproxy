@@ -265,25 +265,54 @@ async fn handle_upload_pack(
         .map(|want| want.chars().take(12).collect::<String>())
         .collect::<Vec<String>>()
         .join(",");
-    let local_decision = match crate::coordination::registry::classify_local_wants_satisfaction(
-        &state, &repo_slug, &wants,
-    )
-    .await
-    {
-        Ok(decision) => decision,
-        Err(error) => {
-            warn!(
-                repo = %repo_slug,
-                wants = wants.len(),
-                want_sample,
-                error = %error,
-                "failed to classify local upload-pack serveability; proxying upstream"
-            );
-            LocalServeDecision::Unavailable {
-                had_local_repo_before_check: state.cache_manager.has_repo(&repo_slug),
-                restored_from_s3_for_request: false,
+    let initial_local_decision =
+        match crate::coordination::registry::classify_local_wants_satisfaction(
+            &state, &repo_slug, &wants,
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(
+                    repo = %repo_slug,
+                    wants = wants.len(),
+                    want_sample,
+                    error = %error,
+                    "failed to classify local upload-pack serveability; proxying upstream"
+                );
+                LocalServeDecision::Unavailable {
+                    had_local_repo_before_check: state.cache_manager.has_repo(&repo_slug),
+                    restored_from_s3_for_request: false,
+                }
+            }
+        };
+    let local_decision = if matches!(
+        initial_local_decision,
+        LocalServeDecision::MissingWantedObjects { .. }
+    ) {
+        match crate::coordination::registry::wait_for_local_catch_up(
+            &state,
+            &owner,
+            &repo,
+            auth_header.as_deref(),
+            &wants,
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(
+                    repo = %repo_slug,
+                    wants = wants.len(),
+                    want_sample,
+                    error = %error,
+                    "failed while waiting for local upload-pack catch-up; proxying upstream"
+                );
+                initial_local_decision
             }
         }
+    } else {
+        initial_local_decision
     };
 
     match &local_decision {
