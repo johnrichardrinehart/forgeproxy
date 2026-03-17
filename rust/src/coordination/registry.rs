@@ -6,7 +6,7 @@ use base64::Engine;
 use fred::interfaces::{ClientLike, HashesInterface, SortedSetsInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, TryAcquireError};
 use tracing::{debug, info, trace, warn};
 
 /// Metadata about a cached repository.
@@ -235,6 +235,15 @@ pub async fn try_ensure_repo_cloned_from_tee(
     try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir), None).await
 }
 
+pub async fn ensure_repo_cloned_from_upstream(
+    state: &crate::AppState,
+    owner: &str,
+    repo: &str,
+    auth_header: Option<&str>,
+) -> Result<()> {
+    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, None, None).await
+}
+
 pub struct CloneHydrationPermits {
     _global_clone_permit: OwnedSemaphorePermit,
     _local_repo_permit: OwnedSemaphorePermit,
@@ -245,13 +254,65 @@ pub async fn try_acquire_clone_hydration_permits(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<Option<CloneHydrationPermits>> {
+    let global_clone_permit = match state.clone_semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => return Ok(None),
+        Err(TryAcquireError::Closed) => {
+            return Err(anyhow::anyhow!("clone semaphore closed"));
+        }
+    };
+    let Some(local_repo_permit) = acquire_local_repo_clone_permit(state, owner_repo).await? else {
+        return Ok(None);
+    };
+    let distributed_permit_key = format!("forgeproxy:semaphore:clone:{owner_repo}");
+    let Some(distributed_repo_permit) = crate::coordination::locks::acquire_semaphore_lease(
+        &state.valkey,
+        &distributed_permit_key,
+        &state.node_id,
+        state
+            .config
+            .clone
+            .max_concurrent_upstream_clones_per_repo_across_instances,
+        state.config.clone.lock_ttl,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(CloneHydrationPermits {
+        _global_clone_permit: global_clone_permit,
+        _local_repo_permit: local_repo_permit,
+        distributed_repo_permit,
+    }))
+}
+
+pub async fn acquire_clone_hydration_permits(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<Option<CloneHydrationPermits>> {
+    if state.config.clone.max_concurrent_upstream_clones == 0
+        || state
+            .config
+            .clone
+            .max_concurrent_upstream_clones_per_repo_per_instance
+            == 0
+        || state
+            .config
+            .clone
+            .max_concurrent_upstream_clones_per_repo_across_instances
+            == 0
+    {
+        return Ok(None);
+    }
+
     let global_clone_permit = state
         .clone_semaphore
         .clone()
         .acquire_owned()
         .await
-        .map_err(|e| anyhow::anyhow!("clone semaphore closed: {e}"))?;
-    let local_repo_permit = acquire_local_repo_clone_permit(state, owner_repo).await?;
+        .map_err(|_| anyhow::anyhow!("clone semaphore closed"))?;
+    let local_repo_permit = acquire_local_repo_clone_permit_waiting(state, owner_repo).await?;
     let distributed_permit_key = format!("forgeproxy:semaphore:clone:{owner_repo}");
     let Some(distributed_repo_permit) = crate::coordination::locks::acquire_semaphore_lease(
         &state.valkey,
@@ -326,6 +387,32 @@ async fn cleanup_tee_capture_dir(capture_dir: &Path) -> Result<()> {
 async fn acquire_local_repo_clone_permit(
     state: &crate::AppState,
     owner_repo: &str,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let semaphore = {
+        let mut semaphores = state.repo_clone_semaphores.lock().await;
+        semaphores
+            .entry(owner_repo.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    state
+                        .config
+                        .clone
+                        .max_concurrent_upstream_clones_per_repo_per_instance,
+                ))
+            })
+            .clone()
+    };
+
+    match semaphore.try_acquire_owned() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(TryAcquireError::NoPermits) => Ok(None),
+        Err(TryAcquireError::Closed) => Err(anyhow::anyhow!("repo clone semaphore closed")),
+    }
+}
+
+async fn acquire_local_repo_clone_permit_waiting(
+    state: &crate::AppState,
+    owner_repo: &str,
 ) -> Result<OwnedSemaphorePermit> {
     let semaphore = {
         let mut semaphores = state.repo_clone_semaphores.lock().await;
@@ -345,7 +432,7 @@ async fn acquire_local_repo_clone_permit(
     semaphore
         .acquire_owned()
         .await
-        .map_err(|e| anyhow::anyhow!("repo clone semaphore closed: {e}"))
+        .map_err(|_| anyhow::anyhow!("repo clone semaphore closed"))
 }
 
 async fn acquire_local_repo_publish_guard(
@@ -498,7 +585,8 @@ async fn try_ensure_repo_cloned_inner(
         }
 
         if clone_hydration_permits.is_none() {
-            clone_hydration_permits = try_acquire_clone_hydration_permits(state, &owner_repo).await?;
+            clone_hydration_permits =
+                acquire_clone_hydration_permits(state, &owner_repo).await?;
         }
         if clone_hydration_permits.is_none() {
             if let Some(capture_dir) = tee_capture_dir.as_ref() {
