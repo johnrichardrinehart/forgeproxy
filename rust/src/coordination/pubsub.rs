@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use fred::interfaces::PubsubInterface;
-use tracing::debug;
+use tracing::{debug, warn};
+
+const VALKEY_PUBLISH_RETRY_ATTEMPTS: usize = 5;
+const VALKEY_PUBLISH_RETRY_BASE_DELAY_MS: u64 = 250;
 
 /// Publish a "ready" notification for a repository.
 ///
@@ -17,11 +20,36 @@ pub async fn publish_ready(
 ) -> Result<()> {
     let channel = format!("forgeproxy:notify:repo:{owner_repo}");
     let message = format!("ready:{node_id}");
-    let _: () = pool
-        .next()
-        .publish(&channel, message.as_str())
-        .await
-        .context("publish ready notification")?;
-    debug!(%owner_repo, %node_id, "published ready notification");
-    Ok(())
+    let mut last_error = None;
+    for attempt in 0..VALKEY_PUBLISH_RETRY_ATTEMPTS {
+        match pool
+            .next()
+            .publish(&channel, message.as_str())
+            .await
+            .context("publish ready notification")
+        {
+            Ok::<(), anyhow::Error>(()) => {
+                debug!(%owner_repo, %node_id, "published ready notification");
+                return Ok(());
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 == VALKEY_PUBLISH_RETRY_ATTEMPTS {
+                    break;
+                }
+
+                let delay_ms = VALKEY_PUBLISH_RETRY_BASE_DELAY_MS * (1_u64 << attempt);
+                warn!(
+                    repo = %owner_repo,
+                    %node_id,
+                    attempt = attempt + 1,
+                    delay_ms,
+                    "publish ready notification failed; retrying"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    Err(last_error.expect("retry loop must capture an error"))
 }
