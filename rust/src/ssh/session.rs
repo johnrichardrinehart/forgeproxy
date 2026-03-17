@@ -293,7 +293,20 @@ async fn serve_local_upload_pack_once(
         should_close_channel,
     } = response;
 
-    let repo_path = state.cache_manager.repo_path(owner_repo);
+    let generation_lease = match crate::coordination::registry::acquire_published_generation_lease(
+        state, owner_repo,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            error!(
+                repo = %owner_repo,
+                error = %error,
+                "failed to acquire published generation lease for local git upload-pack"
+            );
+            return;
+        }
+    };
+    let repo_path = generation_lease.repo_path().to_path_buf();
     let mut cmd = Command::new("git");
     cmd.arg("upload-pack")
         .arg("--stateless-rpc")
@@ -339,6 +352,7 @@ async fn serve_local_upload_pack_once(
         error!(repo = %owner_repo, "missing stderr from local git upload-pack");
         return;
     };
+    let _generation_lease = generation_lease;
 
     let mut writer = stream_channel.map(|channel| channel.make_writer());
     let mut total_bytes: u64 = 0;
@@ -1212,6 +1226,29 @@ impl Handler for SshSession {
                 if repo_cached_locally && !route_v2_through_upstream {
                     // ── Serve from local cache via bidirectional upload-pack ──
                     info!(repo = %repo, "serving git-upload-pack directly from local disk");
+                    let generation_lease =
+                        match crate::coordination::registry::acquire_published_generation_lease(
+                            &self.state,
+                            &repo,
+                        ) {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                error!(
+                                    repo = %repo,
+                                    error = %error,
+                                    "failed to acquire published generation lease for direct SSH upload-pack"
+                                );
+                                session.extended_data(
+                                    channel_id,
+                                    1,
+                                    CryptoVec::from_slice(
+                                        b"ERROR: Published repo generation is unavailable.\n",
+                                    ),
+                                );
+                                finish_channel(session, channel_id, 1);
+                                return Ok(());
+                            }
+                        };
                     let Some(channel) = self.channels.remove(&channel_id) else {
                         error!(repo = %repo, channel = ?channel_id, "missing SSH channel handle for cached upload-pack");
                         session.extended_data(
@@ -1224,7 +1261,9 @@ impl Handler for SshSession {
                     };
 
                     let mut cmd = Command::new("git");
-                    cmd.arg("upload-pack").arg("--strict").arg(&repo_path);
+                    cmd.arg("upload-pack")
+                        .arg("--strict")
+                        .arg(generation_lease.repo_path());
 
                     // Forward the client's GIT_PROTOCOL so upload-pack uses
                     // the protocol version the client negotiated (v2 if
@@ -1267,6 +1306,7 @@ impl Handler for SshSession {
                             // the SSH channel using russh's channel writer so
                             // large responses obey SSH window backpressure.
                             tokio::spawn(async move {
+                                let _generation_lease = generation_lease;
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
                                 let mut channel_writer = channel.make_writer();

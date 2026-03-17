@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -450,43 +450,153 @@ async fn acquire_local_repo_publish_guard(
     mutex.lock_owned().await
 }
 
-async fn register_active_generation(
-    state: &crate::AppState,
-    owner_repo: &str,
-    staged_repo_path: &Path,
-) {
-    let mut active_generations = state.active_repo_generations.lock().await;
-    active_generations
-        .entry(owner_repo.to_string())
-        .or_default()
-        .insert(staged_repo_path.to_path_buf());
+fn leased_generation_paths(state: &crate::AppState, owner_repo: &str) -> HashSet<PathBuf> {
+    state
+        .published_generation_leases
+        .lock()
+        .unwrap()
+        .get(owner_repo)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(path, _)| path.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-async fn unregister_active_generation(
+pub(crate) async fn prune_retired_generations(
     state: &crate::AppState,
     owner_repo: &str,
-    staged_repo_path: &Path,
-) {
-    let mut active_generations = state.active_repo_generations.lock().await;
-    if let Some(paths) = active_generations.get_mut(owner_repo) {
-        paths.remove(staged_repo_path);
-        if paths.is_empty() {
-            active_generations.remove(owner_repo);
-        }
+) -> Result<()> {
+    let mut retain = leased_generation_paths(state, owner_repo)
+        .into_iter()
+        .collect::<Vec<PathBuf>>();
+    if let Some(current_target) = state.cache_manager.current_repo_target(owner_repo)?
+        && !retain.iter().any(|path| path == &current_target)
+    {
+        retain.push(current_target);
+    }
+
+    state
+        .cache_manager
+        .prune_generations_except(owner_repo, &retain)
+}
+
+pub struct PublishedGenerationLease {
+    owner_repo: String,
+    generation_path: PathBuf,
+    cache_manager: crate::cache::CacheManager,
+    repo_publish_mutexes:
+        std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>>,
+    published_generation_leases:
+        std::sync::Arc<std::sync::Mutex<HashMap<String, HashMap<PathBuf, usize>>>>,
+}
+
+impl PublishedGenerationLease {
+    pub fn repo_path(&self) -> &Path {
+        &self.generation_path
     }
 }
 
-async fn active_generation_paths(
+impl Drop for PublishedGenerationLease {
+    fn drop(&mut self) {
+        let mut leases = self.published_generation_leases.lock().unwrap();
+        let should_try_prune = if let Some(repo_leases) = leases.get_mut(&self.owner_repo) {
+            if let Some(count) = repo_leases.get_mut(&self.generation_path) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    repo_leases.remove(&self.generation_path);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if let Some(repo_leases) = leases.get(&self.owner_repo)
+            && repo_leases.is_empty()
+        {
+            leases.remove(&self.owner_repo);
+        }
+        drop(leases);
+
+        if !should_try_prune {
+            return;
+        }
+
+        let owner_repo = self.owner_repo.clone();
+        let cache_manager = self.cache_manager.clone();
+        let repo_publish_mutexes = std::sync::Arc::clone(&self.repo_publish_mutexes);
+        let published_generation_leases = std::sync::Arc::clone(&self.published_generation_leases);
+        tokio::spawn(async move {
+            let mutex = {
+                let mut mutexes = repo_publish_mutexes.lock().await;
+                mutexes
+                    .entry(owner_repo.clone())
+                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            };
+            let _guard = mutex.lock_owned().await;
+
+            let mut retain = published_generation_leases
+                .lock()
+                .unwrap()
+                .get(&owner_repo)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter(|(_, count)| **count > 0)
+                        .map(|(path, _)| path.clone())
+                        .collect::<Vec<PathBuf>>()
+                })
+                .unwrap_or_default();
+            if let Ok(Some(current_target)) = cache_manager.current_repo_target(&owner_repo)
+                && !retain.iter().any(|path| path == &current_target)
+            {
+                retain.push(current_target);
+            }
+
+            if let Err(error) = cache_manager.prune_generations_except(&owner_repo, &retain) {
+                warn!(
+                    repo = %owner_repo,
+                    error = %error,
+                    "failed to prune retired generations after the last reader lease was released"
+                );
+            }
+        });
+    }
+}
+
+pub fn acquire_published_generation_lease(
     state: &crate::AppState,
     owner_repo: &str,
-) -> std::collections::HashSet<PathBuf> {
-    state
-        .active_repo_generations
-        .lock()
-        .await
-        .get(owner_repo)
-        .cloned()
-        .unwrap_or_default()
+) -> Result<PublishedGenerationLease> {
+    let generation_path = state
+        .cache_manager
+        .current_repo_target(owner_repo)?
+        .ok_or_else(|| anyhow::anyhow!("published repo generation is not available"))?;
+
+    let mut leases = state.published_generation_leases.lock().unwrap();
+    let count = leases
+        .entry(owner_repo.to_string())
+        .or_default()
+        .entry(generation_path.clone())
+        .or_insert(0);
+    *count += 1;
+    drop(leases);
+
+    Ok(PublishedGenerationLease {
+        owner_repo: owner_repo.to_string(),
+        generation_path,
+        cache_manager: state.cache_manager.clone(),
+        repo_publish_mutexes: std::sync::Arc::clone(&state.repo_publish_mutexes),
+        published_generation_leases: std::sync::Arc::clone(&state.published_generation_leases),
+    })
 }
 
 async fn try_ensure_repo_cloned_inner(
@@ -923,154 +1033,30 @@ async fn publish_ready_repo(
     staged_repo_path: &Path,
     source: &str,
 ) -> Result<PathBuf> {
-    let final_repo_path =
-        fold_overlapping_generations(state, owner_repo, staged_repo_path, source).await?;
-    let mut retained_generations: Vec<PathBuf> = active_generation_paths(state, owner_repo)
-        .await
-        .into_iter()
-        .collect();
-    if !retained_generations
-        .iter()
-        .any(|path| path == &final_repo_path)
-    {
-        retained_generations.push(final_repo_path.clone());
-    }
-
     info!(
         repo = %owner_repo,
-        path = %final_repo_path.display(),
+        path = %staged_repo_path.display(),
         source,
         "publishing ready repo generation"
     );
     state
         .cache_manager
-        .publish_staged_repo(owner_repo, &final_repo_path)
+        .publish_staged_repo(owner_repo, staged_repo_path)
         .with_context(|| {
             format!(
                 "failed to publish ready repo generation {} for {}",
-                final_repo_path.display(),
+                staged_repo_path.display(),
                 owner_repo,
             )
         })?;
-    state
-        .cache_manager
-        .prune_generations_except(owner_repo, &retained_generations)?;
+    prune_retired_generations(state, owner_repo).await?;
     info!(
         repo = %owner_repo,
-        path = %final_repo_path.display(),
+        path = %staged_repo_path.display(),
         published = %state.cache_manager.repo_path(owner_repo).display(),
-        "published repo generation and pruned superseded generations"
+        "published repo generation"
     );
-    Ok(final_repo_path)
-}
-
-async fn fold_overlapping_generations(
-    state: &crate::AppState,
-    owner_repo: &str,
-    staged_repo_path: &Path,
-    source: &str,
-) -> Result<PathBuf> {
-    let active_generations = active_generation_paths(state, owner_repo).await;
-    let other_generations: Vec<PathBuf> = state
-        .cache_manager
-        .list_generation_dirs(owner_repo)?
-        .into_iter()
-        .filter(|path| path != staged_repo_path)
-        .filter(|path| !active_generations.contains(path))
-        .filter(|path| state.cache_manager.has_repo_at(path))
-        .collect();
-
-    if other_generations.is_empty() {
-        return Ok(staged_repo_path.to_path_buf());
-    }
-
-    let consolidation_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
-    info!(
-        repo = %owner_repo,
-        source,
-        seed = %staged_repo_path.display(),
-        destination = %consolidation_path.display(),
-        generations_to_fold = other_generations.len(),
-        "folding overlapping staged generations into a single published repo"
-    );
-
-    let consolidation_result = async {
-        let mut sorted_generations = other_generations.clone();
-        sorted_generations.sort();
-        let seed_generation = sorted_generations
-            .first()
-            .cloned()
-            .unwrap_or_else(|| staged_repo_path.to_path_buf());
-
-        crate::git::commands::git_clone_bare_local(&seed_generation, &consolidation_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to seed consolidated generation {} from {}",
-                    consolidation_path.display(),
-                    seed_generation.display()
-                )
-            })?;
-
-        let mut generations_to_fetch: Vec<PathBuf> = sorted_generations
-            .iter()
-            .filter(|path| *path != &seed_generation)
-            .cloned()
-            .collect();
-        generations_to_fetch.push(staged_repo_path.to_path_buf());
-
-        for generation_path in &generations_to_fetch {
-            info!(
-                repo = %owner_repo,
-                source_generation = %generation_path.display(),
-                destination = %consolidation_path.display(),
-                "folding staged generation into consolidated repo"
-            );
-            let generation_remote = generation_path.to_string_lossy().to_string();
-            crate::git::commands::git_fetch(&consolidation_path, &generation_remote, &[])
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to fold generation {} into {}",
-                        generation_path.display(),
-                        consolidation_path.display()
-                    )
-                })?;
-        }
-
-        ensure_bare_head_ref(&consolidation_path)
-            .await
-            .with_context(|| {
-                format!("failed to set bare HEAD after generation fold for {owner_repo}")
-            })?;
-        validate_ready_repo(state, owner_repo, &consolidation_path, "generation fold")
-            .await
-            .with_context(|| format!("generation fold validation failed for {owner_repo}"))?;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-
-    if let Err(error) = consolidation_result {
-        if consolidation_path.exists() {
-            tokio::fs::remove_dir_all(&consolidation_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to remove unsuccessful consolidated generation at {}",
-                        consolidation_path.display()
-                    )
-                })?;
-        }
-        warn!(
-            repo = %owner_repo,
-            path = %staged_repo_path.display(),
-            error = %error,
-            "generation fold failed; publishing the validated staged generation directly"
-        );
-        return Ok(staged_repo_path.to_path_buf());
-    }
-
-    Ok(consolidation_path)
+    Ok(staged_repo_path.to_path_buf())
 }
 
 async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
@@ -1137,7 +1123,6 @@ async fn publish_repo_mirror_generation(
     }
 
     let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
-    register_active_generation(state, owner_repo, &staged_repo_path).await;
     let result = async {
         crate::git::commands::git_clone_bare_local(&mirror_path, &staged_repo_path)
             .await
@@ -1153,7 +1138,6 @@ async fn publish_repo_mirror_generation(
         publish_ready_repo(state, owner_repo, &staged_repo_path, source).await
     }
     .await;
-    unregister_active_generation(state, owner_repo, &staged_repo_path).await;
     match result {
         Ok(path) => Ok(path),
         Err(error) => {

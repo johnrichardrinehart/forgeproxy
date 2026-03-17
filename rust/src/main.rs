@@ -104,10 +104,12 @@ pub struct AppState {
     /// generation mutation work while allowing clone/fetch hydration to run
     /// concurrently up to the configured per-repo limits.
     pub repo_publish_mutexes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
-    /// In-flight staged generation directories per repo. This lets publish/prune
-    /// avoid deleting another request's active staging area.
-    pub active_repo_generations: Arc<
-        Mutex<std::collections::HashMap<String, std::collections::HashSet<std::path::PathBuf>>>,
+    /// Per-repo refcounts for published reader generations currently in use by
+    /// local clone/fetch handlers on this node.
+    pub published_generation_leases: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::collections::HashMap<std::path::PathBuf, usize>>,
+        >,
     >,
     /// Most recent upstream `info/refs` advertisement we proxied for a repo.
     /// HTTP clones do not give us a stable request-scoped handle across the
@@ -753,7 +755,9 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         bundle_pack_threads: bundle_execution_policy.pack_threads,
         repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_publish_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        active_repo_generations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        published_generation_leases: Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         recent_info_refs_advertisements: Arc::new(Mutex::new(std::collections::HashMap::new())),
     })
 }
