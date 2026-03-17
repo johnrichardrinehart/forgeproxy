@@ -281,6 +281,7 @@ pkgs.testers.runNixOSTest {
           git
           curl
           jq
+          pv
         ];
         security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
       };
@@ -290,6 +291,9 @@ pkgs.testers.runNixOSTest {
   # Test script
   # ---------------------------------------------------------------------------
   testScript = ''
+    def pkt_line(payload: str) -> str:
+        return f"{len(payload) + 4:04x}{payload}"
+
     ghe.start()
     valkey.start()
     s3.start()
@@ -348,7 +352,9 @@ pkgs.testers.runNixOSTest {
             "git config user.email test@test.local && "
             "git config user.name Test && "
             "echo 'Hello World' > README.md && "
+            "head -c 33554432 /dev/urandom > BIG.bin && "
             "git add README.md && "
+            "git add BIG.bin && "
             "git commit -m 'Initial commit' && "
             "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/hello-world.git && "
             "git push -u origin main"
@@ -449,7 +455,44 @@ pkgs.testers.runNixOSTest {
             "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack directly from local disk'"
         )
 
-    with subtest("Mutable ref updates converge a new generation asynchronously"):
+    with subtest("Mutable ref updates publish a new generation while leased readers keep the old one alive"):
+        old_rev = ghe.succeed(
+            "git ls-remote http://octocat:secret123@localhost:3000/octocat/hello-world.git refs/heads/main | cut -f1"
+        ).strip()
+        request_body = (
+            pkt_line(
+                f"want {old_rev} multi_ack_detailed side-band-64k thin-pack ofs-delta agent=forgeproxy-test\n"
+            )
+            + pkt_line("done\n")
+            + "0000"
+        )
+        client.succeed(
+            "cat > /tmp/slow-upload-pack.req <<'EOF'\n"
+            f"{request_body}\n"
+            "EOF"
+        )
+        client.execute(
+            "sh -lc '"
+            "set -o pipefail; "
+            "curl -sf"
+            " -u octocat:secret123"
+            " -H \"Content-Type: application/x-git-upload-pack-request\""
+            " --data-binary @/tmp/slow-upload-pack.req"
+            " https://proxy/octocat/hello-world.git/git-upload-pack"
+            " | pv -qL 1048576 > /tmp/slow-upload-pack.out"
+            " 2> /tmp/slow-upload-pack.err; "
+            "echo $? > /tmp/slow-upload-pack.status"
+            "' &"
+        )
+        proxy.wait_until_succeeds(
+            "pgrep -af 'git upload-pack --stateless-rpc --strict .*/hello-world' >/dev/null"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack directly from local disk' >/dev/null"
+        )
+        old_generation = proxy.succeed(
+            "readlink -f /var/cache/forgeproxy/repos/octocat/hello-world.git"
+        ).strip()
         ghe.succeed(
             "set -e && "
             "tmp=$(mktemp -d) && "
@@ -467,7 +510,16 @@ pkgs.testers.runNixOSTest {
         ).strip()
         client.succeed("git -C /tmp/repo fetch origin main")
         proxy.wait_until_succeeds(
+            f"test \"$(readlink -f /var/cache/forgeproxy/repos/octocat/hello-world.git)\" != '{old_generation}'"
+        )
+        proxy.wait_until_succeeds(
             f"git --git-dir /var/cache/forgeproxy/repos/octocat/hello-world.git rev-parse refs/heads/main | grep -Fx '{updated_rev}'"
+        )
+        client.wait_until_succeeds("test -f /tmp/slow-upload-pack.status")
+        client.succeed("grep -qx 0 /tmp/slow-upload-pack.status")
+        proxy.wait_until_succeeds(f"! test -d '{old_generation}'")
+        proxy.wait_until_succeeds(
+            "test $(find /var/cache/forgeproxy/repos/.generations/octocat/hello-world.git -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1"
         )
 
     with subtest("Shallow-first clone still results in a stored generation"):

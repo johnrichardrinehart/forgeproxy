@@ -468,6 +468,8 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
                     state
                         .cache_manager
                         .publish_staged_repo(owner_repo, &staged_repo_path)?;
+                    crate::coordination::registry::prune_retired_generations(state, owner_repo)
+                        .await?;
                     published = true;
                     outcome.published = true;
 

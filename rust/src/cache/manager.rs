@@ -158,9 +158,14 @@ impl CacheManager {
     }
 
     /// Atomically publish a staged generation as the current repo entry.
+    ///
+    /// The staged generation becomes the new reader-visible snapshot. The most
+    /// recent previously-published generation may remain as a retiring snapshot
+    /// so in-flight readers can continue on the old target while new readers
+    /// pick up the new one. Pruning is lease-aware and happens outside this
+    /// method.
     pub fn publish_staged_repo(&self, owner_repo: &str, staged_repo_path: &Path) -> Result<()> {
         let published_path = self.repo_path(owner_repo);
-        let mut previous_target: Option<PathBuf> = None;
         if let Some(parent) = published_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -179,7 +184,6 @@ impl CacheManager {
             })?;
 
             if metadata.file_type().is_symlink() {
-                previous_target = std::fs::read_link(&published_path).ok();
             } else if is_usable_bare_repo(&published_path) {
                 let legacy_target = self.create_staging_repo_path(owner_repo)?;
                 std::fs::rename(&published_path, &legacy_target).with_context(|| {
@@ -189,7 +193,6 @@ impl CacheManager {
                         legacy_target.display()
                     )
                 })?;
-                previous_target = Some(legacy_target);
             } else {
                 std::fs::remove_dir_all(&published_path).with_context(|| {
                     format!(
@@ -221,16 +224,38 @@ impl CacheManager {
                 published_path.display()
             )
         })?;
-        self.prune_unpublished_generations(
-            owner_repo,
-            staged_repo_path,
-            previous_target.as_deref(),
-        )?;
 
         Ok(())
     }
 
+    /// Resolve the concrete published generation currently exposed to readers.
+    pub fn current_repo_target(&self, owner_repo: &str) -> Result<Option<PathBuf>> {
+        let published_path = self.repo_path(owner_repo);
+        if !published_path.exists() {
+            return Ok(None);
+        }
+
+        let metadata = std::fs::symlink_metadata(&published_path).with_context(|| {
+            format!(
+                "failed to stat published repo path while resolving current target: {}",
+                published_path.display()
+            )
+        })?;
+
+        if metadata.file_type().is_symlink() {
+            Ok(std::fs::read_link(&published_path).ok())
+        } else if is_usable_bare_repo(&published_path) {
+            Ok(Some(published_path))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Remove every generation except the explicitly retained paths.
+    ///
+    /// Most publication paths should not need this directly now that
+    /// [`publish_staged_repo`] retains only the current and retiring reader
+    /// snapshots by default.
     pub fn prune_generations_except(&self, owner_repo: &str, retain: &[PathBuf]) -> Result<()> {
         let generations_dir = self.repo_generations_dir(owner_repo);
         if !generations_dir.exists() {
@@ -248,65 +273,6 @@ impl CacheManager {
                     path.display()
                 )
             })?;
-        }
-
-        Ok(())
-    }
-
-    fn prune_unpublished_generations(
-        &self,
-        owner_repo: &str,
-        current_target: &Path,
-        previous_target: Option<&Path>,
-    ) -> Result<()> {
-        let generations_dir = self.repo_generations_dir(owner_repo);
-        if !generations_dir.exists() {
-            return Ok(());
-        }
-
-        let fallback_previous = if previous_target.is_none() {
-            std::fs::read_dir(&generations_dir)
-                .with_context(|| {
-                    format!(
-                        "failed to read repo generations directory: {}",
-                        generations_dir.display()
-                    )
-                })?
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .filter(|path| path != current_target)
-                .max_by_key(|path| path.file_name().map(|name| name.to_os_string()))
-        } else {
-            None
-        };
-        let retained_previous = previous_target.or(fallback_previous.as_deref());
-
-        for entry in std::fs::read_dir(&generations_dir).with_context(|| {
-            format!(
-                "failed to read repo generations directory: {}",
-                generations_dir.display()
-            )
-        })? {
-            let entry = entry?;
-            let path = entry.path();
-            if path == current_target || retained_previous.is_some_and(|prev| path == prev) {
-                continue;
-            }
-
-            if path.is_dir() {
-                std::fs::remove_dir_all(&path).with_context(|| {
-                    format!(
-                        "failed to remove stale repo generation at {}",
-                        path.display()
-                    )
-                })?;
-            } else {
-                std::fs::remove_file(&path).with_context(|| {
-                    format!(
-                        "failed to remove stale repo generation at {}",
-                        path.display()
-                    )
-                })?;
-            }
         }
 
         Ok(())
@@ -900,7 +866,7 @@ deadbeef refs/heads/main\n",
     }
 
     #[test]
-    fn publish_staged_repo_prunes_older_unpublished_generations() {
+    fn publish_staged_repo_leaves_pruning_to_the_caller() {
         let tmp = tempdir().unwrap();
         let mgr = test_manager(tmp.path());
         let owner_repo = "acme/widgets";
@@ -925,13 +891,13 @@ deadbeef refs/heads/main\n",
                 .is_symlink()
         );
         assert_eq!(fs::read_link(&published).unwrap(), third);
-        assert!(!first.exists());
+        assert!(first.exists());
         assert!(second.exists());
         assert!(third.exists());
     }
 
     #[test]
-    fn publish_staged_repo_keeps_most_recent_previous_when_symlink_is_missing() {
+    fn prune_generations_except_removes_unretained_generations() {
         let tmp = tempdir().unwrap();
         let mgr = test_manager(tmp.path());
         let owner_repo = "acme/widgets";
@@ -948,15 +914,10 @@ deadbeef refs/heads/main\n",
 
         assert!(first.exists());
         assert!(second.exists());
-
-        fs::remove_file(mgr.repo_path(owner_repo)).unwrap();
-
-        let third = mgr.create_staging_repo_path(owner_repo).unwrap();
-        create_minimal_bare_repo(&third);
-        mgr.publish_staged_repo(owner_repo, &third).unwrap();
+        mgr.prune_generations_except(owner_repo, std::slice::from_ref(&second))
+            .unwrap();
 
         assert!(!first.exists());
         assert!(second.exists());
-        assert!(third.exists());
     }
 }

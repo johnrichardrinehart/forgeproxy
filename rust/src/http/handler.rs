@@ -21,8 +21,10 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde::Deserialize;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,6 +33,35 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::AppState;
 use crate::coordination::registry::LocalServeDecision;
+
+struct LeasedReaderStream<S> {
+    inner: S,
+    lease: Option<crate::coordination::registry::PublishedGenerationLease>,
+}
+
+impl<S> LeasedReaderStream<S> {
+    fn new(inner: S, lease: crate::coordination::registry::PublishedGenerationLease) -> Self {
+        Self {
+            inner,
+            lease: Some(lease),
+        }
+    }
+}
+
+impl<S> Stream for LeasedReaderStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let poll = Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.lease.take();
+        }
+        poll
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -446,7 +477,10 @@ async fn serve_local_upload_pack(
     request_body: &[u8],
     git_protocol: Option<&str>,
 ) -> Result<Response, AppError> {
-    let repo_path = state.cache_manager.repo_path(&format!("{owner}/{repo}"));
+    let owner_repo = format!("{owner}/{repo}");
+    let generation_lease =
+        crate::coordination::registry::acquire_published_generation_lease(state, &owner_repo)?;
+    let repo_path = generation_lease.repo_path().to_path_buf();
 
     let mut cmd = Command::new("git");
     cmd.arg("upload-pack")
@@ -479,7 +513,7 @@ async fn serve_local_upload_pack(
         .context("failed to capture git upload-pack stderr")?;
 
     // Stream stdout as the response body.
-    let stream = ReaderStream::new(stdout);
+    let stream = LeasedReaderStream::new(ReaderStream::new(stdout), generation_lease);
     let body = Body::from_stream(stream);
 
     // Reap the child in the background so we don't leak processes.
