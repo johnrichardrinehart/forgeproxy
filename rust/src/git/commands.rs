@@ -519,16 +519,21 @@ pub async fn git_has_object(repo_path: &Path, oid: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    if output.status.code() == Some(1) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if git_cat_file_missing_object(&output.status, &stderr) {
         return Ok(false);
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
     bail!(
         "git cat-file -e failed (status {}): {}",
         output.status,
         stderr.trim(),
     );
+}
+
+fn git_cat_file_missing_object(status: &std::process::ExitStatus, stderr: &str) -> bool {
+    status.code() == Some(1)
+        || (status.code() == Some(128) && stderr.contains("Not a valid object name"))
 }
 
 /// Run `git symbolic-ref HEAD <target>` in a bare repo.
@@ -866,5 +871,18 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
             redacted,
             "https://x-access-token:****@ghe.example.com/org/repo.git"
         );
+    }
+
+    #[test]
+    fn git_cat_file_invalid_object_name_counts_as_missing() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 128")
+            .status()
+            .unwrap();
+        assert!(git_cat_file_missing_object(
+            &status,
+            "fatal: Not a valid object name 07ae7ae^{object}"
+        ));
     }
 }
