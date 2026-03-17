@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -1139,6 +1140,14 @@ async fn publish_repo_mirror_generation(
 
     let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
     let result = async {
+        let stage_clone_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source,
+            mirror = %mirror_path.display(),
+            staged = %staged_repo_path.display(),
+            "materializing staged generation from mirror"
+        );
         crate::git::commands::git_clone_bare_local(&mirror_path, &staged_repo_path)
             .await
             .with_context(|| {
@@ -1148,9 +1157,66 @@ async fn publish_repo_mirror_generation(
                     mirror_path.display()
                 )
             })?;
+        info!(
+            repo = %owner_repo,
+            source,
+            mirror = %mirror_path.display(),
+            staged = %staged_repo_path.display(),
+            elapsed_ms = stage_clone_started_at.elapsed().as_millis(),
+            "finished materializing staged generation from mirror"
+        );
+
+        let staged_head_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source,
+            staged = %staged_repo_path.display(),
+            "ensuring staged generation HEAD"
+        );
         ensure_bare_head_ref(&staged_repo_path).await?;
+        info!(
+            repo = %owner_repo,
+            source,
+            staged = %staged_repo_path.display(),
+            elapsed_ms = staged_head_started_at.elapsed().as_millis(),
+            "finished ensuring staged generation HEAD"
+        );
+
+        let staged_validation_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source,
+            staged = %staged_repo_path.display(),
+            "validating staged generation before publish"
+        );
         validate_ready_repo(state, owner_repo, &staged_repo_path, source).await?;
-        publish_ready_repo(state, owner_repo, &staged_repo_path, source).await
+        info!(
+            repo = %owner_repo,
+            source,
+            staged = %staged_repo_path.display(),
+            elapsed_ms = staged_validation_started_at.elapsed().as_millis(),
+            "finished validating staged generation before publish"
+        );
+
+        let publish_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source,
+            staged = %staged_repo_path.display(),
+            published = %state.cache_manager.repo_path(owner_repo).display(),
+            "publishing staged generation"
+        );
+        let published_path =
+            publish_ready_repo(state, owner_repo, &staged_repo_path, source).await?;
+        info!(
+            repo = %owner_repo,
+            source,
+            staged = %staged_repo_path.display(),
+            published = %state.cache_manager.repo_path(owner_repo).display(),
+            elapsed_ms = publish_started_at.elapsed().as_millis(),
+            "finished publishing staged generation"
+        );
+        Ok::<PathBuf, anyhow::Error>(published_path)
     }
     .await;
     match result {
@@ -1431,8 +1497,32 @@ async fn hydrate_repo_from_tee_capture(
         "tee hydration index-pack finished"
     );
     if state.config.clone.hydration_mode == crate::config::HydrationMode::PublishFromCapture {
+        let materialize_refs_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            destination = %repo_path.display(),
+            capture_dir = %capture_dir.display(),
+            "materializing capture refs into hydrated mirror"
+        );
         let metadata = materialize_capture_refs(repo_path, capture_dir).await?;
+        info!(
+            repo = %owner_repo,
+            destination = %repo_path.display(),
+            capture_dir = %capture_dir.display(),
+            refs_materialized = metadata.refs.len(),
+            head = ?metadata.head_symref_target,
+            elapsed_ms = materialize_refs_started_at.elapsed().as_millis(),
+            "finished materializing capture refs into hydrated mirror"
+        );
         if !metadata.refs.is_empty() && state.cache_manager.has_repo_at(repo_path) {
+            let direct_publish_validation_started_at = Instant::now();
+            info!(
+                repo = %owner_repo,
+                destination = %repo_path.display(),
+                refs_materialized = metadata.refs.len(),
+                head = ?metadata.head_symref_target,
+                "validating tee-capture metadata for direct publish"
+            );
             let direct_publish_ready = async {
                 ensure_bare_head_ref(repo_path).await?;
                 check_ready_repo(state, owner_repo, repo_path, "tee capture publish").await?;
@@ -1447,6 +1537,7 @@ async fn hydrate_repo_from_tee_capture(
                         destination = %repo_path.display(),
                         refs_materialized = metadata.refs.len(),
                         head = ?metadata.head_symref_target,
+                        elapsed_ms = direct_publish_validation_started_at.elapsed().as_millis(),
                         "publishing generation directly from tee capture metadata"
                     );
                     return Ok(TeeHydrationOutcome::PublishedFromCapture);
@@ -1457,6 +1548,7 @@ async fn hydrate_repo_from_tee_capture(
                         destination = %repo_path.display(),
                         refs_materialized = metadata.refs.len(),
                         head = ?metadata.head_symref_target,
+                        elapsed_ms = direct_publish_validation_started_at.elapsed().as_millis(),
                         error = %error,
                         "capture metadata was insufficient for direct publish; falling back to follow-on fetch"
                     );
@@ -1533,6 +1625,13 @@ async fn validate_ready_repo(
     repo_path: &Path,
     source: &str,
 ) -> Result<()> {
+    let validation_started_at = Instant::now();
+    info!(
+        repo = %owner_repo,
+        source,
+        path = %repo_path.display(),
+        "starting ready-repo validation"
+    );
     let validation_result = check_ready_repo(state, owner_repo, repo_path, source).await;
 
     if let Err(error) = validation_result {
@@ -1549,6 +1648,14 @@ async fn validate_ready_repo(
         }
         return Err(error);
     }
+
+    info!(
+        repo = %owner_repo,
+        source,
+        path = %repo_path.display(),
+        elapsed_ms = validation_started_at.elapsed().as_millis(),
+        "finished ready-repo validation"
+    );
 
     Ok(())
 }
