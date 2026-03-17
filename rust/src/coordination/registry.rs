@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,41 @@ pub(crate) fn repo_key(owner_repo: &str) -> String {
 fn fetch_schedule_key(owner_repo: &str) -> String {
     let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
     format!("forgeproxy:repo:{normalized}:fetch_schedule")
+}
+
+const VALKEY_RETRY_ATTEMPTS: usize = 5;
+const VALKEY_RETRY_BASE_DELAY_MS: u64 = 250;
+
+async fn retry_valkey_op<T, F, Fut>(owner_repo: &str, operation: &str, mut f: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut last_error = None;
+
+    for attempt in 0..VALKEY_RETRY_ATTEMPTS {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 == VALKEY_RETRY_ATTEMPTS {
+                    break;
+                }
+
+                let delay_ms = VALKEY_RETRY_BASE_DELAY_MS * (1_u64 << attempt);
+                warn!(
+                    owner_repo,
+                    operation,
+                    attempt = attempt + 1,
+                    delay_ms,
+                    "Valkey operation failed; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+
+    Err(last_error.expect("retry loop must capture an error"))
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +172,10 @@ pub async fn get_repo_info(
     owner_repo: &str,
 ) -> Result<Option<RepoInfo>> {
     let key = repo_key(owner_repo);
-    let map: HashMap<String, String> = pool.hgetall(&key).await.context("HGETALL repo info")?;
+    let map: HashMap<String, String> = retry_valkey_op(owner_repo, "HGETALL repo info", || async {
+        pool.hgetall(&key).await.context("HGETALL repo info")
+    })
+    .await?;
     if map.is_empty() {
         trace!(%owner_repo, "repo info not found");
         return Ok(None);
@@ -152,7 +191,14 @@ pub async fn set_repo_info(
 ) -> Result<()> {
     let key = repo_key(owner_repo);
     let pairs = repo_info_to_pairs(info);
-    let _: () = pool.hset(&key, pairs).await.context("HSET repo info")?;
+    retry_valkey_op(owner_repo, "HSET repo info", || {
+        let pairs = pairs.clone();
+        async {
+            let _: () = pool.hset(&key, pairs).await.context("HSET repo info")?;
+            Ok(())
+        }
+    })
+    .await?;
     debug!(%owner_repo, "repo info written");
     Ok(())
 }
