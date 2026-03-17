@@ -292,6 +292,10 @@ pub struct CloneConfig {
     /// pack into a staging generation.
     #[serde(default)]
     pub hydration_mode: HydrationMode,
+    /// Maximum time a client request should wait for a local mirror catch-up
+    /// publish before falling back to proxying upstream.
+    #[serde(default = "default_request_wait_for_local_catch_up_secs")]
+    pub request_wait_for_local_catch_up_secs: u64,
     /// How often to scan `_tee` for abandoned captures.
     #[serde(default = "default_tee_cleanup_interval_secs")]
     pub tee_cleanup_interval_secs: u64,
@@ -313,6 +317,7 @@ impl Default for CloneConfig {
             max_concurrent_upstream_clones_per_repo_per_instance:
                 default_max_concurrent_upstream_clones_per_repo_per_instance(),
             hydration_mode: HydrationMode::default(),
+            request_wait_for_local_catch_up_secs: default_request_wait_for_local_catch_up_secs(),
             tee_cleanup_interval_secs: default_tee_cleanup_interval_secs(),
             tee_retention_secs: default_tee_retention_secs(),
         }
@@ -333,6 +338,10 @@ fn default_lock_ttl() -> u64 {
 
 fn default_lock_wait_timeout() -> u64 {
     90
+}
+
+fn default_request_wait_for_local_catch_up_secs() -> u64 {
+    30
 }
 
 fn default_tee_cleanup_interval_secs() -> u64 {

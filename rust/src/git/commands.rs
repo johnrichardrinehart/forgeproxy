@@ -182,7 +182,7 @@ pub async fn git_clone_bare_shared_local(source: &Path, dest: &Path) -> Result<(
 ///
 /// Emits start/progress/finish logs for long-running fetches and returns a
 /// [`FetchResult`] summarising the update.
-#[instrument(skip(env_vars), fields(repo = %repo_path.display()))]
+#[instrument(skip(env_vars, remote_url), fields(repo = %repo_path.display()))]
 pub async fn git_fetch(
     repo_path: &Path,
     remote_url: &str,

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -1968,6 +1968,85 @@ pub async fn classify_local_wants_satisfaction(
             missing_wants,
         })
     }
+}
+
+pub async fn wait_for_local_catch_up(
+    state: &crate::AppState,
+    owner: &str,
+    repo: &str,
+    auth_header: Option<&str>,
+    wants: &[String],
+) -> Result<LocalServeDecision> {
+    let timeout = Duration::from_secs(state.config.clone.request_wait_for_local_catch_up_secs);
+    let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
+    let owner_repo = format!("{owner}/{repo_clean}");
+
+    let initial_decision = classify_local_wants_satisfaction(state, &owner_repo, wants).await?;
+    if !matches!(
+        initial_decision,
+        LocalServeDecision::MissingWantedObjects { .. }
+    ) {
+        return Ok(initial_decision);
+    }
+    if timeout.is_zero() {
+        return Ok(initial_decision);
+    }
+    if !state.cache_manager.has_repo_mirror(&owner_repo) {
+        return Ok(initial_decision);
+    }
+
+    let should_start_refresh = get_repo_info(&state.valkey, &owner_repo)
+        .await?
+        .map(|info| info.hydrating_node_id.is_empty())
+        .unwrap_or(true);
+    if should_start_refresh {
+        let state = state.clone();
+        let owner = owner.to_string();
+        let repo = repo_clean.to_string();
+        let auth_header = auth_header.map(ToOwned::to_owned);
+        let owner_repo_for_log = owner_repo.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                ensure_repo_cloned_from_upstream(&state, &owner, &repo, auth_header.as_deref())
+                    .await
+            {
+                warn!(
+                    repo = %owner_repo_for_log,
+                    error = %error,
+                    "request-time local catch-up refresh failed"
+                );
+            }
+        });
+    }
+
+    let started_at = Instant::now();
+    let mut last_decision = initial_decision;
+    info!(
+        repo = %owner_repo,
+        timeout_secs = timeout.as_secs(),
+        started_refresh = should_start_refresh,
+        "waiting for local mirror catch-up before deciding whether to proxy upstream"
+    );
+    while started_at.elapsed() < timeout {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let decision = classify_local_wants_satisfaction(state, &owner_repo, wants).await?;
+        if matches!(decision, LocalServeDecision::SatisfiesWants { .. }) {
+            info!(
+                repo = %owner_repo,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "local mirror catch-up completed before request timeout"
+            );
+            return Ok(decision);
+        }
+        last_decision = decision;
+    }
+
+    info!(
+        repo = %owner_repo,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "local mirror catch-up timed out; falling back to upstream proxy"
+    );
+    Ok(last_decision)
 }
 
 /// List all tracked repository names by scanning for `forgeproxy:repo:*` keys
