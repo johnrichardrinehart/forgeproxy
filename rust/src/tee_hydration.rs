@@ -18,6 +18,14 @@ const LS_REFS_REQUEST_FILE: &str = "ls_refs_request.bin";
 const LS_REFS_RESPONSE_FILE: &str = "ls_refs_response.bin";
 const SHARED_DIR_MODE: u32 = 0o775;
 const SHARED_FILE_MODE: u32 = 0o664;
+// The tee writer intentionally prioritizes client progress over preserving a
+// complete disk capture:
+// - response bytes are buffered in memory and handed off to a background disk
+//   writer so normal disk latency does not directly slow the client stream
+// - if disk falls behind long enough to exhaust this budget, the capture is
+//   aborted and cleaned up instead of backpressuring the client
+// - slow clients still backpressure the overall stream; that is intentional,
+//   because we prefer client/network pacing over unbounded buffering
 pub const CAPTURE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
 const CAPTURE_WRITE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const CAPTURE_CHUNK_QUEUE_DEPTH: usize = 2048;

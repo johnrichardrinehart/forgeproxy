@@ -278,7 +278,11 @@ fn resolve_clone_concurrency_limit(config: &Config) -> usize {
     let memory_budget = available_bytes.saturating_sub(CLONE_CAPTURE_MEMORY_HEADROOM_BYTES);
     let memory_limited =
         (memory_budget / crate::tee_hydration::CAPTURE_BUFFER_BYTES as u64) as usize;
-    let resolved = configured.min(memory_limited);
+    let resolved = if configured == 0 {
+        0
+    } else {
+        configured.min(memory_limited.max(1))
+    };
 
     tracing::info!(
         configured,
@@ -289,6 +293,14 @@ fn resolve_clone_concurrency_limit(config: &Config) -> usize {
         resolved,
         "resolved clone concurrency limit from startup memory snapshot"
     );
+
+    if configured > 0 && memory_limited == 0 {
+        tracing::warn!(
+            configured,
+            available_bytes,
+            "startup memory budget cannot satisfy the requested 1 GiB tee-capture headroom; allowing a single clone hydration permit so cache miss hydration still works"
+        );
+    }
 
     if resolved == 0 {
         tracing::warn!(

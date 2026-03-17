@@ -1855,8 +1855,9 @@ async fn proxy_upstream_upload_pack(
                 if let Some(active_capture) = capture.take() {
                     match active_capture.finish_success().await {
                         Ok(Some(capture_dir)) => {
-                            if let Ok((owner, repo)) =
-                                super::upstream::split_owner_repo(&owner_repo)
+                            if request_kind == V2RequestKind::Fetch
+                                && let Ok((owner, repo)) =
+                                    super::upstream::split_owner_repo(&owner_repo)
                             {
                                 let state_bg = Arc::clone(&state);
                                 let owner_bg = owner.to_string();
@@ -1925,10 +1926,37 @@ async fn proxy_upstream_upload_pack(
                                     .await
                             {
                                 warn!(
-                                    repo = %owner_repo,
-                                    error = %e,
+                                repo = %owner_repo,
+                                error = %e,
                                     "failed to release clone hydration permits after dropping SSH tee capture"
                                 );
+                            }
+                            if request_kind == V2RequestKind::Fetch
+                                && let Ok((owner, repo)) =
+                                    super::upstream::split_owner_repo(&owner_repo)
+                            {
+                                let state_bg = Arc::clone(&state);
+                                let owner_bg = owner.to_string();
+                                let repo_bg = repo.to_string();
+                                let owner_repo_bg = owner_repo.clone();
+                                let auth_bg = auth_header.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        crate::coordination::registry::ensure_repo_cloned_from_upstream(
+                                            &state_bg,
+                                            &owner_bg,
+                                            &repo_bg,
+                                            auth_bg.as_deref(),
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            repo = %owner_repo_bg,
+                                            error = %e,
+                                            "background upstream hydration after SSH miss completed without tee capture failed"
+                                        );
+                                    }
+                                });
                             }
                         }
                         Err(error) => {
@@ -1945,13 +1973,64 @@ async fn proxy_upstream_upload_pack(
                                     .await
                             {
                                 warn!(
-                                    repo = %owner_repo,
-                                    error = %e,
+                                repo = %owner_repo,
+                                error = %e,
                                     "failed to release clone hydration permits after SSH tee finalization failure"
                                 );
                             }
+                            if let Ok((owner, repo)) =
+                                super::upstream::split_owner_repo(&owner_repo)
+                            {
+                                let state_bg = Arc::clone(&state);
+                                let owner_bg = owner.to_string();
+                                let repo_bg = repo.to_string();
+                                let owner_repo_bg = owner_repo.clone();
+                                let auth_bg = auth_header.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        crate::coordination::registry::ensure_repo_cloned_from_upstream(
+                                            &state_bg,
+                                            &owner_bg,
+                                            &repo_bg,
+                                            auth_bg.as_deref(),
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            repo = %owner_repo_bg,
+                                            error = %e,
+                                            "background upstream hydration after SSH tee finalization failure failed"
+                                        );
+                                    }
+                                });
+                            }
                         }
                     }
+                } else if request_kind == V2RequestKind::Fetch
+                    && let Ok((owner, repo)) = super::upstream::split_owner_repo(&owner_repo)
+                {
+                    let state_bg = Arc::clone(&state);
+                    let owner_bg = owner.to_string();
+                    let repo_bg = repo.to_string();
+                    let owner_repo_bg = owner_repo.clone();
+                    let auth_bg = auth_header.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::coordination::registry::ensure_repo_cloned_from_upstream(
+                                &state_bg,
+                                &owner_bg,
+                                &repo_bg,
+                                auth_bg.as_deref(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                repo = %owner_repo_bg,
+                                error = %e,
+                                "background upstream hydration after SSH miss completed without tee capture failed"
+                            );
+                        }
+                    });
                 }
                 if capture.is_none()
                     && let Some(permits) = hydration_permits.take()

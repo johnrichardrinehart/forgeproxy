@@ -791,6 +791,29 @@ async fn proxy_upload_pack_to_upstream(
                             "failed to release clone hydration permits after dropping HTTP tee capture"
                         );
                     }
+                    let state_bg = state.clone();
+                    let owner_bg = owner.clone();
+                    let repo_bg = repo.clone();
+                    let owner_repo_bg = owner_repo.clone();
+                    let auth_bg = auth_header.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::coordination::registry::ensure_repo_cloned_from_upstream(
+                                &state_bg,
+                                &owner_bg,
+                                &repo_bg,
+                                auth_bg.as_deref(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                repo = %owner_repo_bg,
+                                error = %e,
+                                error_chain = %format!("{e:#}"),
+                                "background upstream hydration after HTTP miss completed without tee capture failed"
+                            );
+                        }
+                    });
                 }
                 Err(error) => {
                     warn!(
@@ -811,8 +834,54 @@ async fn proxy_upload_pack_to_upstream(
                             "failed to release clone hydration permits after HTTP tee finalization failure"
                         );
                     }
+                    let state_bg = state.clone();
+                    let owner_bg = owner.clone();
+                    let repo_bg = repo.clone();
+                    let owner_repo_bg = owner_repo.clone();
+                    let auth_bg = auth_header.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::coordination::registry::ensure_repo_cloned_from_upstream(
+                                &state_bg,
+                                &owner_bg,
+                                &repo_bg,
+                                auth_bg.as_deref(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                repo = %owner_repo_bg,
+                                error = %e,
+                                error_chain = %format!("{e:#}"),
+                                "background upstream hydration after HTTP tee finalization failure failed"
+                            );
+                        }
+                    });
                 }
             }
+        } else {
+            let state_bg = state.clone();
+            let owner_bg = owner.clone();
+            let repo_bg = repo.clone();
+            let owner_repo_bg = owner_repo.clone();
+            let auth_bg = auth_header.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::coordination::registry::ensure_repo_cloned_from_upstream(
+                    &state_bg,
+                    &owner_bg,
+                    &repo_bg,
+                    auth_bg.as_deref(),
+                )
+                .await
+                {
+                    warn!(
+                        repo = %owner_repo_bg,
+                        error = %e,
+                        error_chain = %format!("{e:#}"),
+                        "background upstream hydration after HTTP miss completed without tee capture failed"
+                    );
+                }
+            });
         }
     });
 
