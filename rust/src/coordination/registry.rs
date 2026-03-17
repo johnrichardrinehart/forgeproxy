@@ -505,83 +505,133 @@ async fn try_ensure_repo_cloned_inner(
     let had_local_repo_at_start = state.cache_manager.has_repo(&owner_repo);
 
     let published_repo_path = state.cache_manager.ensure_repo_dir(&owner_repo)?;
-    reset_partial_repo_if_needed(&state.cache_manager, &owner_repo, &published_repo_path).await?;
-    let staged_repo_path = state.cache_manager.create_staging_repo_path(&owner_repo)?;
-    register_active_generation(state, &owner_repo, &staged_repo_path).await;
+    reset_partial_repo_path_if_needed(&published_repo_path).await?;
+    let mirror_path = state.cache_manager.ensure_repo_mirror_dir(&owner_repo)?;
+    reset_partial_repo_path_if_needed(&mirror_path).await?;
     let mut clone_hydration_permits = preacquired_permits;
 
     let result = async {
-        info!(repo = %owner_repo, path = %staged_repo_path.display(), "starting staged repo hydration");
-        if !(had_local_repo_at_start && tee_capture_dir.is_some()) {
-            match try_restore_repo_from_s3(state, &owner_repo, &staged_repo_path).await {
-                Ok(true) => {
-                    info!(repo = %owner_repo, path = %staged_repo_path.display(), "restored repo from S3 bundle");
-                    let _repo_generation_guard =
-                        acquire_local_repo_publish_guard(state, &owner_repo).await;
-                    if state.cache_manager.has_repo(&owner_repo) {
-                        info!(
-                            repo = %owner_repo,
-                            published = %state.cache_manager.repo_path(&owner_repo).display(),
-                            path = %staged_repo_path.display(),
-                            "repo was published by another hydration; skipping redundant finalize/publish work"
-                        );
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                    ensure_bare_head_ref(&staged_repo_path)
-                        .await
-                        .with_context(|| format!("failed to set bare HEAD after S3 restore for {owner_repo}"))?;
-                    validate_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore")
-                        .await
-                        .with_context(|| format!("S3-restored repo validation failed for {owner_repo}"))?;
-                    let published_repo_path =
-                        publish_ready_repo(state, &owner_repo, &staged_repo_path, "S3 restore")
-                            .await?;
-
-                    let mut info = get_repo_info(&state.valkey, &owner_repo)
-                        .await?
-                        .unwrap_or_default();
-                    info.status = "ready".to_string();
-                    info.node_ids = node_id.clone();
-                    info.hydrating_node_id.clear();
-                    info.hydrating_since_ts = 0;
-                    info.bootstrap_bundle_pending = false;
-                    set_repo_info(&state.valkey, &owner_repo, &info).await?;
-                    crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
-                        .await?;
-                    info!(%owner_repo, published = %published_repo_path.display(), "repo hydrated from S3 bundle");
-                    return Ok::<(), anyhow::Error>(());
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    info!(
-                        %owner_repo,
-                        error = %error,
-                        "S3 hydration unavailable; falling back to upstream clone"
-                    );
-                    if staged_repo_path.exists() {
-                        tokio::fs::remove_dir_all(&staged_repo_path)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "failed to remove failed S3 hydration repo at {}",
-                                    staged_repo_path.display()
-                                )
-                            })?;
-                    }
-                }
-            }
-        }
-
         let clone_url = clone_url(state, owner, repo_clean, auth_header);
-        let update_existing_repo = had_local_repo_at_start && tee_capture_dir.is_some();
+        let has_existing_local_state =
+            had_local_repo_at_start || state.cache_manager.has_repo_mirror(&owner_repo);
 
-        if had_local_repo_at_start && !update_existing_repo {
+        if has_existing_local_state {
             info!(
                 repo = %owner_repo,
-                published = %state.cache_manager.repo_path(&owner_repo).display(),
-                "repo became locally available before hydration started; skipping redundant upstream hydration"
+                mirror = %mirror_path.display(),
+                published = %published_repo_path.display(),
+                "updating existing repo through a delta workspace backed by the local mirror"
+            );
+            if clone_hydration_permits.is_none() {
+                clone_hydration_permits =
+                    acquire_clone_hydration_permits(state, &owner_repo).await?;
+            }
+            if clone_hydration_permits.is_none() {
+                if let Some(capture_dir) = tee_capture_dir.as_ref() {
+                    cleanup_tee_capture_dir(capture_dir).await?;
+                }
+                info!(
+                    repo = %owner_repo,
+                    per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
+                    cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
+                    lease_ttl_secs = state.config.clone.lock_ttl,
+                    "skipping delta fetch because the repo clone semaphore is saturated"
+                );
+                return Ok(());
+            }
+            let hydrate_started_at = chrono::Utc::now().timestamp();
+            let mut info = get_repo_info(&state.valkey, &owner_repo)
+                .await?
+                .unwrap_or_default();
+            info.status = "hydrating".to_string();
+            info.hydrating_node_id = node_id.clone();
+            info.hydrating_since_ts = hydrate_started_at;
+            info.bootstrap_bundle_pending = false;
+            set_repo_info(&state.valkey, &owner_repo, &info).await?;
+
+            let fetch_result = fetch_delta_into_repo_mirror(state, &owner_repo, &clone_url).await?;
+            let published_repo_path = state.cache_manager.repo_path(&owner_repo);
+            let mut info = get_repo_info(&state.valkey, &owner_repo)
+                .await?
+                .unwrap_or_default();
+            info.status = "ready".to_string();
+            info.node_ids = node_id.clone();
+            info.hydrating_node_id.clear();
+            info.hydrating_since_ts = 0;
+            info.bootstrap_bundle_pending = false;
+            set_repo_info(&state.valkey, &owner_repo, &info).await?;
+            crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
+                .await?;
+            info!(
+                repo = %owner_repo,
+                mirror = %mirror_path.display(),
+                published = %published_repo_path.display(),
+                refs_updated = fetch_result.refs_updated,
+                bytes_received = fetch_result.bytes_received,
+                "delta workspace fetch integrated into the local mirror and published"
             );
             return Ok::<(), anyhow::Error>(());
+        }
+
+        info!(
+            repo = %owner_repo,
+            mirror = %mirror_path.display(),
+            "starting initial repo mirror hydration"
+        );
+        match try_restore_repo_from_s3(state, &owner_repo, &mirror_path).await {
+            Ok(true) => {
+                info!(repo = %owner_repo, path = %mirror_path.display(), "restored repo mirror from S3 bundle");
+                let _repo_generation_guard =
+                    acquire_local_repo_publish_guard(state, &owner_repo).await;
+                ensure_bare_head_ref(&mirror_path)
+                    .await
+                    .with_context(|| format!("failed to set bare HEAD after S3 restore for {owner_repo}"))?;
+                validate_ready_repo(state, &owner_repo, &mirror_path, "S3 restore")
+                    .await
+                    .with_context(|| format!("S3-restored repo validation failed for {owner_repo}"))?;
+                let published_generation_path =
+                    publish_repo_mirror_generation(state, &owner_repo, "S3 restore").await?;
+                let published_repo_path = state.cache_manager.repo_path(&owner_repo);
+                publish_bootstrap_bundle(state, &owner_repo, &published_repo_path).await?;
+
+                let mut info = get_repo_info(&state.valkey, &owner_repo)
+                    .await?
+                    .unwrap_or_default();
+                info.status = "ready".to_string();
+                info.node_ids = node_id.clone();
+                info.hydrating_node_id.clear();
+                info.hydrating_since_ts = 0;
+                info.bootstrap_bundle_pending = false;
+                set_repo_info(&state.valkey, &owner_repo, &info).await?;
+                crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
+                    .await?;
+                info!(
+                    %owner_repo,
+                    mirror = %mirror_path.display(),
+                    generation = %published_generation_path.display(),
+                    published = %published_repo_path.display(),
+                    "repo hydrated from S3 bundle into the local mirror"
+                );
+                return Ok::<(), anyhow::Error>(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                info!(
+                    %owner_repo,
+                    error = %error,
+                    "S3 hydration unavailable; falling back to upstream clone"
+                );
+                if mirror_path.exists() {
+                    tokio::fs::remove_dir_all(&mirror_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove failed S3 hydration repo at {}",
+                                mirror_path.display()
+                            )
+                        })?;
+                }
+            }
         }
 
         if clone_hydration_permits.is_none() {
@@ -627,15 +677,15 @@ async fn try_ensure_repo_cloned_inner(
                 info!(
                     repo = %owner_repo,
                     capture_dir = %capture_dir.display(),
-                    "attempting tee-based hydration from captured upstream stream"
+                    "attempting tee-based hydration into the repo mirror from the captured upstream stream"
                 );
                 hydrate_repo_from_tee_capture(
                     state,
                     &owner_repo,
-                    &staged_repo_path,
+                    &mirror_path,
                     &clone_url,
                     capture_dir,
-                    update_existing_repo,
+                    false,
                 )
                 .await?
             } else {
@@ -643,11 +693,11 @@ async fn try_ensure_repo_cloned_inner(
             };
 
             if tee_outcome == TeeHydrationOutcome::NotHydrated {
-                info!(repo = %owner_repo, path = %staged_repo_path.display(), "starting upstream bare clone");
-                crate::git::commands::git_clone_bare(&clone_url, &staged_repo_path, &env_vars)
+                info!(repo = %owner_repo, path = %mirror_path.display(), "starting upstream bare clone into repo mirror");
+                crate::git::commands::git_clone_bare(&clone_url, &mirror_path, &env_vars)
                     .await
                     .with_context(|| format!("upstream bare clone failed for {owner_repo}"))?;
-                info!(repo = %owner_repo, path = %staged_repo_path.display(), "upstream bare clone completed");
+                info!(repo = %owner_repo, path = %mirror_path.display(), "upstream bare clone into repo mirror completed");
             }
 
             Ok::<TeeHydrationOutcome, anyhow::Error>(tee_outcome)
@@ -662,23 +712,13 @@ async fn try_ensure_repo_cloned_inner(
         release_result?;
 
         let _repo_generation_guard = acquire_local_repo_publish_guard(state, &owner_repo).await;
-        if state.cache_manager.has_repo(&owner_repo) && !update_existing_repo {
-            info!(
-                repo = %owner_repo,
-                published = %state.cache_manager.repo_path(&owner_repo).display(),
-                path = %staged_repo_path.display(),
-                "repo was published by another hydration; skipping redundant finalize/publish work"
-            );
-            return Ok::<(), anyhow::Error>(());
-        }
-
-        ensure_bare_head_ref(&staged_repo_path)
+        ensure_bare_head_ref(&mirror_path)
             .await
             .with_context(|| format!("failed to set bare HEAD after hydration for {owner_repo}"))?;
         validate_ready_repo(
             state,
             &owner_repo,
-            &staged_repo_path,
+            &mirror_path,
             match tee_outcome {
                 TeeHydrationOutcome::HydratedWithFollowOnFetch => "tee hydration",
                 TeeHydrationOutcome::PublishedFromCapture => "tee capture publish",
@@ -687,10 +727,9 @@ async fn try_ensure_repo_cloned_inner(
         )
         .await
         .with_context(|| format!("ready-repo validation failed for {owner_repo}"))?;
-        let published_generation_path = publish_ready_repo(
+        let published_generation_path = publish_repo_mirror_generation(
             state,
             &owner_repo,
-            &staged_repo_path,
             match tee_outcome {
                 TeeHydrationOutcome::HydratedWithFollowOnFetch => "tee hydration",
                 TeeHydrationOutcome::PublishedFromCapture => "tee capture publish",
@@ -725,6 +764,7 @@ async fn try_ensure_repo_cloned_inner(
 
         debug!(
             repo = %owner_repo,
+            mirror = %mirror_path.display(),
             generation = %published_generation_path.display(),
             published = %published_repo_path.display(),
             "post-publish work is using the stable published repo path"
@@ -746,13 +786,16 @@ async fn try_ensure_repo_cloned_inner(
             error_chain = %format!("{error:#}"),
             "repo hydration failed"
         );
-        if staged_repo_path.exists() {
-            tokio::fs::remove_dir_all(&staged_repo_path)
+        if !had_local_repo_at_start
+            && mirror_path.exists()
+            && !state.cache_manager.has_repo_at(&mirror_path)
+        {
+            tokio::fs::remove_dir_all(&mirror_path)
                 .await
                 .with_context(|| {
                     format!(
-                        "failed to remove failed staged repo generation at {}",
-                        staged_repo_path.display()
+                        "failed to remove failed repo mirror at {}",
+                        mirror_path.display()
                     )
                 })?;
         }
@@ -772,8 +815,6 @@ async fn try_ensure_repo_cloned_inner(
             );
         }
     }
-
-    unregister_active_generation(state, &owner_repo, &staged_repo_path).await;
 
     result
 }
@@ -1032,12 +1073,8 @@ async fn fold_overlapping_generations(
     Ok(consolidation_path)
 }
 
-async fn reset_partial_repo_if_needed(
-    cache_manager: &crate::cache::CacheManager,
-    owner_repo: &str,
-    repo_path: &Path,
-) -> Result<()> {
-    if repo_path.exists() && !cache_manager.has_repo(owner_repo) {
+async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
+    if repo_path.exists() && !crate::cache::manager::is_usable_bare_repo(repo_path) {
         let metadata = tokio::fs::symlink_metadata(repo_path)
             .await
             .with_context(|| format!("failed to stat partial repo at {}", repo_path.display()))?;
@@ -1057,6 +1094,148 @@ async fn reset_partial_repo_if_needed(
         }
     }
     Ok(())
+}
+
+async fn ensure_repo_mirror_seeded(state: &crate::AppState, owner_repo: &str) -> Result<PathBuf> {
+    let mirror_path = state.cache_manager.ensure_repo_mirror_dir(owner_repo)?;
+    reset_partial_repo_path_if_needed(&mirror_path).await?;
+
+    if state.cache_manager.has_repo_at(&mirror_path) {
+        return Ok(mirror_path);
+    }
+
+    let published_repo_path = state.cache_manager.repo_path(owner_repo);
+    if state.cache_manager.has_repo(owner_repo) {
+        info!(
+            repo = %owner_repo,
+            published = %published_repo_path.display(),
+            mirror = %mirror_path.display(),
+            "seeding repo mirror from published generation"
+        );
+        crate::git::commands::git_clone_bare_local(&published_repo_path, &mirror_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to seed repo mirror {} from published repo {}",
+                    mirror_path.display(),
+                    published_repo_path.display()
+                )
+            })?;
+    }
+
+    Ok(mirror_path)
+}
+
+async fn publish_repo_mirror_generation(
+    state: &crate::AppState,
+    owner_repo: &str,
+    source: &str,
+) -> Result<PathBuf> {
+    let mirror_path = state.cache_manager.ensure_repo_mirror_dir(owner_repo)?;
+    if !state.cache_manager.has_repo_at(&mirror_path) {
+        bail!("repo mirror is not available for publication");
+    }
+
+    let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
+    register_active_generation(state, owner_repo, &staged_repo_path).await;
+    let result = async {
+        crate::git::commands::git_clone_bare_local(&mirror_path, &staged_repo_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to materialize staged generation {} from mirror {}",
+                    staged_repo_path.display(),
+                    mirror_path.display()
+                )
+            })?;
+        ensure_bare_head_ref(&staged_repo_path).await?;
+        validate_ready_repo(state, owner_repo, &staged_repo_path, source).await?;
+        publish_ready_repo(state, owner_repo, &staged_repo_path, source).await
+    }
+    .await;
+    unregister_active_generation(state, owner_repo, &staged_repo_path).await;
+    match result {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            if staged_repo_path.exists() {
+                tokio::fs::remove_dir_all(&staged_repo_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove unsuccessful staged generation at {}",
+                            staged_repo_path.display()
+                        )
+                    })?;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn fetch_delta_into_repo_mirror(
+    state: &crate::AppState,
+    owner_repo: &str,
+    clone_url: &str,
+) -> Result<crate::git::commands::FetchResult> {
+    let mirror_path = ensure_repo_mirror_seeded(state, owner_repo).await?;
+    if !state.cache_manager.has_repo_at(&mirror_path) {
+        bail!("repo mirror is not available for delta fetch");
+    }
+
+    let delta_repo_path = state.cache_manager.create_delta_repo_path(owner_repo)?;
+    let result = async {
+        crate::git::commands::git_clone_bare_shared_local(&mirror_path, &delta_repo_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create delta workspace {} from mirror {}",
+                    delta_repo_path.display(),
+                    mirror_path.display()
+                )
+            })?;
+
+        let fetch_result =
+            crate::git::commands::git_fetch(&delta_repo_path, clone_url, &[]).await?;
+        let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+        let delta_remote = delta_repo_path.to_string_lossy().to_string();
+        crate::git::commands::git_fetch(&mirror_path, &delta_remote, &[])
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to integrate delta workspace {} into mirror {}",
+                    delta_repo_path.display(),
+                    mirror_path.display()
+                )
+            })?;
+        ensure_bare_head_ref(&mirror_path).await?;
+        validate_ready_repo(
+            state,
+            owner_repo,
+            &mirror_path,
+            "delta workspace integration",
+        )
+        .await?;
+        let _published_generation_path =
+            publish_repo_mirror_generation(state, owner_repo, "delta workspace integration")
+                .await?;
+        let published_repo_path = state.cache_manager.repo_path(owner_repo);
+        publish_bootstrap_bundle(state, owner_repo, &published_repo_path).await?;
+        Ok::<crate::git::commands::FetchResult, anyhow::Error>(fetch_result)
+    }
+    .await;
+
+    if delta_repo_path.exists() {
+        tokio::fs::remove_dir_all(&delta_repo_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to remove repo delta workspace at {}",
+                    delta_repo_path.display()
+                )
+            })?;
+    }
+
+    result
 }
 
 async fn try_restore_repo_from_s3(
@@ -1144,52 +1323,23 @@ async fn converge_published_repo_generation(
     owner_repo: &str,
     clone_url: &str,
 ) -> Result<()> {
-    let published_repo_path = state.cache_manager.repo_path(owner_repo);
-    if !state.cache_manager.has_repo(owner_repo) {
-        bail!("published repo is not available for convergence");
-    }
-
-    let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
-    register_active_generation(state, owner_repo, &staged_repo_path).await;
-    crate::git::commands::git_clone_bare_local(&published_repo_path, &staged_repo_path)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to seed convergence generation {} from {}",
-                staged_repo_path.display(),
-                published_repo_path.display()
-            )
-        })?;
-
     let redacted_clone_url = redacted_clone_url(state, clone_url);
     info!(
         repo = %owner_repo,
-        destination = %staged_repo_path.display(),
+        mirror = %state.cache_manager.repo_mirror_path(owner_repo).display(),
         clone_url = %redacted_clone_url,
-        "starting capture convergence follow-on git fetch"
+        "starting capture convergence follow-on delta fetch"
     );
-    let result = async {
-        let fetch_result =
-            crate::git::commands::git_fetch(&staged_repo_path, clone_url, &[]).await?;
-        let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
-        ensure_bare_head_ref(&staged_repo_path).await?;
-        validate_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
-        let published_repo_path =
-            publish_ready_repo(state, owner_repo, &staged_repo_path, "capture convergence").await?;
-        publish_bootstrap_bundle(state, owner_repo, &published_repo_path).await?;
-        info!(
-            repo = %owner_repo,
-            destination = %published_repo_path.display(),
-            clone_url = %redacted_clone_url,
-            refs_updated = fetch_result.refs_updated,
-            bytes_received = fetch_result.bytes_received,
-            "capture convergence follow-on git fetch finished"
-        );
-        Ok(())
-    }
-    .await;
-    unregister_active_generation(state, owner_repo, &staged_repo_path).await;
-    result
+    let fetch_result = fetch_delta_into_repo_mirror(state, owner_repo, clone_url).await?;
+    info!(
+        repo = %owner_repo,
+        published = %state.cache_manager.repo_path(owner_repo).display(),
+        clone_url = %redacted_clone_url,
+        refs_updated = fetch_result.refs_updated,
+        bytes_received = fetch_result.bytes_received,
+        "capture convergence follow-on delta fetch finished"
+    );
+    Ok(())
 }
 
 async fn hydrate_repo_from_tee_capture(
@@ -1576,7 +1726,32 @@ async fn ensure_repo_available_locally_detailed(
 
     let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
     let published_repo_path = state.cache_manager.ensure_repo_dir(owner_repo)?;
-    reset_partial_repo_if_needed(&state.cache_manager, owner_repo, &published_repo_path).await?;
+    reset_partial_repo_path_if_needed(&published_repo_path).await?;
+    if state.cache_manager.has_repo_mirror(owner_repo) {
+        let published_generation_path =
+            publish_repo_mirror_generation(state, owner_repo, "mirror restore for request").await?;
+        let mut info = get_repo_info(&state.valkey, owner_repo)
+            .await?
+            .unwrap_or_default();
+        info.status = "ready".to_string();
+        info.node_ids = state.node_id.clone();
+        info.hydrating_node_id.clear();
+        info.hydrating_since_ts = 0;
+        info.bootstrap_bundle_pending = false;
+        set_repo_info(&state.valkey, owner_repo, &info).await?;
+        debug!(
+            repo = %owner_repo,
+            generation = %published_generation_path.display(),
+            published = %published_repo_path.display(),
+            "restored published repo from local mirror for request-time serveability"
+        );
+        return Ok(LocalRepoAvailability {
+            had_local_repo_before_check,
+            restored_from_s3_for_request: false,
+            available: true,
+        });
+    }
+
     let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
     let restore_result = try_restore_repo_from_s3(state, owner_repo, &staged_repo_path).await;
 

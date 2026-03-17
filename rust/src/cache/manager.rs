@@ -83,6 +83,38 @@ impl CacheManager {
         }
     }
 
+    /// Return the persistent writer-owned mirror path for a repository.
+    pub fn repo_mirror_path(&self, owner_repo: &str) -> PathBuf {
+        let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+            self.base_path
+                .join(".mirrors")
+                .join(parts[0])
+                .join(format!("{repo}.git"))
+        } else {
+            let name = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+            self.base_path.join(".mirrors").join(format!("{name}.git"))
+        }
+    }
+
+    /// Create a fresh delta workspace path for an incremental repo update.
+    pub fn create_delta_repo_path(&self, owner_repo: &str) -> Result<PathBuf> {
+        let delta_root = self.repo_delta_dir(owner_repo);
+        std::fs::create_dir_all(&delta_root).with_context(|| {
+            format!(
+                "failed to create repo delta-work directory: {}",
+                delta_root.display()
+            )
+        })?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Ok(delta_root.join(format!("delta-{now}-{}.git", std::process::id())))
+    }
+
     /// Create a fresh staging path for a new immutable generation.
     pub fn create_staging_repo_path(&self, owner_repo: &str) -> Result<PathBuf> {
         let generations_dir = self.repo_generations_dir(owner_repo);
@@ -325,6 +357,30 @@ impl CacheManager {
                 })?;
         }
 
+        let mirror_path = self.repo_mirror_path(owner_repo);
+        if mirror_path.exists() {
+            tokio::fs::remove_dir_all(&mirror_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to remove repo mirror directory: {}",
+                        mirror_path.display()
+                    )
+                })?;
+        }
+
+        let delta_dir = self.repo_delta_dir(owner_repo);
+        if delta_dir.exists() {
+            tokio::fs::remove_dir_all(&delta_dir)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to remove repo delta-work directory: {}",
+                        delta_dir.display()
+                    )
+                })?;
+        }
+
         Ok(())
     }
 
@@ -341,6 +397,11 @@ impl CacheManager {
     /// Check whether an arbitrary on-disk bare repo path looks usable.
     pub fn has_repo_at(&self, repo_path: &Path) -> bool {
         is_usable_bare_repo(repo_path)
+    }
+
+    /// Check whether the persistent writer-owned mirror exists and is usable.
+    pub fn has_repo_mirror(&self, owner_repo: &str) -> bool {
+        is_usable_bare_repo(&self.repo_mirror_path(owner_repo))
     }
 
     /// Walk [`base_path`] and return the total size of all files in bytes.
@@ -631,6 +692,37 @@ impl CacheManager {
         }
         Ok(path)
     }
+
+    /// Ensure the parent directories for a repo mirror path exist and return
+    /// the full path to the bare repo mirror directory.
+    pub fn ensure_repo_mirror_dir(&self, owner_repo: &str) -> Result<PathBuf> {
+        let path = self.repo_mirror_path(owner_repo);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create repo mirror parent directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        Ok(path)
+    }
+
+    fn repo_delta_dir(&self, owner_repo: &str) -> PathBuf {
+        let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+            self.base_path
+                .join(".delta-work")
+                .join(parts[0])
+                .join(format!("{repo}.git"))
+        } else {
+            let name = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+            self.base_path
+                .join(".delta-work")
+                .join(format!("{name}.git"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +763,7 @@ pub(crate) fn dir_size(dir: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn is_usable_bare_repo(path: &Path) -> bool {
+pub(crate) fn is_usable_bare_repo(path: &Path) -> bool {
     path.is_dir()
         && path.join("HEAD").is_file()
         && (has_packed_refs(path) || has_loose_refs(&path.join("refs")))
