@@ -162,6 +162,11 @@ Run the full check suite (formatting, clippy, and all NixOS VM tests):
 nix flake check
 ```
 
+## Design Notes
+
+- [`docs/consolidation-locking.md`](docs/consolidation-locking.md)
+- [`docs/repository-rename-shortcoming.md`](docs/repository-rename-shortcoming.md)
+
 ## License
 
 [MIT](https://opensource.org/licenses/MIT)
