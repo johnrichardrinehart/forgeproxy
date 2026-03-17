@@ -136,6 +136,44 @@ pub async fn git_clone_bare_local(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Run `git clone --bare --shared <source> <dest>` for a local bare repo.
+///
+/// This creates a lightweight workspace that borrows objects from `source`
+/// through Git alternates, avoiding a full local object copy before the
+/// workspace fetches its own delta from upstream.
+#[instrument(fields(source = %source.display(), dest = %dest.display()))]
+pub async fn git_clone_bare_shared_local(source: &Path, dest: &Path) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("clone")
+        .arg("--bare")
+        .arg("--shared")
+        .arg(source)
+        .arg(dest);
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git clone --bare --shared");
+
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git clone --bare --shared")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git clone --bare --shared failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    debug!("git clone --bare --shared succeeded");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Fetch
 // ---------------------------------------------------------------------------
