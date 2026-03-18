@@ -1,0 +1,47 @@
+diff --git a/tests/unit/maxmemory.tcl b/tests/unit/maxmemory.tcl
+--- a/tests/unit/maxmemory.tcl
++++ b/tests/unit/maxmemory.tcl
+@@ -281,6 +281,28 @@ proc slave_query_buffer {srv} {
+     return 0
+ }
+ 
++proc send_deferred_command_batches {client cmd_count command {batch_size 1000}} {
++    set batch {}
++    set batched_count 0
++
++    for {set k 0} {$k < $cmd_count} {incr k} {
++        append batch $command
++        incr batched_count
++
++        if {$batched_count == $batch_size} {
++            $client write $batch
++            $client flush
++            set batch {}
++            set batched_count 0
++        }
++    }
++
++    if {$batched_count > 0} {
++        $client write $batch
++        $client flush
++    }
++}
++
+ proc test_slave_buffers {test_name cmd_count payload_len limit_memory pipeline} {
+     start_server {tags {"maxmemory external:skip"}} {
+         start_server {} {
+@@ -334,12 +356,12 @@ proc test_slave_buffers {test_name cmd_count payload_len limit_memory pipeline}
+             # send some 10mb worth of commands that don't increase the memory usage
+             if {$pipeline == 1} {
+                 set rd_master [valkey_deferring_client -1]
+-                for {set k 0} {$k < $cmd_count} {incr k} {
+-                    $rd_master setrange key:0 0 [string repeat A $payload_len]
+-                }
++                # Batch deferred writes so this remains a real pipeline instead of
++                # paying one socket flush per command.
++                send_deferred_command_batches $rd_master $cmd_count [format_command setrange key:0 0 [string repeat A $payload_len]]
+                 for {set k 0} {$k < $cmd_count} {incr k} {
+                     $rd_master read
+                 }
+             } else {
+                 for {set k 0} {$k < $cmd_count} {incr k} {
