@@ -214,6 +214,20 @@
               inherit gitRevision;
               fipsEnabled = true;
             };
+            valkey-stock-jemalloc = pkgs.valkey-stock-jemalloc;
+            valkey-stock-jemalloc-no-tests = pkgs.valkey-stock-jemalloc.overrideAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+            });
+            valkey-jemalloc-dev = pkgs.valkey-jemalloc-dev;
+            valkey-jemalloc-dev-no-tests = pkgs.valkey-jemalloc-dev.overrideAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+            });
+            valkey-no-tests = pkgs.valkey.overrideAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+            });
             default = config.packages.forgeproxy;
             ghe-key-lookup = pkgs.callPackage ./nix/ghe-key-lookup/package.nix { };
             ghe-key-lookup-oci = pkgs.callPackage ./nix/ghe-key-lookup/oci.nix { };
@@ -224,26 +238,70 @@
       # Flake-wide outputs (overlays, modules, configurations)
       # ────────────────────────────────────────────────────────────────────
       flake = {
-        overlays.default = final: prev: {
-          jemalloc-valkey-rtree-fix = prev.jemalloc.overrideAttrs (old: {
-            patches = (old.patches or [ ]) ++ [
-              ./nix/jemalloc-valkey-rtree-fix.patch
-            ];
-          });
-          valkey = prev.valkey.override {
-            jemalloc = final.jemalloc-valkey-rtree-fix;
+        overlays.default =
+          final: prev:
+          let
+            jemallocDevRev = "86b721921386a7192e010ec28c7b2308373d07b0";
+            jemallocDevVersion = "5.3.0-0-g${builtins.substring 0 12 jemallocDevRev}";
+            jemallocDevSrc = prev.fetchFromGitHub {
+              owner = "jemalloc";
+              repo = "jemalloc";
+              rev = jemallocDevRev;
+              hash = "sha256-0IZ4zSAI4SsUjwR7CiKGysJUl4XvVycXQ2Gn4Sm8/U4=";
+            };
+          in
+          {
+            jemalloc-valkey-rtree-fix = prev.jemalloc.overrideAttrs (old: {
+              patches = (old.patches or [ ]) ++ [
+                ./nix/jemalloc-valkey-startup-rtree-fix.patch
+                ./nix/jemalloc-valkey-runtime-large-dalloc-fix.patch
+              ];
+            });
+            jemalloc-dev-unpatched = prev.stdenv.mkDerivation {
+              pname = "jemalloc";
+              version = jemallocDevVersion;
+              src = jemallocDevSrc;
+              patches = [ ./nix/jemalloc-o3-to-o2.patch ];
+              nativeBuildInputs = with prev; [
+                autogen
+                autoconf
+                automake
+              ];
+              configureScript = "./autogen.sh";
+              configureFlags = [
+                "--with-version=${jemallocDevVersion}"
+                "--with-lg-vaddr=${
+                  with prev.stdenv.hostPlatform; toString (if isILP32 then 32 else parsed.cpu.bits)
+                }"
+                "--with-lg-page=12"
+              ];
+              env.NIX_CFLAGS_COMPILE = prev.lib.optionalString prev.stdenv.hostPlatform.isDarwin "-Wno-error=array-bounds";
+              doCheck = !prev.stdenv.hostPlatform.isStatic;
+              doInstallCheck = true;
+              installCheckPhase = ''
+                ! grep missing_version_try_git_fetch_tags $out/include/jemalloc/jemalloc.h
+              '';
+              enableParallelBuilding = false;
+              meta = prev.jemalloc.meta;
+            };
+            valkey-stock-jemalloc = prev.valkey;
+            valkey-jemalloc-dev = prev.valkey.override {
+              jemalloc = final.jemalloc-dev-unpatched;
+            };
+            valkey = prev.valkey.override {
+              jemalloc = final.jemalloc-valkey-rtree-fix;
+            };
+            forgeproxy = final.callPackage ./nix/package.nix { inherit gitRevision; };
+            forgeproxy-dev = final.callPackage ./nix/package.nix {
+              inherit gitRevision;
+              devEnabled = true;
+            };
+            forgeproxy-fips = final.callPackage ./nix/package.nix {
+              inherit gitRevision;
+              fipsEnabled = true;
+            };
+            ghe-key-lookup = final.callPackage ./nix/ghe-key-lookup/package.nix { };
           };
-          forgeproxy = final.callPackage ./nix/package.nix { inherit gitRevision; };
-          forgeproxy-dev = final.callPackage ./nix/package.nix {
-            inherit gitRevision;
-            devEnabled = true;
-          };
-          forgeproxy-fips = final.callPackage ./nix/package.nix {
-            inherit gitRevision;
-            fipsEnabled = true;
-          };
-          ghe-key-lookup = final.callPackage ./nix/ghe-key-lookup/package.nix { };
-        };
 
         nixosModules = {
           forgeproxy = ./nix/module.nix;
