@@ -214,6 +214,20 @@
               inherit gitRevision;
               fipsEnabled = true;
             };
+            valkey-stock-jemalloc = pkgs.valkey-stock-jemalloc;
+            valkey-stock-jemalloc-no-tests = pkgs.valkey-stock-jemalloc.overrideAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+            });
+            valkey-jemalloc-dev = pkgs.valkey-jemalloc-dev;
+            valkey-jemalloc-dev-no-tests = pkgs.valkey-jemalloc-dev.overrideAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+            });
+            valkey-no-tests = pkgs.valkey.overrideAttrs (_: {
+              doCheck = false;
+              doInstallCheck = false;
+            });
             default = config.packages.forgeproxy;
             ghe-key-lookup = pkgs.callPackage ./nix/ghe-key-lookup/package.nix { };
             ghe-key-lookup-oci = pkgs.callPackage ./nix/ghe-key-lookup/oci.nix { };
@@ -227,12 +241,25 @@
         overlays.default = final: prev: {
           jemalloc-valkey-rtree-fix = prev.jemalloc.overrideAttrs (old: {
             patches = (old.patches or [ ]) ++ [
-              ./nix/jemalloc-valkey-rtree-fix.patch
+              ./nix/jemalloc-valkey-startup-rtree-fix.patch
+              ./nix/jemalloc-valkey-runtime-large-dalloc-fix.patch
             ];
           });
-          valkey = prev.valkey.override {
-            jemalloc = final.jemalloc-valkey-rtree-fix;
-          };
+          valkey-stock-jemalloc = prev.valkey;
+          valkey =
+            (prev.valkey.override {
+              useSystemJemalloc = false;
+            }).overrideAttrs
+              (old: {
+                makeFlags = (old.makeFlags or [ ]) ++ [ "MALLOC=libc" ];
+              });
+          valkey-jemalloc-dev =
+            (prev.valkey.override {
+              useSystemJemalloc = false;
+            }).overrideAttrs
+              (old: {
+                makeFlags = (old.makeFlags or [ ]) ++ [ "MALLOC=libc" ];
+              });
           forgeproxy = final.callPackage ./nix/package.nix { inherit gitRevision; };
           forgeproxy-dev = final.callPackage ./nix/package.nix {
             inherit gitRevision;

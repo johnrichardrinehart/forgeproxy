@@ -1,0 +1,152 @@
+diff --git a/include/jemalloc/internal/rtree.h b/include/jemalloc/internal/rtree.h
+index 07205958..43ae7ede 100644
+--- a/include/jemalloc/internal/rtree.h
++++ b/include/jemalloc/internal/rtree.h
+@@ -359,7 +359,9 @@ rtree_leaf_elm_lookup_fast(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ 	}
+ 
+ 	rtree_leaf_elm_t *leaf = rtree_ctx->cache[slot].leaf;
+-	assert(leaf != NULL);
++	if (unlikely(leaf == NULL)) {
++		return true;
++	}
+ 	uintptr_t subkey = rtree_subkey(key, RTREE_HEIGHT - 1);
+ 	*elm = &leaf[subkey];
+ 
+@@ -379,7 +381,9 @@ rtree_leaf_elm_lookup(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ 	/* Fast path: L1 direct mapped cache. */
+ 	if (likely(rtree_ctx->cache[slot].leafkey == leafkey)) {
+ 		rtree_leaf_elm_t *leaf = rtree_ctx->cache[slot].leaf;
+-		assert(leaf != NULL);
++		if (unlikely(leaf == NULL)) {
++			goto hard;
++		}
+ 		uintptr_t subkey = rtree_subkey(key, RTREE_HEIGHT - 1);
+ 		return &leaf[subkey];
+ 	}
+@@ -391,7 +395,9 @@ rtree_leaf_elm_lookup(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ 	do {                                                                   \
+ 		if (likely(rtree_ctx->l2_cache[i].leafkey == leafkey)) {       \
+ 			rtree_leaf_elm_t *leaf = rtree_ctx->l2_cache[i].leaf;  \
+-			assert(leaf != NULL);                                  \
++			if (unlikely(leaf == NULL)) {                          \
++				break;                                         \
++			}                                                      \
+ 			if (i > 0) {                                           \
+ 				/* Bubble up by one. */                        \
+ 				rtree_ctx->l2_cache[i].leafkey =               \
+@@ -423,6 +429,7 @@ rtree_leaf_elm_lookup(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ 	}
+ #undef RTREE_CACHE_CHECK_L2
+ 
++hard:
+ 	return rtree_leaf_elm_lookup_hard(
+ 	    tsdn, rtree, rtree_ctx, key, dependent, init_missing);
+ }
+@@ -448,7 +455,12 @@ rtree_read(
+     tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx, uintptr_t key) {
+ 	rtree_leaf_elm_t *elm = rtree_leaf_elm_lookup(tsdn, rtree, rtree_ctx,
+ 	    key, /* dependent */ true, /* init_missing */ false);
+-	assert(elm != NULL);
++	if (unlikely(elm == NULL)) {
++		rtree_contents_t zero;
++		memset(&zero, 0, sizeof(zero));
++		zero.metadata.szind = SC_NSIZES;
++		return zero;
++	}
+ 	return rtree_leaf_elm_read(tsdn, rtree, elm, /* dependent */ true);
+ }
+ 
+diff --git a/src/arena.c b/src/arena.c
+index 962a325d..17c1c0ed 100644
+--- a/src/arena.c
++++ b/src/arena.c
+@@ -30,6 +30,7 @@ ssize_t opt_muzzy_decay_ms = MUZZY_DECAY_MS_DEFAULT;
+ 
+ static atomic_zd_t dirty_decay_ms_default;
+ static atomic_zd_t muzzy_decay_ms_default;
++static atomic_zu_t arena_dalloc_small_missing_edata = ATOMIC_INIT(0);
+ 
+ emap_t              arena_emap_global;
+ static pa_central_t arena_pa_central_global;
+@@ -1466,6 +1467,25 @@ arena_dalloc_bin(tsdn_t *tsdn, arena_t *arena, edata_t *edata, void *ptr) {
+ void
+ arena_dalloc_small(tsdn_t *tsdn, void *ptr) {
+ 	edata_t *edata = emap_edata_lookup(tsdn, &arena_emap_global, ptr);
++	if (unlikely(edata == NULL)) {
++		atomic_fetch_add_zu(&arena_dalloc_small_missing_edata,
++		    1, ATOMIC_RELAXED);
++		if (config_opt_safety_checks) {
++			safety_check_fail(
++			    "<jemalloc>: invalid deallocation detected "
++			    "(pointer %p is not present in the extent map). "
++			    "Likely caused by application deallocation bugs. "
++			    "Abort.\n",
++			    ptr);
++			return;
++		}
++		/*
++		 * Avoid crashing in dependent lookup paths when a pointer is not
++		 * present in jemalloc's extent map.  This keeps production
++		 * processes alive while safety-check builds still fail loudly.
++		 */
++		return;
++	}
+ 	arena_t *arena = arena_get_from_edata(edata);
+ 
+ 	arena_dalloc_bin(tsdn, arena, edata, ptr);
+diff --git a/src/rtree.c b/src/rtree.c
+index ac27f829..f1914a38 100644
+--- a/src/rtree.c
++++ b/src/rtree.c
+@@ -109,6 +109,15 @@ rtree_child_node_tryread(rtree_node_elm_t *elm, bool dependent) {
+ 	if (dependent) {
+ 		node = (rtree_node_elm_t *)atomic_load_p(
+ 		    &elm->child, ATOMIC_RELAXED);
++		if (unlikely(!rtree_node_valid(node))) {
++			/*
++			 * Dependent lookups are expected to observe initialized
++			 * nodes, but if the relaxed load sees NULL, retry with
++			 * acquire before higher-level NULL handling.
++			 */
++			node = (rtree_node_elm_t *)atomic_load_p(
++			    &elm->child, ATOMIC_ACQUIRE);
++		}
+ 	} else {
+ 		node = (rtree_node_elm_t *)atomic_load_p(
+ 		    &elm->child, ATOMIC_ACQUIRE);
+@@ -138,6 +147,15 @@ rtree_child_leaf_tryread(rtree_node_elm_t *elm, bool dependent) {
+ 	if (dependent) {
+ 		leaf = (rtree_leaf_elm_t *)atomic_load_p(
+ 		    &elm->child, ATOMIC_RELAXED);
++		if (unlikely(!rtree_leaf_valid(leaf))) {
++			/*
++			 * Dependent lookups are expected to observe initialized
++			 * leaves, but if the relaxed load sees NULL, retry with
++			 * acquire before higher-level NULL handling.
++			 */
++			leaf = (rtree_leaf_elm_t *)atomic_load_p(
++			    &elm->child, ATOMIC_ACQUIRE);
++		}
+ 	} else {
+ 		leaf = (rtree_leaf_elm_t *)atomic_load_p(
+ 		    &elm->child, ATOMIC_ACQUIRE);
+@@ -184,8 +202,7 @@ rtree_leaf_elm_lookup_hard(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ #define RTREE_GET_CHILD(level)                                                 \
+ 	{                                                                      \
+ 		assert(level < RTREE_HEIGHT - 1);                              \
+-		if (level != 0 && !dependent                                   \
+-		    && unlikely(!rtree_node_valid(node))) {                    \
++		if (level != 0 && unlikely(!rtree_node_valid(node))) {         \
+ 			return NULL;                                           \
+ 		}                                                              \
+ 		uintptr_t subkey = rtree_subkey(key, level);                   \
+@@ -211,7 +228,7 @@ rtree_leaf_elm_lookup_hard(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
+ #define RTREE_GET_LEAF(level)                                                  \
+ 	{                                                                      \
+ 		assert(level == RTREE_HEIGHT - 1);                             \
+-		if (!dependent && unlikely(!rtree_leaf_valid(leaf))) {         \
++		if (unlikely(!rtree_leaf_valid(leaf))) {                       \
+ 			return NULL;                                           \
+ 		}                                                              \
+ 		if (RTREE_CTX_NCACHE_L2 > 1) {                                 \

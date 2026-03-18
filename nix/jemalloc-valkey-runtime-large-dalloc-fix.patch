@@ -1,0 +1,76 @@
+diff --git a/include/jemalloc/internal/emap.h b/include/jemalloc/internal/emap.h
+index 11b746f0..3929f1f3 100644
+--- a/include/jemalloc/internal/emap.h
++++ b/include/jemalloc/internal/emap.h
+@@ -227,8 +227,22 @@ JEMALLOC_ALWAYS_INLINE edata_t *
+ emap_edata_lookup(tsdn_t *tsdn, emap_t *emap, const void *ptr) {
+ 	EMAP_DECLARE_RTREE_CTX;
+ 
+ 	return rtree_read(tsdn, &emap->rtree, rtree_ctx, (uintptr_t)ptr).edata;
+ }
+ 
++JEMALLOC_ALWAYS_INLINE bool
++emap_edata_lookup_try(tsdn_t *tsdn, emap_t *emap, const void *ptr,
++    edata_t **r_edata) {
++	EMAP_DECLARE_RTREE_CTX;
++
++	rtree_contents_t contents;
++	bool             err = rtree_read_independent(
++	    tsdn, &emap->rtree, rtree_ctx, (uintptr_t)ptr, &contents);
++	if (err || contents.edata == NULL) {
++		*r_edata = NULL;
++		return true;
++	}
++	*r_edata = contents.edata;
++	return false;
++}
++
+ /* Fills in alloc_ctx with the info in the map. */
+ JEMALLOC_ALWAYS_INLINE void
+ emap_alloc_ctx_lookup(
+diff --git a/include/jemalloc/internal/arena_inlines_b.h b/include/jemalloc/internal/arena_inlines_b.h
+index 9a3b9581..72b21ca8 100644
+--- a/include/jemalloc/internal/arena_inlines_b.h
++++ b/include/jemalloc/internal/arena_inlines_b.h
+@@ -273,8 +273,18 @@ arena_dalloc_large_no_tcache(
+ 	if (config_prof && unlikely(szind < SC_NBINS)) {
+ 		arena_dalloc_promoted(tsdn, ptr, NULL, true);
+ 	} else {
+-		edata_t *edata = emap_edata_lookup(
+-		    tsdn, &arena_emap_global, ptr);
++		edata_t *edata;
++		if (unlikely(emap_edata_lookup_try(
++		        tsdn, &arena_emap_global, ptr, &edata))) {
++			if (config_opt_safety_checks) {
++				safety_check_fail(
++				    "Invalid deallocation detected: "
++				    "pages being freed (%p) are not present in the "
++				    "extent map.",
++				    ptr);
++			}
++			return;
++		}
+ 		if (large_dalloc_safety_checks(edata, ptr, usize)) {
+ 			/* See the comment in isfree. */
+ 			return;
+@@ -323,8 +333,18 @@ arena_dalloc_large(tsdn_t *tsdn, void *ptr, tcache_t *tcache, szind_t szind,
+ 			tcache_dalloc_large(
+ 			    tsdn_tsd(tsdn), tcache, ptr, szind, slow_path);
+ 		} else {
+-			edata_t *edata = emap_edata_lookup(
+-			    tsdn, &arena_emap_global, ptr);
++			edata_t *edata;
++			if (unlikely(emap_edata_lookup_try(
++			        tsdn, &arena_emap_global, ptr, &edata))) {
++				if (config_opt_safety_checks) {
++					safety_check_fail(
++					    "Invalid deallocation detected: "
++					    "pages being freed (%p) are not present in the "
++					    "extent map.",
++					    ptr);
++				}
++				return;
++			}
+ 			if (large_dalloc_safety_checks(edata, ptr, usize)) {
+ 				/* See the comment in isfree. */
+ 				return;
