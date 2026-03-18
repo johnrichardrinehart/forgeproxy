@@ -252,6 +252,9 @@
             }).overrideAttrs
               (old: {
                 makeFlags = (old.makeFlags or [ ]) ++ [ "MALLOC=libc" ];
+                patches = (old.patches or [ ]) ++ [
+                  ./nix/valkey-maxmemory-batched-deferred-client.patch
+                ];
               });
           valkey-jemalloc-dev =
             (prev.valkey.override {
@@ -259,6 +262,9 @@
             }).overrideAttrs
               (old: {
                 makeFlags = (old.makeFlags or [ ]) ++ [ "MALLOC=libc" ];
+                patches = (old.patches or [ ]) ++ [
+                  ./nix/valkey-maxmemory-batched-deferred-client.patch
+                ];
               });
           forgeproxy = final.callPackage ./nix/package.nix { inherit gitRevision; };
           forgeproxy-dev = final.callPackage ./nix/package.nix {
