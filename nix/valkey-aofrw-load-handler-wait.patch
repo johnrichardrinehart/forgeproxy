@@ -1,0 +1,21 @@
+diff --git a/tests/unit/aofrw.tcl b/tests/unit/aofrw.tcl
+--- a/tests/unit/aofrw.tcl
++++ b/tests/unit/aofrw.tcl
+@@ -46,8 +46,15 @@
+             stop_write_load $load_handle3
+             stop_write_load $load_handle4
+ 
+-            # Make sure no more commands processed, before taking debug digest
+-            wait_load_handlers_disconnected
++            # On slower libc/Scudo builders, the helper processes can already
++            # be gone while the server still tracks lingering LOAD_HANDLER
++            # clients. Kill any stragglers, then wait for the list to clear.
++            r client kill name LOAD_HANDLER skipme no
++            wait_for_condition 50 100 {
++                ![string match {*name=LOAD_HANDLER*} [r client list]]
++            } else {
++                fail "load_handler(s) still connected after too long time."
++            }
+ 
+             # Get the data set digest
+             set d1 [debug_digest]
