@@ -255,6 +255,11 @@
                 patches = (old.patches or [ ]) ++ [
                   ./nix/valkey-maxmemory-batched-deferred-client.patch
                 ];
+                preCheck = (old.preCheck or "") + ''
+                  # The libc/Scudo runtime path is materially slower on some builders.
+                  # Keep the test runner from overcommitting replication-heavy suites.
+                  export NIX_BUILD_CORES=2
+                '';
               });
           valkey-jemalloc-dev =
             (prev.valkey.override {
@@ -265,6 +270,11 @@
                 patches = (old.patches or [ ]) ++ [
                   ./nix/valkey-maxmemory-batched-deferred-client.patch
                 ];
+                preCheck = (old.preCheck or "") + ''
+                  # The libc/Scudo runtime path is materially slower on some builders.
+                  # Keep the test runner from overcommitting replication-heavy suites.
+                  export NIX_BUILD_CORES=2
+                '';
               });
           forgeproxy = final.callPackage ./nix/package.nix { inherit gitRevision; };
           forgeproxy-dev = final.callPackage ./nix/package.nix {
