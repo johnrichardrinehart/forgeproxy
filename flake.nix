@@ -254,6 +254,7 @@
                 makeFlags = (old.makeFlags or [ ]) ++ [ "MALLOC=libc" ];
                 patches = (old.patches or [ ]) ++ [
                   ./nix/valkey-aofrw-load-handler-wait.patch
+                  ./nix/valkey-libc-memory-usage-tests.patch
                   ./nix/valkey-maxmemory-batched-deferred-client.patch
                 ];
                 preCheck = (old.preCheck or "") + ''
@@ -270,6 +271,7 @@
                 makeFlags = (old.makeFlags or [ ]) ++ [ "MALLOC=libc" ];
                 patches = (old.patches or [ ]) ++ [
                   ./nix/valkey-aofrw-load-handler-wait.patch
+                  ./nix/valkey-libc-memory-usage-tests.patch
                   ./nix/valkey-maxmemory-batched-deferred-client.patch
                 ];
                 preCheck = (old.preCheck or "") + ''
