@@ -3,6 +3,7 @@
   rustPlatform,
   pkg-config,
   cmake,
+  git,
   openssl,
   go,
   perl,
@@ -30,6 +31,10 @@ rustPlatform.buildRustPackage {
 
   buildInputs = [
     openssl
+  ];
+
+  nativeCheckInputs = [
+    git
   ];
 
   buildFeatures = lib.optionals devEnabled [ "dev" ] ++ lib.optionals fipsEnabled [ "fips" ];
