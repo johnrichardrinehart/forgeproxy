@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::AppState;
 use crate::cache::CacheManager;
-use crate::coordination::registry::LocalServeDecision;
+use crate::coordination::registry::{LocalServeDecision, LocalServeRepoSource};
 
 /// Upper bound for a single SSH channel data message payload.
 ///
@@ -279,6 +279,7 @@ struct LocalUploadPackResponseContext {
 async fn serve_local_upload_pack_once(
     state: &AppState,
     owner_repo: &str,
+    serve_from: LocalServeRepoSource,
     request_body: &[u8],
     git_protocol: Option<&str>,
     response: LocalUploadPackResponseContext,
@@ -293,20 +294,23 @@ async fn serve_local_upload_pack_once(
         should_close_channel,
     } = response;
 
-    let generation_lease = match crate::coordination::registry::acquire_published_generation_lease(
-        state, owner_repo,
-    ) {
+    let repo_lease = match crate::coordination::registry::acquire_local_serve_repo_lease(
+        state, owner_repo, serve_from,
+    )
+    .await
+    {
         Ok(lease) => lease,
         Err(error) => {
             error!(
                 repo = %owner_repo,
                 error = %error,
-                "failed to acquire published generation lease for local git upload-pack"
+                serve_from = ?serve_from,
+                "failed to acquire local serve lease for git upload-pack"
             );
             return;
         }
     };
-    let repo_path = generation_lease.repo_path().to_path_buf();
+    let repo_path = repo_lease.repo_path().to_path_buf();
     let mut cmd = Command::new("git");
     cmd.arg("upload-pack")
         .arg("--stateless-rpc")
@@ -352,7 +356,7 @@ async fn serve_local_upload_pack_once(
         error!(repo = %owner_repo, "missing stderr from local git upload-pack");
         return;
     };
-    let _generation_lease = generation_lease;
+    let _repo_lease = repo_lease;
 
     let mut writer = stream_channel.map(|channel| channel.make_writer());
     let mut total_bytes: u64 = 0;
@@ -1628,12 +1632,14 @@ async fn proxy_upstream_upload_pack(
         };
         match &local_decision {
             LocalServeDecision::SatisfiesWants {
+                serve_from,
                 restored_from_s3_for_request,
                 want_count,
                 ..
             } => {
                 info!(
                     repo = %owner_repo,
+                    serve_from = ?serve_from,
                     wants = *want_count,
                     want_sample,
                     restored_from_s3_for_request = *restored_from_s3_for_request,
@@ -1642,6 +1648,7 @@ async fn proxy_upstream_upload_pack(
                 serve_local_upload_pack_once(
                     &state,
                     &owner_repo,
+                    *serve_from,
                     &want_have,
                     git_protocol.as_deref(),
                     LocalUploadPackResponseContext {

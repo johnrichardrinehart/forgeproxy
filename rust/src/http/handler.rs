@@ -32,15 +32,17 @@ use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::AppState;
-use crate::coordination::registry::LocalServeDecision;
+use crate::coordination::registry::{
+    LocalServeDecision, LocalServeRepoLease, LocalServeRepoSource,
+};
 
 struct LeasedReaderStream<S> {
     inner: S,
-    lease: Option<crate::coordination::registry::PublishedGenerationLease>,
+    lease: Option<LocalServeRepoLease>,
 }
 
 impl<S> LeasedReaderStream<S> {
-    fn new(inner: S, lease: crate::coordination::registry::PublishedGenerationLease) -> Self {
+    fn new(inner: S, lease: LocalServeRepoLease) -> Self {
         Self {
             inner,
             lease: Some(lease),
@@ -317,19 +319,28 @@ async fn handle_upload_pack(
 
     match &local_decision {
         LocalServeDecision::SatisfiesWants {
+            serve_from,
             restored_from_s3_for_request,
             want_count,
             ..
         } => {
             info!(
                 repo = %repo_slug,
+                serve_from = ?serve_from,
                 wants = *want_count,
                 want_sample,
                 restored_from_s3_for_request = *restored_from_s3_for_request,
                 "serving upload-pack directly from local disk"
             );
-            return serve_local_upload_pack(&state, &owner, &repo, &body, git_protocol.as_deref())
-                .await;
+            return serve_local_upload_pack(
+                &state,
+                &owner,
+                &repo,
+                *serve_from,
+                &body,
+                git_protocol.as_deref(),
+            )
+            .await;
         }
         LocalServeDecision::Unavailable {
             had_local_repo_before_check,
@@ -503,13 +514,18 @@ async fn serve_local_upload_pack(
     state: &AppState,
     owner: &str,
     repo: &str,
+    serve_from: LocalServeRepoSource,
     request_body: &[u8],
     git_protocol: Option<&str>,
 ) -> Result<Response, AppError> {
     let owner_repo = format!("{owner}/{repo}");
-    let generation_lease =
-        crate::coordination::registry::acquire_published_generation_lease(state, &owner_repo)?;
-    let repo_path = generation_lease.repo_path().to_path_buf();
+    let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease(
+        state,
+        &owner_repo,
+        serve_from,
+    )
+    .await?;
+    let repo_path = repo_lease.repo_path().to_path_buf();
 
     let mut cmd = Command::new("git");
     cmd.arg("upload-pack")
@@ -542,7 +558,7 @@ async fn serve_local_upload_pack(
         .context("failed to capture git upload-pack stderr")?;
 
     // Stream stdout as the response body.
-    let stream = LeasedReaderStream::new(ReaderStream::new(stdout), generation_lease);
+    let stream = LeasedReaderStream::new(ReaderStream::new(stdout), repo_lease);
     let body = Body::from_stream(stream);
 
     // Reap the child in the background so we don't leak processes.
