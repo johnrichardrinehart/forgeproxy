@@ -974,6 +974,18 @@ pkgs.testers.runNixOSTest {
             "journalctl -u forgeproxy.service"
             f" --since '{since}' --no-pager"
             " | grep -F '\"repo\":\"octocat/repo-many-wants\"'"
+            " | grep -F 'request-time SSH catch-up will fetch only advertised refs that match the missing wants'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"/var/cache/forgeproxy/repos/.delta-work/octocat/repo-many-wants.git'"
+            " | grep -F '\"refspec_mode\":\"selected\"'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"octocat/repo-many-wants\"'"
             " | grep -F 'local mirror catch-up completed before request timeout'"
         )
         proxy.wait_until_succeeds(

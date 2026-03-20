@@ -1594,6 +1594,55 @@ async fn proxy_upstream_upload_pack(
             initial_local_decision,
             LocalServeDecision::MissingWantedObjects { .. }
         ) {
+            let request_refspecs = if let LocalServeDecision::MissingWantedObjects {
+                missing_wants,
+                ..
+            } = &initial_local_decision
+            {
+                let ref_metadata = capture_metadata.lock().await.get(&channel_id).cloned();
+                ref_metadata.and_then(|metadata| {
+                    let plan = if let Some(ls_refs_response) = metadata.ls_refs_response.as_deref()
+                    {
+                        crate::coordination::registry::derive_request_catch_up_plan(
+                            &crate::tee_hydration::parse_ls_refs_response_metadata(
+                                ls_refs_response,
+                            ),
+                            missing_wants,
+                        )
+                    } else if let Some(info_refs_advertisement) =
+                        metadata.info_refs_advertisement.as_deref()
+                    {
+                        crate::coordination::registry::derive_request_catch_up_plan_from_info_refs(
+                            info_refs_advertisement,
+                            missing_wants,
+                        )
+                    } else {
+                        crate::coordination::registry::RequestCatchUpPlan::default()
+                    };
+                    if plan.refspecs.is_empty() {
+                        info!(
+                            repo = %owner_repo,
+                            missing_wants = missing_wants.len(),
+                            matched_wants = plan.matched_wants,
+                            unmatched_wants = plan.unmatched_wants,
+                            "request-time SSH catch-up could not map missing wants to advertised refs; using full ref refresh"
+                        );
+                        None
+                    } else {
+                        info!(
+                            repo = %owner_repo,
+                            missing_wants = missing_wants.len(),
+                            matched_wants = plan.matched_wants,
+                            unmatched_wants = plan.unmatched_wants,
+                            refspec_count = plan.refspecs.len(),
+                            "request-time SSH catch-up will fetch only advertised refs that match the missing wants"
+                        );
+                        Some(plan.refspecs)
+                    }
+                })
+            } else {
+                None
+            };
             let (owner, repo) = owner_repo
                 .split_once('/')
                 .map(|(owner, repo)| (owner.to_string(), repo.to_string()))
@@ -1609,6 +1658,7 @@ async fn proxy_upstream_upload_pack(
                 &repo,
                 auth_header.as_deref(),
                 &wants,
+                request_refspecs,
             )
             .await
             {
