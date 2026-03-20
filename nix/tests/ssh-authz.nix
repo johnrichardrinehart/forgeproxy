@@ -131,7 +131,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-authz";
-  globalTimeout = 360;
+  globalTimeout = 480;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -381,6 +381,15 @@ pkgs.testers.runNixOSTest {
             f""" -d '{{"name": "repo-many-wants", "private": true, "auto_init": false}}'"""
         )
 
+        # Create private repo: octocat/repo-mirror-serve (mirror-vs-published regression)
+        ghe.succeed(
+            f"curl -sf"
+            f" -X POST http://localhost:3000/api/v1/user/repos"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"name": "repo-mirror-serve", "private": true, "auto_init": false}}'"""
+        )
+
         # Create public repo used to validate anonymous HTTP clone behaviour.
         ghe.succeed(
             f"curl -sf"
@@ -487,6 +496,23 @@ pkgs.testers.runNixOSTest {
             "git push -u origin main"
         )
 
+        # Push initial content to repo-mirror-serve to exercise serving from a fresher mirror.
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "for i in $(seq 1 4); do "
+            "  echo mirror-$i > file-$i.txt && "
+            "  git add file-$i.txt && "
+            "  git commit -m \"mirror-$i\"; "
+            "done && "
+            "git remote add origin http://octocat:secret123@localhost:3000/octocat/repo-mirror-serve.git && "
+            "git push -u origin main"
+        )
+
         # Push initial content to public repo for anonymous HTTP clone checks.
         ghe.succeed(
             "set -e && "
@@ -534,6 +560,13 @@ pkgs.testers.runNixOSTest {
         ghe.succeed(
             f"curl -sf"
             f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-many-wants/collaborators/alice"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"permission": "read"}}'"""
+        )
+        ghe.succeed(
+            f"curl -sf"
+            f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-mirror-serve/collaborators/alice"
             f" -H 'Content-Type: application/json'"
             f" -H 'Authorization: token {TOKEN}'"
             f""" -d '{{"permission": "read"}}'"""
@@ -765,9 +798,12 @@ pkgs.testers.runNixOSTest {
     with subtest("Uncached clone publishes a generation symlink and cleans tee capture"):
         stream_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream.git"
         stream_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream.git"
+        stream_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-stream.git"
         stream_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream"
 
-        proxy.succeed(f"rm -rf {stream_repo} {stream_generation_dir} {stream_tee_dir}")
+        proxy.succeed(
+            f"rm -rf {stream_repo} {stream_generation_dir} {stream_mirror} {stream_tee_dir}"
+        )
         client.succeed("rm -rf /tmp/repo-stream-published")
         client.succeed(
             "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
@@ -848,9 +884,8 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             f"test -L {many_wants_repo} && test -f $(readlink -f {many_wants_repo})/HEAD"
         )
-        proxy.succeed(
-            f"mkdir -p $(dirname {many_wants_mirror}) && "
-            f"git clone --bare $(readlink -f {many_wants_repo}) {many_wants_mirror}"
+        proxy.wait_until_succeeds(
+            f"test -d {many_wants_mirror} && test -f {many_wants_mirror}/HEAD"
         )
 
         ghe.succeed(
@@ -860,12 +895,14 @@ pkgs.testers.runNixOSTest {
             "cd $tmp/repo && "
             "git config user.email test@test.local && "
             "git config user.name Test && "
+            "tree=$(git rev-parse HEAD^{tree}) && "
+            "parent=$(git rev-parse HEAD) && "
             "for i in $(seq 1 2048); do "
-            "  printf 'want-%s\\n' \"$i\" >> wants.txt && "
-            "  git add wants.txt && "
-            "  git commit -m \"want-$i\" && "
-            "  git tag \"tag-$i\"; "
+            "  commit=$(printf 'want-%s\\n' \"$i\" | git commit-tree \"$tree\" -p \"$parent\") && "
+            "  git tag \"tag-$i\" \"$commit\" && "
+            "  parent=\"$commit\"; "
             "done && "
+            "git update-ref refs/heads/main \"$parent\" && "
             "git push origin main --tags"
         )
 
@@ -877,7 +914,7 @@ pkgs.testers.runNixOSTest {
             " -p 2222'"
             " git clone git@proxy:octocat/repo-many-wants.git /tmp/repo-many-wants-final"
         )
-        client.succeed("test -f /tmp/repo-many-wants-final/wants.txt")
+        client.succeed("git -C /tmp/repo-many-wants-final rev-parse HEAD")
         client.succeed("git -C /tmp/repo-many-wants-final rev-parse refs/tags/tag-2048")
 
         proxy.wait_until_succeeds(
@@ -899,7 +936,91 @@ pkgs.testers.runNixOSTest {
             " | grep -F 'local mirror catch-up timed out; falling back to upstream proxy'"
         )
 
-    # ── Subtest 5g: Concurrent uncached hydrations complete and drain semaphore ──
+    # ── Subtest 5g: Requests can serve from a fresher mirror than published ──
+    with subtest("SSH fetch serves directly from a fresher mirror when publish lags"):
+        mirror_serve_repo = "/var/cache/forgeproxy/repos/octocat/repo-mirror-serve.git"
+        mirror_serve_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-mirror-serve.git"
+        mirror_serve_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-mirror-serve.git"
+
+        proxy.succeed(
+            f"rm -rf {mirror_serve_repo} {mirror_serve_generation_dir} {mirror_serve_mirror}"
+        )
+        client.succeed("rm -rf /tmp/repo-mirror-serve-seed /tmp/repo-mirror-serve-final")
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone --depth 1 git@proxy:octocat/repo-mirror-serve.git /tmp/repo-mirror-serve-seed"
+        )
+        proxy.wait_until_succeeds(
+            f"test -L {mirror_serve_repo} && test -f $(readlink -f {mirror_serve_repo})/HEAD"
+        )
+        proxy.wait_until_succeeds(
+            f"test -d {mirror_serve_mirror} && test -f {mirror_serve_mirror}/HEAD"
+        )
+
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "git clone http://octocat:secret123@localhost:3000/octocat/repo-mirror-serve.git $tmp/repo && "
+            "cd $tmp/repo && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo fresh-mirror > file-5.txt && "
+            "git add file-5.txt && "
+            "git commit -m 'mirror-5' && "
+            "git push origin main"
+        )
+        fresh_main = ghe.succeed(
+            "git ls-remote http://octocat:secret123@localhost:3000/octocat/repo-mirror-serve.git refs/heads/main | cut -f1"
+        ).strip()
+
+        proxy.succeed(
+            f"git config --global --add safe.directory {mirror_serve_mirror}"
+        )
+        proxy.succeed(
+            f"git -C {mirror_serve_mirror} fetch --prune --force "
+            "http://octocat:secret123@ghe:3000/octocat/repo-mirror-serve.git "
+            "'+refs/*:refs/*'"
+        )
+        proxy.succeed(
+            f"test \"$(git -C {mirror_serve_mirror} rev-parse refs/heads/main)\" = '{fresh_main}'"
+        )
+        proxy.succeed(
+            f"test \"$(git -C {mirror_serve_repo} rev-parse refs/heads/main)\" != '{fresh_main}'"
+        )
+
+        since = proxy.succeed("date --iso-8601=seconds --utc").strip()
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone --depth 1 git@proxy:octocat/repo-mirror-serve.git /tmp/repo-mirror-serve-final"
+        )
+        client.succeed("test -f /tmp/repo-mirror-serve-final/file-5.txt")
+
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"octocat/repo-mirror-serve\"'"
+            " | grep -F 'serving SSH fetch directly from local disk after want resolution'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"octocat/repo-mirror-serve\"'"
+            " | grep -F '\"serve_from\":\"Mirror\"'"
+        )
+        proxy.succeed(
+            "! journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"octocat/repo-mirror-serve\"'"
+            " | grep -F 'local mirror catch-up timed out; falling back to upstream proxy'"
+        )
+
+    # ── Subtest 5h: Concurrent uncached hydrations complete and drain semaphore ──
     with subtest("Concurrent uncached clones release the repo semaphore"):
         semaphore_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
         semaphore_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
@@ -948,7 +1069,7 @@ pkgs.testers.runNixOSTest {
             f"! redis-cli -h valkey EXISTS '{semaphore_key}' | grep -qx 1"
         )
 
-    # ── Subtest 5h: External scrubber handles published generation layout ──
+    # ── Subtest 5i: External scrubber handles published generation layout ──
     with subtest("External scrubber succeeds and keeps generation-backed repos"):
         proxy.succeed("systemctl start forgeproxy-cache-scrub.service")
         proxy.succeed(

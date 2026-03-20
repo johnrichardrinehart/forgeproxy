@@ -497,6 +497,21 @@ async fn acquire_local_repo_publish_guard(
     mutex.lock_owned().await
 }
 
+async fn try_acquire_local_repo_publish_guard(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Option<OwnedMutexGuard<()>> {
+    let mutex = {
+        let mut mutexes = state.repo_publish_mutexes.lock().await;
+        mutexes
+            .entry(owner_repo.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+
+    mutex.try_lock_owned().ok()
+}
+
 fn leased_generation_paths(state: &crate::AppState, owner_repo: &str) -> HashSet<PathBuf> {
     state
         .published_generation_leases
@@ -544,6 +559,29 @@ pub struct PublishedGenerationLease {
 impl PublishedGenerationLease {
     pub fn repo_path(&self) -> &Path {
         &self.generation_path
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalServeRepoSource {
+    PublishedGeneration,
+    Mirror,
+}
+
+pub enum LocalServeRepoLease {
+    Published(PublishedGenerationLease),
+    Mirror {
+        repo_path: PathBuf,
+        _publish_guard: OwnedMutexGuard<()>,
+    },
+}
+
+impl LocalServeRepoLease {
+    pub fn repo_path(&self) -> &Path {
+        match self {
+            Self::Published(lease) => lease.repo_path(),
+            Self::Mirror { repo_path, .. } => repo_path,
+        }
     }
 }
 
@@ -644,6 +682,29 @@ pub fn acquire_published_generation_lease(
         repo_publish_mutexes: std::sync::Arc::clone(&state.repo_publish_mutexes),
         published_generation_leases: std::sync::Arc::clone(&state.published_generation_leases),
     })
+}
+
+pub async fn acquire_local_serve_repo_lease(
+    state: &crate::AppState,
+    owner_repo: &str,
+    source: LocalServeRepoSource,
+) -> Result<LocalServeRepoLease> {
+    match source {
+        LocalServeRepoSource::PublishedGeneration => Ok(LocalServeRepoLease::Published(
+            acquire_published_generation_lease(state, owner_repo)?,
+        )),
+        LocalServeRepoSource::Mirror => {
+            let publish_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+            let repo_path = state.cache_manager.repo_mirror_path(owner_repo);
+            if !state.cache_manager.has_repo_at(&repo_path) {
+                bail!("repo mirror is not available for local serving");
+            }
+            Ok(LocalServeRepoLease::Mirror {
+                repo_path,
+                _publish_guard: publish_guard,
+            })
+        }
+    }
 }
 
 async fn try_ensure_repo_cloned_inner(
@@ -1307,25 +1368,41 @@ async fn fetch_delta_into_repo_mirror(
 
         let fetch_result =
             crate::git::commands::git_fetch(&delta_repo_path, clone_url, &[]).await?;
-        let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
-        let delta_remote = delta_repo_path.to_string_lossy().to_string();
-        crate::git::commands::git_fetch(&mirror_path, &delta_remote, &[])
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to integrate delta workspace {} into mirror {}",
-                    delta_repo_path.display(),
-                    mirror_path.display()
-                )
-            })?;
-        ensure_bare_head_ref(&mirror_path).await?;
-        validate_ready_repo(
+        {
+            let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+            let delta_remote = delta_repo_path.to_string_lossy().to_string();
+            crate::git::commands::git_fetch(&mirror_path, &delta_remote, &[])
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to integrate delta workspace {} into mirror {}",
+                        delta_repo_path.display(),
+                        mirror_path.display()
+                    )
+                })?;
+            ensure_bare_head_ref(&mirror_path).await?;
+        }
+        let mirror_validation_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source = "delta workspace integration",
+            path = %mirror_path.display(),
+            "starting ready-repo validation"
+        );
+        check_ready_repo(
             state,
             owner_repo,
             &mirror_path,
             "delta workspace integration",
         )
         .await?;
+        info!(
+            repo = %owner_repo,
+            source = "delta workspace integration",
+            path = %mirror_path.display(),
+            elapsed_ms = mirror_validation_started_at.elapsed().as_millis(),
+            "finished ready-repo validation"
+        );
         let _published_generation_path =
             publish_repo_mirror_generation(state, owner_repo, "delta workspace integration")
                 .await?;
@@ -1843,6 +1920,7 @@ pub enum LocalServeDecision {
         restored_from_s3_for_request: bool,
     },
     SatisfiesWants {
+        serve_from: LocalServeRepoSource,
         had_local_repo_before_check: bool,
         restored_from_s3_for_request: bool,
         want_count: usize,
@@ -1876,27 +1954,11 @@ async fn ensure_repo_available_locally_detailed(
         });
     }
 
-    let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
-    let published_repo_path = state.cache_manager.ensure_repo_dir(owner_repo)?;
-    reset_partial_repo_path_if_needed(&published_repo_path).await?;
-
     if state.cache_manager.has_repo_mirror(owner_repo) {
-        let published_generation_path =
-            publish_repo_mirror_generation(state, owner_repo, "mirror restore for request").await?;
-        let mut info = get_repo_info(&state.valkey, owner_repo)
-            .await?
-            .unwrap_or_default();
-        info.status = "ready".to_string();
-        info.node_ids = state.node_id.clone();
-        info.hydrating_node_id.clear();
-        info.hydrating_since_ts = 0;
-        info.bootstrap_bundle_pending = false;
-        set_repo_info(&state.valkey, owner_repo, &info).await?;
         debug!(
             repo = %owner_repo,
-            generation = %published_generation_path.display(),
-            published = %published_repo_path.display(),
-            "restored published repo from local mirror for request-time serveability"
+            mirror = %state.cache_manager.repo_mirror_path(owner_repo).display(),
+            "using the local mirror for request-time serveability while the published generation is unavailable"
         );
         return Ok(LocalRepoAvailability {
             had_local_repo_before_check,
@@ -1904,6 +1966,10 @@ async fn ensure_repo_available_locally_detailed(
             available: true,
         });
     }
+
+    let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+    let published_repo_path = state.cache_manager.ensure_repo_dir(owner_repo)?;
+    reset_partial_repo_path_if_needed(&published_repo_path).await?;
 
     let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
     let restore_result = try_restore_repo_from_s3(state, owner_repo, &staged_repo_path).await;
@@ -2008,21 +2074,57 @@ pub async fn classify_local_wants_satisfaction(
         });
     }
 
-    let repo_path = state.cache_manager.repo_path(owner_repo);
-    let missing_wants = crate::git::commands::git_missing_objects(&repo_path, wants).await?;
+    let published_repo_path = state.cache_manager.repo_path(owner_repo);
+    if state.cache_manager.has_repo_at(&published_repo_path) {
+        let missing_wants =
+            crate::git::commands::git_missing_objects(&published_repo_path, wants).await?;
+        if missing_wants.is_empty() {
+            return Ok(LocalServeDecision::SatisfiesWants {
+                serve_from: LocalServeRepoSource::PublishedGeneration,
+                had_local_repo_before_check: availability.had_local_repo_before_check,
+                restored_from_s3_for_request: availability.restored_from_s3_for_request,
+                want_count: wants.len(),
+            });
+        }
+    }
 
-    if missing_wants.is_empty() {
-        Ok(LocalServeDecision::SatisfiesWants {
+    let mirror_repo_path = state.cache_manager.repo_mirror_path(owner_repo);
+    if state.cache_manager.has_repo_at(&mirror_repo_path)
+        && let Some(_publish_guard) = try_acquire_local_repo_publish_guard(state, owner_repo).await
+        && state.cache_manager.has_repo_at(&mirror_repo_path)
+    {
+        let missing_wants =
+            crate::git::commands::git_missing_objects(&mirror_repo_path, wants).await?;
+        if missing_wants.is_empty() {
+            return Ok(LocalServeDecision::SatisfiesWants {
+                serve_from: LocalServeRepoSource::Mirror,
+                had_local_repo_before_check: availability.had_local_repo_before_check,
+                restored_from_s3_for_request: availability.restored_from_s3_for_request,
+                want_count: wants.len(),
+            });
+        }
+
+        return Ok(LocalServeDecision::MissingWantedObjects {
             had_local_repo_before_check: availability.had_local_repo_before_check,
             restored_from_s3_for_request: availability.restored_from_s3_for_request,
             want_count: wants.len(),
-        })
-    } else {
+            missing_wants,
+        });
+    }
+
+    if state.cache_manager.has_repo_at(&published_repo_path) {
+        let missing_wants =
+            crate::git::commands::git_missing_objects(&published_repo_path, wants).await?;
         Ok(LocalServeDecision::MissingWantedObjects {
             had_local_repo_before_check: availability.had_local_repo_before_check,
             restored_from_s3_for_request: availability.restored_from_s3_for_request,
             want_count: wants.len(),
             missing_wants,
+        })
+    } else {
+        Ok(LocalServeDecision::Unavailable {
+            had_local_repo_before_check: availability.had_local_repo_before_check,
+            restored_from_s3_for_request: availability.restored_from_s3_for_request,
         })
     }
 }
