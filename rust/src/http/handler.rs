@@ -292,12 +292,57 @@ async fn handle_upload_pack(
         initial_local_decision,
         LocalServeDecision::MissingWantedObjects { .. }
     ) {
+        let request_refspecs = if let LocalServeDecision::MissingWantedObjects {
+            missing_wants,
+            ..
+        } = &initial_local_decision
+        {
+            let recent_info_refs = state
+                .recent_info_refs_advertisements
+                .lock()
+                .await
+                .get(&repo_slug)
+                .cloned();
+            recent_info_refs.and_then(|recent_info_refs| {
+                if recent_info_refs.captured_at.elapsed() > std::time::Duration::from_secs(60) {
+                    return None;
+                }
+                let plan =
+                    crate::coordination::registry::derive_request_catch_up_plan_from_info_refs(
+                        &recent_info_refs.payload,
+                        missing_wants,
+                    );
+                if plan.refspecs.is_empty() {
+                    info!(
+                        repo = %repo_slug,
+                        missing_wants = missing_wants.len(),
+                        matched_wants = plan.matched_wants,
+                        unmatched_wants = plan.unmatched_wants,
+                        "request-time HTTP catch-up could not map missing wants to advertised refs; using full ref refresh"
+                    );
+                    None
+                } else {
+                    info!(
+                        repo = %repo_slug,
+                        missing_wants = missing_wants.len(),
+                        matched_wants = plan.matched_wants,
+                        unmatched_wants = plan.unmatched_wants,
+                        refspec_count = plan.refspecs.len(),
+                        "request-time HTTP catch-up will fetch only advertised refs that match the missing wants"
+                    );
+                    Some(plan.refspecs)
+                }
+            })
+        } else {
+            None
+        };
         match crate::coordination::registry::wait_for_local_catch_up(
             &state,
             &owner,
             &repo,
             auth_header.as_deref(),
             &wants,
+            request_refspecs,
         )
         .await
         {

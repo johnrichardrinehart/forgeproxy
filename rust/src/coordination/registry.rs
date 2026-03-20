@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -279,7 +279,16 @@ pub async fn try_ensure_repo_cloned_from_tee(
     auth_header: Option<&str>,
     capture_dir: PathBuf,
 ) -> Result<()> {
-    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, Some(capture_dir), None).await
+    try_ensure_repo_cloned_inner(
+        state,
+        owner,
+        repo,
+        auth_header,
+        Some(capture_dir),
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn ensure_repo_cloned_from_upstream(
@@ -288,7 +297,26 @@ pub async fn ensure_repo_cloned_from_upstream(
     repo: &str,
     auth_header: Option<&str>,
 ) -> Result<()> {
-    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, None, None).await
+    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, None, None, None).await
+}
+
+async fn ensure_repo_cloned_from_upstream_with_refspecs(
+    state: &crate::AppState,
+    owner: &str,
+    repo: &str,
+    auth_header: Option<&str>,
+    request_refspecs: Option<&[String]>,
+) -> Result<()> {
+    try_ensure_repo_cloned_inner(
+        state,
+        owner,
+        repo,
+        auth_header,
+        None,
+        None,
+        request_refspecs,
+    )
+    .await
 }
 
 pub struct CloneHydrationPermits {
@@ -409,6 +437,7 @@ pub async fn try_ensure_repo_cloned_from_tee_with_permits(
         auth_header,
         Some(capture_dir),
         Some(permits),
+        None,
     )
     .await
 }
@@ -714,6 +743,7 @@ async fn try_ensure_repo_cloned_inner(
     auth_header: Option<&str>,
     tee_capture_dir: Option<PathBuf>,
     preacquired_permits: Option<CloneHydrationPermits>,
+    request_refspecs: Option<&[String]>,
 ) -> Result<()> {
     // Strip trailing ".git" from repo if present to avoid double-suffixing
     // (the URL path extractor preserves it, and we append ".git" below).
@@ -768,7 +798,9 @@ async fn try_ensure_repo_cloned_inner(
             info.bootstrap_bundle_pending = false;
             set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
-            let fetch_result = fetch_delta_into_repo_mirror(state, &owner_repo, &clone_url).await?;
+            let fetch_result =
+                fetch_delta_into_repo_mirror(state, &owner_repo, &clone_url, request_refspecs)
+                    .await?;
             let published_repo_path = state.cache_manager.repo_path(&owner_repo);
             let mut info = get_repo_info(&state.valkey, &owner_repo)
                 .await?
@@ -1365,6 +1397,7 @@ async fn fetch_delta_into_repo_mirror(
     state: &crate::AppState,
     owner_repo: &str,
     clone_url: &str,
+    request_refspecs: Option<&[String]>,
 ) -> Result<crate::git::commands::FetchResult> {
     let mirror_path = require_existing_repo_mirror(state, owner_repo).await?;
     if !state.cache_manager.has_repo_at(&mirror_path) {
@@ -1384,19 +1417,53 @@ async fn fetch_delta_into_repo_mirror(
             })?;
 
         let fetch_result =
-            crate::git::commands::git_fetch(&delta_repo_path, clone_url, &[]).await?;
+            if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
+                info!(
+                    repo = %owner_repo,
+                    refspec_count = refspecs.len(),
+                    "request-time catch-up is fetching only refs needed for the current wants"
+                );
+                crate::git::commands::git_fetch_refspecs(
+                    &delta_repo_path,
+                    clone_url,
+                    &[],
+                    refspecs,
+                    false,
+                )
+                .await?
+            } else {
+                crate::git::commands::git_fetch(&delta_repo_path, clone_url, &[]).await?
+            };
         {
             let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
             let delta_remote = delta_repo_path.to_string_lossy().to_string();
-            crate::git::commands::git_fetch(&mirror_path, &delta_remote, &[])
+            if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
+                crate::git::commands::git_fetch_refspecs(
+                    &mirror_path,
+                    &delta_remote,
+                    &[],
+                    refspecs,
+                    false,
+                )
                 .await
                 .with_context(|| {
                     format!(
-                        "failed to integrate delta workspace {} into mirror {}",
+                        "failed to integrate selected refs from delta workspace {} into mirror {}",
                         delta_repo_path.display(),
                         mirror_path.display()
                     )
                 })?;
+            } else {
+                crate::git::commands::git_fetch(&mirror_path, &delta_remote, &[])
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to integrate delta workspace {} into mirror {}",
+                            delta_repo_path.display(),
+                            mirror_path.display()
+                        )
+                    })?;
+            }
             ensure_bare_head_ref(&mirror_path).await?;
         }
         let mirror_validation_started_at = Instant::now();
@@ -1535,7 +1602,7 @@ async fn converge_published_repo_generation(
         clone_url = %redacted_clone_url,
         "starting capture convergence follow-on delta fetch"
     );
-    let fetch_result = fetch_delta_into_repo_mirror(state, owner_repo, clone_url).await?;
+    let fetch_result = fetch_delta_into_repo_mirror(state, owner_repo, clone_url, None).await?;
     info!(
         repo = %owner_repo,
         published = %state.cache_manager.repo_path(owner_repo).display(),
@@ -1950,6 +2017,56 @@ pub enum LocalServeDecision {
     },
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestCatchUpPlan {
+    pub refspecs: Vec<String>,
+    pub matched_wants: usize,
+    pub unmatched_wants: usize,
+}
+
+pub fn derive_request_catch_up_plan(
+    metadata: &crate::tee_hydration::CapturedRefMetadata,
+    wants: &[String],
+) -> RequestCatchUpPlan {
+    let oid_to_refs = metadata.refs.iter().fold(
+        HashMap::<&str, Vec<&str>>::new(),
+        |mut acc, (refname, oid)| {
+            acc.entry(oid.as_str()).or_default().push(refname.as_str());
+            acc
+        },
+    );
+
+    let mut refspecs = BTreeSet::new();
+    let mut matched_wants = 0;
+    let mut unmatched_wants = 0;
+
+    for want in wants {
+        if let Some(refnames) = oid_to_refs.get(want.as_str()) {
+            matched_wants += 1;
+            for refname in refnames {
+                refspecs.insert(format!("+{refname}:{refname}"));
+            }
+        } else {
+            unmatched_wants += 1;
+        }
+    }
+
+    RequestCatchUpPlan {
+        refspecs: refspecs.into_iter().collect(),
+        matched_wants,
+        unmatched_wants,
+    }
+}
+
+pub fn derive_request_catch_up_plan_from_info_refs(
+    info_refs_advertisement: &[u8],
+    wants: &[String],
+) -> RequestCatchUpPlan {
+    let metadata =
+        crate::tee_hydration::parse_info_refs_advertisement_metadata(info_refs_advertisement);
+    derive_request_catch_up_plan(&metadata, wants)
+}
+
 async fn ensure_repo_available_locally_detailed(
     state: &crate::AppState,
     owner_repo: &str,
@@ -2181,6 +2298,7 @@ pub async fn wait_for_local_catch_up(
     repo: &str,
     auth_header: Option<&str>,
     wants: &[String],
+    request_refspecs: Option<Vec<String>>,
 ) -> Result<LocalServeDecision> {
     let timeout = Duration::from_secs(state.config.clone.request_wait_for_local_catch_up_secs);
     let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
@@ -2207,10 +2325,16 @@ pub async fn wait_for_local_catch_up(
         let repo = repo_clean.to_string();
         let auth_header = auth_header.map(ToOwned::to_owned);
         let owner_repo_for_log = owner_repo.clone();
+        let request_refspecs = request_refspecs.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                ensure_repo_cloned_from_upstream(&state, &owner, &repo, auth_header.as_deref())
-                    .await
+            if let Err(error) = ensure_repo_cloned_from_upstream_with_refspecs(
+                &state,
+                &owner,
+                &repo,
+                auth_header.as_deref(),
+                request_refspecs.as_deref(),
+            )
+            .await
             {
                 warn!(
                     repo = %owner_repo_for_log,
@@ -2291,6 +2415,7 @@ pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn repo_info_round_trip_preserves_hydration_fields() {
@@ -2313,5 +2438,46 @@ mod tests {
         assert_eq!(round_trip.hydrating_node_id, "node-a");
         assert_eq!(round_trip.hydrating_since_ts, 1234);
         assert!(round_trip.bootstrap_bundle_pending);
+    }
+
+    #[test]
+    fn derive_request_catch_up_plan_selects_only_matching_refs() {
+        let metadata = crate::tee_hydration::CapturedRefMetadata {
+            refs: BTreeMap::from([
+                (
+                    "refs/heads/main".to_string(),
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                ),
+                (
+                    "refs/tags/v1".to_string(),
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                ),
+                (
+                    "refs/tags/v1-dup".to_string(),
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                ),
+            ]),
+            head_symref_target: Some("refs/heads/main".to_string()),
+        };
+
+        let plan = derive_request_catch_up_plan(
+            &metadata,
+            &[
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ],
+        );
+
+        assert_eq!(plan.matched_wants, 2);
+        assert_eq!(plan.unmatched_wants, 1);
+        assert_eq!(
+            plan.refspecs,
+            vec![
+                "+refs/heads/main:refs/heads/main".to_string(),
+                "+refs/tags/v1-dup:refs/tags/v1-dup".to_string(),
+                "+refs/tags/v1:refs/tags/v1".to_string(),
+            ]
+        );
     }
 }

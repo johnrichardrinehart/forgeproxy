@@ -188,14 +188,42 @@ pub async fn git_fetch(
     remote_url: &str,
     env_vars: &[(String, String)],
 ) -> Result<FetchResult> {
+    git_fetch_refspecs(
+        repo_path,
+        remote_url,
+        env_vars,
+        &["+refs/*:refs/*".to_string()],
+        true,
+    )
+    .await
+}
+
+/// Run `git fetch <remote_url> <refspec>...` inside an existing bare repo.
+///
+/// When `prune` is true, Git will drop refs that disappeared from the remote.
+/// Narrow request-time catch-up fetches should typically disable pruning so a
+/// partial refspec update does not delete unrelated refs.
+#[instrument(skip(env_vars, remote_url, refspecs), fields(repo = %repo_path.display()))]
+pub async fn git_fetch_refspecs(
+    repo_path: &Path,
+    remote_url: &str,
+    env_vars: &[(String, String)],
+    refspecs: &[String],
+    prune: bool,
+) -> Result<FetchResult> {
+    if refspecs.is_empty() {
+        bail!("git fetch requires at least one refspec");
+    }
+
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_path)
-        .arg("fetch")
-        .arg("--prune")
-        .arg("--force")
-        .arg(remote_url)
-        .arg("+refs/*:refs/*");
+    cmd.arg("-C").arg(repo_path).arg("fetch").arg("--force");
+    if prune {
+        cmd.arg("--prune");
+    }
+    cmd.arg(remote_url);
+    for refspec in refspecs {
+        cmd.arg(refspec);
+    }
 
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     for (k, v) in env_vars {
@@ -224,6 +252,13 @@ pub async fn git_fetch(
         repo = %repo_path.display(),
         pid,
         remote = %redact_url_secret(remote_url, 4),
+        refspec_mode = if refspecs.len() == 1 && refspecs[0] == "+refs/*:refs/*" {
+            "all"
+        } else {
+            "selected"
+        },
+        refspec_count = refspecs.len(),
+        prune,
         "git fetch started"
     );
 

@@ -379,6 +379,14 @@ pub async fn extract_captured_ref_metadata(capture_dir: &Path) -> Result<Capture
     Ok(metadata)
 }
 
+pub fn parse_info_refs_advertisement_metadata(bytes: &[u8]) -> CapturedRefMetadata {
+    parse_info_refs_advertisement(bytes)
+}
+
+pub fn parse_ls_refs_response_metadata(bytes: &[u8]) -> CapturedRefMetadata {
+    parse_ls_refs_response(bytes)
+}
+
 fn parse_ls_refs_response(bytes: &[u8]) -> CapturedRefMetadata {
     let packets = crate::http::protocolv2::decode_pkt_lines(bytes);
     let mut metadata = CapturedRefMetadata::default();
