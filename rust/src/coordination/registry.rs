@@ -9,7 +9,7 @@ use fred::interfaces::{ClientLike, HashesInterface, SortedSetsInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, TryAcquireError};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Metadata about a cached repository.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -719,6 +719,7 @@ async fn try_ensure_repo_cloned_inner(
     // (the URL path extractor preserves it, and we append ".git" below).
     let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
     let owner_repo = format!("{owner}/{repo_clean}");
+    repair_published_without_mirror_invariant(state, &owner_repo).await?;
     let node_id = state.node_id.clone();
     let had_local_repo_at_start = state.cache_manager.has_repo(&owner_repo);
 
@@ -1126,6 +1127,39 @@ async fn cleanup_temp_want_refs(seed_root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+async fn repair_published_without_mirror_invariant(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<bool> {
+    let published_repo_path = state.cache_manager.repo_path(owner_repo);
+    if !state.cache_manager.has_repo_at(&published_repo_path)
+        || state.cache_manager.has_repo_mirror(owner_repo)
+    {
+        return Ok(false);
+    }
+
+    let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+    if !state.cache_manager.has_repo_at(&published_repo_path)
+        || state.cache_manager.has_repo_mirror(owner_repo)
+    {
+        return Ok(false);
+    }
+
+    let generations_dir = state.cache_manager.repo_generations_dir(owner_repo);
+    error!(
+        repo = %owner_repo,
+        published = %published_repo_path.display(),
+        generations = %generations_dir.display(),
+        mirror = %state.cache_manager.repo_mirror_path(owner_repo).display(),
+        "published repo invariant violated; removing published snapshots because the writer-owned mirror is missing"
+    );
+    state
+        .cache_manager
+        .remove_published_repo_generations(owner_repo)
+        .await?;
+    Ok(true)
+}
+
 async fn clear_hydration_state(
     state: &crate::AppState,
     owner_repo: &str,
@@ -1205,34 +1239,17 @@ async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_repo_mirror_seeded(state: &crate::AppState, owner_repo: &str) -> Result<PathBuf> {
+async fn require_existing_repo_mirror(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<PathBuf> {
     let mirror_path = state.cache_manager.ensure_repo_mirror_dir(owner_repo)?;
     reset_partial_repo_path_if_needed(&mirror_path).await?;
 
     if state.cache_manager.has_repo_at(&mirror_path) {
         return Ok(mirror_path);
     }
-
-    let published_repo_path = state.cache_manager.repo_path(owner_repo);
-    if state.cache_manager.has_repo(owner_repo) {
-        info!(
-            repo = %owner_repo,
-            published = %published_repo_path.display(),
-            mirror = %mirror_path.display(),
-            "seeding repo mirror from published generation"
-        );
-        crate::git::commands::git_clone_bare_local(&published_repo_path, &mirror_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to seed repo mirror {} from published repo {}",
-                    mirror_path.display(),
-                    published_repo_path.display()
-                )
-            })?;
-    }
-
-    Ok(mirror_path)
+    bail!("repo mirror is not available");
 }
 
 async fn publish_repo_mirror_generation(
@@ -1349,7 +1366,7 @@ async fn fetch_delta_into_repo_mirror(
     owner_repo: &str,
     clone_url: &str,
 ) -> Result<crate::git::commands::FetchResult> {
-    let mirror_path = ensure_repo_mirror_seeded(state, owner_repo).await?;
+    let mirror_path = require_existing_repo_mirror(state, owner_repo).await?;
     if !state.cache_manager.has_repo_at(&mirror_path) {
         bail!("repo mirror is not available for delta fetch");
     }
@@ -1937,6 +1954,7 @@ async fn ensure_repo_available_locally_detailed(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<LocalRepoAvailability> {
+    repair_published_without_mirror_invariant(state, owner_repo).await?;
     let had_local_repo_before_check = state.cache_manager.has_repo(owner_repo);
     if had_local_repo_before_check {
         return Ok(LocalRepoAvailability {
@@ -1968,11 +1986,47 @@ async fn ensure_repo_available_locally_detailed(
     }
 
     let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
-    let published_repo_path = state.cache_manager.ensure_repo_dir(owner_repo)?;
-    reset_partial_repo_path_if_needed(&published_repo_path).await?;
+    let published_repo_path = state.cache_manager.repo_path(owner_repo);
+    if state.cache_manager.has_repo_at(&published_repo_path)
+        && !state.cache_manager.has_repo_mirror(owner_repo)
+    {
+        let generations_dir = state.cache_manager.repo_generations_dir(owner_repo);
+        error!(
+            repo = %owner_repo,
+            published = %published_repo_path.display(),
+            generations = %generations_dir.display(),
+            mirror = %state.cache_manager.repo_mirror_path(owner_repo).display(),
+            "published repo invariant violated; removing published snapshots because the writer-owned mirror is missing"
+        );
+        state
+            .cache_manager
+            .remove_published_repo_generations(owner_repo)
+            .await?;
+    }
+    if state.cache_manager.has_repo(owner_repo) {
+        return Ok(LocalRepoAvailability {
+            had_local_repo_before_check,
+            restored_from_s3_for_request: false,
+            available: true,
+        });
+    }
+    if state.cache_manager.has_repo_mirror(owner_repo) {
+        debug!(
+            repo = %owner_repo,
+            mirror = %state.cache_manager.repo_mirror_path(owner_repo).display(),
+            "using the local mirror for request-time serveability while the published generation is unavailable"
+        );
+        return Ok(LocalRepoAvailability {
+            had_local_repo_before_check,
+            restored_from_s3_for_request: false,
+            available: true,
+        });
+    }
 
-    let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
-    let restore_result = try_restore_repo_from_s3(state, owner_repo, &staged_repo_path).await;
+    let mirror_path = state.cache_manager.ensure_repo_mirror_dir(owner_repo)?;
+    reset_partial_repo_path_if_needed(&mirror_path).await?;
+
+    let restore_result = try_restore_repo_from_s3(state, owner_repo, &mirror_path).await;
 
     let availability = match restore_result {
         Ok(true) => {
@@ -1983,26 +2037,15 @@ async fn ensure_repo_available_locally_detailed(
                     available: true,
                 }
             } else {
-                ensure_bare_head_ref(&staged_repo_path)
+                ensure_bare_head_ref(&mirror_path).await.with_context(|| {
+                    format!("failed to set bare HEAD after S3 restore for {owner_repo}")
+                })?;
+                validate_ready_repo(state, owner_repo, &mirror_path, "S3 restore for request")
                     .await
                     .with_context(|| {
-                        format!("failed to set bare HEAD after S3 restore for {owner_repo}")
+                        format!("S3-restored repo validation failed for {owner_repo}")
                     })?;
-                validate_ready_repo(
-                    state,
-                    owner_repo,
-                    &staged_repo_path,
-                    "S3 restore for request",
-                )
-                .await
-                .with_context(|| format!("S3-restored repo validation failed for {owner_repo}"))?;
-                publish_ready_repo(
-                    state,
-                    owner_repo,
-                    &staged_repo_path,
-                    "S3 restore for request",
-                )
-                .await?;
+                publish_repo_mirror_generation(state, owner_repo, "S3 restore for request").await?;
 
                 let mut info = get_repo_info(&state.valkey, owner_repo)
                     .await?
@@ -2026,13 +2069,13 @@ async fn ensure_repo_available_locally_detailed(
             available: false,
         },
         Err(error) => {
-            if staged_repo_path.exists() {
-                tokio::fs::remove_dir_all(&staged_repo_path)
+            if mirror_path.exists() && !state.cache_manager.has_repo_at(&mirror_path) {
+                tokio::fs::remove_dir_all(&mirror_path)
                     .await
                     .with_context(|| {
                         format!(
                             "failed to remove failed request-time S3 restore at {}",
-                            staged_repo_path.display()
+                            mirror_path.display()
                         )
                     })?;
             }
@@ -2040,13 +2083,16 @@ async fn ensure_repo_available_locally_detailed(
         }
     };
 
-    if !availability.available && staged_repo_path.exists() {
-        tokio::fs::remove_dir_all(&staged_repo_path)
+    if !availability.available
+        && mirror_path.exists()
+        && !state.cache_manager.has_repo_at(&mirror_path)
+    {
+        tokio::fs::remove_dir_all(&mirror_path)
             .await
             .with_context(|| {
                 format!(
                     "failed to remove unused request-time S3 restore at {}",
-                    staged_repo_path.display()
+                    mirror_path.display()
                 )
             })?;
     }
@@ -2150,9 +2196,6 @@ pub async fn wait_for_local_catch_up(
     if timeout.is_zero() {
         return Ok(initial_decision);
     }
-    if !state.cache_manager.has_repo_mirror(&owner_repo) {
-        return Ok(initial_decision);
-    }
 
     let should_start_refresh = get_repo_info(&state.valkey, &owner_repo)
         .await?
@@ -2184,6 +2227,8 @@ pub async fn wait_for_local_catch_up(
         repo = %owner_repo,
         timeout_secs = timeout.as_secs(),
         started_refresh = should_start_refresh,
+        has_published_repo = state.cache_manager.has_repo(&owner_repo),
+        has_repo_mirror = state.cache_manager.has_repo_mirror(&owner_repo),
         "waiting for local mirror catch-up before deciding whether to proxy upstream"
     );
     while started_at.elapsed() < timeout {

@@ -819,6 +819,9 @@ pkgs.testers.runNixOSTest {
             f"test $(find {stream_generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l) -ge 1"
         )
         proxy.wait_until_succeeds(
+            f"test -d {stream_mirror} && test -f {stream_mirror}/HEAD"
+        )
+        proxy.wait_until_succeeds(
             f"! test -d {stream_tee_dir} || "
             f"find {stream_tee_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
         )
@@ -827,10 +830,11 @@ pkgs.testers.runNixOSTest {
     with subtest("Concurrent uncached clones fold into one published generation"):
         generation_repo = "/var/cache/forgeproxy/repos/octocat/repo-generations.git"
         generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-generations.git"
+        generation_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-generations.git"
         generation_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-generations"
 
         proxy.succeed(
-            f"rm -rf {generation_repo} {generation_dir} {generation_tee_dir}"
+            f"rm -rf {generation_repo} {generation_dir} {generation_mirror} {generation_tee_dir}"
         )
 
         client.succeed("rm -rf /tmp/repo-generations-1 /tmp/repo-generations-2 /tmp/repo-generations-3")
@@ -857,6 +861,9 @@ pkgs.testers.runNixOSTest {
             f"test $(find {generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l) -ge 1"
         )
         proxy.wait_until_succeeds(
+            f"test -d {generation_mirror} && test -f {generation_mirror}/HEAD"
+        )
+        proxy.wait_until_succeeds(
             f"! test -d {generation_tee_dir} || "
             f"find {generation_tee_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
         )
@@ -864,7 +871,57 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-generations-2/file-3.txt")
         client.succeed("test -f /tmp/repo-generations-3/file-3.txt")
 
-    # ── Subtest 5f: Large stale want sets catch up locally before timeout ──
+    # ── Subtest 5f: Published snapshots are invalid without a mirror ──────
+    with subtest("Published generations are scrubbed when the mirror is missing"):
+        invariant_repo = "/var/cache/forgeproxy/repos/octocat/repo-generations.git"
+        invariant_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-generations.git"
+        invariant_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-generations.git"
+
+        client.succeed("rm -rf /tmp/repo-generations-invariant")
+        proxy.wait_until_succeeds(
+            f"test -L {invariant_repo} && test -f $(readlink -f {invariant_repo})/HEAD"
+        )
+        proxy.wait_until_succeeds(
+            f"test -d {invariant_mirror} && test -f {invariant_mirror}/HEAD"
+        )
+        proxy.wait_until_succeeds(
+            "test \"$(redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-generations' status)\" = ready "
+            "&& test -z \"$(redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-generations' hydrating_node_id)\""
+        )
+        proxy.succeed(f"rm -rf {invariant_mirror}")
+        proxy.succeed(
+            f"test -L {invariant_repo} && "
+            f"test $(find {invariant_generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l) -ge 1 && "
+            f"! test -e {invariant_mirror}"
+        )
+
+        since = proxy.succeed("date --iso-8601=seconds --utc").strip()
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-invariant"
+        )
+        client.succeed("test -f /tmp/repo-generations-invariant/file-3.txt")
+
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"octocat/repo-generations\"'"
+            " | grep -F 'published repo invariant violated; removing published snapshots because the writer-owned mirror is missing'"
+        )
+        proxy.wait_until_succeeds(
+            f"test -L {invariant_repo} && test -f $(readlink -f {invariant_repo})/HEAD"
+        )
+        proxy.wait_until_succeeds(
+            f"test $(find {invariant_generation_dir} -mindepth 1 -maxdepth 1 -type d | wc -l) -ge 1"
+        )
+        proxy.wait_until_succeeds(
+            f"test -d {invariant_mirror} && test -f {invariant_mirror}/HEAD"
+        )
+
+    # ── Subtest 5g: Large stale want sets catch up locally before timeout ──
     with subtest("Large stale fetch resolves many missing wants locally before timeout"):
         many_wants_repo = "/var/cache/forgeproxy/repos/octocat/repo-many-wants.git"
         many_wants_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-many-wants.git"
@@ -936,7 +993,7 @@ pkgs.testers.runNixOSTest {
             " | grep -F 'local mirror catch-up timed out; falling back to upstream proxy'"
         )
 
-    # ── Subtest 5g: Requests can serve from a fresher mirror than published ──
+    # ── Subtest 5h: Requests can serve from a fresher mirror than published ──
     with subtest("SSH fetch serves directly from a fresher mirror when publish lags"):
         mirror_serve_repo = "/var/cache/forgeproxy/repos/octocat/repo-mirror-serve.git"
         mirror_serve_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-mirror-serve.git"
@@ -1020,7 +1077,7 @@ pkgs.testers.runNixOSTest {
             " | grep -F 'local mirror catch-up timed out; falling back to upstream proxy'"
         )
 
-    # ── Subtest 5h: Concurrent uncached hydrations complete and drain semaphore ──
+    # ── Subtest 5i: Concurrent uncached hydrations complete and drain semaphore ──
     with subtest("Concurrent uncached clones release the repo semaphore"):
         semaphore_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
         semaphore_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
@@ -1069,7 +1126,7 @@ pkgs.testers.runNixOSTest {
             f"! redis-cli -h valkey EXISTS '{semaphore_key}' | grep -qx 1"
         )
 
-    # ── Subtest 5i: External scrubber handles published generation layout ──
+    # ── Subtest 5j: External scrubber handles published generation layout ──
     with subtest("External scrubber succeeds and keeps generation-backed repos"):
         proxy.succeed("systemctl start forgeproxy-cache-scrub.service")
         proxy.succeed(
