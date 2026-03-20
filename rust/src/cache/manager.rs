@@ -350,14 +350,64 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Remove the published repo entry and all stored generations, but keep
+    /// the writer-owned mirror and transient workspaces intact.
+    pub async fn remove_published_repo_generations(&self, owner_repo: &str) -> Result<()> {
+        let published_path = self.repo_path(owner_repo);
+        if published_path.exists() {
+            let metadata = tokio::fs::symlink_metadata(&published_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to stat published repo path for removal: {}",
+                        published_path.display()
+                    )
+                })?;
+            if metadata.file_type().is_symlink() {
+                tokio::fs::remove_file(&published_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove published repo symlink: {}",
+                            published_path.display()
+                        )
+                    })?;
+            } else {
+                tokio::fs::remove_dir_all(&published_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove published repo directory: {}",
+                            published_path.display()
+                        )
+                    })?;
+            }
+        }
+
+        let generations_dir = self.repo_generations_dir(owner_repo);
+        if generations_dir.exists() {
+            tokio::fs::remove_dir_all(&generations_dir)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to remove repo generations directory: {}",
+                        generations_dir.display()
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
     /// Check whether a cached bare repo exists for `owner/repo` and looks
     /// like a usable bare Git repository.
     ///
     /// A `HEAD` file alone is not enough: partially initialised clone targets
     /// can contain the bare repo skeleton without any refs that `upload-pack`
-    /// can actually serve.
+    /// can actually serve. Reader-visible published state is only considered
+    /// available when the writer-owned mirror exists too.
     pub fn has_repo(&self, owner_repo: &str) -> bool {
-        is_usable_bare_repo(&self.repo_path(owner_repo))
+        is_usable_bare_repo(&self.repo_path(owner_repo)) && self.has_repo_mirror(owner_repo)
     }
 
     /// Check whether an arbitrary on-disk bare repo path looks usable.
@@ -919,5 +969,45 @@ deadbeef refs/heads/main\n",
 
         assert!(!first.exists());
         assert!(second.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_published_repo_generations_keeps_mirror() {
+        let tmp = tempdir().unwrap();
+        let mgr = test_manager(tmp.path());
+        let owner_repo = "acme/widgets";
+
+        let mirror = mgr.ensure_repo_mirror_dir(owner_repo).unwrap();
+        create_minimal_bare_repo(&mirror);
+
+        let staged = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&staged);
+        mgr.publish_staged_repo(owner_repo, &staged).unwrap();
+
+        mgr.remove_published_repo_generations(owner_repo)
+            .await
+            .unwrap();
+
+        assert!(!mgr.repo_path(owner_repo).exists());
+        assert!(!mgr.repo_generations_dir(owner_repo).exists());
+        assert!(mirror.exists());
+    }
+
+    #[test]
+    fn has_repo_requires_published_snapshot_and_mirror() {
+        let tmp = tempdir().unwrap();
+        let mgr = test_manager(tmp.path());
+        let owner_repo = "acme/widgets";
+
+        let staged = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&staged);
+        mgr.publish_staged_repo(owner_repo, &staged).unwrap();
+
+        assert!(!mgr.has_repo(owner_repo));
+
+        let mirror = mgr.ensure_repo_mirror_dir(owner_repo).unwrap();
+        create_minimal_bare_repo(&mirror);
+
+        assert!(mgr.has_repo(owner_repo));
     }
 }
