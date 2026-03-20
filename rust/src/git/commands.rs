@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, info, instrument};
 
@@ -496,41 +496,66 @@ pub async fn git_fsck_connectivity_only(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check whether a bare repo already contains the requested object ID.
-#[instrument(fields(repo = %repo_path.display(), %oid))]
-pub async fn git_has_object(repo_path: &Path, oid: &str) -> Result<bool> {
+/// Check a batch of object IDs and return the subset missing from the bare repo.
+#[instrument(fields(repo = %repo_path.display(), object_count = oids.len()))]
+pub async fn git_missing_objects(repo_path: &Path, oids: &[String]) -> Result<Vec<String>> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo_path)
         .arg("cat-file")
-        .arg("-e")
-        .arg(format!("{oid}^{{object}}"));
+        .arg("--batch-check");
 
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let output = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn git cat-file --batch-check")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        for oid in oids {
+            stdin
+                .write_all(oid.as_bytes())
+                .await
+                .with_context(|| format!("failed to write object id {oid} to git cat-file"))?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .context("failed to write newline to git cat-file")?;
+        }
+    }
+
+    let output = child
+        .wait_with_output()
         .await
-        .context("failed to spawn git cat-file -e")?;
+        .context("failed to wait on git cat-file --batch-check")?;
 
-    if output.status.success() {
-        return Ok(true);
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git cat-file --batch-check failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if git_cat_file_missing_object(&output.status, &stderr) {
-        return Ok(false);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut missing = Vec::new();
+    for line in stdout.lines() {
+        if let Some(oid) = line.strip_suffix(" missing") {
+            missing.push(oid.to_string());
+        }
     }
 
-    bail!(
-        "git cat-file -e failed (status {}): {}",
-        output.status,
-        stderr.trim(),
-    );
+    Ok(missing)
 }
 
+#[cfg(test)]
 fn git_cat_file_missing_object(status: &std::process::ExitStatus, stderr: &str) -> bool {
     status.code() == Some(1)
         || (status.code() == Some(128) && stderr.contains("Not a valid object name"))

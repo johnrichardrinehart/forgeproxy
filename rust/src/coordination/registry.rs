@@ -1879,6 +1879,7 @@ async fn ensure_repo_available_locally_detailed(
     let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
     let published_repo_path = state.cache_manager.ensure_repo_dir(owner_repo)?;
     reset_partial_repo_path_if_needed(&published_repo_path).await?;
+
     if state.cache_manager.has_repo_mirror(owner_repo) {
         let published_generation_path =
             publish_repo_mirror_generation(state, owner_repo, "mirror restore for request").await?;
@@ -2008,12 +2009,7 @@ pub async fn classify_local_wants_satisfaction(
     }
 
     let repo_path = state.cache_manager.repo_path(owner_repo);
-    let mut missing_wants = Vec::new();
-    for want in wants {
-        if !crate::git::commands::git_has_object(&repo_path, want).await? {
-            missing_wants.push(want.clone());
-        }
-    }
+    let missing_wants = crate::git::commands::git_missing_objects(&repo_path, wants).await?;
 
     if missing_wants.is_empty() {
         Ok(LocalServeDecision::SatisfiesWants {
