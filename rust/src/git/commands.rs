@@ -503,6 +503,12 @@ pub async fn git_missing_objects(repo_path: &Path, oids: &[String]) -> Result<Ve
         return Ok(Vec::new());
     }
 
+    let mut input = Vec::with_capacity(oids.iter().map(|oid| oid.len() + 1).sum());
+    for oid in oids {
+        input.extend_from_slice(oid.as_bytes());
+        input.push(b'\n');
+    }
+
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo_path)
@@ -517,23 +523,29 @@ pub async fn git_missing_objects(repo_path: &Path, oids: &[String]) -> Result<Ve
         .spawn()
         .context("failed to spawn git cat-file --batch-check")?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        for oid in oids {
-            stdin
-                .write_all(oid.as_bytes())
-                .await
-                .with_context(|| format!("failed to write object id {oid} to git cat-file"))?;
-            stdin
-                .write_all(b"\n")
-                .await
-                .context("failed to write newline to git cat-file")?;
-        }
-    }
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to capture git cat-file stdin")?;
+    let stdin_writer = tokio::spawn(async move {
+        stdin
+            .write_all(&input)
+            .await
+            .context("failed to write object ids to git cat-file")?;
+        stdin
+            .shutdown()
+            .await
+            .context("failed to close git cat-file stdin")?;
+        Ok::<(), anyhow::Error>(())
+    });
 
     let output = child
         .wait_with_output()
         .await
         .context("failed to wait on git cat-file --batch-check")?;
+    stdin_writer
+        .await
+        .context("git cat-file stdin writer task join failed")??;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -844,6 +856,8 @@ pub async fn git_for_each_ref(repo_path: &Path) -> Result<HashMap<String, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command as StdCommand;
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn count_updated_refs_basic() {
@@ -909,5 +923,84 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
             &status,
             "fatal: Not a valid object name 07ae7ae^{object}"
         ));
+    }
+
+    #[tokio::test]
+    async fn git_missing_objects_handles_large_batch_output_without_deadlocking() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let repo_path = tempdir.path();
+
+        let status = StdCommand::new("git")
+            .arg("init")
+            .arg(repo_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .arg("config")
+            .arg("user.email")
+            .arg("test@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .arg("config")
+            .arg("user.name")
+            .arg("Test User")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        std::fs::write(repo_path.join("file.txt"), "hello\n").unwrap();
+
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .arg("add")
+            .arg("file.txt")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let status = StdCommand::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .arg("commit")
+            .arg("-m")
+            .arg("initial")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let head = String::from_utf8(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("rev-parse")
+                .arg("HEAD")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let wants = vec![head; 4096];
+        let missing = timeout(
+            Duration::from_secs(10),
+            git_missing_objects(repo_path, &wants),
+        )
+        .await
+        .expect("git_missing_objects timed out")
+        .unwrap();
+
+        assert!(missing.is_empty());
     }
 }
