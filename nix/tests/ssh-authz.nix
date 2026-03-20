@@ -131,7 +131,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-authz";
-  globalTimeout = 210;
+  globalTimeout = 360;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -372,6 +372,15 @@ pkgs.testers.runNixOSTest {
             f""" -d '{{"name": "repo-generations", "private": true, "auto_init": false}}'"""
         )
 
+        # Create private repo: octocat/repo-many-wants (large stale-fetch regression)
+        ghe.succeed(
+            f"curl -sf"
+            f" -X POST http://localhost:3000/api/v1/user/repos"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"name": "repo-many-wants", "private": true, "auto_init": false}}'"""
+        )
+
         # Create public repo used to validate anonymous HTTP clone behaviour.
         ghe.succeed(
             f"curl -sf"
@@ -463,6 +472,21 @@ pkgs.testers.runNixOSTest {
             "git push -u origin main"
         )
 
+        # Push initial content to repo-many-wants to exercise large ref advertisements.
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo initial > README.md && "
+            "git add README.md && "
+            "git commit -m 'Initial commit' && "
+            "git remote add origin http://octocat:secret123@localhost:3000/octocat/repo-many-wants.git && "
+            "git push -u origin main"
+        )
+
         # Push initial content to public repo for anonymous HTTP clone checks.
         ghe.succeed(
             "set -e && "
@@ -503,6 +527,13 @@ pkgs.testers.runNixOSTest {
         ghe.succeed(
             f"curl -sf"
             f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-generations/collaborators/alice"
+            f" -H 'Content-Type: application/json'"
+            f" -H 'Authorization: token {TOKEN}'"
+            f""" -d '{{"permission": "read"}}'"""
+        )
+        ghe.succeed(
+            f"curl -sf"
+            f" -X PUT http://localhost:3000/api/v1/repos/octocat/repo-many-wants/collaborators/alice"
             f" -H 'Content-Type: application/json'"
             f" -H 'Authorization: token {TOKEN}'"
             f""" -d '{{"permission": "read"}}'"""
@@ -797,7 +828,78 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-generations-2/file-3.txt")
         client.succeed("test -f /tmp/repo-generations-3/file-3.txt")
 
-    # ── Subtest 5f: Concurrent uncached hydrations complete and drain semaphore ──
+    # ── Subtest 5f: Large stale want sets catch up locally before timeout ──
+    with subtest("Large stale fetch resolves many missing wants locally before timeout"):
+        many_wants_repo = "/var/cache/forgeproxy/repos/octocat/repo-many-wants.git"
+        many_wants_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-many-wants.git"
+        many_wants_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-many-wants.git"
+
+        proxy.succeed(
+            f"rm -rf {many_wants_repo} {many_wants_generation_dir} {many_wants_mirror}"
+        )
+        client.succeed("rm -rf /tmp/repo-many-wants-seed /tmp/repo-many-wants-final")
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone --depth 1 git@proxy:octocat/repo-many-wants.git /tmp/repo-many-wants-seed"
+        )
+        proxy.wait_until_succeeds(
+            f"test -L {many_wants_repo} && test -f $(readlink -f {many_wants_repo})/HEAD"
+        )
+        proxy.succeed(
+            f"mkdir -p $(dirname {many_wants_mirror}) && "
+            f"git clone --bare $(readlink -f {many_wants_repo}) {many_wants_mirror}"
+        )
+
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "git clone http://octocat:secret123@localhost:3000/octocat/repo-many-wants.git $tmp/repo && "
+            "cd $tmp/repo && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "for i in $(seq 1 2048); do "
+            "  printf 'want-%s\\n' \"$i\" >> wants.txt && "
+            "  git add wants.txt && "
+            "  git commit -m \"want-$i\" && "
+            "  git tag \"tag-$i\"; "
+            "done && "
+            "git push origin main --tags"
+        )
+
+        since = proxy.succeed("date --iso-8601=seconds --utc").strip()
+        client.succeed(
+            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
+            " -o StrictHostKeyChecking=no"
+            " -o UserKnownHostsFile=/dev/null"
+            " -p 2222'"
+            " git clone git@proxy:octocat/repo-many-wants.git /tmp/repo-many-wants-final"
+        )
+        client.succeed("test -f /tmp/repo-many-wants-final/wants.txt")
+        client.succeed("git -C /tmp/repo-many-wants-final rev-parse refs/tags/tag-2048")
+
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"octocat/repo-many-wants\"'"
+            " | grep -F 'local mirror catch-up completed before request timeout'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"octocat/repo-many-wants\"'"
+            " | grep -F 'serving SSH fetch directly from local disk after want resolution'"
+        )
+        proxy.succeed(
+            "! journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            " | grep -F '\"repo\":\"octocat/repo-many-wants\"'"
+            " | grep -F 'local mirror catch-up timed out; falling back to upstream proxy'"
+        )
+
+    # ── Subtest 5g: Concurrent uncached hydrations complete and drain semaphore ──
     with subtest("Concurrent uncached clones release the repo semaphore"):
         semaphore_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
         semaphore_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
@@ -846,7 +948,7 @@ pkgs.testers.runNixOSTest {
             f"! redis-cli -h valkey EXISTS '{semaphore_key}' | grep -qx 1"
         )
 
-    # ── Subtest 5g: External scrubber handles published generation layout ──
+    # ── Subtest 5h: External scrubber handles published generation layout ──
     with subtest("External scrubber succeeds and keeps generation-backed repos"):
         proxy.succeed("systemctl start forgeproxy-cache-scrub.service")
         proxy.succeed(
