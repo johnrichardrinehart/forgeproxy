@@ -58,13 +58,13 @@ struct UpstreamUploadPackBehavior {
     capture_for_hydration: bool,
 }
 
-#[derive(Clone)]
 struct UpstreamUploadPackContext {
     state: Arc<AppState>,
     channel_states: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     capture_metadata: Arc<Mutex<HashMap<ChannelId, UpstreamCaptureMetadata>>>,
     handle: russh::server::Handle,
     channel_id: ChannelId,
+    stream_channel: Option<Channel<Msg>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -89,8 +89,8 @@ pub struct SshSession {
     /// Data received from the SSH client is forwarded here.
     child_stdin: Option<tokio::process::ChildStdin>,
     /// Session channels opened for this connection, keyed by channel id.
-    /// Cached-path upload-pack streaming uses the channel writer API so large
-    /// responses honor SSH window backpressure.
+    /// We retain the handles long enough to validate channel lifecycle state
+    /// and then stream with `Handle::data` so EOF ordering stays explicit.
     channels: HashMap<ChannelId, Channel<Msg>>,
     /// `GIT_PROTOCOL` value sent by the client via SSH env request.
     git_protocol: Option<String>,
@@ -141,44 +141,17 @@ fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32
     session.close(channel_id);
 }
 
-async fn finalize_upload_pack_channel<W>(
+/// Finalize upload-pack without relying on `Channel::make_writer()`: its
+/// `AsyncWrite::shutdown` implementation sends SSH EOF immediately, which can
+/// race ahead of exit-status and break Git's transport expectations.
+async fn finalize_upload_pack_channel(
     owner_repo: &str,
     handle: &russh::server::Handle,
     channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     channel_id: ChannelId,
-    writer: Option<&mut W>,
     exit_status: u32,
     total_bytes: u64,
-) where
-    W: AsyncWriteExt + Unpin,
-{
-    let writer_used = writer.is_some();
-    let writer_shutdown_ok = if let Some(writer) = writer {
-        match writer.shutdown().await {
-            Ok(()) => {
-                info!(
-                    repo = %owner_repo,
-                    ?channel_id,
-                    total_bytes,
-                    "SSH upload-pack channel writer shutdown complete"
-                );
-                Some(true)
-            }
-            Err(error) => {
-                warn!(
-                    repo = %owner_repo,
-                    ?channel_id,
-                    total_bytes,
-                    error = %error,
-                    "SSH upload-pack channel writer shutdown failed"
-                );
-                Some(false)
-            }
-        }
-    } else {
-        None
-    };
-
+) {
     let exit_status_sent = match handle.exit_status_request(channel_id, exit_status).await {
         Ok(()) => {
             info!(
@@ -259,13 +232,42 @@ async fn finalize_upload_pack_channel<W>(
         ?channel_id,
         total_bytes,
         exit_status,
-        writer_used,
-        writer_shutdown_ok = ?writer_shutdown_ok,
         eof_sent,
         exit_status_sent,
         close_sent,
         "SSH upload-pack stream finalized"
     );
+}
+
+async fn send_channel_data_chunks(
+    handle: &russh::server::Handle,
+    channel_id: ChannelId,
+    data: &[u8],
+) -> Result<(), ()> {
+    for part in data.chunks(SSH_DATA_CHUNK_SIZE) {
+        handle
+            .data(channel_id, CryptoVec::from_slice(part))
+            .await
+            .map_err(|_| ())?;
+    }
+
+    Ok(())
+}
+
+async fn send_channel_data<W>(
+    handle: &russh::server::Handle,
+    channel_id: ChannelId,
+    writer: Option<&mut W>,
+    data: &[u8],
+) -> Result<(), ()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if let Some(writer) = writer {
+        writer.write_all(data).await.map_err(|_| ())
+    } else {
+        send_channel_data_chunks(handle, channel_id, data).await
+    }
 }
 
 struct LocalUploadPackResponseContext {
@@ -358,7 +360,7 @@ async fn serve_local_upload_pack_once(
     };
     let _repo_lease = repo_lease;
 
-    let mut writer = stream_channel.map(|channel| channel.make_writer());
+    let mut channel_writer = stream_channel.map(|channel| channel.make_writer());
     let mut total_bytes: u64 = 0;
     let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
     loop {
@@ -367,13 +369,7 @@ async fn serve_local_upload_pack_once(
             Ok(read) => {
                 total_bytes += read as u64;
                 let chunk = &stdout_buf[..read];
-                if let Some(writer) = writer.as_mut() {
-                    if let Err(error) = writer.write_all(chunk).await {
-                        warn!(repo = %owner_repo, error = %error, "failed to stream local git upload-pack output via channel writer");
-                        break;
-                    }
-                } else if handle
-                    .data(channel_id, CryptoVec::from_slice(chunk))
+                if send_channel_data(&handle, channel_id, channel_writer.as_mut(), chunk)
                     .await
                     .is_err()
                 {
@@ -406,12 +402,12 @@ async fn serve_local_upload_pack_once(
     }
 
     if should_close_channel {
+        drop(channel_writer);
         finalize_upload_pack_channel(
             owner_repo,
             &handle,
             &channel_states,
             channel_id,
-            writer.as_mut(),
             0,
             total_bytes,
         )
@@ -870,7 +866,7 @@ impl Handler for SshSession {
             let fetch_in_batch = request_batch
                 .iter()
                 .any(|(_, kind, _, _, _)| *kind == V2RequestKind::Fetch);
-            let fetch_stream_channel = if fetch_in_batch {
+            let mut fetch_stream_channel = if fetch_in_batch {
                 self.channels.remove(&channel_id)
             } else {
                 None
@@ -884,7 +880,6 @@ impl Handler for SshSession {
             let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
             tokio::spawn(async move {
-                let mut fetch_stream_channel = fetch_stream_channel;
                 for (owner_repo, request_kind, want_have, authenticated, git_protocol) in
                     request_batch
                 {
@@ -902,11 +897,11 @@ impl Handler for SshSession {
                             capture_metadata: Arc::clone(&capture_metadata),
                             handle: handle.clone(),
                             channel_id,
-                        },
-                        if request_kind == V2RequestKind::Fetch {
-                            fetch_stream_channel.take()
-                        } else {
-                            None
+                            stream_channel: if request_kind == V2RequestKind::Fetch {
+                                fetch_stream_channel.take()
+                            } else {
+                                None
+                            },
                         },
                         UpstreamUploadPackRequest {
                             owner_repo,
@@ -956,8 +951,8 @@ impl Handler for SshSession {
                         capture_metadata,
                         handle,
                         channel_id,
+                        stream_channel,
                     },
-                    stream_channel,
                     UpstreamUploadPackRequest {
                         owner_repo,
                         want_have,
@@ -1022,8 +1017,8 @@ impl Handler for SshSession {
                         capture_metadata,
                         handle,
                         channel_id,
+                        stream_channel,
                     },
-                    stream_channel,
                     UpstreamUploadPackRequest {
                         owner_repo,
                         want_have,
@@ -1306,9 +1301,10 @@ impl Handler for SshSession {
                             let channel_states = Arc::clone(&self.upstream_proxy_channels);
                             let repo_for_stream = repo.clone();
 
-                            // Spawn a task that streams upload-pack stdout to
-                            // the SSH channel using russh's channel writer so
-                            // large responses obey SSH window backpressure.
+                            // Spawn a task that streams upload-pack stdout via
+                            // the channel writer so channel windows are
+                            // respected while EOF remains under the finalizer's
+                            // control.
                             tokio::spawn(async move {
                                 let _generation_lease = generation_lease;
                                 let mut stdout = stdout;
@@ -1323,14 +1319,19 @@ impl Handler for SshSession {
                                         Ok(0) => break,
                                         Ok(read) => {
                                             total_bytes += read as u64;
-                                            if let Err(error) =
-                                                channel_writer.write_all(&stdout_buf[..read]).await
+                                            if send_channel_data(
+                                                &handle,
+                                                channel_id,
+                                                Some(&mut channel_writer),
+                                                &stdout_buf[..read],
+                                            )
+                                            .await
+                                            .is_err()
                                             {
                                                 debug!(
                                                     repo = %repo_for_stream,
                                                     ?channel_id,
                                                     total_bytes,
-                                                    error = %error,
                                                     "error streaming upload-pack stdout to SSH channel"
                                                 );
                                                 disconnected = true;
@@ -1376,12 +1377,12 @@ impl Handler for SshSession {
 
                                 // RFC 4254: exit-status → EOF → close.
                                 if !disconnected {
+                                    drop(channel_writer);
                                     finalize_upload_pack_channel(
                                         &repo_for_stream,
                                         &handle,
                                         &channel_states,
                                         channel_id,
-                                        Some(&mut channel_writer),
                                         exit_code,
                                         total_bytes,
                                     )
@@ -1473,10 +1474,7 @@ impl Handler for SshSession {
                                 // Forward ref advertisement; channel stays open
                                 // for want/have — `channel_eof` will POST.
                                 debug!(repo = %repo_bg, bytes = advert.len(), "DIAG: sending ref advertisement via handle.data");
-                                match handle
-                                    .data(channel_id, CryptoVec::from_slice(&advert))
-                                    .await
-                                {
+                                match send_channel_data_chunks(&handle, channel_id, &advert).await {
                                     Ok(()) => {
                                         debug!(repo = %repo_bg, "DIAG: handle.data returned Ok")
                                     }
@@ -1508,7 +1506,6 @@ impl Handler for SshSession {
                                     &handle,
                                     &channel_states,
                                     channel_id,
-                                    Option::<&mut tokio::io::Sink>::None,
                                     1,
                                     0,
                                 )
@@ -1542,7 +1539,6 @@ impl Handler for SshSession {
 /// after the client acknowledges teardown.
 async fn proxy_upstream_upload_pack(
     context: UpstreamUploadPackContext,
-    stream_channel: Option<Channel<Msg>>,
     request: UpstreamUploadPackRequest,
     behavior: UpstreamUploadPackBehavior,
 ) {
@@ -1552,6 +1548,7 @@ async fn proxy_upstream_upload_pack(
         capture_metadata,
         handle,
         channel_id,
+        stream_channel,
     } = context;
     let UpstreamUploadPackRequest {
         owner_repo,
@@ -1847,37 +1844,18 @@ async fn proxy_upstream_upload_pack(
                                 capture = Some(active_capture);
                             }
                         }
-                        if let Some(writer) = channel_writer.as_mut() {
-                            if let Err(e) = writer.write_all(&chunk).await {
-                                if behavior.warn_on_disconnect {
-                                    warn!(
-                                        repo = %owner_repo,
-                                        error = %e,
-                                        "client disconnected during pack stream"
-                                    );
-                                }
-                                had_error = true;
+                        if send_channel_data(&handle, channel_id, channel_writer.as_mut(), &chunk)
+                            .await
+                            .is_err()
+                        {
+                            if behavior.warn_on_disconnect {
+                                warn!(
+                                    repo = %owner_repo,
+                                    "client disconnected during pack stream"
+                                );
                             }
-                        } else {
-                            for part in chunk.chunks(SSH_DATA_CHUNK_SIZE) {
-                                if handle
-                                    .data(channel_id, CryptoVec::from_slice(part))
-                                    .await
-                                    .is_err()
-                                {
-                                    if behavior.warn_on_disconnect {
-                                        warn!(
-                                            repo = %owner_repo,
-                                            "client disconnected during pack stream"
-                                        );
-                                    }
-                                    had_error = true;
-                                    break;
-                                }
-                            }
-                            if had_error {
-                                break;
-                            }
+                            had_error = true;
+                            break;
                         }
                     }
                     Err(e) => {
@@ -1920,12 +1898,12 @@ async fn proxy_upstream_upload_pack(
                     );
                 }
                 if behavior.should_close_channel {
+                    drop(channel_writer);
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
                         &channel_states,
                         channel_id,
-                        channel_writer.as_mut(),
                         1,
                         total_bytes,
                     )
@@ -2131,12 +2109,12 @@ async fn proxy_upstream_upload_pack(
                     );
                 }
                 if behavior.should_close_channel {
+                    drop(channel_writer);
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
                         &channel_states,
                         channel_id,
-                        channel_writer.as_mut(),
                         0,
                         total_bytes,
                     )
@@ -2180,7 +2158,6 @@ async fn proxy_upstream_upload_pack(
                     &handle,
                     &channel_states,
                     channel_id,
-                    Option::<&mut tokio::io::Sink>::None,
                     1,
                     0,
                 )
