@@ -288,5 +288,5 @@ variable "org_creds" {
 variable "otlp_endpoint" {
   type        = string
   default     = ""
-  description = "OpenTelemetry (OTLP) endpoint (optional; leave empty to disable)"
+  description = "OpenTelemetry (OTLP) metrics egress endpoint written into the shared forgeproxy service config (optional; leave empty to disable)"
 }

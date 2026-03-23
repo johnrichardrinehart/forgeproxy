@@ -48,14 +48,16 @@ storage:
     use_fips: ${s3_use_fips}
     presigned_url_ttl: ${s3_presigned_url_ttl}
 
-metrics:
-  prometheus:
-    enabled: true
-  otlp:
-    enabled: ${otlp_enabled}
-    endpoint: "${otlp_endpoint}"
-    protocol: "grpc"
-    export_interval_secs: 60
+observability:
+  metrics:
+    prometheus:
+      enabled: true
+  exporters:
+    otlp:
+      enabled: ${otlp_enabled}
+      endpoint: "${otlp_endpoint}"
+      protocol: "grpc"
+      export_interval_secs: 60
 
 logging:
   level: "${log_level}"

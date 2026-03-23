@@ -142,6 +142,15 @@ Additional NixOS modules are available for companion services:
 Prometheus metrics are exposed at `GET /metrics`. A health check endpoint is
 available at `GET /healthz`.
 
+When the shared `config.yaml` includes an
+`observability.exporters.otlp` stanza, the forgeproxy host also runs a local
+OpenTelemetry Collector that scrapes the same `/metrics` endpoint and exports
+it to the configured OTLP destination. The collector's runtime config is
+derived from the same `config.yaml`; there is no separate operator-managed
+collector config file. `observability.metrics.prometheus` and
+`observability.exporters.otlp` can be enabled together; that is the normal
+OTLP path.
+
 ## Development
 
 Enter the dev shell:

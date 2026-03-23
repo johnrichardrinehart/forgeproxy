@@ -106,6 +106,17 @@ let
         endpoint: "http://s3:9000"
         use_fips: false
         presigned_url_ttl: 60
+
+    observability:
+      metrics:
+        prometheus:
+          enabled: true
+      exporters:
+        otlp:
+          enabled: true
+          endpoint: "http://127.0.0.1:4317"
+          protocol: "grpc"
+          export_interval_secs: 15
   '';
 
 in
@@ -390,6 +401,12 @@ pkgs.testers.runNixOSTest {
         proxy.wait_for_unit("forgeproxy.service")
         proxy.wait_for_open_port(8080)
 
+    with subtest("Shared config enables the on-host OTLP collector"):
+        proxy.wait_for_unit("forgeproxy-otlp-collector.service")
+        rendered = proxy.succeed("cat /run/forgeproxy-otelcol/config.yaml")
+        assert 'targets: ["127.0.0.1:8080"]' in rendered, rendered
+        assert 'endpoint: "127.0.0.1:4317"' in rendered, rendered
+
     with subtest("Proxy nginx starts"):
         proxy.wait_for_unit("nginx.service")
         proxy.wait_for_open_port(443)
@@ -441,6 +458,32 @@ pkgs.testers.runNixOSTest {
         )
         proxy.wait_until_succeeds(
             "find /var/cache/forgeproxy/repos/.generations/octocat/hello-world.git -mindepth 1 -maxdepth 1 -type d | grep -q ."
+        )
+
+    with subtest("Forgeproxy metrics are exported at /metrics"):
+        metrics = proxy.succeed("curl -sf http://localhost:8080/metrics")
+        assert "forgeproxy_bundle_generation_total " in metrics, metrics
+        assert "forgeproxy_archive_cache_misses_total " in metrics, metrics
+        assert "forgeproxy_clone_total{" in metrics, metrics
+        assert "forgeproxy_clone_upstream_bytes_total{" in metrics, metrics
+        assert "forgeproxy_clone_downstream_bytes_total{" in metrics, metrics
+        assert "forgeproxy_cache_repos_total " in metrics, metrics
+        assert "forgeproxy_upstream_api_rate_limit_remaining " in metrics, metrics
+
+    with subtest("Forgeproxy metrics egress over OTLP with basic auth"):
+        proxy.wait_until_succeeds(
+            "journalctl -u otlp-test-sink.service --no-pager -o cat"
+            " | grep -F 'forgeproxy_bundle_generation_total'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u otlp-test-sink.service --no-pager -o cat"
+            " | grep -F 'forgeproxy_clone_total'"
+        )
+
+    with subtest("Host metrics egress over OTLP with basic auth"):
+        proxy.wait_until_succeeds(
+            "journalctl -u otlp-test-sink.service --no-pager -o cat"
+            " | grep -F 'system.cpu.time'"
         )
 
     with subtest("Pinned fetch still uses cache after waiting"):

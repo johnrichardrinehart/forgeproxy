@@ -63,7 +63,6 @@ output "secrets_to_populate" {
     [
       aws_secretsmanager_secret.forge_admin_token.name,
       aws_secretsmanager_secret.webhook_secret.name,
-      aws_secretsmanager_secret.otlp_config.name,
     ],
     [for _, secret in aws_secretsmanager_secret.org_creds : secret.name],
     local.ghe_key_lookup_enabled ? [

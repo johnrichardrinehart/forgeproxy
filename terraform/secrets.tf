@@ -100,26 +100,6 @@ resource "aws_secretsmanager_secret_version" "webhook_secret" {
   }
 }
 
-# ── OTLP Config Secret ────────────────────────────────────────────────────
-resource "aws_secretsmanager_secret" "otlp_config" {
-  name_prefix = "${var.name_prefix}/otlp-config-"
-  description = "OpenTelemetry configuration and credentials"
-
-  tags = {
-    Name = "${var.name_prefix}-otlp-config"
-  }
-}
-
-resource "aws_secretsmanager_secret_version" "otlp_config" {
-  secret_id = aws_secretsmanager_secret.otlp_config.id
-
-  secret_string = var.otlp_endpoint != "" ? var.otlp_endpoint : "REPLACE_ME_OR_LEAVE_EMPTY"
-
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
-}
-
 # ── nginx upstream hostname secret ────────────────────────────────────────
 resource "aws_secretsmanager_secret" "nginx_upstream_hostname" {
   name_prefix = "${var.name_prefix}/nginx-upstream-hostname-"

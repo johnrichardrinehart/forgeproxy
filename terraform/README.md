@@ -75,7 +75,6 @@ terraform output -json secrets_to_populate | jq -r '.[]'
 # Example output:
 # forgeproxy/forge-admin-token-abc123
 # forgeproxy/webhook-secret-def456
-# forgeproxy/otlp-config-ghi789
 ```
 
 When `enable_ghe_key_lookup = true`, also populate:
@@ -147,6 +146,7 @@ Configuration is fetched at boot time via `ExecStartPre` scripts in systemd serv
 - **Upstream hostname/port**: Stored in `forgeproxy/nginx-upstream-hostname` and `forgeproxy/nginx-upstream-port`
   - Changes require restarting nginx: `systemctl restart nginx`
 - **Service config**: Complete `config.yaml` in `forgeproxy/service-config`
+  - Includes `observability.metrics` / `observability.exporters` settings when `otlp_endpoint` is set
   - Changes require restarting forgeproxy: `systemctl restart forgeproxy`
 - **Organization credentials**: One secret per org under `forgeproxy/creds/<org-name>`
   - Dynamic discovery at startup; no hardcoded org list
@@ -321,10 +321,11 @@ curl -k http://127.0.0.1:8080/healthz
    - Update `terraform/tls.tf` or
    - Update Secrets Manager secrets `forgeproxy/nginx-tls-cert` and `forgeproxy/nginx-tls-key`
 
-3. **Monitoring**: Set up Prometheus scraping
-   - Forgeproxy metrics: `http://<instance-ip>:9090/metrics`
-   - Add CIDRs to `metrics_scrape_cidrs` variable for direct access
-   - Or use VPC Endpoints to reach instances via private network
+3. **Monitoring**: Configure OTLP egress or optional direct scraping
+   - Set `otlp_endpoint` to have the on-instance collector scrape forgeproxy locally and export via OTLP
+   - The collector derives its runtime config from the same `forgeproxy/service-config` secret as forgeproxy itself
+   - OTLP export assumes the local Prometheus metrics surface remains enabled; both are intended to be on together
+   - Forgeproxy still exposes Prometheus metrics at `http://127.0.0.1:8080/metrics` on the instance
 
 4. **Backup**: Enable automated EBS snapshots and RDS backups (if applicable)
 
