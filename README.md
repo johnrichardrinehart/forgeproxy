@@ -145,11 +145,13 @@ available at `GET /healthz`.
 When the shared `config.yaml` includes an
 `observability.exporters.otlp` stanza, the forgeproxy host also runs a local
 OpenTelemetry Collector that scrapes the same `/metrics` endpoint and exports
-it to the configured OTLP destination. The collector's runtime config is
-derived from the same `config.yaml`; there is no separate operator-managed
-collector config file. `observability.metrics.prometheus` and
-`observability.exporters.otlp` can be enabled together; that is the normal
-OTLP path.
+it to the configured OTLP destination. That same collector also tails
+`forgeproxy.service` from journald and exports those logs over OTLP. The
+collector's runtime config is derived from the same `config.yaml`; there is no
+separate operator-managed collector config file. `observability.metrics.prometheus`
+and `observability.exporters.otlp` can be enabled together; that is the normal
+OTLP metrics path, while OTLP log export continues to follow the same exporter
+settings.
 
 ## Development
 
