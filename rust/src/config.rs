@@ -93,9 +93,53 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ObservabilityConfig {
     #[serde(default)]
+    pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub logs: LogSignalConfig,
+    #[serde(default)]
     pub traces: TraceConfig,
     #[serde(default)]
     pub exporters: ExporterConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub prometheus: PrometheusConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrometheusConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PrometheusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LogSignalConfig {
+    #[serde(default)]
+    pub journald: JournaldLogConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JournaldLogConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for JournaldLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,14 +163,28 @@ fn default_trace_sample_ratio() -> f64 {
     1.0
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ExporterConfig {
     #[serde(default)]
-    pub otlp: OtlpExporterConfig,
+    pub otlp: OtlpExporterSetConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OtlpExporterSetConfig {
+    #[serde(default)]
+    pub metrics: OtlpSignalExporterConfig,
+    #[serde(default)]
+    pub logs: OtlpSignalExporterConfig,
+    #[serde(default)]
+    pub traces: OtlpSignalExporterConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct OtlpExporterConfig {
+pub struct OtlpSignalExporterConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -135,21 +193,38 @@ pub struct OtlpExporterConfig {
     pub protocol: OtlpProtocol,
     #[serde(default = "default_otlp_export_interval_secs")]
     pub export_interval_secs: u64,
+    #[serde(default)]
+    pub auth: OtlpAuthConfig,
 }
 
-impl Default for OtlpExporterConfig {
+impl Default for OtlpSignalExporterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             endpoint: String::new(),
             protocol: OtlpProtocol::default(),
             export_interval_secs: default_otlp_export_interval_secs(),
+            auth: OtlpAuthConfig::default(),
         }
     }
 }
 
 fn default_otlp_export_interval_secs() -> u64 {
     60
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OtlpAuthConfig {
+    #[serde(default)]
+    pub basic: OtlpBasicAuthConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OtlpBasicAuthConfig {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -728,6 +803,10 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
 
 /// Basic sanity checks that cannot be expressed purely with serde.
 fn validate_config(config: &Config) -> Result<()> {
+    let metrics_exporter = &config.observability.exporters.otlp.metrics;
+    let logs_exporter = &config.observability.exporters.otlp.logs;
+    let traces_exporter = &config.observability.exporters.otlp.traces;
+
     anyhow::ensure!(
         config.storage.local.high_water_mark > config.storage.local.low_water_mark,
         "high_water_mark must be greater than low_water_mark"
@@ -756,22 +835,59 @@ fn validate_config(config: &Config) -> Result<()> {
         (0.0..=1.0).contains(&config.observability.traces.sample_ratio),
         "observability.traces.sample_ratio must be in range [0.0, 1.0]"
     );
-    if config.observability.traces.enabled {
+
+    validate_otlp_exporter("observability.exporters.otlp.metrics", metrics_exporter)?;
+    validate_otlp_exporter("observability.exporters.otlp.logs", logs_exporter)?;
+    validate_otlp_exporter("observability.exporters.otlp.traces", traces_exporter)?;
+
+    if metrics_exporter.enabled {
         anyhow::ensure!(
-            config.observability.exporters.otlp.enabled,
-            "observability.traces.enabled requires observability.exporters.otlp.enabled"
-        );
-        anyhow::ensure!(
-            !config
-                .observability
-                .exporters
-                .otlp
-                .endpoint
-                .trim()
-                .is_empty(),
-            "observability.traces.enabled requires observability.exporters.otlp.endpoint"
+            config.observability.metrics.prometheus.enabled,
+            "observability.exporters.otlp.metrics.enabled requires observability.metrics.prometheus.enabled"
         );
     }
+
+    if logs_exporter.enabled {
+        anyhow::ensure!(
+            config.observability.logs.journald.enabled,
+            "observability.exporters.otlp.logs.enabled requires observability.logs.journald.enabled"
+        );
+    }
+
+    if config.observability.traces.enabled {
+        anyhow::ensure!(
+            traces_exporter.enabled,
+            "observability.traces.enabled requires observability.exporters.otlp.traces.enabled"
+        );
+        anyhow::ensure!(
+            !traces_exporter.endpoint.trim().is_empty(),
+            "observability.traces.enabled requires observability.exporters.otlp.traces.endpoint"
+        );
+    }
+    Ok(())
+}
+
+fn validate_otlp_exporter(path: &str, exporter: &OtlpSignalExporterConfig) -> Result<()> {
+    anyhow::ensure!(
+        exporter.export_interval_secs > 0,
+        "{path}.export_interval_secs must be a positive integer"
+    );
+
+    if exporter.enabled {
+        anyhow::ensure!(
+            !exporter.endpoint.trim().is_empty(),
+            "{path}.endpoint must be set when the exporter is enabled"
+        );
+    }
+
+    let basic_auth = &exporter.auth.basic;
+    let has_username = !basic_auth.username.trim().is_empty();
+    let has_password = !basic_auth.password.trim().is_empty();
+    anyhow::ensure!(
+        has_username == has_password,
+        "{path}.auth.basic.username and {path}.auth.basic.password must either both be set or both be empty"
+    );
+
     Ok(())
 }
 

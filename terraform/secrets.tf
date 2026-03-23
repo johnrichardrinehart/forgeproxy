@@ -33,8 +33,24 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     s3_presigned_url_ttl   = var.s3_presigned_url_ttl
     local_cache_max_bytes  = var.local_cache_max_bytes
     eviction_policy        = var.eviction_policy
-    otlp_enabled           = var.otlp_endpoint != "" ? true : false
-    otlp_endpoint          = var.otlp_endpoint != "" ? var.otlp_endpoint : ""
+    otlp_metrics_enabled   = var.otlp_metrics.endpoint != "" ? true : false
+    otlp_metrics_endpoint  = var.otlp_metrics.endpoint
+    otlp_metrics_protocol  = var.otlp_metrics.protocol
+    otlp_metrics_interval  = var.otlp_metrics.export_interval_secs
+    otlp_metrics_username  = var.otlp_metrics.basic_auth_username
+    otlp_metrics_password  = var.otlp_metrics.basic_auth_password
+    otlp_logs_enabled      = var.otlp_logs.endpoint != "" ? true : false
+    otlp_logs_endpoint     = var.otlp_logs.endpoint
+    otlp_logs_protocol     = var.otlp_logs.protocol
+    otlp_logs_interval     = var.otlp_logs.export_interval_secs
+    otlp_logs_username     = var.otlp_logs.basic_auth_username
+    otlp_logs_password     = var.otlp_logs.basic_auth_password
+    otlp_traces_enabled    = var.otlp_traces.endpoint != "" ? true : false
+    otlp_traces_endpoint   = var.otlp_traces.endpoint
+    otlp_traces_protocol   = var.otlp_traces.protocol
+    otlp_traces_interval   = var.otlp_traces.export_interval_secs
+    otlp_traces_username   = var.otlp_traces.basic_auth_username
+    otlp_traces_password   = var.otlp_traces.basic_auth_password
     log_level              = var.log_level
     name_prefix            = var.name_prefix
     org_creds              = var.org_creds

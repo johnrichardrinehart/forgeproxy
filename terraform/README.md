@@ -146,7 +146,7 @@ Configuration is fetched at boot time via `ExecStartPre` scripts in systemd serv
 - **Upstream hostname/port**: Stored in `forgeproxy/nginx-upstream-hostname` and `forgeproxy/nginx-upstream-port`
   - Changes require restarting nginx: `systemctl restart nginx`
 - **Service config**: Complete `config.yaml` in `forgeproxy/service-config`
-  - Includes `observability.metrics` / `observability.exporters` settings when `otlp_endpoint` is set
+  - Includes `observability.metrics`, `observability.logs`, `observability.traces`, and per-signal `observability.exporters.otlp` settings
   - Changes require restarting forgeproxy: `systemctl restart forgeproxy`
 - **Organization credentials**: One secret per org under `forgeproxy/creds/<org-name>`
   - Dynamic discovery at startup; no hardcoded org list
@@ -328,10 +328,16 @@ curl -k http://127.0.0.1:8080/healthz
    - Update Secrets Manager secrets `forgeproxy/nginx-tls-cert` and `forgeproxy/nginx-tls-key`
 
 3. **Monitoring**: Configure OTLP egress or optional direct scraping
-   - Set `otlp_endpoint` to have the on-instance collector scrape forgeproxy locally and export metrics plus `forgeproxy.service` journald logs via OTLP
-   - The collector derives its runtime config from the same `forgeproxy/service-config` secret as forgeproxy itself
-   - OTLP metrics export assumes the local Prometheus metrics surface remains enabled; OTLP log export follows the same exporter settings for journald
-   - The rendered shared config also enables `observability.traces`, so forgeproxy exports OTLP traces directly to the same endpoint
+   - Set `otlp_metrics`, `otlp_logs`, and `otlp_traces` to describe the real external destinations for each signal
+   - The on-instance Collector derives its runtime config from the same `forgeproxy/service-config` secret as forgeproxy itself; there is still no separate operator-managed collector config file
+   - Metrics and logs always egress through the on-instance Collector:
+     - Metrics are scraped from `http://127.0.0.1:8080/metrics`
+     - Logs are tailed from `forgeproxy.service` in journald
+   - Traces also egress through the on-instance Collector:
+     - forgeproxy sends spans to a fixed loopback OTLP receiver on `127.0.0.1:4317`
+     - the on-instance Collector then exports those spans to `otlp_traces.endpoint`
+   - Each signal can use a different OTLP protocol, endpoint, and HTTP basic-auth credential pair
+   - This is the intended place to point at an internal Collector or auth proxy which then forwards to final backends such as VictoriaMetrics
    - Forgeproxy still exposes Prometheus metrics at `http://127.0.0.1:8080/metrics` on the instance
 
 4. **Backup**: Enable automated EBS snapshots and RDS backups (if applicable)

@@ -573,23 +573,17 @@ fn build_tracing_filter(config: &Config) -> EnvFilter {
         .unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
+const LOCAL_OTLP_TRACE_COLLECTOR_ENDPOINT: &str = "http://127.0.0.1:4317";
+
 fn build_trace_provider(config: &Config) -> Result<Option<SdkTracerProvider>> {
     if !config.observability.traces.enabled {
         return Ok(None);
     }
 
-    let otlp = &config.observability.exporters.otlp;
-    let exporter = match otlp.protocol {
-        crate::config::OtlpProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(otlp.endpoint.clone())
-            .build()?,
-        crate::config::OtlpProtocol::HttpProtobuf => opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
-            .with_endpoint(otlp.endpoint.clone())
-            .build()?,
-    };
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(LOCAL_OTLP_TRACE_COLLECTOR_ENDPOINT)
+        .build()?;
 
     let sampler = match config.observability.traces.sample_ratio {
         ratio if ratio <= 0.0 => Sampler::AlwaysOff,

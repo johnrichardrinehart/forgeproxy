@@ -83,4 +83,26 @@ org_creds = [
 ]
 
 # OpenTelemetry configuration (optional)
-otlp_endpoint = ""  # Leave empty to disable OTLP
+otlp_metrics = {
+  endpoint             = ""
+  protocol             = "grpc"
+  export_interval_secs = 60
+  basic_auth_username  = ""
+  basic_auth_password  = ""
+}
+
+otlp_logs = {
+  endpoint             = ""
+  protocol             = "grpc"
+  export_interval_secs = 60
+  basic_auth_username  = ""
+  basic_auth_password  = ""
+}
+
+otlp_traces = {
+  endpoint             = ""
+  protocol             = "grpc"
+  export_interval_secs = 60
+  basic_auth_username  = ""
+  basic_auth_password  = ""
+}
