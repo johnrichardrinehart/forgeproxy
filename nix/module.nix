@@ -126,6 +126,8 @@ let
   };
 in
 {
+  imports = [ ./otel-collector.nix ];
+
   options.services.forgeproxy = {
     enable = lib.mkEnableOption "Git Caching Reverse Proxy service";
 

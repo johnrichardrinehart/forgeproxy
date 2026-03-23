@@ -294,6 +294,7 @@
 
         nixosModules = {
           forgeproxy = ./nix/module.nix;
+          otel-collector = ./nix/otel-collector.nix;
           valkey = ./nix/valkey.nix;
           valkey-tls = ./nix/valkey-tls.nix;
           nginx = ./nix/nginx.nix;

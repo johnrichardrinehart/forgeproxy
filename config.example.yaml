@@ -60,6 +60,18 @@ storage:
     region: "us-gov-west-1"
     use_fips: true
     presigned_url_ttl: 60
+observability:
+  metrics:
+    prometheus:
+      enabled: true
+  exporters:
+    otlp:
+      enabled: false
+      endpoint: ""
+      protocol: "grpc"
+      export_interval_secs: 60
+logging:
+  level: "info"
 repo_overrides:
   "org/monorepo":
     eviction_priority: "pinned"
