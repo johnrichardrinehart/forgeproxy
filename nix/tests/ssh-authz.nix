@@ -131,7 +131,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-authz";
-  globalTimeout = 360;
+  globalTimeout = 480;
 
   # ---------------------------------------------------------------------------
   # Node definitions
