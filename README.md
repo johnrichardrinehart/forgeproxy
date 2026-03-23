@@ -142,21 +142,70 @@ Additional NixOS modules are available for companion services:
 Prometheus metrics are exposed at `GET /metrics`. A health check endpoint is
 available at `GET /healthz`.
 
-When the shared `config.yaml` includes an
-`observability.exporters.otlp` stanza, the forgeproxy host also runs a local
-OpenTelemetry Collector that scrapes the same `/metrics` endpoint and exports
-it to the configured OTLP destination. That same collector also tails
-`forgeproxy.service` from journald and exports those logs over OTLP.
+When the shared `config.yaml` includes any
+`observability.exporters.otlp.<signal>` stanza, the forgeproxy host also runs a
+local OpenTelemetry Collector. There is still only one operator-managed config
+file. The collector's runtime config is derived from that same `config.yaml`;
+there is no separate collector config surface to maintain.
 
-Native OTLP trace export is configured from the same `config.yaml` through
-`observability.traces`. When enabled, forgeproxy exports tracing spans directly
-to the configured OTLP endpoint, including the existing request and background
-task spans emitted through Rust `tracing`. The collector's runtime config is
-derived from the same `config.yaml`; there is no separate operator-managed
-collector config file. `observability.metrics.prometheus`,
-`observability.exporters.otlp`, and `observability.traces` can be enabled
-together. That is the normal OTLP setup for metrics and logs through the local
-collector plus traces directly from forgeproxy.
+The signal flow is:
+
+- Metrics: forgeproxy exposes Prometheus/OpenMetrics at `/metrics`; the
+  host-local Collector scrapes that endpoint and re-exports it as OTLP.
+- Logs: forgeproxy continues to write structured logs to journald; the
+  host-local Collector tails `forgeproxy.service` and exports those logs as
+  OTLP.
+- Traces: forgeproxy emits tracing spans through Rust `tracing`; when
+  `observability.traces.enabled` is true, forgeproxy sends those spans to the
+  host-local Collector over a fixed loopback OTLP receiver at
+  `127.0.0.1:4317`, and the Collector exports them onward.
+
+That means the internal Collector endpoint and the external backend endpoints
+are different things:
+
+- Internal endpoint: a private loopback hop used only on the forgeproxy host so
+  forgeproxy can hand trace spans to the Collector.
+- External endpoints: the real egress destinations configured under
+  `observability.exporters.otlp.metrics`, `observability.exporters.otlp.logs`,
+  and `observability.exporters.otlp.traces`.
+
+The normal configuration shape is:
+
+```yaml
+observability:
+  metrics:
+    prometheus:
+      enabled: true
+  logs:
+    journald:
+      enabled: true
+  traces:
+    enabled: true
+    sample_ratio: 1.0
+  exporters:
+    otlp:
+      metrics:
+        enabled: true
+        endpoint: "https://collector.internal.example/v1/metrics"
+        protocol: "http/protobuf"
+        auth:
+          basic:
+            username: "metrics-user"
+            password: "metrics-password"
+      logs:
+        enabled: true
+        endpoint: "https://logs.internal.example/v1/logs"
+        protocol: "http/protobuf"
+      traces:
+        enabled: true
+        endpoint: "https://traces.internal.example/v1/traces"
+        protocol: "http/protobuf"
+```
+
+Each signal can use a different OTLP endpoint, protocol, and basic-auth
+credential pair. That is the intended way to point forgeproxy at an internal
+Collector or auth proxy which then forwards to the final backend, such as a
+VictoriaMetrics metrics ingest URL plus different log/trace backends.
 
 ## Development
 

@@ -6,12 +6,43 @@
 
 let
   common = import ./common.nix { inherit pkgs lib; };
+  otlpMetricsUser = "metrics-user";
+  otlpMetricsPassword = "metrics-password";
+  otlpLogsUser = "logs-user";
+  otlpLogsPassword = "logs-password";
+  otlpTracesUser = "traces-user";
+  otlpTracesPassword = "traces-password";
+  otlpMetricsIngressPort = 4318;
+  otlpLogsIngressPort = 4319;
+  otlpTracesIngressPort = 4320;
+  otlpMetricsSinkPort = 14318;
+  otlpLogsSinkPort = 14319;
+  otlpTracesSinkPort = 14320;
+  otlpBasicAuthFiles =
+    pkgs.runCommand "forgeproxy-test-otlp-basic-auth"
+      {
+        nativeBuildInputs = [ pkgs.apacheHttpd ];
+      }
+      ''
+        mkdir -p $out
+        htpasswd -nbB ${otlpMetricsUser} ${otlpMetricsPassword} > $out/metrics.htpasswd
+        htpasswd -nbB ${otlpLogsUser} ${otlpLogsPassword} > $out/logs.htpasswd
+        htpasswd -nbB ${otlpTracesUser} ${otlpTracesPassword} > $out/traces.htpasswd
+      '';
   otlpTestSinkConfig = pkgs.writeText "forgeproxy-test-otlp-sink.yaml" ''
     receivers:
-      otlp:
+      otlp/metrics:
         protocols:
-          grpc:
-            endpoint: 127.0.0.1:4317
+          http:
+            endpoint: 127.0.0.1:${toString otlpMetricsSinkPort}
+      otlp/logs:
+        protocols:
+          http:
+            endpoint: 127.0.0.1:${toString otlpLogsSinkPort}
+      otlp/traces:
+        protocols:
+          http:
+            endpoint: 127.0.0.1:${toString otlpTracesSinkPort}
 
     processors:
       batch: {}
@@ -26,15 +57,15 @@ let
           level: none
       pipelines:
         traces:
-          receivers: [otlp]
+          receivers: [otlp/traces]
           processors: [batch]
           exporters: [debug]
         logs:
-          receivers: [otlp]
+          receivers: [otlp/logs]
           processors: [batch]
           exporters: [debug]
         metrics:
-          receivers: [otlp]
+          receivers: [otlp/metrics]
           processors: [batch]
           exporters: [debug]
   '';
@@ -143,15 +174,41 @@ let
       metrics:
         prometheus:
           enabled: true
+      logs:
+        journald:
+          enabled: true
       traces:
         enabled: true
         sample_ratio: 1.0
       exporters:
         otlp:
-          enabled: true
-          endpoint: "http://127.0.0.1:4317"
-          protocol: "grpc"
-          export_interval_secs: 15
+          metrics:
+            enabled: true
+            endpoint: "http://127.0.0.1:${toString otlpMetricsIngressPort}/v1/metrics"
+            protocol: "http/protobuf"
+            export_interval_secs: 15
+            auth:
+              basic:
+                username: "${otlpMetricsUser}"
+                password: "${otlpMetricsPassword}"
+          logs:
+            enabled: true
+            endpoint: "http://127.0.0.1:${toString otlpLogsIngressPort}/v1/logs"
+            protocol: "http/protobuf"
+            export_interval_secs: 15
+            auth:
+              basic:
+                username: "${otlpLogsUser}"
+                password: "${otlpLogsPassword}"
+          traces:
+            enabled: true
+            endpoint: "http://127.0.0.1:${toString otlpTracesIngressPort}/v1/traces"
+            protocol: "http/protobuf"
+            export_interval_secs: 15
+            auth:
+              basic:
+                username: "${otlpTracesUser}"
+                password: "${otlpTracesPassword}"
   '';
 
 in
@@ -262,6 +319,38 @@ pkgs.testers.runNixOSTest {
             RestartSec = 2;
           };
         };
+
+        services.nginx.appendHttpConfig = lib.mkAfter ''
+          server {
+            listen 127.0.0.1:${toString otlpMetricsIngressPort};
+            auth_basic "forgeproxy otlp metrics";
+            auth_basic_user_file ${otlpBasicAuthFiles}/metrics.htpasswd;
+
+            location = /v1/metrics {
+              proxy_pass http://127.0.0.1:${toString otlpMetricsSinkPort};
+            }
+          }
+
+          server {
+            listen 127.0.0.1:${toString otlpLogsIngressPort};
+            auth_basic "forgeproxy otlp logs";
+            auth_basic_user_file ${otlpBasicAuthFiles}/logs.htpasswd;
+
+            location = /v1/logs {
+              proxy_pass http://127.0.0.1:${toString otlpLogsSinkPort};
+            }
+          }
+
+          server {
+            listen 127.0.0.1:${toString otlpTracesIngressPort};
+            auth_basic "forgeproxy otlp traces";
+            auth_basic_user_file ${otlpBasicAuthFiles}/traces.htpasswd;
+
+            location = /v1/traces {
+              proxy_pass http://127.0.0.1:${toString otlpTracesSinkPort};
+            }
+          }
+        '';
 
         services.forgeproxy-nginx = {
           enable = true;
@@ -450,13 +539,19 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Shared config enables the on-host OTLP collector"):
         proxy.wait_for_unit("otlp-test-sink.service")
-        proxy.wait_for_open_port(4317)
         proxy.wait_for_unit("forgeproxy-otlp-collector.service")
         rendered = proxy.succeed("cat /run/forgeproxy-otelcol/config.yaml")
         assert 'targets: ["127.0.0.1:8080"]' in rendered, rendered
+        assert 'endpoint: "http://127.0.0.1:4318/v1/metrics"' in rendered, rendered
+        assert 'endpoint: "http://127.0.0.1:4319/v1/logs"' in rendered, rendered
+        assert 'endpoint: "http://127.0.0.1:4320/v1/traces"' in rendered, rendered
         assert 'endpoint: "127.0.0.1:4317"' in rendered, rendered
         assert 'units: ["forgeproxy.service"]' in rendered, rendered
         assert "logs:" in rendered, rendered
+        assert "traces:" in rendered, rendered
+        assert "basicauth/client-metrics" in rendered, rendered
+        assert "basicauth/client-logs" in rendered, rendered
+        assert "basicauth/client-traces" in rendered, rendered
         proxy.succeed(
             "! journalctl -u forgeproxy-otlp-collector.service --no-pager -o cat"
             " | grep -Eiq 'permission denied|executable file not found|Failed to get journal file list'"
@@ -551,6 +646,12 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             "journalctl -u otlp-test-sink.service --no-pager -o cat"
             " | grep -F 'system.cpu.time'"
+        )
+
+    with subtest("Forgeproxy metrics egress over OTLP with basic auth"):
+        proxy.wait_until_succeeds(
+            "journalctl -u otlp-test-sink.service --no-pager -o cat"
+            " | grep -F 'forgeproxy_bundle_generation_total'"
         )
 
     with subtest("Pinned fetch still uses cache after waiting"):

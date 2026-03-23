@@ -285,8 +285,59 @@ variable "org_creds" {
   description = "List of organization credentials configurations"
 }
 
-variable "otlp_endpoint" {
-  type        = string
-  default     = ""
-  description = "OpenTelemetry (OTLP) metrics egress endpoint written into the shared forgeproxy service config (optional; leave empty to disable)"
+variable "otlp_metrics" {
+  type = object({
+    endpoint             = string
+    protocol             = string
+    export_interval_secs = number
+    basic_auth_username  = string
+    basic_auth_password  = string
+  })
+  default = {
+    endpoint             = ""
+    protocol             = "grpc"
+    export_interval_secs = 60
+    basic_auth_username  = ""
+    basic_auth_password  = ""
+  }
+  description = "OTLP metrics exporter settings written into the shared forgeproxy service config."
+  sensitive   = true
+}
+
+variable "otlp_logs" {
+  type = object({
+    endpoint             = string
+    protocol             = string
+    export_interval_secs = number
+    basic_auth_username  = string
+    basic_auth_password  = string
+  })
+  default = {
+    endpoint             = ""
+    protocol             = "grpc"
+    export_interval_secs = 60
+    basic_auth_username  = ""
+    basic_auth_password  = ""
+  }
+  description = "OTLP log exporter settings written into the shared forgeproxy service config."
+  sensitive   = true
+}
+
+variable "otlp_traces" {
+  type = object({
+    endpoint             = string
+    protocol             = string
+    export_interval_secs = number
+    basic_auth_username  = string
+    basic_auth_password  = string
+  })
+  default = {
+    endpoint             = ""
+    protocol             = "grpc"
+    export_interval_secs = 60
+    basic_auth_username  = ""
+    basic_auth_password  = ""
+  }
+  description = "OTLP trace exporter settings written into the shared forgeproxy service config."
+  sensitive   = true
 }
