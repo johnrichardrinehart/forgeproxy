@@ -51,6 +51,9 @@ observability:
   metrics:
     prometheus:
       enabled: true
+  traces:
+    enabled: ${otlp_enabled}
+    sample_ratio: 1.0
   exporters:
     otlp:
       enabled: ${otlp_enabled}

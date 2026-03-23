@@ -25,6 +25,10 @@ let
         metrics:
           level: none
       pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
         logs:
           receivers: [otlp]
           processors: [batch]
@@ -139,6 +143,9 @@ let
       metrics:
         prometheus:
           enabled: true
+      traces:
+        enabled: true
+        sample_ratio: 1.0
       exporters:
         otlp:
           enabled: true
@@ -496,6 +503,12 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             "journalctl -u otlp-test-sink.service --no-pager -o cat"
             " | grep -F 'rejected git-receive-pack (push)'"
+        )
+
+    with subtest("Forgeproxy traces egress over OTLP"):
+        proxy.wait_until_succeeds(
+            "journalctl -u otlp-test-sink.service --no-pager -o cat"
+            " | grep -F 'Name           : tick_with_summary'"
         )
 
     # ── HTTPS clone through the proxy ─────────────────────────────────────
