@@ -6,6 +6,34 @@
 
 let
   common = import ./common.nix { inherit pkgs lib; };
+  otlpTestSinkConfig = pkgs.writeText "forgeproxy-test-otlp-sink.yaml" ''
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 127.0.0.1:4317
+
+    processors:
+      batch: {}
+
+    exporters:
+      debug:
+        verbosity: detailed
+
+    service:
+      telemetry:
+        metrics:
+          level: none
+      pipelines:
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+  '';
 
   # ---------------------------------------------------------------------------
   # Test TLS certificates (generated at Nix eval time)
@@ -216,6 +244,18 @@ pkgs.testers.runNixOSTest {
           logLevel = "debug";
         };
 
+        systemd.services.otlp-test-sink = {
+          description = "OTLP sink for forgeproxy VM test assertions";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network.target" ];
+          serviceConfig = {
+            Type = "simple";
+            ExecStart = "${lib.getExe' pkgs.opentelemetry-collector-contrib "otelcol-contrib"} --config=${otlpTestSinkConfig}";
+            Restart = "on-failure";
+            RestartSec = 2;
+          };
+        };
+
         services.forgeproxy-nginx = {
           enable = true;
           serverName = "proxy";
@@ -402,10 +442,18 @@ pkgs.testers.runNixOSTest {
         proxy.wait_for_open_port(8080)
 
     with subtest("Shared config enables the on-host OTLP collector"):
+        proxy.wait_for_unit("otlp-test-sink.service")
+        proxy.wait_for_open_port(4317)
         proxy.wait_for_unit("forgeproxy-otlp-collector.service")
         rendered = proxy.succeed("cat /run/forgeproxy-otelcol/config.yaml")
         assert 'targets: ["127.0.0.1:8080"]' in rendered, rendered
         assert 'endpoint: "127.0.0.1:4317"' in rendered, rendered
+        assert 'units: ["forgeproxy.service"]' in rendered, rendered
+        assert "logs:" in rendered, rendered
+        proxy.succeed(
+            "! journalctl -u forgeproxy-otlp-collector.service --no-pager -o cat"
+            " | grep -Eiq 'permission denied|executable file not found|Failed to get journal file list'"
+        )
 
     with subtest("Proxy nginx starts"):
         proxy.wait_for_unit("nginx.service")
@@ -443,6 +491,12 @@ pkgs.testers.runNixOSTest {
             " http://localhost:8080/octocat/hello-world/git-receive-pack"
         )
         assert status.strip().strip("'") == "403", f"Expected HTTP 403, got {status}"
+
+    with subtest("Forgeproxy journald logs egress over OTLP"):
+        proxy.wait_until_succeeds(
+            "journalctl -u otlp-test-sink.service --no-pager -o cat"
+            " | grep -F 'rejected git-receive-pack (push)'"
+        )
 
     # ── HTTPS clone through the proxy ─────────────────────────────────────
     with subtest("HTTPS clone through proxy succeeds"):

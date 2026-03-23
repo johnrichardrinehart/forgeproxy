@@ -10,6 +10,7 @@ let
   cfg = config.services.forgeproxy-otel-collector;
   yq = pkgs."yq-go";
   otelcol = pkgs."opentelemetry-collector-contrib";
+  cursorStorageDir = "/var/lib/forgeproxy-otelcol/storage";
   renderConfigScript = pkgs.writeShellApplication {
     name = "forgeproxy-otlp-collector-config";
     runtimeInputs = [
@@ -35,7 +36,7 @@ let
 
       case "$mode" in
         check-enabled)
-          [[ "$prometheus_enabled" == "true" && "$enabled" == "true" && -n "$endpoint" && "$endpoint" != "null" ]]
+          [[ "$enabled" == "true" && -n "$endpoint" && "$endpoint" != "null" ]]
           exit 0
           ;;
         render)
@@ -50,7 +51,7 @@ let
       export_interval_secs=$(${yq}/bin/yq -r '.observability.exporters.otlp.export_interval_secs // .metrics.otlp.export_interval_secs // 60' "$source_config")
       scrape_target=$(${yq}/bin/yq -r '.proxy.http_listen // ""' "$source_config")
 
-      if [[ -z "$scrape_target" || "$scrape_target" == "null" ]]; then
+      if [[ "$prometheus_enabled" == "true" && ( -z "$scrape_target" || "$scrape_target" == "null" ) ]]; then
         echo "forgeproxy-otlp-collector: proxy.http_listen must be set in $source_config" >&2
         exit 1
       fi
@@ -94,17 +95,35 @@ let
       mkdir -p "$(dirname "$runtime_config")"
 
       printf '%s\n' \
+        "extensions:" \
+        "  file_storage/journald:" \
+        "    directory: \"${cursorStorageDir}\"" \
+        "    create_directory: true" \
+        "" \
         "receivers:" \
-        "  prometheus:" \
-        "    config:" \
-        "      global:" \
-        "        scrape_interval: ''${export_interval_secs}s" \
-        "        scrape_timeout: 10s" \
-        "      scrape_configs:" \
-        "        - job_name: forgeproxy" \
-        "          metrics_path: /metrics" \
-        "          static_configs:" \
-        "            - targets: [\"''${scrape_target}\"]" \
+        "  journald:" \
+        "    start_at: end" \
+        "    priority: debug" \
+        "    units: [\"forgeproxy.service\"]" \
+        "    storage: file_storage/journald" \
+        > "$runtime_config"
+
+      if [[ "$prometheus_enabled" == "true" ]]; then
+        printf '%s\n' \
+          "  prometheus:" \
+          "    config:" \
+          "      global:" \
+          "        scrape_interval: ''${export_interval_secs}s" \
+          "        scrape_timeout: 10s" \
+          "      scrape_configs:" \
+          "        - job_name: forgeproxy" \
+          "          metrics_path: /metrics" \
+          "          static_configs:" \
+          "            - targets: [\"''${scrape_target}\"]" \
+          >> "$runtime_config"
+      fi
+
+      printf '%s\n' \
         "" \
         "processors:" \
         "  batch:" \
@@ -113,7 +132,7 @@ let
         "exporters:" \
         "  ''${exporter_name}:" \
         "    endpoint: \"''${normalized_endpoint}\"" \
-        > "$runtime_config"
+        >> "$runtime_config"
 
       if [[ "$exporter_name" == "otlp" && "$insecure" == "true" ]]; then
         printf '%s\n' \
@@ -125,18 +144,31 @@ let
       printf '\n' >> "$runtime_config"
       printf '%s\n' \
         "service:" \
-        "  pipelines:" \
+        "  telemetry:" \
         "    metrics:" \
-        "      receivers: [prometheus]" \
+        "      level: none" \
+        "  extensions: [file_storage/journald]" \
+        "  pipelines:" \
+        "    logs:" \
+        "      receivers: [journald]" \
         "      processors: [batch]" \
         "      exporters: [''${exporter_name}]" \
         >> "$runtime_config"
+
+      if [[ "$prometheus_enabled" == "true" ]]; then
+        printf '%s\n' \
+          "    metrics:" \
+          "      receivers: [prometheus]" \
+          "      processors: [batch]" \
+          "      exporters: [''${exporter_name}]" \
+          >> "$runtime_config"
+      fi
     '';
   };
 in
 {
   options.services.forgeproxy-otel-collector = {
-    enable = lib.mkEnableOption "host-local OTLP collector for forgeproxy metrics" // {
+    enable = lib.mkEnableOption "host-local OTLP collector for forgeproxy metrics and logs" // {
       default = true;
     };
 
@@ -144,7 +176,7 @@ in
       type = lib.types.package;
       default = otelcol;
       defaultText = lib.literalExpression ''pkgs."otelcol-contrib"'';
-      description = "OpenTelemetry Collector package used to export forgeproxy metrics.";
+      description = "OpenTelemetry Collector package used to export forgeproxy metrics and logs.";
     };
 
     sourceConfigFile = lib.mkOption {
@@ -166,7 +198,7 @@ in
 
   config = lib.mkIf (forgeproxyCfg.enable && cfg.enable) {
     systemd.services.forgeproxy-otlp-collector = {
-      description = "OpenTelemetry Collector for forgeproxy metrics";
+      description = "OpenTelemetry Collector for forgeproxy metrics and logs";
       after = [
         "network-online.target"
         "forgeproxy.service"
@@ -180,11 +212,13 @@ in
         Type = "simple";
         DynamicUser = true;
         RuntimeDirectory = "forgeproxy-otelcol";
+        StateDirectory = "forgeproxy-otelcol";
         ExecCondition = "${renderConfigScript}/bin/forgeproxy-otlp-collector-config check-enabled";
         ExecStartPre = "${renderConfigScript}/bin/forgeproxy-otlp-collector-config render";
         ExecStart = "${lib.getExe' cfg.package "otelcol-contrib"} --config=${cfg.generatedConfigFile}";
         Restart = "on-failure";
         RestartSec = 5;
+        SupplementaryGroups = [ "systemd-journal" ];
         LockPersonality = true;
         NoNewPrivileges = true;
         PrivateTmp = true;
