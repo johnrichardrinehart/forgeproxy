@@ -325,6 +325,7 @@ curl -k http://127.0.0.1:8080/healthz
    - Set `otlp_endpoint` to have the on-instance collector scrape forgeproxy locally and export metrics plus `forgeproxy.service` journald logs via OTLP
    - The collector derives its runtime config from the same `forgeproxy/service-config` secret as forgeproxy itself
    - OTLP metrics export assumes the local Prometheus metrics surface remains enabled; OTLP log export follows the same exporter settings for journald
+   - The rendered shared config also enables `observability.traces`, so forgeproxy exports OTLP traces directly to the same endpoint
    - Forgeproxy still exposes Prometheus metrics at `http://127.0.0.1:8080/metrics` on the instance
 
 4. **Backup**: Enable automated EBS snapshots and RDS backups (if applicable)

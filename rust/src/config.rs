@@ -79,7 +79,108 @@ pub struct Config {
     pub bundles: BundleConfig,
     pub storage: StorageConfig,
     #[serde(default)]
+    pub observability: ObservabilityConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
     pub repo_overrides: HashMap<String, RepoOverride>,
+}
+
+// ---------------------------------------------------------------------------
+// Observability
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ObservabilityConfig {
+    #[serde(default)]
+    pub traces: TraceConfig,
+    #[serde(default)]
+    pub exporters: ExporterConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TraceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_trace_sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_ratio: default_trace_sample_ratio(),
+        }
+    }
+}
+
+fn default_trace_sample_ratio() -> f64 {
+    1.0
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExporterConfig {
+    #[serde(default)]
+    pub otlp: OtlpExporterConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OtlpExporterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub protocol: OtlpProtocol,
+    #[serde(default = "default_otlp_export_interval_secs")]
+    pub export_interval_secs: u64,
+}
+
+impl Default for OtlpExporterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            protocol: OtlpProtocol::default(),
+            export_interval_secs: default_otlp_export_interval_secs(),
+        }
+    }
+}
+
+fn default_otlp_export_interval_secs() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub enum OtlpProtocol {
+    #[default]
+    #[serde(rename = "grpc")]
+    Grpc,
+    #[serde(alias = "http", alias = "http/protobuf", alias = "http_protobuf")]
+    HttpProtobuf,
+}
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+        }
+    }
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +767,26 @@ fn validate_config(config: &Config) -> Result<()> {
         config.bundles.pack_threads.is_none_or(|value| value > 0),
         "pack_threads must be greater than 0"
     );
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&config.observability.traces.sample_ratio),
+        "observability.traces.sample_ratio must be in range [0.0, 1.0]"
+    );
+    if config.observability.traces.enabled {
+        anyhow::ensure!(
+            config.observability.exporters.otlp.enabled,
+            "observability.traces.enabled requires observability.exporters.otlp.enabled"
+        );
+        anyhow::ensure!(
+            !config
+                .observability
+                .exporters
+                .otlp
+                .endpoint
+                .trim()
+                .is_empty(),
+            "observability.traces.enabled requires observability.exporters.otlp.endpoint"
+        );
+    }
     Ok(())
 }
 

@@ -25,6 +25,11 @@ use fred::clients::Pool;
 use fred::interfaces::ClientLike;
 use fred::interfaces::KeysInterface;
 use fred::types::config::{Config as FredConfig, ReconnectPolicy, ServerConfig, TlsConnector};
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tokio::signal;
 use tokio::sync::{Mutex, Semaphore};
 use tracing_subscriber::EnvFilter;
@@ -562,6 +567,67 @@ async fn shutdown_signal() {
     }
 }
 
+fn build_tracing_filter(config: &Config) -> EnvFilter {
+    EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(config.logging.level.clone()))
+        .unwrap_or_else(|_| EnvFilter::new("info"))
+}
+
+fn build_trace_provider(config: &Config) -> Result<Option<SdkTracerProvider>> {
+    if !config.observability.traces.enabled {
+        return Ok(None);
+    }
+
+    let otlp = &config.observability.exporters.otlp;
+    let exporter = match otlp.protocol {
+        crate::config::OtlpProtocol::Grpc => opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(otlp.endpoint.clone())
+            .build()?,
+        crate::config::OtlpProtocol::HttpProtobuf => opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+            .with_endpoint(otlp.endpoint.clone())
+            .build()?,
+    };
+
+    let sampler = match config.observability.traces.sample_ratio {
+        ratio if ratio <= 0.0 => Sampler::AlwaysOff,
+        ratio if ratio >= 1.0 => Sampler::AlwaysOn,
+        ratio => Sampler::TraceIdRatioBased(ratio),
+    };
+    let resource = Resource::builder_empty()
+        .with_attributes([
+            KeyValue::new("service.name", "forgeproxy"),
+            KeyValue::new("service.version", crate::build_info::VERSION.to_string()),
+            KeyValue::new("service.namespace", "forgeproxy"),
+        ])
+        .build();
+
+    Ok(Some(
+        SdkTracerProvider::builder()
+            .with_sampler(sampler)
+            .with_resource(resource)
+            .with_batch_exporter(exporter)
+            .build(),
+    ))
+}
+
+fn init_tracing(config: &Config) -> Result<Option<SdkTracerProvider>> {
+    let trace_provider = build_trace_provider(config)?;
+    let otel_layer = trace_provider
+        .as_ref()
+        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("forgeproxy")));
+
+    tracing_subscriber::registry()
+        .with(build_tracing_filter(config))
+        .with(tracing_subscriber::fmt::layer().json())
+        .with(otel_layer)
+        .init();
+
+    Ok(trace_provider)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -581,10 +647,7 @@ async fn main() -> Result<()> {
     let config = Arc::new(config);
 
     // ---- Tracing ----
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer().json())
-        .init();
+    let trace_provider = init_tracing(config.as_ref())?;
 
     tracing::info!(
         config_path = %cli.config,
@@ -695,6 +758,11 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("forgeproxy shut down cleanly");
+    if let Some(trace_provider) = trace_provider
+        && let Err(error) = trace_provider.shutdown()
+    {
+        eprintln!("failed to shut down OTLP trace exporter cleanly: {error}");
+    }
     Ok(())
 }
 

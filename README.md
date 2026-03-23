@@ -146,12 +146,17 @@ When the shared `config.yaml` includes an
 `observability.exporters.otlp` stanza, the forgeproxy host also runs a local
 OpenTelemetry Collector that scrapes the same `/metrics` endpoint and exports
 it to the configured OTLP destination. That same collector also tails
-`forgeproxy.service` from journald and exports those logs over OTLP. The
-collector's runtime config is derived from the same `config.yaml`; there is no
-separate operator-managed collector config file. `observability.metrics.prometheus`
-and `observability.exporters.otlp` can be enabled together; that is the normal
-OTLP metrics path, while OTLP log export continues to follow the same exporter
-settings.
+`forgeproxy.service` from journald and exports those logs over OTLP.
+
+Native OTLP trace export is configured from the same `config.yaml` through
+`observability.traces`. When enabled, forgeproxy exports tracing spans directly
+to the configured OTLP endpoint, including the existing request and background
+task spans emitted through Rust `tracing`. The collector's runtime config is
+derived from the same `config.yaml`; there is no separate operator-managed
+collector config file. `observability.metrics.prometheus`,
+`observability.exporters.otlp`, and `observability.traces` can be enabled
+together. That is the normal OTLP setup for metrics and logs through the local
+collector plus traces directly from forgeproxy.
 
 ## Development
 
