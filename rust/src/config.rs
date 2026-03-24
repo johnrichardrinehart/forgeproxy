@@ -790,15 +790,32 @@ pub struct RepoOverride {
 // Loader
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub ignored_fields: Vec<String>,
+}
+
+fn parse_config_str(contents: &str) -> Result<LoadedConfig> {
+    let mut ignored_fields = Vec::new();
+    let deserializer = serde_yml::Deserializer::from_str(contents);
+    let config: Config = serde_ignored::deserialize(deserializer, |path| {
+        ignored_fields.push(path.to_string());
+    })?;
+    validate_config(&config)?;
+    Ok(LoadedConfig {
+        config,
+        ignored_fields,
+    })
+}
+
 /// Load and validate a [`Config`] from a YAML file at `path`.
-pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
+pub fn load_config<P: AsRef<Path>>(path: P) -> Result<LoadedConfig> {
     let path = path.as_ref();
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
-    let config: Config = serde_yml::from_str(&contents)
-        .with_context(|| format!("failed to parse config file: {}", path.display()))?;
-    validate_config(&config)?;
-    Ok(config)
+    parse_config_str(&contents)
+        .with_context(|| format!("failed to parse config file: {}", path.display()))
 }
 
 /// Basic sanity checks that cannot be expressed purely with serde.
@@ -893,7 +910,7 @@ fn validate_otlp_exporter(path: &str, exporter: &OtlpSignalExporterConfig) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::BundleConfig;
+    use super::{BundleConfig, parse_config_str};
 
     #[test]
     fn bundle_execution_policy_defaults_single_core() {
@@ -919,5 +936,28 @@ mod tests {
         .execution_policy_for_parallelism(8);
         assert_eq!(policy.max_concurrent_generations, 2);
         assert_eq!(policy.pack_threads, 5);
+    }
+
+    #[test]
+    fn config_example_has_no_ignored_fields() {
+        let loaded = parse_config_str(include_str!("../../config.example.yaml")).unwrap();
+        assert!(loaded.ignored_fields.is_empty());
+    }
+
+    #[test]
+    fn warns_for_legacy_metrics_otlp_shape() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  metrics:\n    prometheus:\n      enabled: true\n",
+            "  metrics:\n    prometheus:\n      enabled: true\n    otlp:\n      enabled: true\n      endpoint: \"https://ingest.metrics.foo.dev/vm/insert/0/opentelemetry/api/v1/push\"\n      protocol: \"http/protobuf\"\n      export_interval_secs: 60\n      auth:\n        basic:\n          username: \"foo\"\n          password: \"bar\"\n",
+        );
+        let loaded = parse_config_str(&config).unwrap();
+        assert!(
+            loaded
+                .ignored_fields
+                .iter()
+                .any(|path| path.starts_with("observability.metrics.otlp")),
+            "expected an ignored-field warning for the legacy observability.metrics.otlp shape, got {:?}",
+            loaded.ignored_fields
+        );
     }
 }

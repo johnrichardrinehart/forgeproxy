@@ -16,7 +16,16 @@ rustPlatform.buildRustPackage {
   pname = "forgeproxy";
   version = "0.1.0";
 
-  src = ../rust;
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../rust
+      # Config parser tests use include_str! on the repo-root example config,
+      # so include it in the Rust build sandbox alongside the crate sources.
+      ../config.example.yaml
+    ];
+  };
+  sourceRoot = "source/rust";
 
   cargoLock.lockFile = ../rust/Cargo.lock;
 
