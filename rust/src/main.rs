@@ -637,11 +637,20 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // ---- Config ----
-    let config = config::load_config(&cli.config)?;
-    let config = Arc::new(config);
+    let loaded_config = config::load_config(&cli.config)?;
+    let ignored_config_fields = loaded_config.ignored_fields.clone();
+    let config = Arc::new(loaded_config.config);
 
     // ---- Tracing ----
     let trace_provider = init_tracing(config.as_ref())?;
+
+    for ignored_field in &ignored_config_fields {
+        tracing::warn!(
+            config_path = %cli.config,
+            ignored_field = %ignored_field,
+            "unknown config field ignored during startup"
+        );
+    }
 
     tracing::info!(
         config_path = %cli.config,

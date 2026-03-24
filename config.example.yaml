@@ -44,7 +44,7 @@ fetch_schedule:
   rolling_window: 1800
 bundles:
   daily_consolidation_hour: 3
-  weekly_consolidation_day: 0
+  weekly_consolidation_day: 1
   min_clone_count_for_bundles: 2
   bundle_lock_ttl: 300
   generate_filtered_bundles: true
@@ -104,5 +104,5 @@ logging:
   level: "info"
 repo_overrides:
   "org/monorepo":
-    eviction_priority: "pinned"
-    generation_interval: 900
+    fetch_interval: 900
+    disable_bundles: false
