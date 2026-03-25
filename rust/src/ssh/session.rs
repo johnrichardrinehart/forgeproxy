@@ -262,20 +262,19 @@ async fn send_channel_data_chunks(
     Ok(())
 }
 
-async fn send_channel_data<W>(
+async fn send_channel_response_data(
     handle: &russh::server::Handle,
     channel_id: ChannelId,
-    writer: Option<&mut W>,
+    stream_channel: Option<&Channel<Msg>>,
     data: &[u8],
-) -> Result<(), ()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    if let Some(writer) = writer {
-        writer.write_all(data).await.map_err(|_| ())
-    } else {
-        send_channel_data_chunks(handle, channel_id, data).await
+) -> Result<(), ()> {
+    if let Some(channel) = stream_channel {
+        let mut writer = channel.make_writer();
+        writer.write_all(data).await.map_err(|_| ())?;
+        return Ok(());
     }
+
+    send_channel_data_chunks(handle, channel_id, data).await
 }
 
 struct LocalUploadPackResponseContext {
@@ -381,7 +380,6 @@ async fn serve_local_upload_pack_once(
     };
     let _repo_lease = repo_lease;
 
-    let mut channel_writer = stream_channel.map(|channel| channel.make_writer());
     let mut total_bytes: u64 = 0;
     let downstream_counter = state
         .metrics
@@ -399,7 +397,7 @@ async fn serve_local_upload_pack_once(
             Ok(0) => break,
             Ok(read) => {
                 let chunk = &stdout_buf[..read];
-                if send_channel_data(&handle, channel_id, channel_writer.as_mut(), chunk)
+                if send_channel_response_data(&handle, channel_id, stream_channel.as_ref(), chunk)
                     .await
                     .is_err()
                 {
@@ -465,7 +463,6 @@ async fn serve_local_upload_pack_once(
     }
 
     if should_close_channel {
-        drop(channel_writer);
         let exit_status = if completed_successfully { 0 } else { 1 };
         info!(
             repo = %owner_repo,
@@ -1373,16 +1370,16 @@ impl Handler for SshSession {
                             let channel_states = Arc::clone(&self.upstream_proxy_channels);
                             let repo_for_stream = repo.clone();
                             let state_for_stream = Arc::clone(&self.state);
+                            let stream_channel = channel;
 
                             // Spawn a task that streams upload-pack stdout via
-                            // the channel writer so channel windows are
-                            // respected while EOF remains under the finalizer's
-                            // control.
+                            // the session channel so large responses respect
+                            // the client's SSH receive window before final
+                            // exit-status/EOF/close messages are queued.
                             tokio::spawn(async move {
                                 let _generation_lease = generation_lease;
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
-                                let mut channel_writer = channel.make_writer();
                                 let mut disconnected = false;
                                 let mut total_bytes: u64 = 0;
                                 let clone_started = clone_started;
@@ -1402,10 +1399,10 @@ impl Handler for SshSession {
                                     match stdout.read(&mut stdout_buf).await {
                                         Ok(0) => break,
                                         Ok(read) => {
-                                            if send_channel_data(
+                                            if send_channel_response_data(
                                                 &handle,
                                                 channel_id,
-                                                Some(&mut channel_writer),
+                                                Some(&stream_channel),
                                                 &stdout_buf[..read],
                                             )
                                             .await
@@ -1471,7 +1468,6 @@ impl Handler for SshSession {
 
                                 // RFC 4254: exit-status → EOF → close.
                                 if !disconnected {
-                                    drop(channel_writer);
                                     finalize_upload_pack_channel(
                                         &repo_for_stream,
                                         &handle,
@@ -1865,6 +1861,7 @@ async fn proxy_upstream_upload_pack(
         }
     }
 
+    let stream_channel = stream_channel;
     match super::upstream::post_upload_pack_stream(
         &state,
         &owner_repo,
@@ -1878,7 +1875,6 @@ async fn proxy_upstream_upload_pack(
             use futures::Stream;
             use std::pin::Pin;
             let mut stream = Pin::new(Box::new(stream));
-            let mut channel_writer = stream_channel.map(|channel| channel.make_writer());
             let mut total_bytes: u64 = 0;
             let upstream_counter = state
                 .metrics
@@ -2031,9 +2027,14 @@ async fn proxy_upstream_upload_pack(
                                 capture = Some(active_capture);
                             }
                         }
-                        if send_channel_data(&handle, channel_id, channel_writer.as_mut(), &chunk)
-                            .await
-                            .is_err()
+                        if send_channel_response_data(
+                            &handle,
+                            channel_id,
+                            stream_channel.as_ref(),
+                            &chunk,
+                        )
+                        .await
+                        .is_err()
                         {
                             if behavior.warn_on_disconnect {
                                 warn!(
@@ -2087,7 +2088,6 @@ async fn proxy_upstream_upload_pack(
                     );
                 }
                 if behavior.should_close_channel {
-                    drop(channel_writer);
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
@@ -2309,7 +2309,6 @@ async fn proxy_upstream_upload_pack(
                     );
                 }
                 if behavior.should_close_channel {
-                    drop(channel_writer);
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
