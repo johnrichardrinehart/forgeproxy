@@ -597,22 +597,16 @@ impl PublishedGenerationLease {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalServeRepoSource {
     PublishedGeneration,
-    Mirror,
 }
 
 pub enum LocalServeRepoLease {
     Published(PublishedGenerationLease),
-    Mirror {
-        repo_path: PathBuf,
-        _publish_guard: OwnedMutexGuard<()>,
-    },
 }
 
 impl LocalServeRepoLease {
     pub fn repo_path(&self) -> &Path {
         match self {
             Self::Published(lease) => lease.repo_path(),
-            Self::Mirror { repo_path, .. } => repo_path,
         }
     }
 }
@@ -725,17 +719,6 @@ pub async fn acquire_local_serve_repo_lease(
         LocalServeRepoSource::PublishedGeneration => Ok(LocalServeRepoLease::Published(
             acquire_published_generation_lease(state, owner_repo)?,
         )),
-        LocalServeRepoSource::Mirror => {
-            let publish_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
-            let repo_path = state.cache_manager.repo_mirror_path(owner_repo);
-            if !state.cache_manager.has_repo_at(&repo_path) {
-                bail!("repo mirror is not available for local serving");
-            }
-            Ok(LocalServeRepoLease::Mirror {
-                repo_path,
-                _publish_guard: publish_guard,
-            })
-        }
     }
 }
 
@@ -2016,10 +1999,6 @@ pub fn clone_cache_status(decision: &LocalServeDecision) -> crate::metrics::Cach
             ..
         } => crate::metrics::CacheStatus::Hot,
         LocalServeDecision::SatisfiesWants {
-            serve_from: LocalServeRepoSource::Mirror,
-            ..
-        }
-        | LocalServeDecision::SatisfiesWants {
             restored_from_s3_for_request: true,
             ..
         }
@@ -2284,15 +2263,6 @@ pub async fn classify_local_wants_satisfaction(
     {
         let missing_wants =
             crate::git::commands::git_missing_objects(&mirror_repo_path, wants).await?;
-        if missing_wants.is_empty() {
-            return Ok(LocalServeDecision::SatisfiesWants {
-                serve_from: LocalServeRepoSource::Mirror,
-                had_local_repo_before_check: availability.had_local_repo_before_check,
-                restored_from_s3_for_request: availability.restored_from_s3_for_request,
-                want_count: wants.len(),
-            });
-        }
-
         return Ok(LocalServeDecision::MissingWantedObjects {
             had_local_repo_before_check: availability.had_local_repo_before_check,
             restored_from_s3_for_request: availability.restored_from_s3_for_request,
@@ -2379,7 +2349,7 @@ pub async fn wait_for_local_catch_up(
         started_refresh = should_start_refresh,
         has_published_repo = state.cache_manager.has_repo(&owner_repo),
         has_repo_mirror = state.cache_manager.has_repo_mirror(&owner_repo),
-        "waiting for local mirror catch-up before deciding whether to proxy upstream"
+        "waiting for local published-generation catch-up before deciding whether to proxy upstream"
     );
     while started_at.elapsed() < timeout {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2388,7 +2358,7 @@ pub async fn wait_for_local_catch_up(
             info!(
                 repo = %owner_repo,
                 elapsed_ms = started_at.elapsed().as_millis(),
-                "local mirror catch-up completed before request timeout"
+                "local published-generation catch-up completed before request timeout"
             );
             return Ok(decision);
         }
@@ -2398,7 +2368,7 @@ pub async fn wait_for_local_catch_up(
     info!(
         repo = %owner_repo,
         elapsed_ms = started_at.elapsed().as_millis(),
-        "local mirror catch-up timed out; falling back to upstream proxy"
+        "local published-generation catch-up timed out; falling back to upstream proxy"
     );
     Ok(last_decision)
 }
