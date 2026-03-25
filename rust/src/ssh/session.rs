@@ -328,6 +328,12 @@ async fn serve_local_upload_pack_once(
         }
     };
     let repo_path = repo_lease.repo_path().to_path_buf();
+    info!(
+        repo = %owner_repo,
+        serve_from = ?serve_from,
+        path = %repo_path.display(),
+        "starting local SSH git upload-pack"
+    );
     let mut cmd = Command::new("git");
     cmd.arg("upload-pack")
         .arg("--stateless-rpc")
@@ -397,7 +403,12 @@ async fn serve_local_upload_pack_once(
                     .await
                     .is_err()
                 {
-                    warn!(repo = %owner_repo, "client disconnected during local git upload-pack response");
+                    warn!(
+                        repo = %owner_repo,
+                        serve_from = ?serve_from,
+                        total_bytes,
+                        "client disconnected during local git upload-pack response"
+                    );
                     break;
                 }
                 total_bytes += read as u64;
@@ -416,6 +427,7 @@ async fn serve_local_upload_pack_once(
         Ok(status) if !status.success() => {
             warn!(
                 repo = %owner_repo,
+                serve_from = ?serve_from,
                 %status,
                 stderr = %String::from_utf8_lossy(&stderr_buf),
                 "local git upload-pack exited with non-zero status"
@@ -423,10 +435,24 @@ async fn serve_local_upload_pack_once(
             false
         }
         Err(error) => {
-            error!(repo = %owner_repo, error = %error, "failed to wait on local git upload-pack");
+            error!(
+                repo = %owner_repo,
+                serve_from = ?serve_from,
+                error = %error,
+                "failed to wait on local git upload-pack"
+            );
             false
         }
-        Ok(_) => true,
+        Ok(status) => {
+            info!(
+                repo = %owner_repo,
+                serve_from = ?serve_from,
+                total_bytes,
+                %status,
+                "local SSH git upload-pack completed"
+            );
+            true
+        }
     };
 
     if completed_successfully {
@@ -440,12 +466,20 @@ async fn serve_local_upload_pack_once(
 
     if should_close_channel {
         drop(channel_writer);
+        let exit_status = if completed_successfully { 0 } else { 1 };
+        info!(
+            repo = %owner_repo,
+            serve_from = ?serve_from,
+            total_bytes,
+            exit_status,
+            "finalizing local SSH git upload-pack channel"
+        );
         finalize_upload_pack_channel(
             owner_repo,
             &handle,
             &channel_states,
             channel_id,
-            0,
+            exit_status,
             total_bytes,
         )
         .await;

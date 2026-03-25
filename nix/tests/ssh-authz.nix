@@ -990,7 +990,7 @@ pkgs.testers.runNixOSTest {
             "journalctl -u forgeproxy.service"
             f" --since '{since}' --no-pager"
             " | grep -F '\"repo\":\"octocat/repo-many-wants\"'"
-            " | grep -F 'local mirror catch-up completed before request timeout'"
+            " | grep -F 'local published-generation catch-up completed before request timeout'"
         )
         proxy.wait_until_succeeds(
             "journalctl -u forgeproxy.service"
@@ -1002,11 +1002,11 @@ pkgs.testers.runNixOSTest {
             "! journalctl -u forgeproxy.service"
             f" --since '{since}' --no-pager"
             " | grep -F '\"repo\":\"octocat/repo-many-wants\"'"
-            " | grep -F 'local mirror catch-up timed out; falling back to upstream proxy'"
+            " | grep -F 'local published-generation catch-up timed out; falling back to upstream proxy'"
         )
 
-    # ── Subtest 5h: Requests can serve from a fresher mirror than published ──
-    with subtest("SSH fetch serves directly from a fresher mirror when publish lags"):
+    # ── Subtest 5h: Requests must not serve directly from the mutable mirror ──
+    with subtest("SSH fetch does not serve directly from a fresher mirror when publish lags"):
         mirror_serve_repo = "/var/cache/forgeproxy/repos/octocat/repo-mirror-serve.git"
         mirror_serve_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-mirror-serve.git"
         mirror_serve_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-mirror-serve.git"
@@ -1074,19 +1074,13 @@ pkgs.testers.runNixOSTest {
             "journalctl -u forgeproxy.service"
             f" --since '{since}' --no-pager"
             " | grep -F '\"repo\":\"octocat/repo-mirror-serve\"'"
-            " | grep -F 'serving SSH fetch directly from local disk after want resolution'"
-        )
-        proxy.wait_until_succeeds(
-            "journalctl -u forgeproxy.service"
-            f" --since '{since}' --no-pager"
-            " | grep -F '\"repo\":\"octocat/repo-mirror-serve\"'"
-            " | grep -F '\"serve_from\":\"Mirror\"'"
+            " | grep -F 'waiting for local published-generation catch-up before deciding whether to proxy upstream'"
         )
         proxy.succeed(
             "! journalctl -u forgeproxy.service"
             f" --since '{since}' --no-pager"
             " | grep -F '\"repo\":\"octocat/repo-mirror-serve\"'"
-            " | grep -F 'local mirror catch-up timed out; falling back to upstream proxy'"
+            " | grep -F '\"serve_from\":\"Mirror\"'"
         )
 
     # ── Subtest 5i: Concurrent uncached hydrations complete and drain semaphore ──
