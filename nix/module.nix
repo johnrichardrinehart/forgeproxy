@@ -143,6 +143,16 @@ in
       description = "Path to the forgeproxy configuration file.";
     };
 
+    runtimeResourceFile = lib.mkOption {
+      type = lib.types.path;
+      default = "/run/forgeproxy/runtime-resource-attributes.json";
+      description = ''
+        Path to the runtime-discovered observability resource attributes file.
+        forgeproxy populates this at service startup so the app and the
+        host-local collector can share the same stable instance metadata.
+      '';
+    };
+
     cacheDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/cache/forgeproxy";
@@ -215,7 +225,15 @@ in
         # only grant possessor access).
         KeyringMode = "shared";
 
-        ExecStart = "${cfg.package}/bin/forgeproxy --config ${cfg.configFile}";
+        ExecStart =
+          "${cfg.package}/bin/forgeproxy"
+          + " --config ${cfg.configFile}"
+          + " --runtime-resource-file ${cfg.runtimeResourceFile}";
+        ExecStartPre = lib.mkAfter [
+          # Generate stable resource attributes before the main process starts so
+          # traces, logs, and scraped metrics all use the same instance identity.
+          "${cfg.package}/bin/forgeproxy write-runtime-resource-attributes --output ${cfg.runtimeResourceFile}"
+        ];
 
         Restart = "on-failure";
         RestartSec = 5;

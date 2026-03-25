@@ -10,6 +10,7 @@ mod git;
 mod health;
 mod http;
 mod metrics;
+mod runtime_resource;
 mod ssh;
 mod storage;
 mod tee_hydration;
@@ -19,14 +20,11 @@ use std::sync::atomic::AtomicI64;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::Parser;
-#[cfg(feature = "dev")]
-use clap::Subcommand;
+use clap::{Parser, Subcommand};
 use fred::clients::Pool;
 use fred::interfaces::ClientLike;
 use fred::interfaces::KeysInterface;
 use fred::types::config::{Config as FredConfig, ReconnectPolicy, ServerConfig, TlsConnector};
-use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
@@ -39,6 +37,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::Config;
 use crate::metrics::{ActiveConnectionGuard, MetricsRegistry, Protocol};
+use crate::runtime_resource::RuntimeResourceAttributes;
 
 const CLONE_CAPTURE_MEMORY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -58,19 +57,30 @@ struct Cli {
     #[arg(short, long, default_value = "/run/forgeproxy/config.yaml")]
     config: String,
 
-    #[cfg(feature = "dev")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/run/forgeproxy/runtime-resource-attributes.json"
+    )]
+    runtime_resource_file: String,
+
     #[command(subcommand)]
-    command: Option<DevCommand>,
+    command: Option<Command>,
 }
 
-#[cfg(feature = "dev")]
 #[derive(Subcommand, Debug)]
-enum DevCommand {
+enum Command {
     /// Run bundle lifecycle work on demand without waiting for the scheduler.
+    #[cfg(feature = "dev")]
     Bundle {
         /// Suppress the final one-shot summary log.
         #[arg(long)]
         no_summary: bool,
+    },
+    #[command(name = "write-runtime-resource-attributes", hide = true)]
+    WriteRuntimeResourceAttributes {
+        #[arg(long)]
+        output: String,
     },
 }
 
@@ -533,9 +543,9 @@ async fn run_node_heartbeat(state: AppState) -> Result<()> {
 }
 
 #[cfg(feature = "dev")]
-async fn run_dev_command(state: AppState, command: DevCommand) -> Result<()> {
+async fn run_dev_command(state: AppState, command: Command) -> Result<()> {
     match command {
-        DevCommand::Bundle { no_summary } => {
+        Command::Bundle { no_summary } => {
             let started_at = Instant::now();
             tracing::info!("running dev bundle command");
             let summary = crate::bundleuri::lifecycle::tick_with_summary(&state).await?;
@@ -562,6 +572,7 @@ async fn run_dev_command(state: AppState, command: DevCommand) -> Result<()> {
             }
             Ok(())
         }
+        Command::WriteRuntimeResourceAttributes { .. } => unreachable!(),
     }
 }
 
@@ -601,7 +612,10 @@ fn build_tracing_filter(config: &Config) -> EnvFilter {
 
 const LOCAL_OTLP_TRACE_COLLECTOR_ENDPOINT: &str = "http://127.0.0.1:4317";
 
-fn build_trace_provider(config: &Config) -> Result<Option<SdkTracerProvider>> {
+fn build_trace_provider(
+    config: &Config,
+    runtime_resource_attributes: &RuntimeResourceAttributes,
+) -> Result<Option<SdkTracerProvider>> {
     if !config.observability.traces.enabled {
         return Ok(None);
     }
@@ -617,11 +631,7 @@ fn build_trace_provider(config: &Config) -> Result<Option<SdkTracerProvider>> {
         ratio => Sampler::TraceIdRatioBased(ratio),
     };
     let resource = Resource::builder_empty()
-        .with_attributes([
-            KeyValue::new("service.name", "forgeproxy"),
-            KeyValue::new("service.version", crate::build_info::VERSION.to_string()),
-            KeyValue::new("service.namespace", "forgeproxy"),
-        ])
+        .with_attributes(runtime_resource_attributes.to_otel_resource_attributes())
         .build();
 
     Ok(Some(
@@ -633,8 +643,11 @@ fn build_trace_provider(config: &Config) -> Result<Option<SdkTracerProvider>> {
     ))
 }
 
-fn init_tracing(config: &Config) -> Result<Option<SdkTracerProvider>> {
-    let trace_provider = build_trace_provider(config)?;
+fn init_tracing(
+    config: &Config,
+    runtime_resource_attributes: &RuntimeResourceAttributes,
+) -> Result<Option<SdkTracerProvider>> {
+    let trace_provider = build_trace_provider(config, runtime_resource_attributes)?;
     let otel_layer = trace_provider
         .as_ref()
         .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("forgeproxy")));
@@ -662,13 +675,31 @@ async fn main() -> Result<()> {
     // ---- CLI ----
     let cli = Cli::parse();
 
+    if let Some(Command::WriteRuntimeResourceAttributes { output }) = &cli.command {
+        let detection = crate::runtime_resource::write_runtime_resource_attributes_file(
+            std::path::Path::new(output),
+            crate::build_info::VERSION,
+        )
+        .await?;
+        for warning in detection.warnings {
+            eprintln!("forgeproxy: warning: {warning}");
+        }
+        return Ok(());
+    }
+
     // ---- Config ----
     let loaded_config = config::load_config(&cli.config)?;
     let ignored_config_fields = loaded_config.ignored_fields.clone();
     let config = Arc::new(loaded_config.config);
+    let runtime_resource_detection =
+        crate::runtime_resource::load_or_detect_runtime_resource_attributes(
+            std::path::Path::new(&cli.runtime_resource_file),
+            crate::build_info::VERSION,
+        )
+        .await;
 
     // ---- Tracing ----
-    let trace_provider = init_tracing(config.as_ref())?;
+    let trace_provider = init_tracing(config.as_ref(), &runtime_resource_detection.attributes)?;
 
     for ignored_field in &ignored_config_fields {
         tracing::warn!(
@@ -677,18 +708,50 @@ async fn main() -> Result<()> {
             "unknown config field ignored during startup"
         );
     }
+    for warning in &runtime_resource_detection.warnings {
+        tracing::warn!(
+            runtime_resource_file = %cli.runtime_resource_file,
+            warning = %warning,
+            "runtime resource detection warning"
+        );
+    }
 
     tracing::info!(
         config_path = %cli.config,
         version = crate::build_info::VERSION,
         git_revision = crate::build_info::GIT_REVISION,
+        service_instance_id = runtime_resource_detection
+            .attributes
+            .service_instance_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        service_ip_address = runtime_resource_detection
+            .attributes
+            .service_ip_address
+            .as_deref()
+            .unwrap_or("unknown"),
+        service_machine_id = runtime_resource_detection
+            .attributes
+            .service_machine_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        cloud_provider = runtime_resource_detection
+            .attributes
+            .cloud_provider
+            .as_deref()
+            .unwrap_or("unknown"),
+        cloud_region = runtime_resource_detection
+            .attributes
+            .cloud_region
+            .as_deref()
+            .unwrap_or("unknown"),
         "starting forgeproxy"
     );
 
     #[cfg(feature = "dev")]
-    if let Some(command) = cli.command {
+    if let Some(Command::Bundle { no_summary }) = cli.command {
         let state = build_app_state(Arc::clone(&config)).await?;
-        return run_dev_command(state, command).await;
+        return run_dev_command(state, Command::Bundle { no_summary }).await;
     }
 
     let startup_init_errors = run_startup_init(config.as_ref()).await;
