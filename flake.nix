@@ -70,6 +70,9 @@
                   nixos-vm-test-compliance = pkgs.callPackage ./nix/tests/compliance.nix { inherit self; };
                   nixos-vm-test-backend = pkgs.callPackage ./nix/tests/backend.nix { inherit self; };
                   nixos-vm-test-ssh-authz = pkgs.callPackage ./nix/tests/ssh-authz.nix { inherit self; };
+                  nixos-vm-test-ssh-large-lsrefs = pkgs.callPackage ./nix/tests/ssh-large-lsrefs.nix {
+                    inherit self;
+                  };
                   nixos-vm-test-keyring-creds = pkgs.callPackage ./nix/tests/keyring-creds.nix { inherit self; };
                   nixos-vm-test-ghe-key-lookup-keyring = pkgs.callPackage ./nix/tests/ghe-key-lookup-keyring.nix {
                     inherit self;
