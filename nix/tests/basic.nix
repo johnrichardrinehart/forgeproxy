@@ -539,10 +539,22 @@ pkgs.testers.runNixOSTest {
         proxy.wait_for_unit("forgeproxy.service")
         proxy.wait_for_open_port(8080)
 
+    with subtest("forgeproxy writes runtime resource attributes at startup"):
+        proxy.succeed("test -s /run/forgeproxy/runtime-resource-attributes.json")
+        machine_id = proxy.succeed("cat /etc/machine-id").strip()
+        runtime_attrs = proxy.succeed("cat /run/forgeproxy/runtime-resource-attributes.json")
+        assert '"service_name": "forgeproxy"' in runtime_attrs, runtime_attrs
+        assert f'"service_instance_id": "{machine_id}"' in runtime_attrs, runtime_attrs
+        assert f'"service_machine_id": "{machine_id}"' in runtime_attrs, runtime_attrs
+
     with subtest("Shared config enables the on-host OTLP collector"):
         proxy.wait_for_unit("otlp-test-sink.service")
         proxy.wait_for_unit("forgeproxy-otlp-collector.service")
         rendered = proxy.succeed("cat /run/forgeproxy-otelcol/config.yaml")
+        assert "resource/common:" in rendered, rendered
+        assert "key: service.instance.id" in rendered, rendered
+        assert "key: service.machine_id" in rendered, rendered
+        assert "key: service.ip_address" in rendered, rendered
         assert 'targets: ["127.0.0.1:8080"]' in rendered, rendered
         assert "hostmetrics:" in rendered, rendered
         assert 'receivers: ["prometheus", "hostmetrics"]' in rendered, rendered
@@ -553,6 +565,9 @@ pkgs.testers.runNixOSTest {
         assert 'units: ["forgeproxy.service"]' in rendered, rendered
         assert "logs:" in rendered, rendered
         assert "traces:" in rendered, rendered
+        assert "processors: [resource/common, batch/metrics]" in rendered, rendered
+        assert "processors: [resource/common, batch/logs]" in rendered, rendered
+        assert "processors: [resource/common, batch/traces]" in rendered, rendered
         assert "basicauth/client-metrics" in rendered, rendered
         assert "basicauth/client-logs" in rendered, rendered
         assert "basicauth/client-traces" in rendered, rendered
