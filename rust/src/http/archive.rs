@@ -173,6 +173,7 @@ pub async fn handle_archive(
 
     // Background: after the tee completes, upload to S3.
     let s3_client = state.s3_client.clone();
+    let metrics = state.metrics.clone();
     let s3_bucket = bucket.clone();
     let s3_key_owned = s3_key.clone();
     let local_path_bg = local_path.clone();
@@ -186,6 +187,7 @@ pub async fn handle_archive(
         if local_path_bg.exists() {
             if let Err(e) = crate::storage::s3::upload_bundle(
                 &s3_client,
+                &metrics,
                 &s3_bucket,
                 &s3_key_owned,
                 &local_path_bg,

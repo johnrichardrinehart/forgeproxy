@@ -9,13 +9,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, info};
 
+use crate::metrics::MetricsRegistry;
+
 /// Shared rate-limit state updated after every forge API response.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RateLimitState {
     /// Remaining API calls before the rate limit resets.
     remaining: Arc<AtomicU64>,
     /// Unix timestamp at which the rate limit window resets.
     reset_at: Arc<AtomicU64>,
+    metrics: Option<MetricsRegistry>,
 }
 
 impl Default for RateLimitState {
@@ -29,6 +32,15 @@ impl RateLimitState {
         Self {
             remaining: Arc::new(AtomicU64::new(u64::MAX)),
             reset_at: Arc::new(AtomicU64::new(0)),
+            metrics: None,
+        }
+    }
+
+    pub fn with_metrics(metrics: MetricsRegistry) -> Self {
+        Self {
+            remaining: Arc::new(AtomicU64::new(u64::MAX)),
+            reset_at: Arc::new(AtomicU64::new(0)),
+            metrics: Some(metrics),
         }
     }
 
@@ -65,6 +77,16 @@ impl RateLimitState {
         if let Some(r) = reset {
             self.reset_at.store(r, Ordering::Relaxed);
         }
+        if let Some(metrics) = &self.metrics {
+            crate::metrics::set_upstream_api_rate_limit_remaining(metrics, self.remaining());
+        }
+    }
+
+    pub fn record_response(&self, endpoint: &str, headers: &reqwest::header::HeaderMap) {
+        if let Some(metrics) = &self.metrics {
+            crate::metrics::inc_upstream_api_call(metrics, endpoint);
+        }
+        self.update_from_headers(headers);
     }
 
     /// If the remaining calls are below `buffer`, sleep until the rate-limit

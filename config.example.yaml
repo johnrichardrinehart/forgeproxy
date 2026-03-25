@@ -65,6 +65,8 @@ observability:
   metrics:
     prometheus:
       enabled: true
+    host:
+      enabled: false
   logs:
     journald:
       enabled: true

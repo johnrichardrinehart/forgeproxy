@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -26,6 +27,10 @@ use tracing::{debug, error, info, warn};
 use crate::AppState;
 use crate::cache::CacheManager;
 use crate::coordination::registry::{LocalServeDecision, LocalServeRepoSource};
+use crate::metrics::{
+    ActiveConnectionGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource,
+    CloneUpstreamBytesLabels, Protocol,
+};
 
 /// Upper bound for a single SSH channel data message payload.
 ///
@@ -81,6 +86,7 @@ struct UpstreamCaptureMetadata {
 /// Per-connection SSH session state.
 pub struct SshSession {
     state: Arc<AppState>,
+    _active_connection: ActiveConnectionGuard,
     peer_addr: Option<SocketAddr>,
     fingerprint: Option<String>,
     username: Option<String>,
@@ -110,9 +116,11 @@ pub struct SshSession {
 impl SshSession {
     /// Create a new session for an incoming connection.
     pub fn new(state: Arc<AppState>, peer_addr: Option<SocketAddr>) -> Self {
+        let active_connection = state.begin_active_connection(Protocol::Ssh);
         let cache_manager = state.cache_manager.clone();
         Self {
             state,
+            _active_connection: active_connection,
             peer_addr,
             fingerprint: None,
             username: None,
@@ -278,12 +286,19 @@ struct LocalUploadPackResponseContext {
     should_close_channel: bool,
 }
 
+#[derive(Clone)]
+struct CloneCompletion {
+    cache_status: CacheStatus,
+    started_at: Instant,
+}
+
 async fn serve_local_upload_pack_once(
     state: &AppState,
     owner_repo: &str,
     serve_from: LocalServeRepoSource,
     request_body: &[u8],
     git_protocol: Option<&str>,
+    completion: CloneCompletion,
     response: LocalUploadPackResponseContext,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -362,12 +377,21 @@ async fn serve_local_upload_pack_once(
 
     let mut channel_writer = stream_channel.map(|channel| channel.make_writer());
     let mut total_bytes: u64 = 0;
+    let downstream_counter = state
+        .metrics
+        .metrics
+        .clone_downstream_bytes
+        .get_or_create(&CloneDownstreamBytesLabels {
+            protocol: Protocol::Ssh,
+            phase: ClonePhase::UploadPack,
+            source: CloneSource::Local,
+        })
+        .clone();
     let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
     loop {
         match stdout.read(&mut stdout_buf).await {
             Ok(0) => break,
             Ok(read) => {
-                total_bytes += read as u64;
                 let chunk = &stdout_buf[..read];
                 if send_channel_data(&handle, channel_id, channel_writer.as_mut(), chunk)
                     .await
@@ -376,6 +400,8 @@ async fn serve_local_upload_pack_once(
                     warn!(repo = %owner_repo, "client disconnected during local git upload-pack response");
                     break;
                 }
+                total_bytes += read as u64;
+                downstream_counter.inc_by(read as u64);
             }
             Err(error) => {
                 error!(repo = %owner_repo, error = %error, "failed to read local git upload-pack stdout");
@@ -386,7 +412,7 @@ async fn serve_local_upload_pack_once(
 
     let mut stderr_buf = Vec::new();
     let _ = stderr.read_to_end(&mut stderr_buf).await;
-    match child.wait().await {
+    let completed_successfully = match child.wait().await {
         Ok(status) if !status.success() => {
             warn!(
                 repo = %owner_repo,
@@ -394,11 +420,22 @@ async fn serve_local_upload_pack_once(
                 stderr = %String::from_utf8_lossy(&stderr_buf),
                 "local git upload-pack exited with non-zero status"
             );
+            false
         }
         Err(error) => {
             error!(repo = %owner_repo, error = %error, "failed to wait on local git upload-pack");
+            false
         }
-        _ => {}
+        Ok(_) => true,
+    };
+
+    if completed_successfully {
+        crate::metrics::record_clone_completion(
+            &state.metrics,
+            Protocol::Ssh,
+            completion.cache_status,
+            completion.started_at.elapsed(),
+        );
     }
 
     if should_close_channel {
@@ -1223,6 +1260,7 @@ impl Handler for SshSession {
                 let route_v2_through_upstream = self.git_protocol.as_deref() == Some("version=2");
 
                 if repo_cached_locally && !route_v2_through_upstream {
+                    let clone_started = Instant::now();
                     // ── Serve from local cache via bidirectional upload-pack ──
                     info!(repo = %repo, "serving git-upload-pack directly from local disk");
                     let generation_lease =
@@ -1300,6 +1338,7 @@ impl Handler for SshSession {
                             let handle = session.handle();
                             let channel_states = Arc::clone(&self.upstream_proxy_channels);
                             let repo_for_stream = repo.clone();
+                            let state_for_stream = Arc::clone(&self.state);
 
                             // Spawn a task that streams upload-pack stdout via
                             // the channel writer so channel windows are
@@ -1312,13 +1351,23 @@ impl Handler for SshSession {
                                 let mut channel_writer = channel.make_writer();
                                 let mut disconnected = false;
                                 let mut total_bytes: u64 = 0;
+                                let clone_started = clone_started;
+                                let downstream_counter = state_for_stream
+                                    .metrics
+                                    .metrics
+                                    .clone_downstream_bytes
+                                    .get_or_create(&CloneDownstreamBytesLabels {
+                                        protocol: Protocol::Ssh,
+                                        phase: ClonePhase::UploadPack,
+                                        source: CloneSource::Local,
+                                    })
+                                    .clone();
 
                                 let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
                                 loop {
                                     match stdout.read(&mut stdout_buf).await {
                                         Ok(0) => break,
                                         Ok(read) => {
-                                            total_bytes += read as u64;
                                             if send_channel_data(
                                                 &handle,
                                                 channel_id,
@@ -1337,6 +1386,8 @@ impl Handler for SshSession {
                                                 disconnected = true;
                                                 break;
                                             }
+                                            total_bytes += read as u64;
+                                            downstream_counter.inc_by(read as u64);
                                         }
                                         Err(error) => {
                                             error!(
@@ -1357,6 +1408,15 @@ impl Handler for SshSession {
                                     Ok(status) => status.code().unwrap_or(1) as u32,
                                     Err(_) => 1,
                                 };
+
+                                if exit_code == 0 {
+                                    crate::metrics::record_clone_completion(
+                                        &state_for_stream.metrics,
+                                        Protocol::Ssh,
+                                        CacheStatus::Hot,
+                                        clone_started.elapsed(),
+                                    );
+                                }
 
                                 // Send any stderr on the extended-data channel.
                                 let mut stderr_buf = Vec::new();
@@ -1471,6 +1531,16 @@ impl Handler for SshSession {
                                     .entry(channel_id)
                                     .or_default()
                                     .info_refs_advertisement = Some(advert.clone());
+                                state
+                                    .metrics
+                                    .metrics
+                                    .clone_downstream_bytes
+                                    .get_or_create(&CloneDownstreamBytesLabels {
+                                        protocol: Protocol::Ssh,
+                                        phase: ClonePhase::InfoRefs,
+                                        source: CloneSource::Upstream,
+                                    })
+                                    .inc_by(advert.len() as u64);
                                 // Forward ref advertisement; channel stays open
                                 // for want/have — `channel_eof` will POST.
                                 debug!(repo = %repo_bg, bytes = advert.len(), "DIAG: sending ref advertisement via handle.data");
@@ -1557,7 +1627,10 @@ async fn proxy_upstream_upload_pack(
         git_protocol,
         request_kind,
     } = request;
+    let mut fetch_started_at = None;
+    let mut fetch_cache_status = None;
     if request_kind == V2RequestKind::Fetch {
+        fetch_started_at = Some(Instant::now());
         let wants = crate::tee_hydration::parse_fetch_request_metadata(&want_have)
             .map(|meta| meta.want_oids)
             .unwrap_or_default();
@@ -1677,6 +1750,9 @@ async fn proxy_upstream_upload_pack(
         } else {
             initial_local_decision
         };
+        fetch_cache_status = Some(crate::coordination::registry::clone_cache_status(
+            &local_decision,
+        ));
         match &local_decision {
             LocalServeDecision::SatisfiesWants {
                 serve_from,
@@ -1698,6 +1774,13 @@ async fn proxy_upstream_upload_pack(
                     *serve_from,
                     &want_have,
                     git_protocol.as_deref(),
+                    CloneCompletion {
+                        cache_status: crate::coordination::registry::clone_cache_status(
+                            &local_decision,
+                        ),
+                        started_at: fetch_started_at
+                            .expect("fetch start time must be set for fetch requests"),
+                    },
                     LocalUploadPackResponseContext {
                         handle: handle.clone(),
                         channel_states: Arc::clone(&channel_states),
@@ -1763,6 +1846,25 @@ async fn proxy_upstream_upload_pack(
             let mut stream = Pin::new(Box::new(stream));
             let mut channel_writer = stream_channel.map(|channel| channel.make_writer());
             let mut total_bytes: u64 = 0;
+            let upstream_counter = state
+                .metrics
+                .metrics
+                .clone_upstream_bytes
+                .get_or_create(&CloneUpstreamBytesLabels {
+                    protocol: Protocol::Ssh,
+                    phase: ClonePhase::UploadPack,
+                })
+                .clone();
+            let downstream_counter = state
+                .metrics
+                .metrics
+                .clone_downstream_bytes
+                .get_or_create(&CloneDownstreamBytesLabels {
+                    protocol: Protocol::Ssh,
+                    phase: ClonePhase::UploadPack,
+                    source: CloneSource::Upstream,
+                })
+                .clone();
             let mut had_error = false;
             let mut response_buf = Vec::new();
             let auth_header = if authenticated {
@@ -1871,7 +1973,8 @@ async fn proxy_upstream_upload_pack(
             {
                 match chunk_result {
                     Ok(chunk) => {
-                        total_bytes += chunk.len() as u64;
+                        let chunk_len = chunk.len() as u64;
+                        upstream_counter.inc_by(chunk_len);
                         if request_kind == V2RequestKind::LsRefs {
                             response_buf.extend_from_slice(&chunk);
                         }
@@ -1907,6 +2010,8 @@ async fn proxy_upstream_upload_pack(
                             had_error = true;
                             break;
                         }
+                        total_bytes += chunk_len;
+                        downstream_counter.inc_by(chunk_len);
                     }
                     Err(e) => {
                         error!(
@@ -1965,6 +2070,17 @@ async fn proxy_upstream_upload_pack(
                     total_bytes,
                     "upstream proxy pack stream complete"
                 );
+                if request_kind == V2RequestKind::Fetch
+                    && let (Some(cache_status), Some(started_at)) =
+                        (fetch_cache_status.clone(), fetch_started_at)
+                {
+                    crate::metrics::record_clone_completion(
+                        &state.metrics,
+                        Protocol::Ssh,
+                        cache_status,
+                        started_at.elapsed(),
+                    );
+                }
                 if let Some(active_capture) = capture.take() {
                     match active_capture.finish_success().await {
                         Ok(Some(capture_dir)) => {

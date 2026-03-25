@@ -10,6 +10,7 @@
 //! - `GET  /metrics`                       - Prometheus metrics
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use axum::{
@@ -22,6 +23,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use prometheus_client::metrics::counter::Counter;
 use serde::Deserialize;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
@@ -34,6 +36,10 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::AppState;
 use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoLease, LocalServeRepoSource,
+};
+use crate::metrics::{
+    CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource, CloneUpstreamBytesLabels,
+    Protocol,
 };
 
 struct LeasedReaderStream<S> {
@@ -62,6 +68,100 @@ where
             self.lease.take();
         }
         poll
+    }
+}
+
+struct CountingBytesStream<S> {
+    inner: S,
+    counter: Counter,
+}
+
+impl<S> CountingBytesStream<S> {
+    fn new(inner: S, counter: Counter) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl<S, E> Stream for CountingBytesStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let poll = Pin::new(&mut self.inner).poll_next(cx);
+        if let Poll::Ready(Some(Ok(bytes))) = &poll {
+            self.counter.inc_by(bytes.len() as u64);
+        }
+        poll
+    }
+}
+
+#[derive(Clone)]
+struct CloneCompletion {
+    cache_status: CacheStatus,
+    started_at: Instant,
+}
+
+struct CloneCompletionStream<S> {
+    inner: S,
+    metrics: crate::metrics::MetricsRegistry,
+    protocol: Protocol,
+    cache_status: CacheStatus,
+    started_at: Instant,
+    recorded: bool,
+}
+
+impl<S> CloneCompletionStream<S> {
+    fn new(
+        inner: S,
+        metrics: crate::metrics::MetricsRegistry,
+        protocol: Protocol,
+        cache_status: CacheStatus,
+        started_at: Instant,
+    ) -> Self {
+        Self {
+            inner,
+            metrics,
+            protocol,
+            cache_status,
+            started_at,
+            recorded: false,
+        }
+    }
+
+    fn record_once(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        crate::metrics::record_clone_completion(
+            &self.metrics,
+            self.protocol.clone(),
+            self.cache_status.clone(),
+            self.started_at.elapsed(),
+        );
+    }
+}
+
+impl<S, E> Stream for CloneCompletionStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let poll = Pin::new(&mut self.inner).poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.record_once();
+        }
+        poll
+    }
+}
+
+impl<S> Drop for CloneCompletionStream<S> {
+    fn drop(&mut self) {
+        self.record_once();
     }
 }
 
@@ -121,6 +221,7 @@ async fn handle_info_refs(
     Query(query): Query<InfoRefsQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    let _active_connection = state.begin_active_connection(Protocol::Https);
     // 1. Validate path segments.
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
@@ -210,6 +311,26 @@ async fn handle_info_refs(
     let modified_body =
         crate::http::protocolv2::inject_bundle_uri(&upstream_bytes, &bundle_list_url);
 
+    state
+        .metrics
+        .metrics
+        .clone_upstream_bytes
+        .get_or_create(&CloneUpstreamBytesLabels {
+            protocol: Protocol::Https,
+            phase: ClonePhase::InfoRefs,
+        })
+        .inc_by(upstream_bytes.len() as u64);
+    state
+        .metrics
+        .metrics
+        .clone_downstream_bytes
+        .get_or_create(&CloneDownstreamBytesLabels {
+            protocol: Protocol::Https,
+            phase: ClonePhase::InfoRefs,
+            source: CloneSource::Upstream,
+        })
+        .inc_by(modified_body.len() as u64);
+
     state.recent_info_refs_advertisements.lock().await.insert(
         format!("{owner}/{repo}"),
         crate::RecentInfoRefsAdvertisement {
@@ -243,6 +364,8 @@ async fn handle_upload_pack(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
+    let _active_connection = state.begin_active_connection(Protocol::Https);
+    let started_at = Instant::now();
     // 1. Validate path segments.
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
@@ -384,6 +507,12 @@ async fn handle_upload_pack(
                 *serve_from,
                 &body,
                 git_protocol.as_deref(),
+                CloneCompletion {
+                    cache_status: crate::coordination::registry::clone_cache_status(
+                        &local_decision,
+                    ),
+                    started_at,
+                },
             )
             .await;
         }
@@ -427,8 +556,18 @@ async fn handle_upload_pack(
 
     // Proxy to upstream forge.
     info!(repo = %repo_slug, "proxying upload-pack to upstream forge");
-    let response =
-        proxy_upload_pack_to_upstream(&state, &owner, &repo, auth_header.as_deref(), body).await?;
+    let response = proxy_upload_pack_to_upstream(
+        &state,
+        &owner,
+        &repo,
+        auth_header.as_deref(),
+        body,
+        CloneCompletion {
+            cache_status: crate::coordination::registry::clone_cache_status(&local_decision),
+            started_at,
+        },
+    )
+    .await?;
 
     Ok(response)
 }
@@ -504,6 +643,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 ///
 /// Returns Prometheus metrics collected by the proxy.
 async fn handle_metrics(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
+    state.refresh_live_metrics();
     let mut buf = String::new();
     prometheus_client::encoding::text::encode(&mut buf, &state.metrics.registry)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("metrics encoding failed: {e}")))?;
@@ -562,6 +702,7 @@ async fn serve_local_upload_pack(
     serve_from: LocalServeRepoSource,
     request_body: &[u8],
     git_protocol: Option<&str>,
+    completion: CloneCompletion,
 ) -> Result<Response, AppError> {
     let owner_repo = format!("{owner}/{repo}");
     let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease(
@@ -603,7 +744,26 @@ async fn serve_local_upload_pack(
         .context("failed to capture git upload-pack stderr")?;
 
     // Stream stdout as the response body.
-    let stream = LeasedReaderStream::new(ReaderStream::new(stdout), repo_lease);
+    let downstream_counter = state
+        .metrics
+        .metrics
+        .clone_downstream_bytes
+        .get_or_create(&CloneDownstreamBytesLabels {
+            protocol: Protocol::Https,
+            phase: ClonePhase::UploadPack,
+            source: CloneSource::Local,
+        })
+        .clone();
+    let stream = CloneCompletionStream::new(
+        LeasedReaderStream::new(
+            CountingBytesStream::new(ReaderStream::new(stdout), downstream_counter),
+            repo_lease,
+        ),
+        state.metrics.clone(),
+        Protocol::Https,
+        completion.cache_status,
+        completion.started_at,
+    );
     let body = Body::from_stream(stream);
 
     // Reap the child in the background so we don't leak processes.
@@ -642,6 +802,7 @@ async fn proxy_upload_pack_to_upstream(
     repo: &str,
     auth_header: Option<&str>,
     body: Bytes,
+    completion: CloneCompletion,
 ) -> Result<Response, AppError> {
     let upstream_url = format!(
         "https://{}/{}/{}/git-upload-pack",
@@ -785,10 +946,30 @@ async fn proxy_upload_pack_to_upstream(
     }
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(8);
+    let completion_metrics = state.metrics.clone();
     let state = state.clone();
     let owner = owner.to_string();
     let repo = repo.to_string();
     let auth_header = auth_header.map(str::to_string);
+    let upstream_counter = state
+        .metrics
+        .metrics
+        .clone_upstream_bytes
+        .get_or_create(&CloneUpstreamBytesLabels {
+            protocol: Protocol::Https,
+            phase: ClonePhase::UploadPack,
+        })
+        .clone();
+    let downstream_counter = state
+        .metrics
+        .metrics
+        .clone_downstream_bytes
+        .get_or_create(&CloneDownstreamBytesLabels {
+            protocol: Protocol::Https,
+            phase: ClonePhase::UploadPack,
+            source: CloneSource::Upstream,
+        })
+        .clone();
     tokio::spawn(async move {
         let mut stream = upstream_resp.bytes_stream();
         let mut capture = capture;
@@ -797,6 +978,8 @@ async fn proxy_upload_pack_to_upstream(
         while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
+                    let chunk_len = chunk.len() as u64;
+                    upstream_counter.inc_by(chunk_len);
                     if let Some(mut active_capture) = capture.take() {
                         if let Err(e) = active_capture.try_write_response_chunk(chunk.clone()) {
                             warn!(
@@ -820,6 +1003,7 @@ async fn proxy_upload_pack_to_upstream(
                     if tx.send(Ok(chunk)).await.is_err() {
                         break;
                     }
+                    downstream_counter.inc_by(chunk_len);
                 }
                 Err(e) => {
                     if let Some(active_capture) = capture.take()
@@ -1009,7 +1193,13 @@ async fn proxy_upload_pack_to_upstream(
         }
     });
 
-    let body = Body::from_stream(ReceiverStream::new(rx));
+    let body = Body::from_stream(CloneCompletionStream::new(
+        ReceiverStream::new(rx),
+        completion_metrics,
+        Protocol::Https,
+        completion.cache_status,
+        completion.started_at,
+    ));
 
     Ok((
         StatusCode::OK,

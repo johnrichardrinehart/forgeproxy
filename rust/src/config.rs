@@ -106,6 +106,14 @@ pub struct ObservabilityConfig {
 pub struct MetricsConfig {
     #[serde(default)]
     pub prometheus: PrometheusConfig,
+    #[serde(default)]
+    pub host: HostMetricsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HostMetricsConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -874,8 +882,16 @@ fn validate_config(config: &Config) -> Result<()> {
 
     if metrics_exporter.enabled {
         anyhow::ensure!(
-            config.observability.metrics.prometheus.enabled,
-            "observability.exporters.otlp.metrics.enabled requires observability.metrics.prometheus.enabled"
+            config.observability.metrics.prometheus.enabled
+                || config.observability.metrics.host.enabled,
+            "observability.exporters.otlp.metrics.enabled requires observability.metrics.prometheus.enabled and/or observability.metrics.host.enabled"
+        );
+    }
+
+    if config.observability.metrics.host.enabled {
+        anyhow::ensure!(
+            metrics_exporter.enabled,
+            "observability.metrics.host.enabled requires observability.exporters.otlp.metrics.enabled"
         );
     }
 

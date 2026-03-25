@@ -12,13 +12,18 @@ use tracing::{debug, instrument};
 // ---------------------------------------------------------------------------
 
 /// Upload a local file to S3.
-#[instrument(skip(client), fields(%bucket, %key))]
+#[instrument(skip(client, metrics), fields(%bucket, %key))]
 pub async fn upload_bundle(
     client: &Client,
+    metrics: &crate::metrics::MetricsRegistry,
     bucket: &str,
     key: &str,
     file_path: &Path,
 ) -> Result<()> {
+    let size_bytes = tokio::fs::metadata(file_path)
+        .await
+        .with_context(|| format!("stat file for upload: {}", file_path.display()))?
+        .len();
     let body = ByteStream::from_path(file_path)
         .await
         .with_context(|| format!("open file for upload: {}", file_path.display()))?;
@@ -32,15 +37,17 @@ pub async fn upload_bundle(
         .await
         .context("S3 PutObject")?;
 
+    metrics.metrics.s3_upload_bytes.inc_by(size_bytes);
     debug!(path = %file_path.display(), "bundle uploaded");
     Ok(())
 }
 
 /// Download an S3 object to a local file path, creating parent directories if
 /// needed.
-#[instrument(skip(client), fields(%bucket, %key, path = %file_path.display()))]
+#[instrument(skip(client, metrics), fields(%bucket, %key, path = %file_path.display()))]
 pub async fn download_to_path(
     client: &Client,
+    metrics: &crate::metrics::MetricsRegistry,
     bucket: &str,
     key: &str,
     file_path: &Path,
@@ -70,6 +77,7 @@ pub async fn download_to_path(
         .await
         .with_context(|| format!("write downloaded object to {}", file_path.display()))?;
 
+    metrics.metrics.s3_download_bytes.inc_by(bytes.len() as u64);
     debug!(path = %file_path.display(), bytes = bytes.len(), "S3 object downloaded");
     Ok(())
 }

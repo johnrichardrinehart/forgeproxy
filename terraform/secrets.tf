@@ -34,6 +34,7 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     s3_presigned_url_ttl   = var.s3_presigned_url_ttl
     local_cache_max_bytes  = var.local_cache_max_bytes
     eviction_policy        = var.eviction_policy
+    host_metrics_enabled   = var.host_metrics_enabled
     otlp_metrics_enabled   = var.otlp_metrics.endpoint != "" ? true : false
     otlp_metrics_endpoint  = var.otlp_metrics.endpoint
     otlp_metrics_protocol  = var.otlp_metrics.protocol

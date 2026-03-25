@@ -59,9 +59,10 @@ module "forgeproxy" {
   s3_use_fips          = var.s3_use_fips
   s3_presigned_url_ttl = var.s3_presigned_url_ttl
 
-  log_level    = var.log_level
-  org_creds    = var.org_creds
-  otlp_metrics = var.otlp_metrics
-  otlp_logs    = var.otlp_logs
-  otlp_traces  = var.otlp_traces
+  log_level            = var.log_level
+  org_creds            = var.org_creds
+  otlp_metrics         = var.otlp_metrics
+  host_metrics_enabled = var.host_metrics_enabled
+  otlp_logs            = var.otlp_logs
+  otlp_traces          = var.otlp_traces
 }

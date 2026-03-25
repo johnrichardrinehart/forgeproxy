@@ -91,6 +91,8 @@ otlp_metrics = {
   basic_auth_password  = ""
 }
 
+host_metrics_enabled = false
+
 otlp_logs = {
   endpoint             = ""
   protocol             = "grpc"

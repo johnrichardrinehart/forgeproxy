@@ -151,7 +151,10 @@ there is no separate collector config surface to maintain.
 The signal flow is:
 
 - Metrics: forgeproxy exposes Prometheus/OpenMetrics at `/metrics`; the
-  host-local Collector scrapes that endpoint and re-exports it as OTLP.
+  host-local Collector scrapes that endpoint and re-exports it as OTLP. If
+  `observability.metrics.host.enabled` is true, the same Collector also emits
+  host CPU, disk, filesystem, load, memory, network, and paging metrics from
+  the forgeproxy node itself.
 - Logs: forgeproxy continues to write structured logs to journald; the
   host-local Collector tails `forgeproxy.service` and exports those logs as
   OTLP.
@@ -176,6 +179,8 @@ observability:
   metrics:
     prometheus:
       enabled: true
+    host:
+      enabled: false
   logs:
     journald:
       enabled: true
@@ -206,6 +211,22 @@ Each signal can use a different OTLP endpoint, protocol, and basic-auth
 credential pair. That is the intended way to point forgeproxy at an internal
 Collector or auth proxy which then forwards to the final backend, such as a
 VictoriaMetrics metrics ingest URL plus different log/trace backends.
+
+Host metrics are controlled separately from forgeproxy's own `/metrics`
+endpoint:
+
+- `observability.metrics.prometheus.enabled`: expose forgeproxy application
+  metrics locally at `/metrics` so the on-host Collector can scrape them.
+- `observability.metrics.host.enabled`: collect host-level system metrics from
+  the forgeproxy node through the Collector's `hostmetrics` receiver.
+- `observability.exporters.otlp.metrics.enabled`: actually export whichever
+  metrics sources were enabled above.
+
+The current host metrics include CPU, disk I/O, filesystem capacity and usage,
+load average, memory usage, paging activity, and network traffic. The OTLP
+metric names for those come from the Collector's hostmetrics receiver, for
+example `system.cpu.time`, `system.memory.usage`, `system.filesystem.usage`,
+and `system.network.io`.
 
 ## Development
 

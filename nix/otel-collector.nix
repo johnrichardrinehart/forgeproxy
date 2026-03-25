@@ -134,6 +134,7 @@ let
       }
 
       prometheus_enabled=$(read_config '.observability.metrics.prometheus.enabled // true')
+      host_metrics_enabled=$(read_config '.observability.metrics.host.enabled // false')
       journald_enabled=$(read_config '.observability.logs.journald.enabled // true')
       traces_enabled=$(read_config '.observability.traces.enabled // false')
       scrape_target=$(read_config '.proxy.http_listen // ""')
@@ -181,14 +182,19 @@ let
       esac
 
       if [[ "$metrics_enabled" == "true" ]]; then
-        if [[ "$prometheus_enabled" != "true" ]]; then
-          echo "forgeproxy-otlp-collector: observability.exporters.otlp.metrics.enabled requires observability.metrics.prometheus.enabled" >&2
+        if [[ "$prometheus_enabled" != "true" && "$host_metrics_enabled" != "true" ]]; then
+          echo "forgeproxy-otlp-collector: observability.exporters.otlp.metrics.enabled requires observability.metrics.prometheus.enabled and/or observability.metrics.host.enabled" >&2
           exit 1
         fi
-        if [[ -z "$scrape_target" || "$scrape_target" == "null" ]]; then
-          echo "forgeproxy-otlp-collector: proxy.http_listen must be set when OTLP metrics export is enabled" >&2
+        if [[ "$prometheus_enabled" == "true" && ( -z "$scrape_target" || "$scrape_target" == "null" ) ]]; then
+          echo "forgeproxy-otlp-collector: proxy.http_listen must be set when Prometheus metrics export is enabled" >&2
           exit 1
         fi
+      fi
+
+      if [[ "$host_metrics_enabled" == "true" && "$metrics_enabled" != "true" ]]; then
+        echo "forgeproxy-otlp-collector: observability.metrics.host.enabled requires observability.exporters.otlp.metrics.enabled" >&2
+        exit 1
       fi
 
       if [[ "$logs_enabled" == "true" && "$journald_enabled" != "true" ]]; then
@@ -280,17 +286,33 @@ let
         fi
 
         if [[ "$metrics_enabled" == "true" ]]; then
-          printf '%s\n' \
-            "  prometheus:" \
-            "    config:" \
-            "      global:" \
-            "        scrape_interval: ''${metrics_interval}s" \
-            "        scrape_timeout: 10s" \
-            "      scrape_configs:" \
-            "        - job_name: forgeproxy" \
-            "          metrics_path: /metrics" \
-            "          static_configs:" \
-            "            - targets: [\"''${scrape_target}\"]"
+          if [[ "$prometheus_enabled" == "true" ]]; then
+            printf '%s\n' \
+              "  prometheus:" \
+              "    config:" \
+              "      global:" \
+              "        scrape_interval: ''${metrics_interval}s" \
+              "        scrape_timeout: 10s" \
+              "      scrape_configs:" \
+              "        - job_name: forgeproxy" \
+              "          metrics_path: /metrics" \
+              "          static_configs:" \
+              "            - targets: [\"''${scrape_target}\"]"
+          fi
+
+          if [[ "$host_metrics_enabled" == "true" ]]; then
+            printf '%s\n' \
+              "  hostmetrics:" \
+              "    collection_interval: ''${metrics_interval}s" \
+              "    scrapers:" \
+              "      cpu: {}" \
+              "      disk: {}" \
+              "      filesystem: {}" \
+              "      load: {}" \
+              "      memory: {}" \
+              "      network: {}" \
+              "      paging: {}"
+          fi
         fi
 
         if [[ "$traces_export_enabled" == "true" ]]; then
@@ -385,9 +407,16 @@ let
 
         if [[ "$metrics_enabled" == "true" ]]; then
           metrics_exporter=$(exporter_name_for metrics "$metrics_protocol")
+          metrics_receivers=()
+          if [[ "$prometheus_enabled" == "true" ]]; then
+            metrics_receivers+=("prometheus")
+          fi
+          if [[ "$host_metrics_enabled" == "true" ]]; then
+            metrics_receivers+=("hostmetrics")
+          fi
           printf '%s\n' \
             "    metrics:" \
-            "      receivers: [prometheus]" \
+            "      receivers: $(yaml_inline_list "''${metrics_receivers[@]}")" \
             "      processors: [batch/metrics]" \
             "      exporters: [\"''${metrics_exporter}\"]"
         fi

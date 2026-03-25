@@ -52,6 +52,8 @@ observability:
   metrics:
     prometheus:
       enabled: true
+    host:
+      enabled: ${host_metrics_enabled}
   logs:
     journald:
       enabled: true

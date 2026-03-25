@@ -323,9 +323,11 @@ curl -k http://127.0.0.1:8080/healthz
 
 3. **Monitoring**: Configure OTLP egress or optional direct scraping
    - Set `otlp_metrics`, `otlp_logs`, and `otlp_traces` to describe the real external destinations for each signal
+   - Set `host_metrics_enabled = true` if you also want the on-instance Collector to emit host CPU, disk, filesystem, load, memory, network, and paging metrics
    - The on-instance Collector derives its runtime config from the same `forgeproxy/service-config` secret as forgeproxy itself; there is still no separate operator-managed collector config file
    - Metrics and logs always egress through the on-instance Collector:
      - Metrics are scraped from `http://127.0.0.1:8080/metrics`
+     - Optional host metrics are read locally from the node through the Collector's `hostmetrics` receiver
      - Logs are tailed from `forgeproxy.service` in journald
    - Traces also egress through the on-instance Collector:
      - forgeproxy sends spans to a fixed loopback OTLP receiver on `127.0.0.1:4317`

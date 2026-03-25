@@ -174,6 +174,8 @@ let
       metrics:
         prometheus:
           enabled: true
+        host:
+          enabled: true
       logs:
         journald:
           enabled: true
@@ -542,6 +544,8 @@ pkgs.testers.runNixOSTest {
         proxy.wait_for_unit("forgeproxy-otlp-collector.service")
         rendered = proxy.succeed("cat /run/forgeproxy-otelcol/config.yaml")
         assert 'targets: ["127.0.0.1:8080"]' in rendered, rendered
+        assert "hostmetrics:" in rendered, rendered
+        assert 'receivers: ["prometheus", "hostmetrics"]' in rendered, rendered
         assert 'endpoint: "http://127.0.0.1:4318/v1/metrics"' in rendered, rendered
         assert 'endpoint: "http://127.0.0.1:4319/v1/logs"' in rendered, rendered
         assert 'endpoint: "http://127.0.0.1:4320/v1/traces"' in rendered, rendered
@@ -647,11 +651,25 @@ pkgs.testers.runNixOSTest {
             "journalctl -u otlp-test-sink.service --no-pager -o cat"
             " | grep -F 'system.cpu.time'"
         )
-
-    with subtest("Forgeproxy metrics egress over OTLP with basic auth"):
-        proxy.wait_until_succeeds(
-            "journalctl -u otlp-test-sink.service --no-pager -o cat"
-            " | grep -F 'forgeproxy_bundle_generation_total'"
+        proxy.succeed(
+            "curl -sf http://localhost:8080/metrics"
+            " | grep -q '^forgeproxy_clone_total{'"
+        )
+        proxy.succeed(
+            "curl -sf http://localhost:8080/metrics"
+            " | grep -q '^forgeproxy_clone_upstream_bytes_total{'"
+        )
+        proxy.succeed(
+            "curl -sf http://localhost:8080/metrics"
+            " | grep -q '^forgeproxy_clone_downstream_bytes_total{'"
+        )
+        proxy.succeed(
+            "curl -sf http://localhost:8080/metrics"
+            " | grep -q '^forgeproxy_cache_repos_total '"
+        )
+        proxy.succeed(
+            "curl -sf http://localhost:8080/metrics"
+            " | grep -q '^forgeproxy_upstream_api_rate_limit_remaining '"
         )
 
     with subtest("Pinned fetch still uses cache after waiting"):
