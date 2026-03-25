@@ -823,9 +823,11 @@ async fn try_ensure_repo_cloned_inner(
                 ensure_bare_head_ref(&mirror_path)
                     .await
                     .with_context(|| format!("failed to set bare HEAD after S3 restore for {owner_repo}"))?;
-                validate_ready_repo(state, &owner_repo, &mirror_path, "S3 restore")
+                quick_check_ready_repo(state, &owner_repo, &mirror_path, "S3 restore", None)
                     .await
-                    .with_context(|| format!("S3-restored repo validation failed for {owner_repo}"))?;
+                    .with_context(|| {
+                        format!("S3-restored repo quick verification failed for {owner_repo}")
+                    })?;
                 let published_generation_path =
                     publish_repo_mirror_generation(state, &owner_repo, "S3 restore").await?;
                 let published_repo_path = state.cache_manager.repo_path(&owner_repo);
@@ -952,7 +954,7 @@ async fn try_ensure_repo_cloned_inner(
         ensure_bare_head_ref(&mirror_path)
             .await
             .with_context(|| format!("failed to set bare HEAD after hydration for {owner_repo}"))?;
-        validate_ready_repo(
+        quick_check_ready_repo(
             state,
             &owner_repo,
             &mirror_path,
@@ -961,9 +963,10 @@ async fn try_ensure_repo_cloned_inner(
                 TeeHydrationOutcome::PublishedFromCapture => "tee capture publish",
                 TeeHydrationOutcome::NotHydrated => "upstream clone",
             },
+            None,
         )
         .await
-        .with_context(|| format!("ready-repo validation failed for {owner_repo}"))?;
+        .with_context(|| format!("ready-repo quick verification failed for {owner_repo}"))?;
         let published_generation_path = publish_repo_mirror_generation(
             state,
             &owner_repo,
@@ -1273,6 +1276,7 @@ async fn publish_repo_mirror_generation(
             source,
             mirror = %mirror_path.display(),
             staged = %staged_repo_path.display(),
+            snapshot_mode = "git-clone-local",
             "materializing staged generation from mirror"
         );
         crate::git::commands::git_clone_bare_local(&mirror_path, &staged_repo_path)
@@ -1289,6 +1293,7 @@ async fn publish_repo_mirror_generation(
             source,
             mirror = %mirror_path.display(),
             staged = %staged_repo_path.display(),
+            snapshot_mode = "git-clone-local",
             elapsed_ms = stage_clone_started_at.elapsed().as_millis(),
             "finished materializing staged generation from mirror"
         );
@@ -1314,15 +1319,15 @@ async fn publish_repo_mirror_generation(
             repo = %owner_repo,
             source,
             staged = %staged_repo_path.display(),
-            "validating staged generation before publish"
+            "performing quick staged-generation verification before publish"
         );
-        validate_ready_repo(state, owner_repo, &staged_repo_path, source).await?;
+        quick_check_ready_repo(state, owner_repo, &staged_repo_path, source, None).await?;
         info!(
             repo = %owner_repo,
             source,
             staged = %staged_repo_path.display(),
             elapsed_ms = staged_validation_started_at.elapsed().as_millis(),
-            "finished validating staged generation before publish"
+            "finished quick staged-generation verification before publish"
         );
 
         let publish_started_at = Instant::now();
@@ -1335,6 +1340,18 @@ async fn publish_repo_mirror_generation(
         );
         let published_path =
             publish_ready_repo(state, owner_repo, &staged_repo_path, source).await?;
+        spawn_generation_deep_validation(
+            state.clone(),
+            owner_repo.to_string(),
+            published_path.clone(),
+            source.to_string(),
+        );
+        spawn_mirror_deep_validation(
+            state.clone(),
+            owner_repo.to_string(),
+            mirror_path.clone(),
+            source.to_string(),
+        );
         info!(
             repo = %owner_repo,
             source,
@@ -1406,6 +1423,8 @@ async fn fetch_delta_into_repo_mirror(
                 crate::git::commands::git_fetch(&delta_repo_path, clone_url, &[]).await?
             };
         {
+            // Keep the writer-owned mirror stable from the moment we merge the
+            // delta workspace until a new published generation is ready.
             let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
             let delta_remote = delta_repo_path.to_string_lossy().to_string();
             if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
@@ -1436,33 +1455,34 @@ async fn fetch_delta_into_repo_mirror(
                     })?;
             }
             ensure_bare_head_ref(&mirror_path).await?;
+            let mirror_validation_started_at = Instant::now();
+            info!(
+                repo = %owner_repo,
+                source = "delta workspace integration",
+                path = %mirror_path.display(),
+                "starting quick mirror verification before publishing a generation"
+            );
+            quick_check_ready_repo(
+                state,
+                owner_repo,
+                &mirror_path,
+                "delta workspace integration",
+                None,
+            )
+            .await?;
+            info!(
+                repo = %owner_repo,
+                source = "delta workspace integration",
+                path = %mirror_path.display(),
+                elapsed_ms = mirror_validation_started_at.elapsed().as_millis(),
+                "finished quick mirror verification before publishing a generation"
+            );
+            let _published_generation_path =
+                publish_repo_mirror_generation(state, owner_repo, "delta workspace integration")
+                    .await?;
+            let published_repo_path = state.cache_manager.repo_path(owner_repo);
+            publish_bootstrap_bundle(state, owner_repo, &published_repo_path).await?;
         }
-        let mirror_validation_started_at = Instant::now();
-        info!(
-            repo = %owner_repo,
-            source = "delta workspace integration",
-            path = %mirror_path.display(),
-            "starting ready-repo validation"
-        );
-        check_ready_repo(
-            state,
-            owner_repo,
-            &mirror_path,
-            "delta workspace integration",
-        )
-        .await?;
-        info!(
-            repo = %owner_repo,
-            source = "delta workspace integration",
-            path = %mirror_path.display(),
-            elapsed_ms = mirror_validation_started_at.elapsed().as_millis(),
-            "finished ready-repo validation"
-        );
-        let _published_generation_path =
-            publish_repo_mirror_generation(state, owner_repo, "delta workspace integration")
-                .await?;
-        let published_repo_path = state.cache_manager.repo_path(owner_repo);
-        publish_bootstrap_bundle(state, owner_repo, &published_repo_path).await?;
         Ok::<crate::git::commands::FetchResult, anyhow::Error>(fetch_result)
     }
     .await;
@@ -1798,45 +1818,180 @@ async fn check_ready_repo(
     Ok(())
 }
 
-async fn validate_ready_repo(
+async fn quick_check_ready_repo(
     state: &crate::AppState,
-    owner_repo: &str,
+    _owner_repo: &str,
     repo_path: &Path,
     source: &str,
+    wants: Option<&[String]>,
 ) -> Result<()> {
-    let validation_started_at = Instant::now();
-    info!(
-        repo = %owner_repo,
-        source,
-        path = %repo_path.display(),
-        "starting ready-repo validation"
-    );
-    let validation_result = check_ready_repo(state, owner_repo, repo_path, source).await;
-
-    if let Err(error) = validation_result {
-        if repo_path.exists() {
-            tokio::fs::remove_dir_all(repo_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to remove invalid repo at {} after {}",
-                        repo_path.display(),
-                        source
-                    )
-                })?;
-        }
-        return Err(error);
+    if !state.cache_manager.has_repo_at(repo_path) {
+        bail!("repo is missing required bare-repo refs after {source}");
     }
 
-    info!(
-        repo = %owner_repo,
-        source,
-        path = %repo_path.display(),
-        elapsed_ms = validation_started_at.elapsed().as_millis(),
-        "finished ready-repo validation"
-    );
+    if let Some(wants) = wants.filter(|wants| !wants.is_empty()) {
+        let missing_wants = crate::git::commands::git_missing_objects(repo_path, wants).await?;
+        if !missing_wants.is_empty() {
+            let sample = missing_wants
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",");
+            bail!(
+                "repo is missing {} wanted objects after {} (sample: {})",
+                missing_wants.len(),
+                source,
+                sample,
+            );
+        }
+    }
 
     Ok(())
+}
+
+fn spawn_generation_deep_validation(
+    state: crate::AppState,
+    owner_repo: String,
+    generation_path: PathBuf,
+    source: String,
+) {
+    tokio::spawn(async move {
+        let validation_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source,
+            path = %generation_path.display(),
+            "starting background deep validation for published generation"
+        );
+        match check_ready_repo(&state, &owner_repo, &generation_path, &source).await {
+            Ok(()) => {
+                info!(
+                    repo = %owner_repo,
+                    source,
+                    path = %generation_path.display(),
+                    elapsed_ms = validation_started_at.elapsed().as_millis(),
+                    "finished background deep validation for published generation"
+                );
+            }
+            Err(error) => {
+                error!(
+                    repo = %owner_repo,
+                    source,
+                    path = %generation_path.display(),
+                    elapsed_ms = validation_started_at.elapsed().as_millis(),
+                    error = %error,
+                    "published generation failed background deep validation"
+                );
+            }
+        }
+    });
+}
+
+fn spawn_mirror_deep_validation(
+    state: crate::AppState,
+    owner_repo: String,
+    mirror_path: PathBuf,
+    source: String,
+) {
+    tokio::spawn(async move {
+        let Some(_publish_guard) = try_acquire_local_repo_publish_guard(&state, &owner_repo).await
+        else {
+            info!(
+                repo = %owner_repo,
+                source,
+                path = %mirror_path.display(),
+                "skipping background deep validation for mirror because publish work is already in progress"
+            );
+            return;
+        };
+
+        if !state.cache_manager.has_repo_at(&mirror_path) {
+            return;
+        }
+
+        let validation_root = state.cache_manager.base_path.join(".validation-work");
+        if let Err(error) = std::fs::create_dir_all(&validation_root) {
+            error!(
+                repo = %owner_repo,
+                source,
+                path = %validation_root.display(),
+                error = %error,
+                "failed to create validation-work directory for background mirror validation"
+            );
+            return;
+        }
+        let temp_root = match tempfile::Builder::new()
+            .prefix("mirror-validate-")
+            .tempdir_in(&validation_root)
+        {
+            Ok(dir) => dir,
+            Err(error) => {
+                error!(
+                    repo = %owner_repo,
+                    source,
+                    path = %mirror_path.display(),
+                    error = %error,
+                    "failed to create tempdir for background mirror validation"
+                );
+                return;
+            }
+        };
+        let snapshot_path = temp_root.path().join("snapshot.git");
+        info!(
+            repo = %owner_repo,
+            source,
+            mirror = %mirror_path.display(),
+            snapshot = %snapshot_path.display(),
+            "creating local snapshot for background mirror validation"
+        );
+        if let Err(error) =
+            crate::git::commands::git_clone_bare_local(&mirror_path, &snapshot_path).await
+        {
+            error!(
+                repo = %owner_repo,
+                source,
+                mirror = %mirror_path.display(),
+                snapshot = %snapshot_path.display(),
+                error = %error,
+                "failed to create local snapshot for background mirror validation"
+            );
+            return;
+        }
+        drop(_publish_guard);
+
+        let validation_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source,
+            mirror = %mirror_path.display(),
+            snapshot = %snapshot_path.display(),
+            "starting background deep validation for mirror snapshot"
+        );
+        match check_ready_repo(&state, &owner_repo, &snapshot_path, &source).await {
+            Ok(()) => {
+                info!(
+                    repo = %owner_repo,
+                    source,
+                    mirror = %mirror_path.display(),
+                    snapshot = %snapshot_path.display(),
+                    elapsed_ms = validation_started_at.elapsed().as_millis(),
+                    "finished background deep validation for mirror snapshot"
+                );
+            }
+            Err(error) => {
+                error!(
+                    repo = %owner_repo,
+                    source,
+                    mirror = %mirror_path.display(),
+                    snapshot = %snapshot_path.display(),
+                    elapsed_ms = validation_started_at.elapsed().as_millis(),
+                    error = %error,
+                    "mirror snapshot failed background deep validation"
+                );
+            }
+        }
+    });
 }
 
 async fn ensure_bare_head_ref(repo_path: &Path) -> Result<()> {
@@ -2162,11 +2317,17 @@ async fn ensure_repo_available_locally_detailed(
                 ensure_bare_head_ref(&mirror_path).await.with_context(|| {
                     format!("failed to set bare HEAD after S3 restore for {owner_repo}")
                 })?;
-                validate_ready_repo(state, owner_repo, &mirror_path, "S3 restore for request")
-                    .await
-                    .with_context(|| {
-                        format!("S3-restored repo validation failed for {owner_repo}")
-                    })?;
+                quick_check_ready_repo(
+                    state,
+                    owner_repo,
+                    &mirror_path,
+                    "S3 restore for request",
+                    None,
+                )
+                .await
+                .with_context(|| {
+                    format!("S3-restored repo quick verification failed for {owner_repo}")
+                })?;
                 publish_repo_mirror_generation(state, owner_repo, "S3 restore for request").await?;
 
                 let mut info = get_repo_info(&state.valkey, owner_repo)
@@ -2315,15 +2476,14 @@ pub async fn wait_for_local_catch_up(
         .await?
         .map(|info| info.hydrating_node_id.is_empty())
         .unwrap_or(true);
-    if should_start_refresh {
+    let mut refresh_handle = if should_start_refresh {
         let state = state.clone();
         let owner = owner.to_string();
         let repo = repo_clean.to_string();
         let auth_header = auth_header.map(ToOwned::to_owned);
-        let owner_repo_for_log = owner_repo.clone();
         let request_refspecs = request_refspecs.clone();
-        tokio::spawn(async move {
-            if let Err(error) = ensure_repo_cloned_from_upstream_with_refspecs(
+        Some(tokio::spawn(async move {
+            ensure_repo_cloned_from_upstream_with_refspecs(
                 &state,
                 &owner,
                 &repo,
@@ -2331,15 +2491,10 @@ pub async fn wait_for_local_catch_up(
                 request_refspecs.as_deref(),
             )
             .await
-            {
-                warn!(
-                    repo = %owner_repo_for_log,
-                    error = %error,
-                    "request-time local catch-up refresh failed"
-                );
-            }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     let started_at = Instant::now();
     let mut last_decision = initial_decision;
@@ -2352,6 +2507,31 @@ pub async fn wait_for_local_catch_up(
         "waiting for local published-generation catch-up before deciding whether to proxy upstream"
     );
     while started_at.elapsed() < timeout {
+        if refresh_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            let refresh_result = refresh_handle.take().unwrap().await;
+            match refresh_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    error!(
+                        repo = %owner_repo,
+                        error = %error,
+                        "request-time quick local verification failed; falling back to upstream proxy"
+                    );
+                    return Ok(last_decision);
+                }
+                Err(error) => {
+                    error!(
+                        repo = %owner_repo,
+                        error = %error,
+                        "request-time catch-up task failed; falling back to upstream proxy"
+                    );
+                    return Ok(last_decision);
+                }
+            }
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
         let decision = classify_local_wants_satisfaction(state, &owner_repo, wants).await?;
         if matches!(decision, LocalServeDecision::SatisfiesWants { .. }) {
