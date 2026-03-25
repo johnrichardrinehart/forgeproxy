@@ -102,13 +102,18 @@ pub async fn git_clone_bare(url: &str, dest: &Path, env_vars: &[(String, String)
     Ok(())
 }
 
-/// Run `git clone --bare --no-local <source> <dest>` for a local bare repo.
+/// Run `git clone --bare --local <source> <dest>` for a local bare repo.
+///
+/// This snapshots a local repository cheaply by letting Git hard-link object
+/// files when possible, while still copying refs into an independent bare repo.
+/// We use this for published generations so the reader-visible snapshot remains
+/// stable without paying the full cost of a byte-for-byte local object copy.
 #[instrument(fields(source = %source.display(), dest = %dest.display()))]
 pub async fn git_clone_bare_local(source: &Path, dest: &Path) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("clone")
         .arg("--bare")
-        .arg("--no-local")
+        .arg("--local")
         .arg(source)
         .arg(dest);
 
@@ -116,23 +121,23 @@ pub async fn git_clone_bare_local(source: &Path, dest: &Path) -> Result<()> {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    debug!("spawning git clone --bare --no-local");
+    debug!("spawning git clone --bare --local");
 
     let output = cmd
         .output()
         .await
-        .context("failed to spawn git clone --bare --no-local")?;
+        .context("failed to spawn git clone --bare --local")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "git clone --bare --no-local failed (status {}): {}",
+            "git clone --bare --local failed (status {}): {}",
             output.status,
             stderr.trim(),
         );
     }
 
-    debug!("git clone --bare --no-local succeeded");
+    debug!("git clone --bare --local succeeded");
     Ok(())
 }
 
