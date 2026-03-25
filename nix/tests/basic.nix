@@ -642,34 +642,14 @@ pkgs.testers.runNixOSTest {
         )
 
     with subtest("Forgeproxy metrics are exported at /metrics"):
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_bundle_generation_total '"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_archive_cache_misses_total '"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_clone_total{'"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_clone_upstream_bytes_total{'"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_clone_downstream_bytes_total{'"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_cache_repos_total '"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_upstream_api_rate_limit_remaining '"
-        )
+        metrics = proxy.succeed("curl -sf http://localhost:8080/metrics")
+        assert "forgeproxy_bundle_generation_total " in metrics, metrics
+        assert "forgeproxy_archive_cache_misses_total " in metrics, metrics
+        assert "forgeproxy_clone_total{" in metrics, metrics
+        assert "forgeproxy_clone_upstream_bytes_total{" in metrics, metrics
+        assert "forgeproxy_clone_downstream_bytes_total{" in metrics, metrics
+        assert "forgeproxy_cache_repos_total " in metrics, metrics
+        assert "forgeproxy_upstream_api_rate_limit_remaining " in metrics, metrics
 
     with subtest("Forgeproxy metrics egress over OTLP with basic auth"):
         proxy.wait_until_succeeds(
