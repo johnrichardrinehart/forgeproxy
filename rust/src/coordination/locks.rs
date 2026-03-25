@@ -33,6 +33,7 @@ pub async fn acquire_lock(
     key: &str,
     node_id: &str,
     ttl_secs: u64,
+    metrics: Option<&crate::metrics::MetricsRegistry>,
 ) -> Result<bool> {
     let value = format!("{node_id}:{}", chrono::Utc::now().timestamp());
     let result: Option<String> = pool
@@ -45,6 +46,13 @@ pub async fn acquire_lock(
         )
         .await?;
     let acquired = result.is_some();
+    if let Some(metrics) = metrics {
+        if acquired {
+            metrics.metrics.lock_acquisitions.inc();
+        } else {
+            metrics.metrics.lock_waits.inc();
+        }
+    }
     debug!(%key, %node_id, acquired, "acquire_lock");
     Ok(acquired)
 }
@@ -58,6 +66,7 @@ pub async fn acquire_lock_lease(
     key: &str,
     node_id: &str,
     ttl_secs: u64,
+    metrics: Option<&crate::metrics::MetricsRegistry>,
 ) -> Result<Option<LockLease>> {
     let token = format!("{node_id}:{}", Uuid::new_v4());
     let result: Option<String> = pool
@@ -70,6 +79,13 @@ pub async fn acquire_lock_lease(
         )
         .await?;
     let acquired = result.is_some();
+    if let Some(metrics) = metrics {
+        if acquired {
+            metrics.metrics.lock_acquisitions.inc();
+        } else {
+            metrics.metrics.lock_waits.inc();
+        }
+    }
     debug!(%key, %node_id, acquired, "acquire_lock_lease");
     Ok(acquired.then(|| LockLease {
         key: key.to_string(),
@@ -127,6 +143,7 @@ pub async fn release_lock(
     key: &str,
     node_id: &str,
     expected_owned: bool,
+    metrics: Option<&crate::metrics::MetricsRegistry>,
 ) -> Result<LockReleaseStatus> {
     let script = r#"
         local val = redis.call('GET', KEYS[1])
@@ -158,6 +175,9 @@ pub async fn release_lock(
             debug!(%key, %node_id, "lock released");
         }
         LockReleaseStatus::Expired => {
+            if let Some(metrics) = metrics {
+                metrics.metrics.lock_timeouts.inc();
+            }
             info!(%key, %node_id, "lock expired before release");
         }
         LockReleaseStatus::Missing => {
@@ -176,6 +196,7 @@ pub async fn release_lock_lease(
     pool: &fred::clients::Pool,
     lease: &LockLease,
     expected_owned: bool,
+    metrics: Option<&crate::metrics::MetricsRegistry>,
 ) -> Result<LockReleaseStatus> {
     let script = r#"
         local val = redis.call('GET', KEYS[1])
@@ -207,6 +228,9 @@ pub async fn release_lock_lease(
             debug!(key = %lease.key, node_id = %lease.node_id, "lock lease released");
         }
         LockReleaseStatus::Expired => {
+            if let Some(metrics) = metrics {
+                metrics.metrics.lock_timeouts.inc();
+            }
             info!(key = %lease.key, node_id = %lease.node_id, "lock lease expired before release");
         }
         LockReleaseStatus::Missing => {
@@ -238,6 +262,7 @@ pub async fn acquire_semaphore_lease(
     node_id: &str,
     limit: usize,
     ttl_secs: u64,
+    metrics: Option<&crate::metrics::MetricsRegistry>,
 ) -> Result<Option<SemaphoreLease>> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let ttl_ms = (ttl_secs as i64) * 1000;
@@ -274,12 +299,18 @@ pub async fn acquire_semaphore_lease(
         .context("semaphore acquire script failed")?;
 
     if acquired == 1 {
+        if let Some(metrics) = metrics {
+            metrics.metrics.lock_acquisitions.inc();
+        }
         debug!(%key, %node_id, limit, "distributed semaphore lease acquired");
         Ok(Some(SemaphoreLease {
             key: key.to_string(),
             token,
         }))
     } else {
+        if let Some(metrics) = metrics {
+            metrics.metrics.lock_waits.inc();
+        }
         debug!(%key, %node_id, limit, "distributed semaphore saturated");
         Ok(None)
     }
@@ -288,6 +319,7 @@ pub async fn acquire_semaphore_lease(
 pub async fn release_semaphore_lease(
     pool: &fred::clients::Pool,
     lease: &SemaphoreLease,
+    metrics: Option<&crate::metrics::MetricsRegistry>,
 ) -> Result<()> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let script = r#"
@@ -325,7 +357,12 @@ pub async fn release_semaphore_lease(
 
     match status.as_str() {
         "released" => debug!(key = %lease.key, "distributed semaphore lease released"),
-        "expired" => info!(key = %lease.key, "distributed semaphore lease already expired"),
+        "expired" => {
+            if let Some(metrics) = metrics {
+                metrics.metrics.lock_timeouts.inc();
+            }
+            info!(key = %lease.key, "distributed semaphore lease already expired")
+        }
         "missing" => warn!(
             key = %lease.key,
             "distributed semaphore lease missing at release time"

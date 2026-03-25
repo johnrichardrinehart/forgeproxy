@@ -15,6 +15,7 @@ mod storage;
 mod tee_hydration;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -37,7 +38,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::Config;
-use crate::metrics::MetricsRegistry;
+use crate::metrics::{ActiveConnectionGuard, MetricsRegistry, Protocol};
 
 const CLONE_CAPTURE_MEMORY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -121,12 +122,37 @@ pub struct AppState {
     /// advertisement and fetch POST, so we keep a short-lived in-memory copy.
     pub recent_info_refs_advertisements:
         Arc<Mutex<std::collections::HashMap<String, RecentInfoRefsAdvertisement>>>,
+    pub active_https_connections: Arc<AtomicI64>,
+    pub active_ssh_connections: Arc<AtomicI64>,
 }
 
 #[derive(Clone)]
 pub struct RecentInfoRefsAdvertisement {
     pub captured_at: Instant,
     pub payload: Vec<u8>,
+}
+
+impl AppState {
+    pub fn begin_active_connection(&self, protocol: Protocol) -> ActiveConnectionGuard {
+        let counter = match protocol {
+            Protocol::Https => Arc::clone(&self.active_https_connections),
+            Protocol::Ssh => Arc::clone(&self.active_ssh_connections),
+        };
+        ActiveConnectionGuard::new(self.metrics.clone(), protocol, counter)
+    }
+
+    pub fn refresh_live_metrics(&self) {
+        if let Ok(size_bytes) = self.cache_manager.total_size_bytes() {
+            crate::metrics::set_cache_size_bytes(&self.metrics, size_bytes);
+        }
+        if let Ok(repos) = self.cache_manager.list_repos() {
+            crate::metrics::set_cache_repos_total(&self.metrics, repos.len());
+        }
+        crate::metrics::set_upstream_api_rate_limit_remaining(
+            &self.metrics,
+            self.rate_limit.remaining(),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +824,7 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         );
     }
 
-    let rate_limit = forge::rate_limit::RateLimitState::new();
+    let rate_limit = forge::rate_limit::RateLimitState::with_metrics(metrics.clone());
     let clone_concurrency_limit = resolve_clone_concurrency_limit(&config);
     let bundle_execution_policy = config.bundles.execution_policy();
     tracing::info!(
@@ -807,7 +833,7 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         "resolved bundle execution policy"
     );
 
-    Ok(AppState {
+    let state = AppState {
         config: Arc::clone(&config),
         valkey,
         s3_client: s3,
@@ -830,5 +856,9 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
             std::collections::HashMap::new(),
         )),
         recent_info_refs_advertisements: Arc::new(Mutex::new(std::collections::HashMap::new())),
-    })
+        active_https_connections: Arc::new(AtomicI64::new(0)),
+        active_ssh_connections: Arc::new(AtomicI64::new(0)),
+    };
+    state.refresh_live_metrics();
+    Ok(state)
 }

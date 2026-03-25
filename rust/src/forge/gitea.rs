@@ -106,7 +106,7 @@ impl ForgeBackend for GiteaBackend {
             .await
             .context("upstream startup probe request failed")?;
 
-        rate_limit.update_from_headers(resp.headers());
+        rate_limit.record_response("GET /user", resp.headers());
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -139,7 +139,7 @@ impl ForgeBackend for GiteaBackend {
         }
         let resp = req.send().await.context("upstream API request failed")?;
 
-        rate_limit.update_from_headers(resp.headers());
+        rate_limit.record_response("GET /repos/{owner}/{repo}", resp.headers());
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -183,7 +183,7 @@ impl ForgeBackend for GiteaBackend {
             .await
             .context("upstream admin API request failed")?;
 
-        rate_limit.update_from_headers(resp.headers());
+        rate_limit.record_response("GET /admin/ssh-keys?fingerprint=...", resp.headers());
 
         if !resp.status().is_success() {
             warn!(
@@ -235,7 +235,10 @@ impl ForgeBackend for GiteaBackend {
             .send()
             .await?;
 
-        rate_limit.update_from_headers(resp.headers());
+        rate_limit.record_response(
+            "GET /repos/{owner}/{repo}/collaborators/{username}/permission",
+            resp.headers(),
+        );
 
         if !resp.status().is_success() {
             warn!(
@@ -319,7 +322,10 @@ impl ForgeBackend for GiteaBackend {
             .await
             .context("upstream API request failed for ref resolution")?;
 
-        rate_limit.update_from_headers(resp.headers());
+        rate_limit.record_response(
+            "GET /repos/{owner}/{repo}/commits/{git_ref}",
+            resp.headers(),
+        );
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);

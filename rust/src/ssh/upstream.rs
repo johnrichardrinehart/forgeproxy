@@ -22,6 +22,7 @@ use tracing::{debug, info, instrument};
 
 use crate::AppState;
 use crate::config::{Config, CredentialMode};
+use crate::metrics::{ClonePhase, CloneUpstreamBytesLabels, Protocol};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -78,6 +79,16 @@ pub async fn fetch_ref_advertisement(
                 .context("failed to read ref advertisement body")?;
 
             let stripped = strip_http_service_line(&body).to_vec();
+
+            state
+                .metrics
+                .metrics
+                .clone_upstream_bytes
+                .get_or_create(&CloneUpstreamBytesLabels {
+                    protocol: Protocol::Ssh,
+                    phase: ClonePhase::InfoRefs,
+                })
+                .inc_by(stripped.len() as u64);
 
             info!(
                 %owner_repo,

@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
@@ -36,6 +38,31 @@ pub struct ProtocolLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CloneUpstreamBytesLabels {
+    pub protocol: Protocol,
+    pub phase: ClonePhase,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CloneDownstreamBytesLabels {
+    pub protocol: Protocol,
+    pub phase: ClonePhase,
+    pub source: CloneSource,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum ClonePhase {
+    InfoRefs,
+    UploadPack,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum CloneSource {
+    Local,
+    Upstream,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EndpointLabels {
     pub endpoint: String,
 }
@@ -49,6 +76,8 @@ pub struct Metrics {
     // -- clone --
     pub clone_total: Family<CloneLabels, Counter>,
     pub clone_duration_seconds: Family<ProtocolLabels, Histogram>,
+    pub clone_upstream_bytes: Family<CloneUpstreamBytesLabels, Counter>,
+    pub clone_downstream_bytes: Family<CloneDownstreamBytesLabels, Counter>,
 
     // -- bundles --
     pub bundle_generation_total: Counter,
@@ -103,6 +132,20 @@ impl Metrics {
             "forgeproxy_clone_duration_seconds",
             "Clone request latency in seconds",
             clone_duration_seconds.clone(),
+        );
+
+        let clone_upstream_bytes = Family::<CloneUpstreamBytesLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_clone_upstream_bytes",
+            "Bytes fetched from upstream to satisfy clone traffic, by protocol and phase",
+            clone_upstream_bytes.clone(),
+        );
+
+        let clone_downstream_bytes = Family::<CloneDownstreamBytesLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_clone_downstream_bytes",
+            "Bytes sent downstream to clone clients, by protocol, phase, and source",
+            clone_downstream_bytes.clone(),
         );
 
         let bundle_generation_total = Counter::default();
@@ -227,6 +270,8 @@ impl Metrics {
         Self {
             clone_total,
             clone_duration_seconds,
+            clone_upstream_bytes,
+            clone_downstream_bytes,
             bundle_generation_total,
             bundle_generation_duration_seconds,
             auth_cache_hits,
@@ -268,5 +313,90 @@ impl MetricsRegistry {
             registry: Arc::new(registry),
             metrics: Arc::new(metrics),
         }
+    }
+}
+
+pub fn record_clone_completion(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    cache_status: CacheStatus,
+    elapsed: Duration,
+) {
+    metrics
+        .metrics
+        .clone_total
+        .get_or_create(&CloneLabels {
+            protocol: protocol.clone(),
+            cache_status,
+        })
+        .inc();
+    metrics
+        .metrics
+        .clone_duration_seconds
+        .get_or_create(&ProtocolLabels { protocol })
+        .observe(elapsed.as_secs_f64());
+}
+
+pub fn inc_upstream_api_call(metrics: &MetricsRegistry, endpoint: &str) {
+    metrics
+        .metrics
+        .upstream_api_calls
+        .get_or_create(&EndpointLabels {
+            endpoint: endpoint.to_string(),
+        })
+        .inc();
+}
+
+pub fn set_upstream_api_rate_limit_remaining(metrics: &MetricsRegistry, remaining: u64) {
+    metrics
+        .metrics
+        .upstream_api_rate_limit_remaining
+        .set(remaining.min(i64::MAX as u64) as i64);
+}
+
+pub fn set_active_connections(metrics: &MetricsRegistry, protocol: Protocol, value: i64) {
+    metrics
+        .metrics
+        .active_connections
+        .get_or_create(&ProtocolLabels { protocol })
+        .set(value.max(0));
+}
+
+pub fn set_cache_size_bytes(metrics: &MetricsRegistry, size_bytes: u64) {
+    metrics
+        .metrics
+        .cache_size_bytes
+        .set(size_bytes.min(i64::MAX as u64) as i64);
+}
+
+pub fn set_cache_repos_total(metrics: &MetricsRegistry, repo_count: usize) {
+    metrics
+        .metrics
+        .cache_repos_total
+        .set(repo_count.min(i64::MAX as usize) as i64);
+}
+
+pub struct ActiveConnectionGuard {
+    metrics: MetricsRegistry,
+    protocol: Protocol,
+    counter: Arc<AtomicI64>,
+}
+
+impl ActiveConnectionGuard {
+    pub fn new(metrics: MetricsRegistry, protocol: Protocol, counter: Arc<AtomicI64>) -> Self {
+        let next = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        set_active_connections(&metrics, protocol.clone(), next);
+        Self {
+            metrics,
+            protocol,
+            counter,
+        }
+    }
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        let next = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
+        set_active_connections(&self.metrics, self.protocol.clone(), next);
     }
 }

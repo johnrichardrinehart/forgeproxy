@@ -322,6 +322,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
         &lock_key,
         &node_id,
         lock_ttl,
+        Some(&state.metrics),
     )
     .await?
     else {
@@ -377,8 +378,13 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
         );
         // Release lock and return.
         let lock_lease = stop_bundle_lock_heartbeat(bundle_lock_heartbeat).await;
-        let _ =
-            crate::coordination::locks::release_lock_lease(&state.valkey, &lock_lease, true).await;
+        let _ = crate::coordination::locks::release_lock_lease(
+            &state.valkey,
+            &lock_lease,
+            true,
+            Some(&state.metrics),
+        )
+        .await;
         return Ok(RepoTickOutcome::with_status(
             RepoTickStatus::SkippedNotCached,
         ));
@@ -436,6 +442,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
 
                     if let Err(e) = crate::storage::s3::upload_bundle(
                         &state.s3_client,
+                        &state.metrics,
                         &state.config.storage.s3.bucket,
                         &s3_key,
                         &bundle.bundle_path,
@@ -492,6 +499,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
                                 );
                                 if let Err(e) = crate::storage::s3::upload_bundle(
                                     &state.s3_client,
+                                    &state.metrics,
                                     &state.config.storage.s3.bucket,
                                     &filtered_s3_key,
                                     &filtered.bundle_path,
@@ -540,7 +548,13 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
 
     // Release the distributed lock.
     let lock_lease = stop_bundle_lock_heartbeat(bundle_lock_heartbeat).await;
-    let _ = crate::coordination::locks::release_lock_lease(&state.valkey, &lock_lease, true).await;
+    let _ = crate::coordination::locks::release_lock_lease(
+        &state.valkey,
+        &lock_lease,
+        true,
+        Some(&state.metrics),
+    )
+    .await;
 
     if !published && staged_repo_path.exists() {
         tokio::fs::remove_dir_all(&staged_repo_path)
@@ -728,9 +742,14 @@ pub(crate) async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
 
         let lock_key = format!("forgeproxy:lock:daily-consolidation:{owner_repo}");
         let node_id = crate::coordination::node::node_id();
-        let lock_acquired =
-            crate::coordination::locks::acquire_lock(&state.valkey, &lock_key, &node_id, lock_ttl)
-                .await?;
+        let lock_acquired = crate::coordination::locks::acquire_lock(
+            &state.valkey,
+            &lock_key,
+            &node_id,
+            lock_ttl,
+            Some(&state.metrics),
+        )
+        .await?;
 
         if !lock_acquired {
             debug!(
@@ -791,6 +810,7 @@ pub(crate) async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
                                 );
                                 crate::storage::s3::upload_bundle(
                                     &state.s3_client,
+                                    &state.metrics,
                                     &state.config.storage.s3.bucket,
                                     &filtered_s3_key,
                                     &filtered.bundle_path,
@@ -825,8 +845,14 @@ pub(crate) async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
                 }
             };
 
-        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true)
-            .await;
+        let _ = crate::coordination::locks::release_lock(
+            &state.valkey,
+            &lock_key,
+            &node_id,
+            true,
+            Some(&state.metrics),
+        )
+        .await;
 
         if let Err(e) = result {
             debug!(
@@ -903,9 +929,14 @@ pub(crate) async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
 
         let lock_key = format!("forgeproxy:lock:weekly-consolidation:{owner_repo}");
         let node_id = crate::coordination::node::node_id();
-        let lock_acquired =
-            crate::coordination::locks::acquire_lock(&state.valkey, &lock_key, &node_id, lock_ttl)
-                .await?;
+        let lock_acquired = crate::coordination::locks::acquire_lock(
+            &state.valkey,
+            &lock_key,
+            &node_id,
+            lock_ttl,
+            Some(&state.metrics),
+        )
+        .await?;
 
         if !lock_acquired {
             debug!(
@@ -957,8 +988,14 @@ pub(crate) async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
                 }
             };
 
-        let _ = crate::coordination::locks::release_lock(&state.valkey, &lock_key, &node_id, true)
-            .await;
+        let _ = crate::coordination::locks::release_lock(
+            &state.valkey,
+            &lock_key,
+            &node_id,
+            true,
+            Some(&state.metrics),
+        )
+        .await;
 
         if let Err(e) = result {
             debug!(

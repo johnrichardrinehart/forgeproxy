@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::{debug, info, instrument, warn};
@@ -46,6 +47,7 @@ pub async fn generate_incremental_bundle(
     owner_repo: &str,
     since_refs: &HashMap<String, String>,
 ) -> Result<BundleResult> {
+    let started_at = Instant::now();
     let current_refs = get_refs(repo_path).await?;
 
     // Determine which refs are new or updated.
@@ -132,6 +134,11 @@ pub async fn generate_incremental_bundle(
         crate::bundleuri::creation_token::next_creation_token(state, owner_repo).await?;
 
     state.metrics.metrics.bundle_generation_total.inc();
+    state
+        .metrics
+        .metrics
+        .bundle_generation_duration_seconds
+        .observe(started_at.elapsed().as_secs_f64());
 
     Ok(BundleResult {
         _temp_dir: tmp_dir,
@@ -148,6 +155,7 @@ pub async fn generate_full_bundle(
     repo_path: &Path,
     owner_repo: &str,
 ) -> Result<BundleResult> {
+    let started_at = Instant::now();
     let current_refs = get_refs(repo_path).await?;
 
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for bundle")?;
@@ -202,6 +210,11 @@ pub async fn generate_full_bundle(
         crate::bundleuri::creation_token::next_creation_token(state, owner_repo).await?;
 
     state.metrics.metrics.bundle_generation_total.inc();
+    state
+        .metrics
+        .metrics
+        .bundle_generation_duration_seconds
+        .observe(started_at.elapsed().as_secs_f64());
 
     Ok(BundleResult {
         _temp_dir: tmp_dir,
@@ -222,6 +235,7 @@ pub async fn generate_filtered_bundle(
     repo_path: &Path,
     owner_repo: &str,
 ) -> Result<BundleResult> {
+    let started_at = Instant::now();
     let current_refs = get_refs(repo_path).await?;
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for filtered bundle")?;
     let bundle_path = tmp_dir
@@ -269,6 +283,11 @@ pub async fn generate_filtered_bundle(
         crate::bundleuri::creation_token::next_creation_token(state, owner_repo).await?;
 
     state.metrics.metrics.bundle_generation_total.inc();
+    state
+        .metrics
+        .metrics
+        .bundle_generation_duration_seconds
+        .observe(started_at.elapsed().as_secs_f64());
 
     Ok(BundleResult {
         _temp_dir: tmp_dir,

@@ -298,6 +298,12 @@ variable "otlp_metrics" {
   sensitive   = true
 }
 
+variable "host_metrics_enabled" {
+  type        = bool
+  default     = false
+  description = "Enable host-level CPU, memory, filesystem, disk, network, load, and paging metrics in the on-instance OTLP collector."
+}
+
 variable "otlp_logs" {
   type = object({
     endpoint             = string

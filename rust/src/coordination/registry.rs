@@ -349,6 +349,7 @@ pub async fn try_acquire_clone_hydration_permits(
             .clone
             .max_concurrent_upstream_clones_per_repo_across_instances,
         state.config.clone.lock_ttl,
+        Some(&state.metrics),
     )
     .await?
     else {
@@ -398,6 +399,7 @@ pub async fn acquire_clone_hydration_permits(
             .clone
             .max_concurrent_upstream_clones_per_repo_across_instances,
         state.config.clone.lock_ttl,
+        Some(&state.metrics),
     )
     .await?
     else {
@@ -418,6 +420,7 @@ pub async fn release_clone_hydration_permits(
     crate::coordination::locks::release_semaphore_lease(
         &state.valkey,
         &permits.distributed_repo_permit,
+        Some(&state.metrics),
     )
     .await
 }
@@ -1517,6 +1520,7 @@ async fn try_restore_repo_from_s3(
     let bundle_path = tmp_dir.path().join("hydrate.bundle");
     crate::storage::s3::download_to_path(
         &state.s3_client,
+        &state.metrics,
         &state.config.storage.s3.bucket,
         &s3_key,
         &bundle_path,
@@ -1939,6 +1943,7 @@ async fn publish_bootstrap_bundle(
             );
             crate::storage::s3::upload_bundle(
                 &state.s3_client,
+                &state.metrics,
                 &state.config.storage.s3.bucket,
                 &s3_key,
                 &bundle.bundle_path,
@@ -2000,6 +2005,42 @@ pub enum LocalServeDecision {
         want_count: usize,
         missing_wants: Vec<String>,
     },
+}
+
+pub fn clone_cache_status(decision: &LocalServeDecision) -> crate::metrics::CacheStatus {
+    match decision {
+        LocalServeDecision::SatisfiesWants {
+            serve_from: LocalServeRepoSource::PublishedGeneration,
+            had_local_repo_before_check: true,
+            restored_from_s3_for_request: false,
+            ..
+        } => crate::metrics::CacheStatus::Hot,
+        LocalServeDecision::SatisfiesWants {
+            serve_from: LocalServeRepoSource::Mirror,
+            ..
+        }
+        | LocalServeDecision::SatisfiesWants {
+            restored_from_s3_for_request: true,
+            ..
+        }
+        | LocalServeDecision::Unavailable {
+            had_local_repo_before_check: true,
+            ..
+        }
+        | LocalServeDecision::Unavailable {
+            restored_from_s3_for_request: true,
+            ..
+        }
+        | LocalServeDecision::MissingWantedObjects {
+            had_local_repo_before_check: true,
+            ..
+        }
+        | LocalServeDecision::MissingWantedObjects {
+            restored_from_s3_for_request: true,
+            ..
+        } => crate::metrics::CacheStatus::Warm,
+        _ => crate::metrics::CacheStatus::Cold,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
