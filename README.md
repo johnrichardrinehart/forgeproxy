@@ -163,6 +163,15 @@ The signal flow is:
   host-local Collector over a fixed loopback OTLP receiver at
   `127.0.0.1:4317`, and the Collector exports them onward.
 
+At service startup, forgeproxy also performs best-effort runtime environment
+detection and writes a shared resource-attributes file under
+`/run/forgeproxy/runtime-resource-attributes.json`. Both forgeproxy itself and
+the host-local Collector reuse that file so all three signals share the same
+resource identity. On AWS this uses IMDSv2; Azure and GCP metadata detection is
+also attempted. If cloud metadata is indeterminate, startup continues and
+forgeproxy logs a warning before falling back to local identifiers such as
+`/etc/machine-id`.
+
 That means the internal Collector endpoint and the external backend endpoints
 are different things:
 
@@ -211,6 +220,16 @@ Each signal can use a different OTLP endpoint, protocol, and basic-auth
 credential pair. That is the intended way to point forgeproxy at an internal
 Collector or auth proxy which then forwards to the final backend, such as a
 VictoriaMetrics metrics ingest URL plus different log/trace backends.
+
+The Collector also upserts these runtime resource attributes onto metrics,
+logs, and traces when it exports them:
+
+- `service.instance.id`: cloud instance ID when available, otherwise a
+  best-effort stable fallback
+- `service.machine_id`: `/etc/machine-id`
+- `service.ip_address`: best-effort source IP for the node's outbound interface
+- `cloud.provider`, `cloud.platform`, `cloud.region`: when detected from AWS,
+  Azure, or GCP metadata
 
 Host metrics are controlled separately from forgeproxy's own `/metrics`
 endpoint:

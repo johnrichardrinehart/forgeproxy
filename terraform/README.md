@@ -335,9 +335,14 @@ curl -k http://127.0.0.1:8080/healthz
      - Metrics are scraped from `http://127.0.0.1:8080/metrics`
      - Optional host metrics are read locally from the node through the Collector's `hostmetrics` receiver
      - Logs are tailed from `forgeproxy.service` in journald
-   - Traces also egress through the on-instance Collector:
+  - Traces also egress through the on-instance Collector:
      - forgeproxy sends spans to a fixed loopback OTLP receiver on `127.0.0.1:4317`
      - the on-instance Collector then exports those spans to `otlp_traces.endpoint`
+   - At startup, forgeproxy writes shared runtime resource attributes to `/run/forgeproxy/runtime-resource-attributes.json`
+     - AWS uses IMDSv2; Azure and GCP metadata detection are also attempted
+     - the on-instance Collector reuses that file so metrics, logs, and traces share the same stable instance identity
+     - when cloud metadata is indeterminate, forgeproxy logs a warning and falls back to best-effort local identifiers instead of failing startup
+   - The Collector exports `service.instance.id`, `service.machine_id`, and `service.ip_address` resource attributes, plus `cloud.provider`, `cloud.platform`, and `cloud.region` when they can be detected
    - Each signal can use a different OTLP protocol, endpoint, and HTTP basic-auth credential pair
    - This is the intended place to point at an internal Collector or auth proxy which then forwards to final backends such as VictoriaMetrics
    - Forgeproxy still exposes Prometheus metrics at `http://127.0.0.1:8080/metrics` on the instance

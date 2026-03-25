@@ -27,6 +27,7 @@ let
       mode=''${1:-}
       source_config=${lib.escapeShellArg cfg.sourceConfigFile}
       runtime_config=${lib.escapeShellArg cfg.generatedConfigFile}
+      runtime_resource_file=${lib.escapeShellArg cfg.resourceAttributesFile}
 
       if [[ ! -f "$source_config" ]]; then
         echo "forgeproxy-otlp-collector: missing source config $source_config" >&2
@@ -60,6 +61,15 @@ let
         local signal=$1
         local suffix=$2
         read_config ".observability.exporters.otlp.''${signal}.''${suffix}"
+      }
+
+      read_runtime_attr() {
+        local path=$1
+        if [[ ! -f "$runtime_resource_file" ]]; then
+          printf '\n'
+          return 0
+        fi
+        ${yq}/bin/yq -r "$path" "$runtime_resource_file"
       }
 
       validate_positive_integer() {
@@ -222,6 +232,23 @@ let
       mkdir -p "$(dirname "$runtime_config")"
       umask 077
 
+      resource_service_name=$(read_runtime_attr '.service_name // ""')
+      resource_service_namespace=$(read_runtime_attr '.service_namespace // ""')
+      resource_service_version=$(read_runtime_attr '.service_version // ""')
+      resource_service_instance_id=$(read_runtime_attr '.service_instance_id // ""')
+      resource_service_machine_id=$(read_runtime_attr '.service_machine_id // ""')
+      resource_service_ip_address=$(read_runtime_attr '.service_ip_address // ""')
+      resource_cloud_provider=$(read_runtime_attr '.cloud_provider // ""')
+      resource_cloud_platform=$(read_runtime_attr '.cloud_platform // ""')
+      resource_cloud_region=$(read_runtime_attr '.cloud_region // ""')
+
+      if [[ -z "$resource_service_name" || "$resource_service_name" == "null" ]]; then
+        resource_service_name="forgeproxy"
+      fi
+      if [[ -z "$resource_service_namespace" || "$resource_service_namespace" == "null" ]]; then
+        resource_service_namespace="forgeproxy"
+      fi
+
       {
         extensions=()
 
@@ -325,6 +352,41 @@ let
 
         printf '\n%s\n' "processors:"
 
+        printf '%s\n' \
+          "  resource/common:" \
+          "    attributes:" \
+          "      - key: service.name" \
+          "        value: \"$(yaml_escape "$resource_service_name")\"" \
+          "        action: upsert" \
+          "      - key: service.namespace" \
+          "        value: \"$(yaml_escape "$resource_service_namespace")\"" \
+          "        action: upsert"
+
+        if [[ -n "$resource_service_version" && "$resource_service_version" != "null" ]]; then
+          printf '%s\n' \
+            "      - key: service.version" \
+            "        value: \"$(yaml_escape "$resource_service_version")\"" \
+            "        action: upsert"
+        fi
+
+        for attr in \
+          "service.instance.id:$resource_service_instance_id" \
+          "service.machine_id:$resource_service_machine_id" \
+          "service.ip_address:$resource_service_ip_address" \
+          "cloud.provider:$resource_cloud_provider" \
+          "cloud.platform:$resource_cloud_platform" \
+          "cloud.region:$resource_cloud_region"
+        do
+          key=''${attr%%:*}
+          value=''${attr#*:}
+          if [[ -n "$value" && "$value" != "null" ]]; then
+            printf '%s\n' \
+              "      - key: ''${key}" \
+              "        value: \"$(yaml_escape "$value")\"" \
+              "        action: upsert"
+          fi
+        done
+
         if [[ "$metrics_enabled" == "true" ]]; then
           printf '%s\n' \
             "  batch/metrics:" \
@@ -417,7 +479,7 @@ let
           printf '%s\n' \
             "    metrics:" \
             "      receivers: $(yaml_inline_list "''${metrics_receivers[@]}")" \
-            "      processors: [batch/metrics]" \
+            "      processors: [resource/common, batch/metrics]" \
             "      exporters: [\"''${metrics_exporter}\"]"
         fi
 
@@ -426,7 +488,7 @@ let
           printf '%s\n' \
             "    logs:" \
             "      receivers: [journald]" \
-            "      processors: [batch/logs]" \
+            "      processors: [resource/common, batch/logs]" \
             "      exporters: [\"''${logs_exporter}\"]"
         fi
 
@@ -435,7 +497,7 @@ let
           printf '%s\n' \
             "    traces:" \
             "      receivers: [otlp/internal]" \
-            "      processors: [batch/traces]" \
+            "      processors: [resource/common, batch/traces]" \
             "      exporters: [\"''${traces_exporter}\"]"
         fi
       } > "$runtime_config"
@@ -464,6 +526,17 @@ in
       description = ''
         Shared forgeproxy configuration file. The collector derives its runtime
         config from this file so operators only manage one config surface.
+      '';
+    };
+
+    resourceAttributesFile = lib.mkOption {
+      type = lib.types.path;
+      default = forgeproxyCfg.runtimeResourceFile;
+      defaultText = lib.literalExpression "config.services.forgeproxy.runtimeResourceFile";
+      description = ''
+        Runtime-discovered resource attributes produced by forgeproxy at
+        service startup. The collector reuses this file so metrics, logs, and
+        traces share the same stable instance identity and cloud metadata.
       '';
     };
 
