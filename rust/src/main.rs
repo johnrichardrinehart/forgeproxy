@@ -16,7 +16,7 @@ mod storage;
 mod tee_hydration;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -30,7 +30,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tokio::signal;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -136,6 +136,7 @@ pub struct AppState {
         Arc<Mutex<std::collections::HashMap<String, RecentInfoRefsAdvertisement>>>,
     pub active_https_connections: Arc<AtomicI64>,
     pub active_ssh_connections: Arc<AtomicI64>,
+    pub draining: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -151,6 +152,14 @@ impl AppState {
             Protocol::Ssh => Arc::clone(&self.active_ssh_connections),
         };
         ActiveConnectionGuard::new(self.metrics.clone(), protocol, counter)
+    }
+
+    pub fn start_draining(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
     }
 
     pub fn refresh_live_metrics(&self) {
@@ -489,7 +498,7 @@ async fn run_startup_init(config: &Config) -> usize {
 // HTTP server (axum)
 // ---------------------------------------------------------------------------
 
-async fn run_http_server(state: AppState) -> Result<()> {
+async fn run_http_server(state: AppState, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     let app = http::handler::create_router(Arc::new(state.clone()));
 
     let listen_addr: std::net::SocketAddr = state
@@ -506,10 +515,22 @@ async fn run_http_server(state: AppState) -> Result<()> {
     tracing::info!(%listen_addr, "HTTP server listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            if *shutdown_rx.borrow() {
+                tracing::info!("HTTP listener received drain signal before serving");
+                return;
+            }
+            while shutdown_rx.changed().await.is_ok() {
+                if *shutdown_rx.borrow() {
+                    tracing::info!("HTTP listener entering graceful shutdown");
+                    break;
+                }
+            }
+        })
         .await
         .context("HTTP server error")?;
 
+    tracing::info!("HTTP server exited cleanly");
     Ok(())
 }
 
@@ -517,8 +538,8 @@ async fn run_http_server(state: AppState) -> Result<()> {
 // Background tasks
 // ---------------------------------------------------------------------------
 
-async fn run_ssh_server(state: AppState) -> Result<()> {
-    crate::ssh::start_ssh_server(Arc::new(state)).await
+async fn run_ssh_server(state: AppState, shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+    crate::ssh::start_ssh_server(Arc::new(state), shutdown_rx).await
 }
 
 async fn run_bundle_lifecycle(state: AppState) -> Result<()> {
@@ -572,7 +593,7 @@ async fn run_dev_command(state: AppState, command: Command) -> Result<()> {
 // Graceful shutdown
 // ---------------------------------------------------------------------------
 
-async fn shutdown_signal() {
+async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -760,6 +781,8 @@ async fn main() -> Result<()> {
         runtime_resource_detection.attributes.clone(),
     )
     .await?;
+    let (http_shutdown_tx, http_shutdown_rx) = watch::channel(false);
+    let (ssh_shutdown_tx, ssh_shutdown_rx) = watch::channel(false);
 
     // ---- Telemetry buffer ----
     let telemetry_buffer = cache::telemetry::TelemetryBuffer::new();
@@ -773,8 +796,9 @@ async fn main() -> Result<()> {
 
     let http_handle = tokio::spawn({
         let s = state.clone();
+        let shutdown_rx = http_shutdown_rx.clone();
         async move {
-            if let Err(e) = run_http_server(s).await {
+            if let Err(e) = run_http_server(s, shutdown_rx).await {
                 tracing::error!(error = %e, "HTTP server failed");
             }
         }
@@ -782,8 +806,9 @@ async fn main() -> Result<()> {
 
     let ssh_handle = tokio::spawn({
         let s = state.clone();
+        let shutdown_rx = ssh_shutdown_rx.clone();
         async move {
-            if let Err(e) = run_ssh_server(s).await {
+            if let Err(e) = run_ssh_server(s, shutdown_rx).await {
                 tracing::error!(error = %e, "SSH server failed");
             }
         }
@@ -824,25 +849,47 @@ async fn main() -> Result<()> {
     // Wait for a shutdown signal or for any task to exit unexpectedly.
     // On shutdown, abort all remaining tasks so the process exits promptly.
     let abort_handles = [
-        http_handle.abort_handle(),
-        ssh_handle.abort_handle(),
         bundle_handle.abort_handle(),
         tee_cleanup_handle.abort_handle(),
         heartbeat_handle.abort_handle(),
         telemetry_handle.abort_handle(),
     ];
     let abort_handles = abort_handles.to_vec();
+    tokio::pin!(
+        http_handle,
+        ssh_handle,
+        bundle_handle,
+        tee_cleanup_handle,
+        heartbeat_handle,
+        telemetry_handle
+    );
     tokio::select! {
-        _ = shutdown_signal() => {
+        _ = wait_for_shutdown_signal() => {
+            tracing::info!("forgeproxy entering drain mode");
+            state.start_draining();
+            let _ = ssh_shutdown_tx.send(true);
+            tracing::info!(
+                active_https_connections = state.active_https_connections.load(Ordering::SeqCst),
+                active_ssh_connections = state.active_ssh_connections.load(Ordering::SeqCst),
+                "drain signal broadcast to listeners"
+            );
             for h in &abort_handles { h.abort(); }
+            tracing::info!("awaiting SSH server drain completion");
+            let _ = (&mut ssh_handle).await;
+            tracing::info!("SSH server drain completed");
+            tracing::info!("signaling HTTP listener shutdown after request drain");
+            let _ = http_shutdown_tx.send(true);
+            tracing::info!("awaiting HTTP server drain completion");
+            let _ = (&mut http_handle).await;
+            tracing::info!("HTTP server drain completed");
         }
         _ = async {
             let _ = tokio::try_join!(
-                http_handle,
-                ssh_handle,
-                bundle_handle,
-                heartbeat_handle,
-                telemetry_handle
+                &mut http_handle,
+                &mut ssh_handle,
+                &mut bundle_handle,
+                &mut heartbeat_handle,
+                &mut telemetry_handle
             );
         } => {
             for h in &abort_handles { h.abort(); }
@@ -932,6 +979,7 @@ async fn build_app_state(
         recent_info_refs_advertisements: Arc::new(Mutex::new(std::collections::HashMap::new())),
         active_https_connections: Arc::new(AtomicI64::new(0)),
         active_ssh_connections: Arc::new(AtomicI64::new(0)),
+        draining: Arc::new(AtomicBool::new(false)),
     };
     state.refresh_live_metrics();
     Ok(state)
