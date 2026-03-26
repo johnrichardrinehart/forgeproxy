@@ -61,6 +61,12 @@ fn permission_from_repo_response(body: &serde_json::Value) -> Permission {
     Permission::None
 }
 
+fn extract_current_user_login(body: &serde_json::Value) -> Option<String> {
+    body.get("login")
+        .and_then(|login| login.as_str())
+        .map(|login| login.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementation
 // ---------------------------------------------------------------------------
@@ -137,6 +143,42 @@ impl ForgeBackend for GitHubBackend {
             .context("failed to parse upstream API response")?;
 
         Ok(permission_from_repo_response(&body))
+    }
+
+    async fn resolve_http_user(
+        &self,
+        http_client: &reqwest::Client,
+        auth_header: Option<&str>,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>> {
+        let Some(auth_header) = auth_header.filter(|header| !header.trim().is_empty()) else {
+            return Ok(None);
+        };
+
+        let url = format!("{}/user", self.api_url);
+        let resp = http_client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .header("Accept", self.accept)
+            .send()
+            .await
+            .context("upstream current-user request failed")?;
+
+        rate_limit.record_response("GET /user", resp.headers());
+
+        if !resp.status().is_success() {
+            warn!(
+                status = %resp.status(),
+                "upstream current-user API returned non-success"
+            );
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("failed to parse upstream current-user response")?;
+        Ok(extract_current_user_login(&body))
     }
 
     async fn resolve_ssh_user(
@@ -415,6 +457,18 @@ mod tests {
     fn extract_key_lookup_login_missing_field() {
         let body = serde_json::json!([{"id": 1}]);
         assert_eq!(extract_key_lookup_login(&body), None);
+    }
+
+    #[test]
+    fn extract_current_user_login_found() {
+        let body = serde_json::json!({ "login": "alice" });
+        assert_eq!(extract_current_user_login(&body), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn extract_current_user_login_missing_field() {
+        let body = serde_json::json!({ "id": 1 });
+        assert_eq!(extract_current_user_login(&body), None);
     }
 
     // ── Collaborator permission parsing ─────────────────────────────────

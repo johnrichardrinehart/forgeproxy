@@ -76,6 +76,13 @@ fn permission_from_repo_response(body: &serde_json::Value) -> Permission {
     Permission::None
 }
 
+fn extract_current_user_username(body: &serde_json::Value) -> Option<String> {
+    body.get("login")
+        .or_else(|| body.get("username"))
+        .and_then(|username| username.as_str())
+        .map(|username| username.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementation
 // ---------------------------------------------------------------------------
@@ -153,6 +160,42 @@ impl ForgeBackend for GiteaBackend {
             .context("failed to parse Gitea API response")?;
 
         Ok(permission_from_repo_response(&body))
+    }
+
+    async fn resolve_http_user(
+        &self,
+        http_client: &reqwest::Client,
+        auth_header: Option<&str>,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>> {
+        let Some(auth_header) = auth_header.filter(|header| !header.trim().is_empty()) else {
+            return Ok(None);
+        };
+
+        let url = format!("{}/user", self.api_url);
+        let resp = http_client
+            .get(&url)
+            .header("Authorization", auth_header)
+            .header("Accept", self.accept)
+            .send()
+            .await
+            .context("upstream current-user request failed")?;
+
+        rate_limit.record_response("GET /user", resp.headers());
+
+        if !resp.status().is_success() {
+            warn!(
+                status = %resp.status(),
+                "Gitea current-user API returned non-success"
+            );
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("failed to parse Gitea current-user response")?;
+        Ok(extract_current_user_username(&body))
     }
 
     async fn resolve_ssh_user(
@@ -386,6 +429,30 @@ mod tests {
     fn public_repo_without_permissions_is_readable() {
         let body = serde_json::json!({"private": false});
         assert_eq!(permission_from_repo_response(&body), Permission::Read);
+    }
+
+    #[test]
+    fn extract_current_user_username_login_field() {
+        let body = serde_json::json!({ "login": "alice" });
+        assert_eq!(
+            extract_current_user_username(&body),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_current_user_username_username_field() {
+        let body = serde_json::json!({ "username": "alice" });
+        assert_eq!(
+            extract_current_user_username(&body),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_current_user_username_missing() {
+        let body = serde_json::json!({ "id": 1 });
+        assert_eq!(extract_current_user_username(&body), None);
     }
 
     // ── Gitea HMAC verification (no sha256= prefix) ────────────────────

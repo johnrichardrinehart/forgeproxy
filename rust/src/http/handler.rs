@@ -101,6 +101,8 @@ where
 struct CloneCompletion {
     cache_status: CacheStatus,
     started_at: Instant,
+    metric_username: String,
+    metric_repo: String,
 }
 
 struct CloneCompletionStream<S> {
@@ -109,6 +111,8 @@ struct CloneCompletionStream<S> {
     protocol: Protocol,
     cache_status: CacheStatus,
     started_at: Instant,
+    metric_username: String,
+    metric_repo: String,
     recorded: bool,
 }
 
@@ -119,6 +123,8 @@ impl<S> CloneCompletionStream<S> {
         protocol: Protocol,
         cache_status: CacheStatus,
         started_at: Instant,
+        metric_username: String,
+        metric_repo: String,
     ) -> Self {
         Self {
             inner,
@@ -126,6 +132,8 @@ impl<S> CloneCompletionStream<S> {
             protocol,
             cache_status,
             started_at,
+            metric_username,
+            metric_repo,
             recorded: false,
         }
     }
@@ -139,6 +147,8 @@ impl<S> CloneCompletionStream<S> {
             &self.metrics,
             self.protocol.clone(),
             self.cache_status.clone(),
+            &self.metric_username,
+            &self.metric_repo,
             self.started_at.elapsed(),
         );
     }
@@ -228,23 +238,26 @@ async fn handle_info_refs(
 
     // 2. Validate auth (optional for public repos).
     let auth_header = extract_optional_auth_header(&headers);
-    crate::auth::http_validator::validate_http_auth(&state, auth_header.as_deref(), &owner, &repo)
-        .await
-        .map_err(|e| {
-            // If rate-limited, return 503 with Retry-After.
-            let remaining = state.rate_limit.remaining();
-            if remaining < state.config.upstream.api_rate_limit_buffer as u64
-                && remaining != u64::MAX
-            {
-                let retry = state.rate_limit.retry_after_secs();
-                warn!(error = %e, retry_after = retry, "auth failed due to rate limiting");
-                return AppError::RateLimited {
-                    retry_after_secs: retry,
-                };
-            }
-            warn!(error = %e, "auth validation failed");
-            AppError::Unauthorized(e.to_string())
-        })?;
+    let auth_context = crate::auth::http_validator::validate_http_auth_with_context(
+        &state,
+        auth_header.as_deref(),
+        &owner,
+        &repo,
+    )
+    .await
+    .map_err(|e| {
+        // If rate-limited, return 503 with Retry-After.
+        let remaining = state.rate_limit.remaining();
+        if remaining < state.config.upstream.api_rate_limit_buffer as u64 && remaining != u64::MAX {
+            let retry = state.rate_limit.retry_after_secs();
+            warn!(error = %e, retry_after = retry, "auth failed due to rate limiting");
+            return AppError::RateLimited {
+                retry_after_secs: retry,
+            };
+        }
+        warn!(error = %e, "auth validation failed");
+        AppError::Unauthorized(e.to_string())
+    })?;
 
     let service = query.service.unwrap_or_default();
     if service == "git-receive-pack" {
@@ -318,6 +331,8 @@ async fn handle_info_refs(
         .get_or_create(&CloneUpstreamBytesLabels {
             protocol: Protocol::Https,
             phase: ClonePhase::InfoRefs,
+            username: auth_context.metric_username.clone(),
+            repo: format!("{owner}/{repo}"),
         })
         .inc_by(upstream_bytes.len() as u64);
     state
@@ -328,6 +343,8 @@ async fn handle_info_refs(
             protocol: Protocol::Https,
             phase: ClonePhase::InfoRefs,
             source: CloneSource::Upstream,
+            username: auth_context.metric_username,
+            repo: format!("{owner}/{repo}"),
         })
         .inc_by(modified_body.len() as u64);
 
@@ -372,9 +389,14 @@ async fn handle_upload_pack(
 
     // 2. Validate auth (optional for public repos).
     let auth_header = extract_optional_auth_header(&headers);
-    crate::auth::http_validator::validate_http_auth(&state, auth_header.as_deref(), &owner, &repo)
-        .await
-        .map_err(|e| AppError::Unauthorized(e.to_string()))?;
+    let auth_context = crate::auth::http_validator::validate_http_auth_with_context(
+        &state,
+        auth_header.as_deref(),
+        &owner,
+        &repo,
+    )
+    .await
+    .map_err(|e| AppError::Unauthorized(e.to_string()))?;
 
     let repo_slug = format!("{}/{}", owner, repo);
     let git_protocol = headers
@@ -512,6 +534,8 @@ async fn handle_upload_pack(
                         &local_decision,
                     ),
                     started_at,
+                    metric_username: auth_context.metric_username.clone(),
+                    metric_repo: repo_slug.clone(),
                 },
             )
             .await;
@@ -565,6 +589,8 @@ async fn handle_upload_pack(
         CloneCompletion {
             cache_status: crate::coordination::registry::clone_cache_status(&local_decision),
             started_at,
+            metric_username: auth_context.metric_username.clone(),
+            metric_repo: repo_slug,
         },
     )
     .await?;
@@ -752,6 +778,8 @@ async fn serve_local_upload_pack(
             protocol: Protocol::Https,
             phase: ClonePhase::UploadPack,
             source: CloneSource::Local,
+            username: completion.metric_username.clone(),
+            repo: completion.metric_repo.clone(),
         })
         .clone();
     let stream = CloneCompletionStream::new(
@@ -763,6 +791,8 @@ async fn serve_local_upload_pack(
         Protocol::Https,
         completion.cache_status,
         completion.started_at,
+        completion.metric_username,
+        completion.metric_repo,
     );
     let body = Body::from_stream(stream);
 
@@ -958,6 +988,8 @@ async fn proxy_upload_pack_to_upstream(
         .get_or_create(&CloneUpstreamBytesLabels {
             protocol: Protocol::Https,
             phase: ClonePhase::UploadPack,
+            username: completion.metric_username.clone(),
+            repo: owner_repo.clone(),
         })
         .clone();
     let downstream_counter = state
@@ -968,6 +1000,8 @@ async fn proxy_upload_pack_to_upstream(
             protocol: Protocol::Https,
             phase: ClonePhase::UploadPack,
             source: CloneSource::Upstream,
+            username: completion.metric_username.clone(),
+            repo: owner_repo.clone(),
         })
         .clone();
     tokio::spawn(async move {
@@ -1199,6 +1233,8 @@ async fn proxy_upload_pack_to_upstream(
         Protocol::Https,
         completion.cache_status,
         completion.started_at,
+        completion.metric_username,
+        completion.metric_repo,
     ));
 
     Ok((

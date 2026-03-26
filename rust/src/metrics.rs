@@ -17,6 +17,8 @@ use prometheus_client::registry::Registry;
 pub struct CloneLabels {
     pub protocol: Protocol,
     pub cache_status: CacheStatus,
+    pub username: String,
+    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
@@ -33,6 +35,13 @@ pub enum CacheStatus {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CloneDurationLabels {
+    pub protocol: Protocol,
+    pub username: String,
+    pub repo: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ProtocolLabels {
     pub protocol: Protocol,
 }
@@ -41,6 +50,8 @@ pub struct ProtocolLabels {
 pub struct CloneUpstreamBytesLabels {
     pub protocol: Protocol,
     pub phase: ClonePhase,
+    pub username: String,
+    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -48,6 +59,8 @@ pub struct CloneDownstreamBytesLabels {
     pub protocol: Protocol,
     pub phase: ClonePhase,
     pub source: CloneSource,
+    pub username: String,
+    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
@@ -75,7 +88,7 @@ pub struct EndpointLabels {
 pub struct Metrics {
     // -- clone --
     pub clone_total: Family<CloneLabels, Counter>,
-    pub clone_duration_seconds: Family<ProtocolLabels, Histogram>,
+    pub clone_duration_seconds: Family<CloneDurationLabels, Histogram>,
     pub clone_upstream_bytes: Family<CloneUpstreamBytesLabels, Counter>,
     pub clone_downstream_bytes: Family<CloneDownstreamBytesLabels, Counter>,
 
@@ -125,7 +138,7 @@ impl Metrics {
         );
 
         let clone_duration_seconds =
-            Family::<ProtocolLabels, Histogram>::new_with_constructor(|| {
+            Family::<CloneDurationLabels, Histogram>::new_with_constructor(|| {
                 Histogram::new(exponential_buckets(0.01, 2.0, 14))
             });
         registry.register(
@@ -320,6 +333,8 @@ pub fn record_clone_completion(
     metrics: &MetricsRegistry,
     protocol: Protocol,
     cache_status: CacheStatus,
+    username: &str,
+    repo: &str,
     elapsed: Duration,
 ) {
     metrics
@@ -328,13 +343,30 @@ pub fn record_clone_completion(
         .get_or_create(&CloneLabels {
             protocol: protocol.clone(),
             cache_status,
+            username: username.to_string(),
+            repo: repo.to_string(),
         })
         .inc();
     metrics
         .metrics
         .clone_duration_seconds
-        .get_or_create(&ProtocolLabels { protocol })
+        .get_or_create(&CloneDurationLabels {
+            protocol,
+            username: username.to_string(),
+            repo: repo.to_string(),
+        })
         .observe(elapsed.as_secs_f64());
+}
+
+pub fn clone_metric_username(resolved_username: Option<&str>, auth_present: bool) -> String {
+    match resolved_username
+        .map(str::trim)
+        .filter(|username| !username.is_empty())
+    {
+        Some(username) => username.to_string(),
+        None if auth_present => "unresolved".to_string(),
+        None => "anonymous".to_string(),
+    }
 }
 
 pub fn inc_upstream_api_call(metrics: &MetricsRegistry, endpoint: &str) {

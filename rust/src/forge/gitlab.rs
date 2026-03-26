@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use axum::http::HeaderMap;
+use base64::Engine as _;
 use tracing::warn;
 
 use crate::auth::middleware::Permission;
@@ -20,6 +21,39 @@ use super::{ForgeBackend, WebhookEvent};
 pub struct GitLabBackend {
     api_url: String,
     admin_token_env: String,
+}
+
+fn extract_current_username(body: &serde_json::Value) -> Option<String> {
+    body.get("username")
+        .and_then(|username| username.as_str())
+        .map(|username| username.to_string())
+}
+
+fn apply_gitlab_api_auth(
+    req: reqwest::RequestBuilder,
+    auth_header: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let Some(auth_header) = auth_header
+        .map(str::trim)
+        .filter(|header| !header.is_empty())
+    else {
+        return req;
+    };
+
+    if auth_header.starts_with("Bearer ") {
+        return req.header("Authorization", auth_header);
+    }
+
+    if let Some(basic_payload) = auth_header.strip_prefix("Basic ")
+        && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(basic_payload)
+        && let Ok(credentials) = String::from_utf8(decoded)
+        && let Some((_, token)) = credentials.split_once(':')
+        && !token.is_empty()
+    {
+        return req.header("PRIVATE-TOKEN", token);
+    }
+
+    req.header("Authorization", auth_header)
 }
 
 impl GitLabBackend {
@@ -87,12 +121,10 @@ impl ForgeBackend for GitLabBackend {
         let project_path = format!("{owner}%2F{repo}");
         let url = format!("{}/projects/{project_path}", self.api_url);
 
-        let mut req = http_client.get(&url).header("Accept", "application/json");
-        if let Some(header) = auth_header
-            && !header.trim().is_empty()
-        {
-            req = req.header("Authorization", header);
-        }
+        let req = apply_gitlab_api_auth(
+            http_client.get(&url).header("Accept", "application/json"),
+            auth_header,
+        );
         let resp = req.send().await.context("upstream API request failed")?;
 
         rate_limit.record_response("GET /projects/{owner}%2F{repo}", resp.headers());
@@ -109,6 +141,42 @@ impl ForgeBackend for GitLabBackend {
             .context("failed to parse GitLab API response")?;
 
         Ok(permission_from_project_response(&body))
+    }
+
+    async fn resolve_http_user(
+        &self,
+        http_client: &reqwest::Client,
+        auth_header: Option<&str>,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>> {
+        let Some(auth_header) = auth_header.filter(|header| !header.trim().is_empty()) else {
+            return Ok(None);
+        };
+
+        let url = format!("{}/user", self.api_url);
+        let resp = apply_gitlab_api_auth(
+            http_client.get(&url).header("Accept", "application/json"),
+            Some(auth_header),
+        )
+        .send()
+        .await
+        .context("GitLab current-user request failed")?;
+
+        rate_limit.record_response("GET /user", resp.headers());
+
+        if !resp.status().is_success() {
+            warn!(
+                status = %resp.status(),
+                "GitLab current-user API returned non-success"
+            );
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("failed to parse GitLab current-user response")?;
+        Ok(extract_current_username(&body))
     }
 
     async fn resolve_ssh_user(
@@ -248,12 +316,10 @@ impl ForgeBackend for GitLabBackend {
             self.api_url
         );
 
-        let mut req = http_client.get(&url).header("Accept", "application/json");
-        if let Some(header) = auth_header
-            && !header.trim().is_empty()
-        {
-            req = req.header("Authorization", header);
-        }
+        let req = apply_gitlab_api_auth(
+            http_client.get(&url).header("Accept", "application/json"),
+            auth_header,
+        );
         let resp = req
             .send()
             .await
@@ -547,5 +613,17 @@ mod tests {
             backend.parse_webhook_payload("Note Hook", &payload),
             WebhookEvent::NoAction
         );
+    }
+
+    #[test]
+    fn extract_current_username_found() {
+        let body = serde_json::json!({ "username": "alice" });
+        assert_eq!(extract_current_username(&body), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn extract_current_username_missing() {
+        let body = serde_json::json!({ "id": 1 });
+        assert_eq!(extract_current_username(&body), None);
     }
 }

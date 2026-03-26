@@ -60,6 +60,19 @@ pub trait ForgeBackend: Send + Sync {
         rate_limit: &RateLimitState,
     ) -> Result<Permission>;
 
+    /// Resolve the authenticated HTTP caller to a forge username/login.
+    ///
+    /// Returns `Ok(Some(username))` when the forge exposes a current-user
+    /// endpoint for the presented credentials, `Ok(None)` when the request is
+    /// anonymous or the user cannot be determined, or an error on transport /
+    /// parsing failure.
+    async fn resolve_http_user(
+        &self,
+        http_client: &reqwest::Client,
+        auth_header: Option<&str>,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>>;
+
     /// Resolve an SSH key fingerprint to a username via the upstream admin API.
     async fn resolve_ssh_user(
         &self,
