@@ -211,6 +211,7 @@ in
 
       serviceConfig = {
         Type = "simple";
+        KillMode = "mixed";
 
         # DynamicUser allocates an ephemeral UID for this service invocation.
         # Secrets in the user keyring (@u) are scoped to this UID, so only

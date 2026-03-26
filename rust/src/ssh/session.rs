@@ -168,12 +168,17 @@ fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32
     session.close(channel_id);
 }
 
-/// Finalize upload-pack without relying on `Channel::make_writer()`: its
-/// `AsyncWrite::shutdown` implementation sends SSH EOF immediately, which can
-/// race ahead of exit-status and break Git's transport expectations.
+/// Finalize upload-pack in RFC 4254 order after the response stream has been
+/// copied through the SSH channel's window-aware writer.
+///
+/// The important constraint is that we must not let `ChannelTx::poll_shutdown`
+/// send SSH EOF on our behalf before the exit-status request is queued, so the
+/// response stream itself is copied with `write_all()` only and EOF is sent
+/// explicitly here.
 async fn finalize_upload_pack_channel(
     owner_repo: &str,
     handle: &russh::server::Handle,
+    stream_channel: Option<&Channel<Msg>>,
     channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     channel_id: ChannelId,
     exit_status: u32,
@@ -228,7 +233,11 @@ async fn finalize_upload_pack_channel(
         }
     };
 
-    let eof_sent = match handle.eof(channel_id).await {
+    let eof_sent = match if let Some(stream_channel) = stream_channel {
+        stream_channel.eof().await.map_err(|_| ())
+    } else {
+        handle.eof(channel_id).await
+    } {
         Ok(()) => {
             info!(
                 repo = %owner_repo,
@@ -250,7 +259,11 @@ async fn finalize_upload_pack_channel(
         }
     };
 
-    let close_sent = match handle.close(channel_id).await {
+    let close_sent = match if let Some(stream_channel) = stream_channel {
+        stream_channel.close().await.map_err(|_| ())
+    } else {
+        handle.close(channel_id).await
+    } {
         Ok(()) => {
             info!(
                 repo = %owner_repo,
@@ -312,11 +325,12 @@ async fn send_channel_response_data(
     stream_channel: Option<&Arc<Channel<Msg>>>,
     data: &[u8],
 ) -> Result<(), ()> {
-    // Always stream payload with explicit `Handle::data()` chunking. This
-    // keeps all channel output on the same code path and avoids relying on
-    // `Channel::make_writer()` buffering semantics while forgeproxy controls
-    // exit-status/EOF/close ordering explicitly.
-    send_channel_data_chunks(handle, channel_id, data).await
+    if let Some(stream_channel) = stream_channel {
+        let mut writer = stream_channel.make_writer();
+        writer.write_all(data).await.map_err(|_| ())
+    } else {
+        send_channel_data_chunks(handle, channel_id, data).await
+    }
 }
 
 async fn output_lock_for_channel(
@@ -534,6 +548,7 @@ async fn serve_local_upload_pack_once(
         finalize_upload_pack_channel(
             owner_repo,
             &handle,
+            stream_channel.as_ref(),
             &channel_states,
             channel_id,
             exit_status,
@@ -1556,6 +1571,7 @@ impl Handler for SshSession {
                                     finalize_upload_pack_channel(
                                         &repo_for_stream,
                                         &handle,
+                                        Some(&stream_channel),
                                         &channel_states,
                                         channel_id,
                                         exit_code,
@@ -1701,6 +1717,7 @@ impl Handler for SshSession {
                                 finalize_upload_pack_channel(
                                     &repo_bg,
                                     &handle,
+                                    None,
                                     &channel_states,
                                     channel_id,
                                     1,
@@ -2198,6 +2215,7 @@ async fn proxy_upstream_upload_pack(
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
+                        stream_channel.as_ref(),
                         &channel_states,
                         channel_id,
                         1,
@@ -2421,6 +2439,7 @@ async fn proxy_upstream_upload_pack(
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
+                        stream_channel.as_ref(),
                         &channel_states,
                         channel_id,
                         0,
@@ -2464,6 +2483,7 @@ async fn proxy_upstream_upload_pack(
                 finalize_upload_pack_channel(
                     &owner_repo,
                     &handle,
+                    stream_channel.as_ref(),
                     &channel_states,
                     channel_id,
                     1,
