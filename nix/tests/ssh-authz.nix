@@ -93,6 +93,7 @@ let
     clone:
       lock_ttl: 60
       lock_wait_timeout: 120
+      request_wait_for_local_catch_up_secs: 60
       max_concurrent_upstream_clones: 5
       max_concurrent_upstream_fetches: 10
       max_concurrent_upstream_clones_per_repo_across_instances: 4
@@ -129,7 +130,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-authz";
-  globalTimeout = 360;
+  globalTimeout = 390;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -213,12 +214,15 @@ pkgs.testers.runNixOSTest {
           enable = true;
           package = pkgs.forgeproxy;
           configFile = testConfigYaml;
-          logLevel = "info";
+          logLevel = "forgeproxy=debug,info";
           allowEnvSecretFallback = true;
         };
 
-        # Prevent auto-start so we can inject the Gitea admin token first
+        # Keep the unit available, but block startup until the test script
+        # writes the admin token and explicitly allows the service to start.
         systemd.services.forgeproxy.wantedBy = lib.mkForce [ ];
+        systemd.services.forgeproxy.serviceConfig.Restart = lib.mkForce "no";
+        systemd.services.forgeproxy.unitConfig.ConditionPathExists = "/run/forgeproxy-enable";
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
         systemd.services.forgeproxy.environment = {
@@ -268,8 +272,79 @@ pkgs.testers.runNixOSTest {
   # ---------------------------------------------------------------------------
   testScript = ''
     import json
+    import shlex
 
     start_all()
+
+    def ssh_clone_env_words(trace_name, key_path="/tmp/alice_key"):
+        ssh_cmd = (
+            f"ssh -E /tmp/{trace_name}.ssh.log "
+            "-vvv -oLogLevel=DEBUG3 "
+            "-oServerAliveInterval=5 -oServerAliveCountMax=12 "
+            f"-i {key_path} -o StrictHostKeyChecking=no "
+            "-o UserKnownHostsFile=/dev/null -p 2222"
+        )
+        return " ".join(
+            [
+                f"GIT_TRACE={shlex.quote(f'/tmp/{trace_name}.git.trace.log')}",
+                f"GIT_TRACE_PACKET={shlex.quote(f'/tmp/{trace_name}.packet.trace.log')}",
+                f"GIT_TRACE_PACKFILE={shlex.quote(f'/tmp/{trace_name}.pack.trace')}",
+                f"GIT_TRACE2_EVENT={shlex.quote(f'/tmp/{trace_name}.trace2.json')}",
+                f"GIT_SSH_COMMAND={shlex.quote(ssh_cmd)}",
+            ]
+        )
+
+    def ssh_clone_cmd(trace_name, repo, dest, *, key_path="/tmp/alice_key", extra_args=""):
+        extra = f"{extra_args} " if extra_args else ""
+        return (
+            f"env {ssh_clone_env_words(trace_name, key_path=key_path)} "
+            f"git clone {extra}git@proxy:{repo}.git {dest}"
+        )
+
+    def dump_clone_debug(trace_name):
+        print(
+            client.succeed(
+                "set -eu; "
+                f"trace_base=/tmp/{trace_name}; "
+                "echo '==== clone debug artifacts ===='; "
+                "for suffix in "
+                ".git.trace.log "
+                ".packet.trace.log "
+                ".trace2.json "
+                ".ssh.log; do "
+                "  file=\"''${trace_base}''${suffix}\"; "
+                "  echo \"---- ''${file} ----\"; "
+                "  if [ -f \"$file\" ]; then "
+                "    tail -n 200 \"$file\"; "
+                "  else "
+                "    echo '(missing)'; "
+                "  fi; "
+                "done; "
+                "pack_file=\"''${trace_base}.pack.trace\"; "
+                "echo \"---- ''${pack_file} ----\"; "
+                "if [ -f \"$pack_file\" ]; then "
+                "  wc -c \"$pack_file\"; "
+                "  sha256sum \"$pack_file\"; "
+                "else "
+                "  echo '(missing)'; "
+                "fi"
+            )
+        )
+
+    def ssh_clone_succeed(trace_name, repo, dest, *, key_path="/tmp/alice_key", extra_args=""):
+        try:
+            client.succeed(
+                ssh_clone_cmd(
+                    trace_name,
+                    repo,
+                    dest,
+                    key_path=key_path,
+                    extra_args=extra_args,
+                )
+            )
+        except Exception:
+            dump_clone_debug(trace_name)
+            raise
 
     # ── Infrastructure comes up ───────────────────────────────────────────
     ${common.valkeyStartScript}
@@ -600,6 +675,7 @@ pkgs.testers.runNixOSTest {
     with subtest("Start forgeproxy with admin token"):
         proxy.succeed(
             f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
+            f"touch /run/forgeproxy-enable && "
             f"cat > /run/forgeproxy-admin-token.env <<'ENV'\n"
             f"FORGE_ADMIN_TOKEN={TOKEN}\n"
             f"ENV\n"
@@ -727,13 +803,7 @@ pkgs.testers.runNixOSTest {
             "mkdir -p /var/cache/forgeproxy/repos/octocat/repo-stream.git"
         )
         client.succeed("rm -rf /tmp/repo-stream")
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone git@proxy:octocat/repo-stream.git /tmp/repo-stream"
-        )
+        ssh_clone_succeed("repo-stream-full", "octocat/repo-stream", "/tmp/repo-stream")
         client.succeed("test -f /tmp/repo-stream/blob-24.bin")
         client.succeed("git -C /tmp/repo-stream rev-parse HEAD")
         client.succeed("git -C /tmp/repo-stream fsck --no-dangling")
@@ -745,12 +815,11 @@ pkgs.testers.runNixOSTest {
             "mkdir -p /var/cache/forgeproxy/repos/octocat/repo-stream.git"
         )
         client.succeed("rm -rf /tmp/repo-stream-shallow")
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone --depth 1 git@proxy:octocat/repo-stream.git /tmp/repo-stream-shallow"
+        ssh_clone_succeed(
+            "repo-stream-shallow",
+            "octocat/repo-stream",
+            "/tmp/repo-stream-shallow",
+            extra_args="--depth 1",
         )
         client.succeed("test -f /tmp/repo-stream-shallow/blob-24.bin")
         client.succeed("git -C /tmp/repo-stream-shallow rev-parse --is-shallow-repository | grep -qx true")
@@ -760,12 +829,11 @@ pkgs.testers.runNixOSTest {
     # ── Subtest 5c: Subsequent clone succeeds after hydration/cache fill ───
     with subtest("Second clone succeeds after upstream proxy hydration"):
         client.succeed("rm -rf /tmp/repo-stream-second")
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone --depth 1 git@proxy:octocat/repo-stream.git /tmp/repo-stream-second"
+        ssh_clone_succeed(
+            "repo-stream-second",
+            "octocat/repo-stream",
+            "/tmp/repo-stream-second",
+            extra_args="--depth 1",
         )
         client.succeed("test -f /tmp/repo-stream-second/blob-24.bin")
         client.succeed("git -C /tmp/repo-stream-second rev-parse HEAD")
@@ -780,10 +848,7 @@ pkgs.testers.runNixOSTest {
         proxy.succeed(f"rm -rf {live_repo} {live_generation_dir} {live_tee_dir}")
         client.succeed("rm -rf /tmp/repo-stream-live /tmp/repo-stream-live.log /tmp/repo-stream-live.pid")
         client.succeed(
-            "env GIT_SSH_COMMAND=\"ssh -i /tmp/alice_key "
-            "-o StrictHostKeyChecking=no "
-            "-o UserKnownHostsFile=/dev/null "
-            "-p 2222\" "
+            f"env {ssh_clone_env_words('repo-stream-live')} "
             "sh -c '"
             "set -e; "
             "git clone --progress git@proxy:octocat/repo-stream-live.git /tmp/repo-stream-live "
@@ -828,10 +893,7 @@ pkgs.testers.runNixOSTest {
 
         since = proxy.succeed("date --iso-8601=seconds --utc").strip()
         client.succeed(
-            "env GIT_SSH_COMMAND=\"ssh -i /tmp/alice_key "
-            "-o StrictHostKeyChecking=no "
-            "-o UserKnownHostsFile=/dev/null "
-            "-p 2222\" "
+            f"env {ssh_clone_env_words('repo-stream-live-drain')} "
             "sh -c '"
             "set -e; "
             "git clone --progress git@proxy:octocat/repo-stream-live.git /tmp/repo-stream-live-drain "
@@ -907,12 +969,10 @@ pkgs.testers.runNixOSTest {
             f"rm -rf {stream_repo} {stream_generation_dir} {stream_mirror} {stream_tee_dir}"
         )
         client.succeed("rm -rf /tmp/repo-stream-published")
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone git@proxy:octocat/repo-stream.git /tmp/repo-stream-published"
+        ssh_clone_succeed(
+            "repo-stream-published",
+            "octocat/repo-stream",
+            "/tmp/repo-stream-published",
         )
         proxy.wait_until_succeeds(
             f"test -L {stream_repo} && test -f $(readlink -f {stream_repo})/HEAD"
@@ -943,14 +1003,13 @@ pkgs.testers.runNixOSTest {
 
         client.succeed(
             "set -euo pipefail; "
-            "export GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'; "
+            f"env {ssh_clone_env_words('repo-generations-1')} "
             "git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-1 >/tmp/repo-generations-1.log 2>&1 & "
             "pid1=$!; "
+            f"env {ssh_clone_env_words('repo-generations-2')} "
             "git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-2 >/tmp/repo-generations-2.log 2>&1 & "
             "pid2=$!; "
+            f"env {ssh_clone_env_words('repo-generations-3')} "
             "git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-3 >/tmp/repo-generations-3.log 2>&1 & "
             "pid3=$!; "
             "wait $pid1 $pid2 $pid3"
@@ -994,12 +1053,11 @@ pkgs.testers.runNixOSTest {
         )
 
         since = proxy.succeed("date --iso-8601=seconds --utc").strip()
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-invariant"
+        ssh_clone_succeed(
+            "repo-generations-invariant",
+            "octocat/repo-generations",
+            "/tmp/repo-generations-invariant",
+            extra_args="--depth 1",
         )
         client.succeed("test -f /tmp/repo-generations-invariant/file-3.txt")
 
@@ -1029,12 +1087,11 @@ pkgs.testers.runNixOSTest {
             f"rm -rf {many_wants_repo} {many_wants_generation_dir} {many_wants_mirror}"
         )
         client.succeed("rm -rf /tmp/repo-many-wants-seed /tmp/repo-many-wants-final")
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone --depth 1 git@proxy:octocat/repo-many-wants.git /tmp/repo-many-wants-seed"
+        ssh_clone_succeed(
+            "repo-many-wants-seed",
+            "octocat/repo-many-wants",
+            "/tmp/repo-many-wants-seed",
+            extra_args="--depth 1",
         )
         proxy.wait_until_succeeds(
             f"test -L {many_wants_repo} && test -f $(readlink -f {many_wants_repo})/HEAD"
@@ -1062,12 +1119,10 @@ pkgs.testers.runNixOSTest {
         )
 
         since = proxy.succeed("date --iso-8601=seconds --utc").strip()
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone git@proxy:octocat/repo-many-wants.git /tmp/repo-many-wants-final"
+        ssh_clone_succeed(
+            "repo-many-wants-final",
+            "octocat/repo-many-wants",
+            "/tmp/repo-many-wants-final",
         )
         client.succeed("git -C /tmp/repo-many-wants-final rev-parse HEAD")
         client.succeed("git -C /tmp/repo-many-wants-final rev-parse refs/tags/tag-2048")
@@ -1113,12 +1168,11 @@ pkgs.testers.runNixOSTest {
             f"rm -rf {mirror_serve_repo} {mirror_serve_generation_dir} {mirror_serve_mirror}"
         )
         client.succeed("rm -rf /tmp/repo-mirror-serve-seed /tmp/repo-mirror-serve-final")
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone --depth 1 git@proxy:octocat/repo-mirror-serve.git /tmp/repo-mirror-serve-seed"
+        ssh_clone_succeed(
+            "repo-mirror-serve-seed",
+            "octocat/repo-mirror-serve",
+            "/tmp/repo-mirror-serve-seed",
+            extra_args="--depth 1",
         )
         proxy.wait_until_succeeds(
             f"test -L {mirror_serve_repo} && test -f $(readlink -f {mirror_serve_repo})/HEAD"
@@ -1159,12 +1213,11 @@ pkgs.testers.runNixOSTest {
         )
 
         since = proxy.succeed("date --iso-8601=seconds --utc").strip()
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone --depth 1 git@proxy:octocat/repo-mirror-serve.git /tmp/repo-mirror-serve-final"
+        ssh_clone_succeed(
+            "repo-mirror-serve-final",
+            "octocat/repo-mirror-serve",
+            "/tmp/repo-mirror-serve-final",
+            extra_args="--depth 1",
         )
         client.succeed("test -f /tmp/repo-mirror-serve-final/file-5.txt")
 
@@ -1201,10 +1254,7 @@ pkgs.testers.runNixOSTest {
             "/tmp/repo-stream-live-semaphore.pids"
         )
         client.succeed(
-            "env GIT_SSH_COMMAND=\"ssh -i /tmp/alice_key "
-            "-o StrictHostKeyChecking=no "
-            "-o UserKnownHostsFile=/dev/null "
-            "-p 2222\" "
+            f"env {ssh_clone_env_words('repo-stream-live-semaphore')} "
             "sh -c '"
             "set -eu; "
             ": > /tmp/repo-stream-live-semaphore.pids; "
@@ -1243,12 +1293,11 @@ pkgs.testers.runNixOSTest {
             "find /var/cache/forgeproxy/repos/_tee/octocat/repo-generations -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
         )
         client.succeed("rm -rf /tmp/repo-generations-scrubbed")
-        client.succeed(
-            "GIT_SSH_COMMAND='ssh -i /tmp/alice_key"
-            " -o StrictHostKeyChecking=no"
-            " -o UserKnownHostsFile=/dev/null"
-            " -p 2222'"
-            " git clone --depth 1 git@proxy:octocat/repo-generations.git /tmp/repo-generations-scrubbed"
+        ssh_clone_succeed(
+            "repo-generations-scrubbed",
+            "octocat/repo-generations",
+            "/tmp/repo-generations-scrubbed",
+            extra_args="--depth 1",
         )
         client.succeed("test -f /tmp/repo-generations-scrubbed/file-3.txt")
   '';

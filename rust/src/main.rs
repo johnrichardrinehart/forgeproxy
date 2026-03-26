@@ -17,7 +17,7 @@ mod tee_hydration;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -624,6 +624,7 @@ fn build_tracing_filter(config: &Config) -> EnvFilter {
 }
 
 const LOCAL_OTLP_TRACE_COLLECTOR_ENDPOINT: &str = "http://127.0.0.1:4317";
+const READYZ_DRAIN_OBSERVATION_WINDOW: Duration = Duration::from_secs(1);
 
 fn build_trace_provider(
     config: &Config,
@@ -877,6 +878,11 @@ async fn main() -> Result<()> {
             tracing::info!("awaiting SSH server drain completion");
             let _ = (&mut ssh_handle).await;
             tracing::info!("SSH server drain completed");
+            tracing::info!(
+                readyz_hold_secs = READYZ_DRAIN_OBSERVATION_WINDOW.as_secs_f64(),
+                "holding HTTP listener in draining state before shutdown so readiness probes can observe /readyz=503"
+            );
+            tokio::time::sleep(READYZ_DRAIN_OBSERVATION_WINDOW).await;
             tracing::info!("signaling HTTP listener shutdown after request drain");
             let _ = http_shutdown_tx.send(true);
             tracing::info!("awaiting HTTP server drain completion");
