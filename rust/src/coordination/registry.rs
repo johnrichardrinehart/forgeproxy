@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -325,10 +325,15 @@ pub struct CloneHydrationPermits {
     distributed_repo_permit: crate::coordination::locks::SemaphoreLease,
 }
 
+fn normalize_owner_repo(owner_repo: &str) -> &str {
+    owner_repo.strip_suffix(".git").unwrap_or(owner_repo)
+}
+
 pub async fn try_acquire_clone_hydration_permits(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<Option<CloneHydrationPermits>> {
+    let owner_repo = normalize_owner_repo(owner_repo);
     let global_clone_permit = match state.clone_semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(TryAcquireError::NoPermits) => return Ok(None),
@@ -367,6 +372,7 @@ pub async fn acquire_clone_hydration_permits(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<Option<CloneHydrationPermits>> {
+    let owner_repo = normalize_owner_repo(owner_repo);
     if state.config.clone.max_concurrent_upstream_clones == 0
         || state
             .config
@@ -460,6 +466,44 @@ async fn cleanup_tee_capture_dir(capture_dir: &Path) -> Result<()> {
                 format!("failed to remove tee capture at {}", capture_dir.display())
             })?;
     }
+    Ok(())
+}
+
+fn create_temporary_initial_repo_clone_path(mirror_path: &Path) -> Result<PathBuf> {
+    let parent = mirror_path
+        .parent()
+        .with_context(|| format!("repo mirror path has no parent: {}", mirror_path.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create temp repo mirror parent {}",
+            parent.display()
+        )
+    })?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = mirror_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("repo.git");
+    Ok(parent.join(format!(
+        ".{stem}.hydrating-{nanos}-{}.git",
+        std::process::id()
+    )))
+}
+
+async fn promote_initial_repo_clone(temp_repo_path: &Path, mirror_path: &Path) -> Result<()> {
+    reset_partial_repo_path_if_needed(mirror_path).await?;
+    tokio::fs::rename(temp_repo_path, mirror_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to promote hydrated repo {} into mirror {}",
+                temp_repo_path.display(),
+                mirror_path.display()
+            )
+        })?;
     Ok(())
 }
 
@@ -931,15 +975,50 @@ async fn try_ensure_repo_cloned_inner(
                 TeeHydrationOutcome::NotHydrated
             };
 
+            let mut initial_clone_path = None;
+
             if tee_outcome == TeeHydrationOutcome::NotHydrated {
-                info!(repo = %owner_repo, path = %mirror_path.display(), "starting upstream bare clone into repo mirror");
-                crate::git::commands::git_clone_bare(&clone_url, &mirror_path, &env_vars)
+                let temp_clone_path = create_temporary_initial_repo_clone_path(&mirror_path)?;
+                info!(
+                    repo = %owner_repo,
+                    temporary = %temp_clone_path.display(),
+                    mirror = %mirror_path.display(),
+                    "starting upstream bare clone into temporary repo mirror"
+                );
+                crate::git::commands::git_clone_bare(&clone_url, &temp_clone_path, &env_vars)
                     .await
                     .with_context(|| format!("upstream bare clone failed for {owner_repo}"))?;
-                info!(repo = %owner_repo, path = %mirror_path.display(), "upstream bare clone into repo mirror completed");
+                info!(
+                    repo = %owner_repo,
+                    temporary = %temp_clone_path.display(),
+                    mirror = %mirror_path.display(),
+                    "upstream bare clone into temporary repo mirror completed"
+                );
+                ensure_bare_head_ref(&temp_clone_path).await.with_context(|| {
+                    format!(
+                        "failed to set bare HEAD after temporary upstream clone for {owner_repo}"
+                    )
+                })?;
+                quick_check_ready_repo(
+                    state,
+                    &owner_repo,
+                    &temp_clone_path,
+                    "temporary upstream clone",
+                    None,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "temporary upstream clone quick verification failed for {owner_repo}"
+                    )
+                })?;
+                initial_clone_path = Some(temp_clone_path);
             }
 
-            Ok::<TeeHydrationOutcome, anyhow::Error>(tee_outcome)
+            Ok::<(TeeHydrationOutcome, Option<PathBuf>), anyhow::Error>((
+                tee_outcome,
+                initial_clone_path,
+            ))
         }
         .await;
         let release_result = if let Some(permits) = clone_hydration_permits.take() {
@@ -947,10 +1026,36 @@ async fn try_ensure_repo_cloned_inner(
         } else {
             Ok(())
         };
-        let tee_outcome = hydrate_result?;
+        let (tee_outcome, initial_clone_path) = hydrate_result?;
         release_result?;
 
         let _repo_generation_guard = acquire_local_repo_publish_guard(state, &owner_repo).await;
+        if let Some(initial_clone_path) = initial_clone_path.as_ref() {
+            if state.cache_manager.has_repo_mirror(&owner_repo) {
+                info!(
+                    repo = %owner_repo,
+                    temporary = %initial_clone_path.display(),
+                    mirror = %mirror_path.display(),
+                    "discarding temporary initial repo clone because a writer-owned mirror already exists"
+                );
+                tokio::fs::remove_dir_all(initial_clone_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove redundant temporary initial repo clone at {}",
+                            initial_clone_path.display()
+                        )
+                    })?;
+            } else {
+                info!(
+                    repo = %owner_repo,
+                    temporary = %initial_clone_path.display(),
+                    mirror = %mirror_path.display(),
+                    "promoting temporary initial repo clone into the writer-owned mirror"
+                );
+                promote_initial_repo_clone(initial_clone_path, &mirror_path).await?;
+            }
+        }
         ensure_bare_head_ref(&mirror_path)
             .await
             .with_context(|| format!("failed to set bare HEAD after hydration for {owner_repo}"))?;
