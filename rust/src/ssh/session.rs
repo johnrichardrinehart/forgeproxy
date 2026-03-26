@@ -40,6 +40,7 @@ const SSH_DATA_CHUNK_SIZE: usize = 32 * 1024;
 
 #[derive(Debug, Clone)]
 struct UpstreamProxyChannelState {
+    owner_repo: Option<String>,
     output_lock: Arc<Mutex<()>>,
     stream_finished: bool,
     exit_status_sent: bool,
@@ -52,6 +53,7 @@ struct UpstreamProxyChannelState {
 impl Default for UpstreamProxyChannelState {
     fn default() -> Self {
         Self {
+            owner_repo: None,
             output_lock: Arc::new(Mutex::new(())),
             stream_finished: false,
             exit_status_sent: false,
@@ -177,6 +179,31 @@ async fn finalize_upload_pack_channel(
     exit_status: u32,
     total_bytes: u64,
 ) {
+    let pre_finalize_state = channel_states.lock().await.get(&channel_id).cloned();
+    if let Some(state) = pre_finalize_state.as_ref() {
+        info!(
+            repo = %owner_repo,
+            ?channel_id,
+            total_bytes,
+            exit_status,
+            client_eof_seen = state.client_eof_seen,
+            client_close_seen = state.client_close_seen,
+            stream_finished = state.stream_finished,
+            exit_status_sent = state.exit_status_sent,
+            eof_sent = state.eof_sent,
+            close_sent = state.close_sent,
+            "finalizing SSH upload-pack channel"
+        );
+    } else {
+        info!(
+            repo = %owner_repo,
+            ?channel_id,
+            total_bytes,
+            exit_status,
+            "finalizing SSH upload-pack channel without tracked channel state"
+        );
+    }
+
     let exit_status_sent = match handle.exit_status_request(channel_id, exit_status).await {
         Ok(()) => {
             info!(
@@ -282,23 +309,14 @@ async fn send_channel_data_chunks(
 async fn send_channel_response_data(
     handle: &russh::server::Handle,
     channel_id: ChannelId,
-    stream_channel: Option<&Channel<Msg>>,
+    _stream_channel: Option<&Channel<Msg>>,
     data: &[u8],
 ) -> Result<(), ()> {
-    if let Some(stream_channel) = stream_channel {
-        use tokio::io::AsyncWriteExt;
-
-        // When we still own the confirmed SSH channel, write through its
-        // window-aware writer so payload delivery cannot outrun the client's
-        // receive window and leave unsent data buffered inside `russh` while
-        // forgeproxy is already queuing exit-status/EOF/close.
-        let mut writer = Box::pin(stream_channel.make_writer());
-        writer.write_all(data).await.map_err(|_| ())
-    } else {
-        // Fallback for the small pre-fetch negotiation messages where we only
-        // retained the session handle, not the channel object.
-        send_channel_data_chunks(handle, channel_id, data).await
-    }
+    // Always stream payload with explicit `Handle::data()` chunking. This
+    // keeps all channel output on the same code path and avoids relying on
+    // `Channel::make_writer()` buffering semantics while forgeproxy controls
+    // exit-status/EOF/close ordering explicitly.
+    send_channel_data_chunks(handle, channel_id, data).await
 }
 
 async fn output_lock_for_channel(
@@ -1179,16 +1197,31 @@ impl Handler for SshSession {
         }
 
         if let Some(state) = close_state {
-            debug!(
-                channel = ?channel_id,
-                stream_finished = state.stream_finished,
-                exit_status_sent = state.exit_status_sent,
-                eof_sent = state.eof_sent,
-                close_sent = state.close_sent,
-                client_eof_seen = state.client_eof_seen,
-                client_close_seen = state.client_close_seen,
-                "DIAG: channel_close fired"
-            );
+            if !state.stream_finished {
+                warn!(
+                    repo = state.owner_repo.as_deref().unwrap_or("<unknown>"),
+                    channel = ?channel_id,
+                    stream_finished = state.stream_finished,
+                    exit_status_sent = state.exit_status_sent,
+                    eof_sent = state.eof_sent,
+                    close_sent = state.close_sent,
+                    client_eof_seen = state.client_eof_seen,
+                    client_close_seen = state.client_close_seen,
+                    "SSH channel closed before forgeproxy marked upload-pack stream finished"
+                );
+            } else {
+                debug!(
+                    repo = state.owner_repo.as_deref().unwrap_or("<unknown>"),
+                    channel = ?channel_id,
+                    stream_finished = state.stream_finished,
+                    exit_status_sent = state.exit_status_sent,
+                    eof_sent = state.eof_sent,
+                    close_sent = state.close_sent,
+                    client_eof_seen = state.client_eof_seen,
+                    client_close_seen = state.client_close_seen,
+                    "DIAG: channel_close fired"
+                );
+            }
         }
 
         self.upstream_proxy_channels
@@ -1433,10 +1466,9 @@ impl Handler for SshSession {
                                 true,
                             );
 
-                            // Spawn a task that streams upload-pack stdout via
-                            // the session channel so large responses respect
-                            // the client's SSH receive window before final
-                            // exit-status/EOF/close messages are queued.
+                            // Spawn a task that streams upload-pack stdout
+                            // with explicit `Handle::data()` chunking and then
+                            // finalizes the channel in RFC 4254 order.
                             tokio::spawn(async move {
                                 let _generation_lease = generation_lease;
                                 let mut stdout = stdout;
@@ -1593,7 +1625,10 @@ impl Handler for SshSession {
                         authenticated,
                         self.git_protocol.clone(),
                     ));
-                    let channel_state = UpstreamProxyChannelState::default();
+                    let channel_state = UpstreamProxyChannelState {
+                        owner_repo: Some(repo.clone()),
+                        ..UpstreamProxyChannelState::default()
+                    };
                     let output_lock = Arc::clone(&channel_state.output_lock);
                     self.upstream_proxy_channels
                         .lock()
