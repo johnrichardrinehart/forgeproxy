@@ -121,8 +121,10 @@ in
     with subtest("S3 starts"):
         s3.wait_for_unit("minio.service")
         s3.wait_for_open_port(${toString s3Port})
+        s3.wait_until_succeeds(
+            "mc alias set local http://localhost:${toString s3Port} ${minioRootUser} ${minioRootPassword}"
+        )
         s3.succeed(
-            "mc alias set local http://localhost:${toString s3Port} ${minioRootUser} ${minioRootPassword} && "
             "mc mb --ignore-existing local/test-bucket"
         )
   '';
