@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use russh::MethodSet;
 use russh::server::{self, Server};
 use russh_keys::key::KeyPair;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use super::session::SshSession;
@@ -92,7 +94,10 @@ fn load_host_key_from_keyring() -> Result<KeyPair> {
 
 /// Start the SSH listener.  This function runs until the server is shut down
 /// or an unrecoverable error occurs.
-pub async fn start_ssh_server(state: Arc<AppState>) -> Result<()> {
+pub async fn start_ssh_server(
+    state: Arc<AppState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
     let listen_addr: SocketAddr = state.config.proxy.ssh_listen.parse().with_context(|| {
         format!(
             "invalid SSH listen address: {:?}",
@@ -120,11 +125,84 @@ pub async fn start_ssh_server(state: Arc<AppState>) -> Result<()> {
 
     info!(address = %listen_addr, "starting SSH server");
 
-    let mut ssh_server = SshServer::new(state);
-    ssh_server
-        .run_on_address(config, listen_addr)
+    let listener = TcpListener::bind(listen_addr)
         .await
-        .context("SSH server exited with error")?;
+        .with_context(|| format!("failed to bind SSH listener on {listen_addr}"))?;
+    let (error_tx, mut error_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut ssh_server = SshServer::new(Arc::clone(&state));
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    info!("SSH listener entering drain mode");
+                    break;
+                }
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((socket, _)) => {
+                        if state.is_draining() {
+                            info!(
+                                peer = ?socket.peer_addr().ok(),
+                                "rejecting new SSH connection because forgeproxy is draining"
+                            );
+                            drop(socket);
+                            continue;
+                        }
+                        let config = Arc::clone(&config);
+                        let handler = ssh_server.new_client(socket.peer_addr().ok());
+                        let error_tx = error_tx.clone();
+                        let state = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            info!(
+                                active_ssh_connections = state.active_ssh_connections.load(std::sync::atomic::Ordering::SeqCst),
+                                "spawned SSH session task"
+                            );
+                            let session = match russh::server::run_stream(config, socket, handler).await {
+                                Ok(session) => session,
+                                Err(error) => {
+                                    let _ = error_tx.send(error);
+                                    return;
+                                }
+                            };
+                            if let Err(error) = session.await {
+                                let _ = error_tx.send(error);
+                            }
+                            info!(
+                                active_ssh_connections = state.active_ssh_connections.load(std::sync::atomic::Ordering::SeqCst),
+                                "SSH session task completed"
+                            );
+                        });
+                    }
+                    Err(error) => return Err(error).context("SSH accept loop failed"),
+                }
+            }
+            Some(error) = error_rx.recv() => {
+                ssh_server.handle_session_error(error);
+            }
+        }
+    }
+
+    info!("waiting for active SSH sessions to finish");
+    let mut wait_logged_at = std::time::Instant::now();
+    while state
+        .active_ssh_connections
+        .load(std::sync::atomic::Ordering::SeqCst)
+        > 0
+    {
+        if wait_logged_at.elapsed() >= Duration::from_secs(1) {
+            info!(
+                active_ssh_connections = state
+                    .active_ssh_connections
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "still waiting for active SSH sessions to finish"
+            );
+            wait_logged_at = std::time::Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    info!("all active SSH sessions drained");
 
     Ok(())
 }

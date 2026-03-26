@@ -129,7 +129,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-authz";
-  globalTimeout = 480;
+  globalTimeout = 360;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -214,6 +214,7 @@ pkgs.testers.runNixOSTest {
           package = pkgs.forgeproxy;
           configFile = testConfigYaml;
           logLevel = "info";
+          allowEnvSecretFallback = true;
         };
 
         # Prevent auto-start so we can inject the Gitea admin token first
@@ -593,20 +594,39 @@ pkgs.testers.runNixOSTest {
 
     # ── Start forgeproxy with admin token ────────────────────────────────
     # The ExecStartPre also pre-seeds the local cache for repo-cached so
-    # the authz tests can distinguish cached vs uncached paths. The token
-    # injection must run inside the service context so the dynamic user's
-    # keyring (@u) contains FORGE_ADMIN_TOKEN at startup.
+    # the authz tests can distinguish cached vs uncached paths. We keep the
+    # admin token in the service environment so it survives systemctl restarts
+    # during drain tests.
     with subtest("Start forgeproxy with admin token"):
         proxy.succeed(
             f"mkdir -p /run/systemd/system/forgeproxy.service.d && "
+            f"cat > /run/forgeproxy-admin-token.env <<'ENV'\n"
+            f"FORGE_ADMIN_TOKEN={TOKEN}\n"
+            f"ENV\n"
             f"cat > /run/systemd/system/forgeproxy.service.d/token.conf <<'UNIT'\n"
             f"[Service]\n"
-            f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user FORGE_ADMIN_TOKEN @u >/dev/null'\n"
-            f"ExecStartPre=/bin/sh -c 'mkdir -p /var/cache/forgeproxy/repos/octocat && git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git /var/cache/forgeproxy/repos/octocat/repo-cached.git'\n"
+            f"EnvironmentFile=/run/forgeproxy-admin-token.env\n"
+            f"ExecStartPre=/bin/sh -c 'test -n \"$FORGE_ADMIN_TOKEN\"'\n"
+            f"ExecStartPre=/bin/sh -c 'mkdir -p /var/cache/forgeproxy/repos/octocat && test -d /var/cache/forgeproxy/repos/octocat/repo-cached.git || git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git /var/cache/forgeproxy/repos/octocat/repo-cached.git'\n"
             f"UNIT"
         )
-        proxy.succeed("systemctl daemon-reload")
-        proxy.succeed("systemctl start forgeproxy")
+        proxy.succeed(
+            "systemctl daemon-reload && "
+            "systemctl reset-failed forgeproxy && "
+            "systemctl start forgeproxy"
+        )
+        proxy.succeed(
+            "systemctl show forgeproxy -p EnvironmentFiles --no-pager | "
+            "grep -F '/run/forgeproxy-admin-token.env'"
+        )
+        proxy.succeed(
+            "systemctl show forgeproxy -p Environment --no-pager | "
+            "grep -F 'FORGEPROXY_ALLOW_ENV_SECRET_FALLBACK=true'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service --no-pager | "
+            "grep -F 'startup init probe succeeded for upstream'"
+        )
         proxy.wait_for_open_port(2222)
 
     # ── Prepare client SSH keys ──────────────────────────────────────────
@@ -792,7 +812,91 @@ pkgs.testers.runNixOSTest {
             f"find {live_tee_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
         )
 
-    # ── Subtest 5d: Uncached clone publishes a symlinked generation cleanly ──
+    # ── Subtest 5e: Restart drains an in-flight SSH clone cleanly ───────────
+    with subtest("systemctl restart drains an in-flight SSH clone"):
+        drain_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
+        drain_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
+        drain_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream-live"
+
+        proxy.succeed(f"rm -rf {drain_repo} {drain_generation_dir} {drain_tee_dir}")
+        client.succeed(
+            "rm -rf "
+            "/tmp/repo-stream-live-drain "
+            "/tmp/repo-stream-live-drain.log "
+            "/tmp/repo-stream-live-drain.pid"
+        )
+
+        since = proxy.succeed("date --iso-8601=seconds --utc").strip()
+        client.succeed(
+            "env GIT_SSH_COMMAND=\"ssh -i /tmp/alice_key "
+            "-o StrictHostKeyChecking=no "
+            "-o UserKnownHostsFile=/dev/null "
+            "-p 2222\" "
+            "sh -c '"
+            "set -e; "
+            "git clone --progress git@proxy:octocat/repo-stream-live.git /tmp/repo-stream-live-drain "
+            "> /tmp/repo-stream-live-drain.log 2>&1 & "
+            "pid=$!; "
+            "echo \"$pid\" > /tmp/repo-stream-live-drain.pid'"
+        )
+        client.wait_until_succeeds(
+            "grep -Eq "
+            "'Enumerating objects:|Counting objects:|Compressing objects:|Receiving objects:|Resolving deltas:' "
+            "/tmp/repo-stream-live-drain.log"
+        )
+        client.succeed("kill -0 $(cat /tmp/repo-stream-live-drain.pid)")
+        proxy.succeed(
+            "sh -c '"
+            "systemctl restart forgeproxy >/tmp/forgeproxy-restart.log 2>&1 & "
+            "echo \"$!\" > /tmp/forgeproxy-restart.pid'"
+        )
+        proxy.succeed("test -s /tmp/forgeproxy-restart.pid && kill -0 $(cat /tmp/forgeproxy-restart.pid)")
+        proxy.succeed(
+            "sh -c '"
+            "set -eu; "
+            "for _ in $(seq 1 20); do "
+            "  if journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager"
+            "    | grep -Fq \"forgeproxy entering drain mode\"; then "
+            "    exit 0; "
+            "  fi; "
+            "  sleep 1; "
+            "done; "
+            "echo \"==== forgeproxy restart log ====\"; "
+            "cat /tmp/forgeproxy-restart.log || true; "
+            "echo \"==== forgeproxy restart pid ====\"; "
+            "cat /tmp/forgeproxy-restart.pid || true; "
+            "echo \"==== systemctl show forgeproxy ====\"; "
+            "systemctl show forgeproxy -p ActiveState -p SubState -p Job -p MainPID -p ExecMainPID -p ExecMainStatus || true; "
+            "echo \"==== systemctl status forgeproxy ====\"; "
+            "systemctl status forgeproxy --no-pager || true; "
+            "echo \"==== recent forgeproxy journal ====\"; "
+            "journalctl -u forgeproxy.service"
+            f" --since '{since}' --no-pager || true; "
+            "exit 1'"
+        )
+        proxy.succeed(
+            "sh -c '"
+            "for _ in $(seq 1 50); do "
+            "  health_code=$(curl -s -o /tmp/healthz.out -w \"%{http_code}\" http://127.0.0.1:8080/healthz || true); "
+            "  ready_code=$(curl -s -o /tmp/readyz.out -w \"%{http_code}\" http://127.0.0.1:8080/readyz || true); "
+            "  if [ \"$health_code\" = 200 ] && [ \"$ready_code\" = 503 ]; then "
+            "    exit 0; "
+            "  fi; "
+            "  sleep 0.1; "
+            "done; "
+            "echo \"expected /healthz=200 and /readyz=503 during drain\"; "
+            "echo \"last health_code=$health_code ready_code=$ready_code\"; "
+            "exit 1'"
+        )
+        proxy.succeed("grep -Fqx 'forgeproxy is draining and not accepting new requests' /tmp/readyz.out")
+        client.wait_until_succeeds("! kill -0 $(cat /tmp/repo-stream-live-drain.pid) 2>/dev/null")
+        client.succeed("test -f /tmp/repo-stream-live-drain/blob-32.bin")
+        client.succeed("git -C /tmp/repo-stream-live-drain fsck --no-dangling")
+        proxy.wait_until_succeeds("! kill -0 $(cat /tmp/forgeproxy-restart.pid) 2>/dev/null")
+        proxy.succeed("systemctl is-active forgeproxy | grep -qx active")
+
+    # ── Subtest 5f: Uncached clone publishes a symlinked generation cleanly ──
     with subtest("Uncached clone publishes a generation symlink and cleans tee capture"):
         stream_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream.git"
         stream_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream.git"
@@ -824,7 +928,7 @@ pkgs.testers.runNixOSTest {
             f"find {stream_tee_dir} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
         )
 
-    # ── Subtest 5e: Generations converge after concurrent uncached clones ──
+    # ── Subtest 5g: Generations converge after concurrent uncached clones ──
     with subtest("Concurrent uncached clones fold into one published generation"):
         generation_repo = "/var/cache/forgeproxy/repos/octocat/repo-generations.git"
         generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-generations.git"
@@ -869,7 +973,7 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-generations-2/file-3.txt")
         client.succeed("test -f /tmp/repo-generations-3/file-3.txt")
 
-    # ── Subtest 5f: Published snapshots are invalid without a mirror ──────
+    # ── Subtest 5h: Published snapshots are invalid without a mirror ──────
     with subtest("Published generations are scrubbed when the mirror is missing"):
         invariant_repo = "/var/cache/forgeproxy/repos/octocat/repo-generations.git"
         invariant_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-generations.git"
@@ -919,7 +1023,7 @@ pkgs.testers.runNixOSTest {
             f"test -d {invariant_mirror} && test -f {invariant_mirror}/HEAD"
         )
 
-    # ── Subtest 5g: Large stale want sets catch up locally before timeout ──
+    # ── Subtest 5i: Large stale want sets catch up locally before timeout ──
     with subtest("Large stale fetch resolves many missing wants locally before timeout"):
         many_wants_repo = "/var/cache/forgeproxy/repos/octocat/repo-many-wants.git"
         many_wants_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-many-wants.git"
@@ -1003,7 +1107,7 @@ pkgs.testers.runNixOSTest {
             " | grep -F 'local published-generation catch-up timed out; falling back to upstream proxy'"
         )
 
-    # ── Subtest 5h: Requests must not serve directly from the mutable mirror ──
+    # ── Subtest 5j: Requests must not serve directly from the mutable mirror ──
     with subtest("SSH fetch does not serve directly from a fresher mirror when publish lags"):
         mirror_serve_repo = "/var/cache/forgeproxy/repos/octocat/repo-mirror-serve.git"
         mirror_serve_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-mirror-serve.git"
@@ -1081,7 +1185,7 @@ pkgs.testers.runNixOSTest {
             " | grep -F '\"serve_from\":\"Mirror\"'"
         )
 
-    # ── Subtest 5i: Concurrent uncached hydrations complete and drain semaphore ──
+    # ── Subtest 5k: Concurrent uncached hydrations complete and drain semaphore ──
     with subtest("Concurrent uncached clones release the repo semaphore"):
         semaphore_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
         semaphore_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
@@ -1130,7 +1234,7 @@ pkgs.testers.runNixOSTest {
             f"! redis-cli -h valkey EXISTS '{semaphore_key}' | grep -qx 1"
         )
 
-    # ── Subtest 5j: External scrubber handles published generation layout ──
+    # ── Subtest 5l: External scrubber handles published generation layout ──
     with subtest("External scrubber succeeds and keeps generation-backed repos"):
         proxy.succeed("systemctl start forgeproxy-cache-scrub.service")
         proxy.succeed(

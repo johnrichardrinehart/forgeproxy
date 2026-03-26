@@ -237,6 +237,7 @@ in
 
         Restart = "on-failure";
         RestartSec = 5;
+        TimeoutStopSec = "5min";
 
         # RuntimeDirectory is per-service. The shared cache tree is managed
         # separately via tmpfiles plus forgeproxy-cache group permissions.
