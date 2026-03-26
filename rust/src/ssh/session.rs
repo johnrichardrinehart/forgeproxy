@@ -38,14 +38,29 @@ use crate::metrics::{
 /// fragmentation behavior for large buffers while streaming big packfiles.
 const SSH_DATA_CHUNK_SIZE: usize = 32 * 1024;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct UpstreamProxyChannelState {
+    output_lock: Arc<Mutex<()>>,
     stream_finished: bool,
     exit_status_sent: bool,
     eof_sent: bool,
     close_sent: bool,
     client_eof_seen: bool,
     client_close_seen: bool,
+}
+
+impl Default for UpstreamProxyChannelState {
+    fn default() -> Self {
+        Self {
+            output_lock: Arc::new(Mutex::new(())),
+            stream_finished: false,
+            exit_status_sent: false,
+            eof_sent: false,
+            close_sent: false,
+            client_eof_seen: false,
+            client_close_seen: false,
+        }
+    }
 }
 
 struct UpstreamUploadPackRequest {
@@ -71,6 +86,7 @@ struct UpstreamUploadPackContext {
     handle: russh::server::Handle,
     channel_id: ChannelId,
     stream_channel: Option<Channel<Msg>>,
+    output_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -266,14 +282,35 @@ async fn send_channel_data_chunks(
 async fn send_channel_response_data(
     handle: &russh::server::Handle,
     channel_id: ChannelId,
-    _stream_channel: Option<&Channel<Msg>>,
+    stream_channel: Option<&Channel<Msg>>,
     data: &[u8],
 ) -> Result<(), ()> {
-    // Always queue response bytes through `Handle::data()`. `Channel::make_writer()`
-    // ultimately drives the same session, but it obscures the exact ordering we
-    // need here and previously let upload-pack payload delivery race with
-    // exit-status/EOF/close finalization.
-    send_channel_data_chunks(handle, channel_id, data).await
+    if let Some(stream_channel) = stream_channel {
+        use tokio::io::AsyncWriteExt;
+
+        // When we still own the confirmed SSH channel, write through its
+        // window-aware writer so payload delivery cannot outrun the client's
+        // receive window and leave unsent data buffered inside `russh` while
+        // forgeproxy is already queuing exit-status/EOF/close.
+        let mut writer = Box::pin(stream_channel.make_writer());
+        writer.write_all(data).await.map_err(|_| ())
+    } else {
+        // Fallback for the small pre-fetch negotiation messages where we only
+        // retained the session handle, not the channel object.
+        send_channel_data_chunks(handle, channel_id, data).await
+    }
+}
+
+async fn output_lock_for_channel(
+    channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
+    channel_id: ChannelId,
+) -> Arc<Mutex<()>> {
+    channel_states
+        .lock()
+        .await
+        .get(&channel_id)
+        .map(|state| Arc::clone(&state.output_lock))
+        .unwrap_or_else(|| Arc::new(Mutex::new(())))
 }
 
 struct LocalUploadPackResponseContext {
@@ -952,6 +989,7 @@ impl Handler for SshSession {
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
+            let output_lock = output_lock_for_channel(&channel_states, channel_id).await;
             let metric_username =
                 crate::metrics::clone_metric_username(self.username.as_deref(), true);
             tokio::spawn(async move {
@@ -977,6 +1015,7 @@ impl Handler for SshSession {
                             } else {
                                 None
                             },
+                            output_lock: Arc::clone(&output_lock),
                         },
                         UpstreamUploadPackRequest {
                             owner_repo,
@@ -1019,6 +1058,7 @@ impl Handler for SshSession {
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
+            let output_lock = output_lock_for_channel(&channel_states, channel_id).await;
             let metric_username =
                 crate::metrics::clone_metric_username(self.username.as_deref(), true);
             tokio::spawn(async move {
@@ -1030,6 +1070,7 @@ impl Handler for SshSession {
                         handle,
                         channel_id,
                         stream_channel,
+                        output_lock,
                     },
                     UpstreamUploadPackRequest {
                         owner_repo,
@@ -1088,6 +1129,7 @@ impl Handler for SshSession {
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
+            let output_lock = output_lock_for_channel(&channel_states, channel_id).await;
             let metric_username =
                 crate::metrics::clone_metric_username(self.username.as_deref(), true);
             tokio::spawn(async move {
@@ -1099,6 +1141,7 @@ impl Handler for SshSession {
                         handle,
                         channel_id,
                         stream_channel,
+                        output_lock,
                     },
                     UpstreamUploadPackRequest {
                         owner_repo,
@@ -1550,10 +1593,12 @@ impl Handler for SshSession {
                         authenticated,
                         self.git_protocol.clone(),
                     ));
+                    let channel_state = UpstreamProxyChannelState::default();
+                    let output_lock = Arc::clone(&channel_state.output_lock);
                     self.upstream_proxy_channels
                         .lock()
                         .await
-                        .insert(channel_id, UpstreamProxyChannelState::default());
+                        .insert(channel_id, channel_state);
 
                     // RFC 4254 §6.5: OpenSSH won't read channel data until it
                     // receives SSH_MSG_CHANNEL_SUCCESS.  Send it now so the
@@ -1580,6 +1625,7 @@ impl Handler for SshSession {
                         .await
                         {
                             Ok(advert) => {
+                                let _output_guard = output_lock.lock().await;
                                 capture_metadata
                                     .lock()
                                     .await
@@ -1611,6 +1657,7 @@ impl Handler for SshSession {
                                 }
                             }
                             Err(e) => {
+                                let _output_guard = output_lock.lock().await;
                                 error!(
                                     repo = %repo_bg,
                                     error = %format!("{e:#}"),
@@ -1676,6 +1723,7 @@ async fn proxy_upstream_upload_pack(
         handle,
         channel_id,
         stream_channel,
+        output_lock,
     } = context;
     let UpstreamUploadPackRequest {
         owner_repo,
@@ -1685,6 +1733,7 @@ async fn proxy_upstream_upload_pack(
         request_kind,
         metric_username,
     } = request;
+    let _output_guard = output_lock.lock().await;
     let mut fetch_started_at = None;
     let mut fetch_cache_status = None;
     if request_kind == V2RequestKind::Fetch {
