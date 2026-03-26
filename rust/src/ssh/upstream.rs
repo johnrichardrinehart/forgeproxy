@@ -46,6 +46,7 @@ pub async fn fetch_ref_advertisement(
     owner_repo: &str,
     authenticated: bool,
     git_protocol: Option<&str>,
+    metric_username: &str,
 ) -> Result<Vec<u8>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =
@@ -87,6 +88,8 @@ pub async fn fetch_ref_advertisement(
                 .get_or_create(&CloneUpstreamBytesLabels {
                     protocol: Protocol::Ssh,
                     phase: ClonePhase::InfoRefs,
+                    username: metric_username.to_string(),
+                    repo: owner_repo.to_string(),
                 })
                 .inc_by(stripped.len() as u64);
 
@@ -122,6 +125,7 @@ pub async fn post_upload_pack_stream(
     want_have: &[u8],
     authenticated: bool,
     git_protocol: Option<&str>,
+    _metric_username: &str,
 ) -> Result<impl Stream<Item = reqwest::Result<bytes::Bytes>>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =

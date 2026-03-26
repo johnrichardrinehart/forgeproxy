@@ -54,6 +54,7 @@ struct UpstreamUploadPackRequest {
     authenticated: bool,
     git_protocol: Option<String>,
     request_kind: V2RequestKind,
+    metric_username: String,
 }
 
 #[derive(Clone, Copy)]
@@ -287,6 +288,8 @@ struct LocalUploadPackResponseContext {
 struct CloneCompletion {
     cache_status: CacheStatus,
     started_at: Instant,
+    metric_username: String,
+    metric_repo: String,
 }
 
 async fn serve_local_upload_pack_once(
@@ -387,6 +390,8 @@ async fn serve_local_upload_pack_once(
             protocol: Protocol::Ssh,
             phase: ClonePhase::UploadPack,
             source: CloneSource::Local,
+            username: completion.metric_username.clone(),
+            repo: completion.metric_repo.clone(),
         })
         .clone();
     let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
@@ -456,6 +461,8 @@ async fn serve_local_upload_pack_once(
             &state.metrics,
             Protocol::Ssh,
             completion.cache_status,
+            &completion.metric_username,
+            &completion.metric_repo,
             completion.started_at.elapsed(),
         );
     }
@@ -945,6 +952,8 @@ impl Handler for SshSession {
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
+            let metric_username =
+                crate::metrics::clone_metric_username(self.username.as_deref(), true);
             tokio::spawn(async move {
                 for (owner_repo, request_kind, want_have, authenticated, git_protocol) in
                     request_batch
@@ -975,6 +984,7 @@ impl Handler for SshSession {
                             authenticated,
                             git_protocol,
                             request_kind,
+                            metric_username: metric_username.clone(),
                         },
                         UpstreamUploadPackBehavior {
                             warn_on_disconnect: true,
@@ -1009,6 +1019,8 @@ impl Handler for SshSession {
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
+            let metric_username =
+                crate::metrics::clone_metric_username(self.username.as_deref(), true);
             tokio::spawn(async move {
                 proxy_upstream_upload_pack(
                     UpstreamUploadPackContext {
@@ -1025,6 +1037,7 @@ impl Handler for SshSession {
                         authenticated,
                         git_protocol,
                         request_kind,
+                        metric_username,
                     },
                     UpstreamUploadPackBehavior {
                         warn_on_disconnect: true,
@@ -1075,6 +1088,8 @@ impl Handler for SshSession {
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
             let handle = session.handle();
+            let metric_username =
+                crate::metrics::clone_metric_username(self.username.as_deref(), true);
             tokio::spawn(async move {
                 proxy_upstream_upload_pack(
                     UpstreamUploadPackContext {
@@ -1091,6 +1106,7 @@ impl Handler for SshSession {
                         authenticated,
                         git_protocol,
                         request_kind: V2RequestKind::Fetch,
+                        metric_username,
                     },
                     UpstreamUploadPackBehavior {
                         warn_on_disconnect: false,
@@ -1369,6 +1385,10 @@ impl Handler for SshSession {
                             let repo_for_stream = repo.clone();
                             let state_for_stream = Arc::clone(&self.state);
                             let stream_channel = channel;
+                            let metric_username = crate::metrics::clone_metric_username(
+                                self.username.as_deref(),
+                                true,
+                            );
 
                             // Spawn a task that streams upload-pack stdout via
                             // the session channel so large responses respect
@@ -1389,6 +1409,8 @@ impl Handler for SshSession {
                                         protocol: Protocol::Ssh,
                                         phase: ClonePhase::UploadPack,
                                         source: CloneSource::Local,
+                                        username: metric_username.clone(),
+                                        repo: repo_for_stream.clone(),
                                     })
                                     .clone();
 
@@ -1443,6 +1465,8 @@ impl Handler for SshSession {
                                         &state_for_stream.metrics,
                                         Protocol::Ssh,
                                         CacheStatus::Hot,
+                                        &metric_username,
+                                        &repo_for_stream,
                                         clone_started.elapsed(),
                                     );
                                 }
@@ -1543,12 +1567,15 @@ impl Handler for SshSession {
                     let handle = session.handle();
                     let repo_bg = repo.clone();
                     let git_protocol = self.git_protocol.clone();
+                    let metric_username =
+                        crate::metrics::clone_metric_username(self.username.as_deref(), true);
                     tokio::spawn(async move {
                         match super::upstream::fetch_ref_advertisement(
                             &state,
                             &repo_bg,
                             authenticated,
                             git_protocol.as_deref(),
+                            &metric_username,
                         )
                         .await
                         {
@@ -1567,6 +1594,8 @@ impl Handler for SshSession {
                                         protocol: Protocol::Ssh,
                                         phase: ClonePhase::InfoRefs,
                                         source: CloneSource::Upstream,
+                                        username: metric_username,
+                                        repo: repo_bg.clone(),
                                     })
                                     .inc_by(advert.len() as u64);
                                 // Forward ref advertisement; channel stays open
@@ -1654,6 +1683,7 @@ async fn proxy_upstream_upload_pack(
         authenticated,
         git_protocol,
         request_kind,
+        metric_username,
     } = request;
     let mut fetch_started_at = None;
     let mut fetch_cache_status = None;
@@ -1808,6 +1838,8 @@ async fn proxy_upstream_upload_pack(
                         ),
                         started_at: fetch_started_at
                             .expect("fetch start time must be set for fetch requests"),
+                        metric_username: metric_username.clone(),
+                        metric_repo: owner_repo.clone(),
                     },
                     LocalUploadPackResponseContext {
                         handle: handle.clone(),
@@ -1866,6 +1898,7 @@ async fn proxy_upstream_upload_pack(
         &want_have,
         authenticated,
         git_protocol.as_deref(),
+        &metric_username,
     )
     .await
     {
@@ -1881,6 +1914,8 @@ async fn proxy_upstream_upload_pack(
                 .get_or_create(&CloneUpstreamBytesLabels {
                     protocol: Protocol::Ssh,
                     phase: ClonePhase::UploadPack,
+                    username: metric_username.clone(),
+                    repo: owner_repo.clone(),
                 })
                 .clone();
             let downstream_counter = state
@@ -1891,6 +1926,8 @@ async fn proxy_upstream_upload_pack(
                     protocol: Protocol::Ssh,
                     phase: ClonePhase::UploadPack,
                     source: CloneSource::Upstream,
+                    username: metric_username.clone(),
+                    repo: owner_repo.clone(),
                 })
                 .clone();
             let mut had_error = false;
@@ -2110,6 +2147,8 @@ async fn proxy_upstream_upload_pack(
                         &state.metrics,
                         Protocol::Ssh,
                         cache_status,
+                        &metric_username,
+                        &owner_repo,
                         started_at.elapsed(),
                     );
                 }
