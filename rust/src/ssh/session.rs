@@ -265,15 +265,13 @@ async fn send_channel_data_chunks(
 async fn send_channel_response_data(
     handle: &russh::server::Handle,
     channel_id: ChannelId,
-    stream_channel: Option<&Channel<Msg>>,
+    _stream_channel: Option<&Channel<Msg>>,
     data: &[u8],
 ) -> Result<(), ()> {
-    if let Some(channel) = stream_channel {
-        let mut writer = channel.make_writer();
-        writer.write_all(data).await.map_err(|_| ())?;
-        return Ok(());
-    }
-
+    // Always queue response bytes through `Handle::data()`. `Channel::make_writer()`
+    // ultimately drives the same session, but it obscures the exact ordering we
+    // need here and previously let upload-pack payload delivery race with
+    // exit-status/EOF/close finalization.
     send_channel_data_chunks(handle, channel_id, data).await
 }
 
