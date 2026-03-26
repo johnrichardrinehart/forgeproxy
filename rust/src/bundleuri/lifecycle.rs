@@ -5,8 +5,7 @@
 //! 1. Scan the repo registry for repos that need a background fetch from the upstream forge.
 //! 2. Generate incremental bundles after each fetch.
 //! 3. Upload bundles to S3 and update the Valkey registry.
-//! 4. Consolidate hourly bundles into daily bundles.
-//! 5. Consolidate daily bundles into a new base bundle.
+//! 4. Keep publishing generational bundles after each fresh mirror update.
 //!
 //! The fetch interval for each repo is dynamically adjusted based on the delta
 //! size observed in the most recent fetch: large deltas shorten the interval,
@@ -16,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, Timelike, Utc};
+use chrono::Utc;
 use fred::interfaces::HashesInterface;
 use futures::{StreamExt, stream};
 use tokio::sync::watch;
@@ -404,22 +403,11 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
             let _new_interval =
                 update_fetch_schedule(state, owner_repo, result.bytes_received).await?;
 
-            // 8. Generate an incremental bundle.
-            // Read the previously recorded refs (if any) from Valkey.
-            let prev_refs_json: Option<String> =
-                HashesInterface::hget(&state.valkey, &repo_key, "prev_refs")
-                    .await
-                    .unwrap_or(None);
-
-            let prev_refs: std::collections::HashMap<String, String> = prev_refs_json
-                .and_then(|json: String| serde_json::from_str(&json).ok())
-                .unwrap_or_default();
-
-            let bundle_result = crate::bundleuri::generator::generate_incremental_bundle(
+            // 8. Generate a full bundle for this node's published generation.
+            let bundle_result = crate::bundleuri::generator::generate_full_bundle(
                 state,
                 &staged_repo_path,
                 owner_repo,
-                &prev_refs,
             )
             .await;
 
@@ -434,54 +422,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
                         "incremental bundle generated"
                     );
 
-                    // 9. Upload bundle to S3.
-                    let s3_key = format!(
-                        "{}{}/bundles/{}.bundle",
-                        state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
-                    );
-
-                    if let Err(e) = crate::storage::s3::upload_bundle(
-                        &state.s3_client,
-                        &state.metrics,
-                        &state.config.storage.s3.bucket,
-                        &s3_key,
-                        &bundle.bundle_path,
-                    )
-                    .await
-                    {
-                        outcome.bundle_upload_failed = true;
-                        warn!(
-                            repo = %owner_repo,
-                            s3_key = %s3_key,
-                            error = %e,
-                            "failed to upload bundle to S3"
-                        );
-                    }
-
-                    // Record the current refs snapshot for the next incremental.
-                    let current_refs =
-                        crate::bundleuri::generator::get_refs(&staged_repo_path).await?;
-                    let refs_json = serde_json::to_string(&current_refs)?;
-                    HashesInterface::hset::<(), _, _>(
-                        &state.valkey,
-                        &repo_key,
-                        [
-                            ("prev_refs", refs_json.as_str()),
-                            ("latest_bundle_s3_key", s3_key.as_str()),
-                            ("latest_bundle_token", &bundle.creation_token.to_string()),
-                        ],
-                    )
-                    .await?;
-                    state
-                        .cache_manager
-                        .publish_staged_repo(owner_repo, &staged_repo_path)?;
-                    crate::coordination::registry::prune_retired_generations(state, owner_repo)
-                        .await?;
-                    published = true;
-                    outcome.published = true;
-
-                    // Generate filtered (blobless) bundle variant if configured.
-                    if state.config.bundles.generate_filtered_bundles {
+                    let filtered_bundle = if state.config.bundles.generate_filtered_bundles {
                         match crate::bundleuri::generator::generate_filtered_bundle(
                             state,
                             &staged_repo_path,
@@ -491,28 +432,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
                         {
                             Ok(filtered) => {
                                 outcome.filtered_bundle_generated = true;
-                                let filtered_s3_key = format!(
-                                    "{}{}/bundles/{}.filtered.bundle",
-                                    state.config.storage.s3.prefix,
-                                    owner_repo,
-                                    filtered.creation_token,
-                                );
-                                if let Err(e) = crate::storage::s3::upload_bundle(
-                                    &state.s3_client,
-                                    &state.metrics,
-                                    &state.config.storage.s3.bucket,
-                                    &filtered_s3_key,
-                                    &filtered.bundle_path,
-                                )
-                                .await
-                                {
-                                    outcome.filtered_bundle_upload_failed = true;
-                                    warn!(
-                                        repo = %owner_repo,
-                                        error = %e,
-                                        "failed to upload filtered bundle to S3"
-                                    );
-                                }
+                                Some(filtered)
                             }
                             Err(e) => {
                                 warn!(
@@ -520,9 +440,39 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
                                     error = %e,
                                     "filtered bundle generation failed (Git 2.40+ required)"
                                 );
+                                None
                             }
                         }
+                    } else {
+                        None
+                    };
+
+                    if let Err(e) = crate::coordination::registry::publish_bundle_artifacts(
+                        state,
+                        owner_repo,
+                        &bundle,
+                        filtered_bundle.as_ref(),
+                    )
+                    .await
+                    {
+                        outcome.bundle_upload_failed = true;
+                        if filtered_bundle.is_some() {
+                            outcome.filtered_bundle_upload_failed = true;
+                        }
+                        warn!(
+                            repo = %owner_repo,
+                            error = %e,
+                            "failed to publish bundle artifacts to S3"
+                        );
                     }
+
+                    state
+                        .cache_manager
+                        .publish_staged_repo(owner_repo, &staged_repo_path)?;
+                    crate::coordination::registry::prune_retired_generations(state, owner_repo)
+                        .await?;
+                    published = true;
+                    outcome.published = true;
                 }
                 Err(e) => {
                     outcome.status = RepoTickStatus::BundleGenerationFailed;
@@ -682,332 +632,6 @@ pub async fn update_fetch_schedule(
         .await?;
 
     Ok(Duration::from_secs(new_interval))
-}
-
-// ---------------------------------------------------------------------------
-// Daily consolidation
-// ---------------------------------------------------------------------------
-
-/// Collapse hourly bundles into a single daily bundle.
-///
-/// Runs indefinitely, waking once per minute and performing the consolidation
-/// at the configured `daily_consolidation_hour` (UTC).
-pub async fn run_daily_consolidation(state: Arc<AppState>) {
-    let target_hour = state.config.bundles.daily_consolidation_hour;
-    info!(
-        target_hour = target_hour,
-        "daily bundle consolidation scheduler started"
-    );
-
-    let mut last_run_date = None;
-
-    loop {
-        let now = Utc::now();
-        let today = now.date_naive();
-
-        // Only run once per day at the target hour.
-        if now.hour() as u8 == target_hour && last_run_date != Some(today) {
-            info!("starting daily bundle consolidation");
-            last_run_date = Some(today);
-
-            if let Err(e) = daily_consolidation_tick(&state).await {
-                error!(error = %e, "daily consolidation failed");
-            }
-        }
-
-        tokio::time::sleep(Duration::from_secs(60)).await;
-    }
-}
-
-/// Perform one round of daily consolidation across all repos.
-pub(crate) async fn daily_consolidation_tick(state: &AppState) -> Result<()> {
-    let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
-    let lock_ttl = state.config.bundles.bundle_lock_ttl;
-
-    for owner_repo in &repos {
-        // Check if bundles are disabled for this repo.
-        if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo.as_str())
-            && override_cfg.disable_bundles == Some(true)
-        {
-            debug!(repo = %owner_repo, "bundles disabled for repo; skipping consolidation");
-            continue;
-        }
-
-        let repo_path = state.cache_manager.repo_path(owner_repo);
-
-        if !repo_path.exists() || !repo_path.join("HEAD").is_file() {
-            debug!(repo = %owner_repo, "repo not locally cached; skipping daily consolidation");
-            continue;
-        }
-
-        let lock_key = format!("forgeproxy:lock:daily-consolidation:{owner_repo}");
-        let node_id = crate::coordination::node::node_id();
-        let lock_acquired = crate::coordination::locks::acquire_lock(
-            &state.valkey,
-            &lock_key,
-            &node_id,
-            lock_ttl,
-            Some(&state.metrics),
-        )
-        .await?;
-
-        if !lock_acquired {
-            debug!(
-                repo = %owner_repo,
-                "another node holds the daily consolidation lock; skipping"
-            );
-            continue;
-        }
-
-        // Generate a new full bundle that replaces the hourly incrementals.
-        let result =
-            match crate::bundleuri::generator::generate_full_bundle(state, &repo_path, owner_repo)
-                .await
-            {
-                Ok(bundle) => {
-                    info!(
-                        repo = %owner_repo,
-                        creation_token = bundle.creation_token,
-                        size_bytes = bundle.size_bytes,
-                        "daily consolidation bundle generated"
-                    );
-
-                    // Update registry with new bundle info.
-                    let repo_key = crate::coordination::registry::repo_key(owner_repo);
-                    let s3_key = format!(
-                        "{}{}/bundles/daily-{}.bundle",
-                        state.config.storage.s3.prefix,
-                        owner_repo,
-                        Utc::now().format("%Y%m%d"),
-                    );
-                    HashesInterface::hset::<(), _, _>(
-                        &state.valkey,
-                        &repo_key,
-                        [
-                            ("latest_daily_bundle_s3_key", s3_key.as_str()),
-                            (
-                                "latest_daily_bundle_token",
-                                &bundle.creation_token.to_string(),
-                            ),
-                        ],
-                    )
-                    .await
-                    .unwrap_or_default();
-
-                    // Generate filtered (blobless) bundle variant if configured.
-                    if state.config.bundles.generate_filtered_bundles {
-                        match crate::bundleuri::generator::generate_filtered_bundle(
-                            state, &repo_path, owner_repo,
-                        )
-                        .await
-                        {
-                            Ok(filtered) => {
-                                let filtered_s3_key = format!(
-                                    "{}{}/bundles/daily-{}.filtered.bundle",
-                                    state.config.storage.s3.prefix,
-                                    owner_repo,
-                                    Utc::now().format("%Y%m%d"),
-                                );
-                                crate::storage::s3::upload_bundle(
-                                    &state.s3_client,
-                                    &state.metrics,
-                                    &state.config.storage.s3.bucket,
-                                    &filtered_s3_key,
-                                    &filtered.bundle_path,
-                                )
-                                .await
-                                .unwrap_or_else(|e| {
-                                    warn!(
-                                        repo = %owner_repo,
-                                        error = %e,
-                                        "failed to upload filtered daily bundle to S3"
-                                    );
-                                });
-                            }
-                            Err(e) => {
-                                warn!(
-                                    repo = %owner_repo,
-                                    error = %e,
-                                    "filtered bundle generation failed during daily consolidation"
-                                );
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!(
-                        repo = %owner_repo,
-                        error = %e,
-                        "daily consolidation bundle generation failed"
-                    );
-                    Err(e)
-                }
-            };
-
-        let _ = crate::coordination::locks::release_lock(
-            &state.valkey,
-            &lock_key,
-            &node_id,
-            true,
-            Some(&state.metrics),
-        )
-        .await;
-
-        if let Err(e) = result {
-            debug!(
-                repo = %owner_repo,
-                error = %e,
-                "daily consolidation finished with repo-level error"
-            );
-        }
-    }
-
-    info!("daily bundle consolidation complete");
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Weekly consolidation
-// ---------------------------------------------------------------------------
-
-/// Collapse daily bundles into a new base bundle.
-///
-/// Runs indefinitely, waking once per minute and performing the consolidation
-/// on the configured weekday at the `daily_consolidation_hour` (UTC).
-pub async fn run_weekly_consolidation(state: Arc<AppState>) {
-    let target_day = state.config.bundles.weekly_consolidation_day;
-    let target_hour = state.config.bundles.daily_consolidation_hour;
-    info!(
-        target_day = target_day,
-        target_hour = target_hour,
-        "weekly bundle consolidation scheduler started"
-    );
-
-    let mut last_run_date = None;
-
-    loop {
-        let now = Utc::now();
-        let today = now.date_naive();
-
-        // ISO weekday: 1=Mon .. 7=Sun.
-        let current_weekday = now.weekday().num_days_from_monday() as u8 + 1;
-
-        if current_weekday == target_day
-            && now.hour() as u8 == target_hour
-            && last_run_date != Some(today)
-        {
-            info!("starting weekly bundle consolidation");
-            last_run_date = Some(today);
-
-            if let Err(e) = weekly_consolidation_tick(&state).await {
-                error!(error = %e, "weekly consolidation failed");
-            }
-        }
-
-        tokio::time::sleep(Duration::from_secs(60)).await;
-    }
-}
-
-/// Perform one round of weekly consolidation across all repos.
-pub(crate) async fn weekly_consolidation_tick(state: &AppState) -> Result<()> {
-    let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
-    let lock_ttl = state.config.bundles.bundle_lock_ttl;
-
-    for owner_repo in &repos {
-        if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo.as_str())
-            && override_cfg.disable_bundles == Some(true)
-        {
-            continue;
-        }
-
-        let repo_path = state.cache_manager.repo_path(owner_repo);
-
-        if !repo_path.exists() || !repo_path.join("HEAD").is_file() {
-            continue;
-        }
-
-        let lock_key = format!("forgeproxy:lock:weekly-consolidation:{owner_repo}");
-        let node_id = crate::coordination::node::node_id();
-        let lock_acquired = crate::coordination::locks::acquire_lock(
-            &state.valkey,
-            &lock_key,
-            &node_id,
-            lock_ttl,
-            Some(&state.metrics),
-        )
-        .await?;
-
-        if !lock_acquired {
-            debug!(
-                repo = %owner_repo,
-                "another node holds the weekly consolidation lock; skipping"
-            );
-            continue;
-        }
-
-        // Generate a new base (full) bundle.
-        let result =
-            match crate::bundleuri::generator::generate_full_bundle(state, &repo_path, owner_repo)
-                .await
-            {
-                Ok(bundle) => {
-                    info!(
-                        repo = %owner_repo,
-                        creation_token = bundle.creation_token,
-                        size_bytes = bundle.size_bytes,
-                        "weekly consolidation (base) bundle generated"
-                    );
-
-                    let repo_key = crate::coordination::registry::repo_key(owner_repo);
-                    let s3_key = format!(
-                        "{}{}/bundles/base-{}.bundle",
-                        state.config.storage.s3.prefix,
-                        owner_repo,
-                        Utc::now().format("%Y%m%d"),
-                    );
-                    HashesInterface::hset::<(), _, _>(
-                        &state.valkey,
-                        &repo_key,
-                        [
-                            ("base_bundle_s3_key", s3_key.as_str()),
-                            ("base_bundle_token", &bundle.creation_token.to_string()),
-                        ],
-                    )
-                    .await
-                    .unwrap_or_default();
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!(
-                        repo = %owner_repo,
-                        error = %e,
-                        "weekly consolidation bundle generation failed"
-                    );
-                    Err(e)
-                }
-            };
-
-        let _ = crate::coordination::locks::release_lock(
-            &state.valkey,
-            &lock_key,
-            &node_id,
-            true,
-            Some(&state.metrics),
-        )
-        .await;
-
-        if let Err(e) = result {
-            debug!(
-                repo = %owner_repo,
-                error = %e,
-                "weekly consolidation finished with repo-level error"
-            );
-        }
-    }
-
-    info!("weekly bundle consolidation complete");
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

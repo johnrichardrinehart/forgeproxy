@@ -13,7 +13,7 @@ load on the upstream forge and speeding up clones.
 ## Features
 
 - **SSH and HTTP transport** — proxy both `git clone ssh://` and `git clone https://`
-- **Bundle-URI** — automatic bundle generation with incremental, daily, and weekly consolidation; clients that support `bundle-uri` fetch most data from pre-built bundles
+- **Bundle-URI** — automatic generational bundle publication from freshly updated mirrors; clients that support `bundle-uri` fetch most data from pre-built bundles
 - **Filtered bundles** — optional blobless / treeless bundle variants for partial-clone workflows
 - **Multi-forge support** — pluggable backend for GitHub Enterprise, GitHub.com, GitLab, Gitea, and Forgejo
 - **Distributed coordination** — Valkey/Redis-backed locks, pub/sub invalidation, and node registry for multi-node deployments

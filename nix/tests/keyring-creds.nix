@@ -87,8 +87,6 @@ let
       rolling_window: 1800
 
     bundles:
-      daily_consolidation_hour: 3
-      weekly_consolidation_day: 7
       min_clone_count_for_bundles: 2
       bundle_lock_ttl: 300
       generate_filtered_bundles: false
