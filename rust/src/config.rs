@@ -613,12 +613,6 @@ fn default_rolling_window() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BundleConfig {
-    /// Hour (0-23 UTC) at which the daily consolidation job runs.
-    #[serde(default = "default_daily_hour")]
-    pub daily_consolidation_hour: u8,
-    /// ISO weekday (1 = Monday .. 7 = Sunday) for the weekly consolidation.
-    #[serde(default = "default_weekly_day")]
-    pub weekly_consolidation_day: u8,
     /// Minimum number of clones a repo must have received before bundles are
     /// generated for it.
     #[serde(default = "default_min_clone_count")]
@@ -651,8 +645,6 @@ pub struct BundleExecutionPolicy {
 impl Default for BundleConfig {
     fn default() -> Self {
         Self {
-            daily_consolidation_hour: default_daily_hour(),
-            weekly_consolidation_day: default_weekly_day(),
             min_clone_count_for_bundles: default_min_clone_count(),
             bundle_lock_ttl: default_bundle_lock_ttl(),
             max_concurrent_generations: default_max_concurrent_generations(),
@@ -684,14 +676,6 @@ impl BundleConfig {
             pack_threads,
         }
     }
-}
-
-fn default_daily_hour() -> u8 {
-    3
-}
-
-fn default_weekly_day() -> u8 {
-    7
 }
 
 fn default_min_clone_count() -> u64 {
@@ -839,14 +823,6 @@ fn validate_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.storage.local.high_water_mark <= 1.0 && config.storage.local.low_water_mark >= 0.0,
         "water marks must be in range [0.0, 1.0]"
-    );
-    anyhow::ensure!(
-        config.bundles.daily_consolidation_hour < 24,
-        "daily_consolidation_hour must be 0-23"
-    );
-    anyhow::ensure!(
-        (1..=7).contains(&config.bundles.weekly_consolidation_day),
-        "weekly_consolidation_day must be 1-7"
     );
     anyhow::ensure!(
         config.bundles.max_concurrent_generations > 0,

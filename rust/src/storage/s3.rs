@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use tracing::{debug, instrument};
 
 // ---------------------------------------------------------------------------
@@ -39,6 +40,22 @@ pub async fn upload_bundle(
 
     metrics.metrics.s3_upload_bytes.inc_by(size_bytes);
     debug!(path = %file_path.display(), "bundle uploaded");
+    Ok(())
+}
+
+/// Upload an in-memory UTF-8 object to S3.
+#[instrument(skip(client), fields(%bucket, %key, size_bytes = contents.len()))]
+pub async fn upload_text(client: &Client, bucket: &str, key: &str, contents: &str) -> Result<()> {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(contents.as_bytes().to_vec()))
+        .send()
+        .await
+        .context("S3 PutObject")?;
+
+    debug!(bytes = contents.len(), "S3 text object uploaded");
     Ok(())
 }
 
@@ -80,6 +97,87 @@ pub async fn download_to_path(
     metrics.metrics.s3_download_bytes.inc_by(bytes.len() as u64);
     debug!(path = %file_path.display(), bytes = bytes.len(), "S3 object downloaded");
     Ok(())
+}
+
+/// Download an S3 object into memory, returning `None` if the object does not
+/// exist.
+#[instrument(skip(client, metrics), fields(%bucket, %key))]
+pub async fn download_bytes_if_exists(
+    client: &Client,
+    metrics: &crate::metrics::MetricsRegistry,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<Vec<u8>>> {
+    let response = match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(service_error) = error.as_service_error()
+                && (service_error.code() == Some("NoSuchKey")
+                    || service_error.code() == Some("NotFound"))
+            {
+                return Ok(None);
+            }
+            return Err(error).context("S3 GetObject");
+        }
+    };
+
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .context("read S3 object body")?
+        .into_bytes();
+
+    metrics.metrics.s3_download_bytes.inc_by(bytes.len() as u64);
+    debug!(bytes = bytes.len(), "S3 object downloaded into memory");
+    Ok(Some(bytes.to_vec()))
+}
+
+/// Download an S3 UTF-8 text object, returning `None` if the object does not
+/// exist.
+#[instrument(skip(client, metrics), fields(%bucket, %key))]
+pub async fn download_text_if_exists(
+    client: &Client,
+    metrics: &crate::metrics::MetricsRegistry,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let Some(bytes) = download_bytes_if_exists(client, metrics, bucket, key).await? else {
+        return Ok(None);
+    };
+
+    let contents = String::from_utf8(bytes).context("S3 object body was not valid UTF-8")?;
+    Ok(Some(contents))
+}
+
+/// List S3 object keys under a prefix.
+#[instrument(skip(client), fields(%bucket, %prefix))]
+pub async fn list_object_keys(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    let mut continuation_token: Option<String> = None;
+    let mut keys = Vec::new();
+
+    loop {
+        let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(token) = continuation_token.as_deref() {
+            request = request.continuation_token(token);
+        }
+
+        let response = request.send().await.context("S3 ListObjectsV2")?;
+
+        for object in response.contents() {
+            if let Some(key) = object.key() {
+                keys.push(key.to_string());
+            }
+        }
+
+        if response.is_truncated().unwrap_or(false) {
+            continuation_token = response.next_continuation_token().map(str::to_owned);
+        } else {
+            break;
+        }
+    }
+
+    Ok(keys)
 }
 
 /// Generate a pre-signed GET URL for an S3 object.

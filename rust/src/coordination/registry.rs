@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use fred::interfaces::{ClientLike, HashesInterface, SortedSetsInterface};
+use fred::interfaces::{ClientLike, HashesInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, TryAcquireError};
@@ -1506,16 +1506,7 @@ async fn try_restore_repo_from_s3(
     owner_repo: &str,
     repo_path: &Path,
 ) -> Result<bool> {
-    let repo_key = repo_key(owner_repo);
-    let latest_bundle_s3_key: Option<String> =
-        HashesInterface::hget(&state.valkey, &repo_key, "latest_bundle_s3_key")
-            .await
-            .unwrap_or(None);
-    let base_bundle_s3_key: Option<String> =
-        HashesInterface::hget(&state.valkey, &repo_key, "base_bundle_s3_key")
-            .await
-            .unwrap_or(None);
-    let Some(s3_key) = latest_bundle_s3_key.or(base_bundle_s3_key) else {
+    let Some(metadata) = latest_published_bundle_metadata(state, owner_repo).await? else {
         return Ok(false);
     };
 
@@ -1525,7 +1516,7 @@ async fn try_restore_repo_from_s3(
         &state.s3_client,
         &state.metrics,
         &state.config.storage.s3.bucket,
-        &s3_key,
+        &metadata.bundle_s3_key,
         &bundle_path,
     )
     .await
@@ -1535,6 +1526,172 @@ async fn try_restore_repo_from_s3(
     crate::git::commands::git_fetch_bundle(repo_path, &bundle_path).await?;
 
     Ok(state.cache_manager.has_repo_at(repo_path))
+}
+
+pub(crate) async fn load_current_node_bundle_metadata(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<Option<crate::bundleuri::PublishedBundleMetadata>> {
+    let metadata_key = crate::bundleuri::bundle_metadata_s3_key(
+        &state.config.storage.s3.prefix,
+        owner_repo,
+        &state.bundle_publisher_id,
+    );
+    let Some(metadata_json) = crate::storage::s3::download_text_if_exists(
+        &state.s3_client,
+        &state.metrics,
+        &state.config.storage.s3.bucket,
+        &metadata_key,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let metadata = serde_json::from_str(&metadata_json)
+        .with_context(|| format!("parse published bundle metadata JSON for {owner_repo}"))?;
+    Ok(Some(metadata))
+}
+
+async fn list_published_bundle_metadata(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<Vec<crate::bundleuri::PublishedBundleMetadata>> {
+    let prefix =
+        crate::bundleuri::bundle_metadata_s3_prefix(&state.config.storage.s3.prefix, owner_repo);
+    let keys = crate::storage::s3::list_object_keys(
+        &state.s3_client,
+        &state.config.storage.s3.bucket,
+        &prefix,
+    )
+    .await?;
+
+    let mut metadata = Vec::new();
+    for key in keys.into_iter().filter(|key| key.ends_with(".json")) {
+        let Some(metadata_json) = crate::storage::s3::download_text_if_exists(
+            &state.s3_client,
+            &state.metrics,
+            &state.config.storage.s3.bucket,
+            &key,
+        )
+        .await?
+        else {
+            continue;
+        };
+
+        match serde_json::from_str::<crate::bundleuri::PublishedBundleMetadata>(&metadata_json) {
+            Ok(item) => metadata.push(item),
+            Err(error) => warn!(
+                repo = %owner_repo,
+                key = %key,
+                error = %error,
+                "skipping malformed published bundle metadata object"
+            ),
+        }
+    }
+
+    Ok(metadata)
+}
+
+async fn latest_published_bundle_metadata(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<Option<crate::bundleuri::PublishedBundleMetadata>> {
+    let mut metadata = list_published_bundle_metadata(state, owner_repo).await?;
+    metadata.sort_by_key(|item| (item.creation_token, item.updated_at_unix_secs));
+    Ok(metadata.pop())
+}
+
+pub(crate) async fn publish_bundle_artifacts(
+    state: &crate::AppState,
+    owner_repo: &str,
+    bundle: &crate::bundleuri::generator::BundleResult,
+    filtered_bundle: Option<&crate::bundleuri::generator::BundleResult>,
+) -> Result<crate::bundleuri::PublishedBundleMetadata> {
+    let bundle_s3_key = crate::bundleuri::bundle_object_s3_key(
+        &state.config.storage.s3.prefix,
+        owner_repo,
+        &state.bundle_publisher_id,
+    );
+    crate::storage::s3::upload_bundle(
+        &state.s3_client,
+        &state.metrics,
+        &state.config.storage.s3.bucket,
+        &bundle_s3_key,
+        &bundle.bundle_path,
+    )
+    .await
+    .with_context(|| format!("failed to upload published bundle for {owner_repo}"))?;
+
+    let filtered_bundle_s3_key = if let Some(filtered_bundle) = filtered_bundle {
+        let filtered_s3_key = crate::bundleuri::filtered_bundle_object_s3_key(
+            &state.config.storage.s3.prefix,
+            owner_repo,
+            &state.bundle_publisher_id,
+        );
+        crate::storage::s3::upload_bundle(
+            &state.s3_client,
+            &state.metrics,
+            &state.config.storage.s3.bucket,
+            &filtered_s3_key,
+            &filtered_bundle.bundle_path,
+        )
+        .await
+        .with_context(|| format!("failed to upload filtered bundle for {owner_repo}"))?;
+        Some(filtered_s3_key)
+    } else {
+        None
+    };
+
+    let metadata = crate::bundleuri::PublishedBundleMetadata {
+        publisher_id: state.bundle_publisher_id.clone(),
+        creation_token: bundle.creation_token,
+        bundle_s3_key: bundle_s3_key.clone(),
+        filtered_bundle_s3_key,
+        updated_at_unix_secs: chrono::Utc::now().timestamp(),
+        service_instance_id: state
+            .runtime_resource_attributes
+            .service_instance_id
+            .clone(),
+        service_machine_id: state.runtime_resource_attributes.service_machine_id.clone(),
+    };
+    let metadata_key = crate::bundleuri::bundle_metadata_s3_key(
+        &state.config.storage.s3.prefix,
+        owner_repo,
+        &state.bundle_publisher_id,
+    );
+    let metadata_json =
+        serde_json::to_string_pretty(&metadata).context("serialize published bundle metadata")?;
+    crate::storage::s3::upload_text(
+        &state.s3_client,
+        &state.config.storage.s3.bucket,
+        &metadata_key,
+        &metadata_json,
+    )
+    .await
+    .with_context(|| format!("failed to upload published bundle metadata for {owner_repo}"))?;
+
+    let repo_key = repo_key(owner_repo);
+    HashesInterface::hset::<(), _, _>(
+        &state.valkey,
+        &repo_key,
+        [
+            ("bundle_list_key", metadata_key.as_str()),
+            ("latest_bundle_s3_key", bundle_s3_key.as_str()),
+            ("latest_bundle_token", &bundle.creation_token.to_string()),
+        ],
+    )
+    .await?;
+
+    let mut info = get_repo_info(&state.valkey, owner_repo)
+        .await?
+        .unwrap_or_default();
+    info.last_bundle_ts = metadata.updated_at_unix_secs;
+    info.latest_creation_token = metadata.creation_token;
+    info.s3_bundle_list_key = metadata_key;
+    set_repo_info(&state.valkey, owner_repo, &info).await?;
+
+    Ok(metadata)
 }
 
 async fn materialize_capture_refs(
@@ -2019,91 +2176,16 @@ async fn ensure_bare_head_ref(repo_path: &Path) -> Result<()> {
     crate::git::commands::git_set_head_symbolic_ref(repo_path, head_ref).await
 }
 
-async fn register_bundle_in_valkey(
-    state: &crate::AppState,
-    owner_repo: &str,
-    repo_path: &Path,
-    s3_key: &str,
-    creation_token: u64,
-) -> Result<()> {
-    let refs = crate::bundleuri::generator::get_refs(repo_path).await?;
-    let refs_json = serde_json::to_string(&refs)?;
-    let repo_key = repo_key(owner_repo);
-
-    HashesInterface::hset::<(), _, _>(
-        &state.valkey,
-        &repo_key,
-        [
-            ("prev_refs", refs_json.as_str()),
-            ("latest_bundle_s3_key", s3_key),
-            ("latest_bundle_token", &creation_token.to_string()),
-        ],
-    )
-    .await?;
-
-    let bundle_name = format!("bootstrap-{creation_token}");
-    let bundle_registry_key = format!("bundles:{owner_repo}");
-    HashesInterface::hset::<(), _, _>(
-        &state.valkey,
-        &bundle_registry_key,
-        [(bundle_name.as_str(), s3_key)],
-    )
-    .await?;
-
-    let bundle_tokens_key = format!("bundle_tokens:{owner_repo}");
-    SortedSetsInterface::zadd::<(), _, _>(
-        &state.valkey,
-        &bundle_tokens_key,
-        None,
-        None,
-        false,
-        false,
-        (creation_token as f64, bundle_name.as_str()),
-    )
-    .await?;
-
-    Ok(())
-}
-
 async fn publish_bootstrap_bundle(
     state: &crate::AppState,
     owner_repo: &str,
     published_repo_path: &Path,
 ) -> Result<()> {
-    let now = chrono::Utc::now().timestamp();
     match crate::bundleuri::generator::generate_full_bundle(state, published_repo_path, owner_repo)
         .await
     {
         Ok(bundle) => {
-            let s3_key = format!(
-                "{}{}/bundles/{}.bundle",
-                state.config.storage.s3.prefix, owner_repo, bundle.creation_token,
-            );
-            crate::storage::s3::upload_bundle(
-                &state.s3_client,
-                &state.metrics,
-                &state.config.storage.s3.bucket,
-                &s3_key,
-                &bundle.bundle_path,
-            )
-            .await
-            .with_context(|| format!("failed to upload bootstrap bundle for {owner_repo}"))?;
-
-            register_bundle_in_valkey(
-                state,
-                owner_repo,
-                published_repo_path,
-                &s3_key,
-                bundle.creation_token,
-            )
-            .await?;
-
-            let mut info = get_repo_info(&state.valkey, owner_repo)
-                .await?
-                .unwrap_or_default();
-            info.last_bundle_ts = now;
-            info.latest_creation_token = bundle.creation_token;
-            set_repo_info(&state.valkey, owner_repo, &info).await?;
+            publish_bundle_artifacts(state, owner_repo, &bundle, None).await?;
         }
         Err(error) => {
             warn!(
