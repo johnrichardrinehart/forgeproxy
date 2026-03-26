@@ -98,6 +98,8 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub cache_manager: cache::CacheManager,
     pub node_id: String,
+    pub runtime_resource_attributes: RuntimeResourceAttributes,
+    pub bundle_publisher_id: String,
     /// Forge-specific API backend (GitHub, GitLab, Gitea, etc.).
     pub forge: Arc<dyn forge::ForgeBackend>,
     /// Upstream API rate-limit state shared across all callers.
@@ -521,19 +523,9 @@ async fn run_ssh_server(state: AppState) -> Result<()> {
 
 async fn run_bundle_lifecycle(state: AppState) -> Result<()> {
     let state = Arc::new(state);
-    let lifecycle_handle = tokio::spawn({
-        let s = Arc::clone(&state);
-        async move { bundleuri::lifecycle::run_bundle_lifecycle(s).await }
-    });
-    let daily_handle = tokio::spawn({
-        let s = Arc::clone(&state);
-        async move { bundleuri::lifecycle::run_daily_consolidation(s).await }
-    });
-    let weekly_handle = tokio::spawn({
-        let s = Arc::clone(&state);
-        async move { bundleuri::lifecycle::run_weekly_consolidation(s).await }
-    });
-    let _ = tokio::try_join!(lifecycle_handle, daily_handle, weekly_handle);
+    let lifecycle_handle =
+        tokio::spawn(async move { bundleuri::lifecycle::run_bundle_lifecycle(state).await });
+    let _ = lifecycle_handle.await;
     Ok(())
 }
 
@@ -750,7 +742,11 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "dev")]
     if let Some(Command::Bundle { no_summary }) = cli.command {
-        let state = build_app_state(Arc::clone(&config)).await?;
+        let state = build_app_state(
+            Arc::clone(&config),
+            runtime_resource_detection.attributes.clone(),
+        )
+        .await?;
         return run_dev_command(state, Command::Bundle { no_summary }).await;
     }
 
@@ -759,7 +755,11 @@ async fn main() -> Result<()> {
         std::process::exit(startup_init_errors.min(u8::MAX as usize) as i32);
     }
 
-    let state = build_app_state(Arc::clone(&config)).await?;
+    let state = build_app_state(
+        Arc::clone(&config),
+        runtime_resource_detection.attributes.clone(),
+    )
+    .await?;
 
     // ---- Telemetry buffer ----
     let telemetry_buffer = cache::telemetry::TelemetryBuffer::new();
@@ -858,7 +858,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
+async fn build_app_state(
+    config: Arc<Config>,
+    runtime_resource_attributes: RuntimeResourceAttributes,
+) -> Result<AppState> {
     tokio::fs::create_dir_all(&config.storage.local.path)
         .await
         .with_context(|| {
@@ -896,6 +899,12 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         "resolved bundle execution policy"
     );
 
+    let bundle_publisher_id = runtime_resource_attributes
+        .service_instance_id
+        .clone()
+        .or_else(|| runtime_resource_attributes.service_machine_id.clone())
+        .unwrap_or_else(|| node_id.clone());
+
     let state = AppState {
         config: Arc::clone(&config),
         valkey,
@@ -904,6 +913,8 @@ async fn build_app_state(config: Arc<Config>) -> Result<AppState> {
         http_client,
         cache_manager,
         node_id,
+        runtime_resource_attributes,
+        bundle_publisher_id,
         forge,
         rate_limit,
         clone_semaphore: Arc::new(Semaphore::new(clone_concurrency_limit)),

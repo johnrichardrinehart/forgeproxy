@@ -1,40 +1,88 @@
 //! Monotonic creation token management for Git bundle-URI.
 //!
-//! Each bundle in a bundle-list carries a `creationToken` that clients use to
-//! determine which bundles they already have (from a previous clone or fetch)
-//! and which they still need.  Tokens must be **strictly monotonically
-//! increasing** within a given repository's bundle-list.
-//!
-//! This module provides two strategies for assigning tokens:
-//!
-//! 1. **Atomic counter** ([`next_creation_token`]) -- increments a per-repo
-//!    counter in Valkey by a fixed step (1000) to leave room for manual
-//!    insertions.  This is the primary strategy used during incremental bundle
-//!    generation.
-//!
-//! 2. **Deterministic timestamp-based** ([`creation_token_for_bundle_type`]) --
-//!    derives a token from the bundle type and the current UTC timestamp.
-//!    This is used for consolidation bundles where a predictable token value
-//!    simplifies reasoning about ordering (base < daily < hourly).
+//! The source of truth for the per-repository generation counter lives in S3 at
+//! `.../gen.counter`. We still guard updates with a short Valkey lease so
+//! nodes serialise counter allocation even when using S3-compatible backends
+//! that do not offer object-level locking primitives.
 
-use anyhow::{Context, Result};
-use fred::interfaces::HashesInterface;
+use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Atomic counter
-// ---------------------------------------------------------------------------
+use anyhow::{Context, Result, bail};
+
+const CREATION_TOKEN_STEP: u64 = 1000;
+const COUNTER_LOCK_RETRY_ATTEMPTS: usize = 20;
+const COUNTER_LOCK_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Atomically allocate the next creation token for a repository.
-///
-/// Increments the `latest_creation_token` field in the repo's Valkey hash
-/// by 1000 and returns the new value.  The step of 1000 leaves room for
-/// out-of-band insertions or manual corrections without risking collisions.
-///
-/// Key: `forgeproxy:repo:{owner_repo}`, field: `latest_creation_token`.
 pub async fn next_creation_token(state: &crate::AppState, owner_repo: &str) -> Result<u64> {
-    let key = format!("forgeproxy:repo:{owner_repo}");
-    let new_val: i64 = HashesInterface::hincrby(&state.valkey, &key, "latest_creation_token", 1000)
+    let lock_key = format!("forgeproxy:lock:bundle-counter:{owner_repo}");
+    let ttl_secs = state.config.bundles.bundle_lock_ttl;
+
+    let lease = acquire_counter_lock(state, &lock_key, ttl_secs, owner_repo).await?;
+    let counter_key =
+        crate::bundleuri::bundle_counter_s3_key(&state.config.storage.s3.prefix, owner_repo);
+
+    let result = async {
+        let current = crate::storage::s3::download_text_if_exists(
+            &state.s3_client,
+            &state.metrics,
+            &state.config.storage.s3.bucket,
+            &counter_key,
+        )
+        .await?
+        .map(|text| text.trim().parse::<u64>())
+        .transpose()
+        .with_context(|| format!("parse S3 creation counter for {owner_repo}"))?
+        .unwrap_or(0);
+
+        let next = current
+            .saturating_add(CREATION_TOKEN_STEP)
+            .max(CREATION_TOKEN_STEP);
+        crate::storage::s3::upload_text(
+            &state.s3_client,
+            &state.config.storage.s3.bucket,
+            &counter_key,
+            &format!("{next}\n"),
+        )
         .await
-        .with_context(|| format!("failed to increment creation token for {owner_repo}"))?;
-    Ok(new_val as u64)
+        .with_context(|| format!("write S3 creation counter for {owner_repo}"))?;
+
+        Ok::<u64, anyhow::Error>(next)
+    }
+    .await;
+
+    let _ = crate::coordination::locks::release_lock_lease(
+        &state.valkey,
+        &lease,
+        true,
+        Some(&state.metrics),
+    )
+    .await;
+
+    result
+}
+
+async fn acquire_counter_lock(
+    state: &crate::AppState,
+    lock_key: &str,
+    ttl_secs: u64,
+    owner_repo: &str,
+) -> Result<crate::coordination::locks::LockLease> {
+    for _ in 0..COUNTER_LOCK_RETRY_ATTEMPTS {
+        if let Some(lease) = crate::coordination::locks::acquire_lock_lease(
+            &state.valkey,
+            lock_key,
+            &state.node_id,
+            ttl_secs,
+            Some(&state.metrics),
+        )
+        .await?
+        {
+            return Ok(lease);
+        }
+
+        tokio::time::sleep(COUNTER_LOCK_RETRY_DELAY).await;
+    }
+
+    bail!("timed out waiting for bundle counter lock for {owner_repo}")
 }
