@@ -6,7 +6,8 @@
 //! - `POST /:owner/:repo/git-receive-pack` - Always rejected (403)
 //! - `GET  /bundles/:owner/:repo/bundle-list` - Bundle-list for bundle-uri
 //! - `POST /webhook`                       - GitHub webhook receiver
-//! - `GET  /healthz`                       - Health check
+//! - `GET  /healthz`                       - Liveness check
+//! - `GET  /readyz`                        - Readiness check
 //! - `GET  /metrics`                       - Prometheus metrics
 
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -202,7 +204,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Webhook, health, metrics
         .route("/webhook", post(handle_webhook))
         .route("/healthz", get(handle_health))
+        .route("/readyz", get(handle_ready))
         .route("/metrics", get(handle_metrics))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            reject_new_requests_while_draining,
+        ))
         .with_state(state)
 }
 
@@ -662,7 +669,29 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         valkey: state.valkey.clone(),
         http_client: state.http_client.clone(),
     };
-    crate::health::health_handler(axum::extract::State(health_state)).await
+    crate::health::health_handler(axum::extract::State(health_state))
+        .await
+        .into_response()
+}
+
+/// `GET /readyz`
+async fn handle_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state.is_draining() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "forgeproxy is draining and not accepting new requests\n",
+        )
+            .into_response();
+    }
+
+    let health_state = crate::health::HealthState {
+        config: Arc::clone(&state.config),
+        valkey: state.valkey.clone(),
+        http_client: state.http_client.clone(),
+    };
+    crate::health::health_handler(axum::extract::State(health_state))
+        .await
+        .into_response()
 }
 
 /// `GET /metrics`
@@ -683,6 +712,24 @@ async fn handle_metrics(State(state): State<Arc<AppState>>) -> Result<Response, 
         buf,
     )
         .into_response())
+}
+
+async fn reject_new_requests_while_draining(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let allow_during_drain = matches!(path, "/healthz" | "/readyz" | "/metrics");
+    if state.is_draining() && !allow_during_drain {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "forgeproxy is draining and not accepting new requests\n",
+        )
+            .into_response();
+    }
+
+    next.run(request).await
 }
 
 // ---------------------------------------------------------------------------
