@@ -305,7 +305,7 @@ pkgs.testers.runNixOSTest {
           enable = true;
           package = pkgs.forgeproxy;
           configFile = testConfigYaml;
-          logLevel = "debug";
+          logLevel = "info";
         };
 
         systemd.services.otlp-test-sink = {
