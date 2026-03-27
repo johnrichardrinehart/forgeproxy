@@ -276,14 +276,24 @@ pkgs.testers.runNixOSTest {
 
     start_all()
 
-    def ssh_clone_env_words(trace_name, key_path="/tmp/alice_key"):
-        ssh_cmd = (
-            f"ssh -E /tmp/{trace_name}.ssh.log "
-            "-vvv -oLogLevel=DEBUG3 "
-            "-oServerAliveInterval=5 -oServerAliveCountMax=12 "
-            f"-i {key_path} -o StrictHostKeyChecking=no "
-            "-o UserKnownHostsFile=/dev/null -p 2222"
+    def ssh_cmd_words(*, key_path="/tmp/alice_key", trace_name=None):
+        parts = ["ssh"]
+        if trace_name is not None:
+            parts.extend([f"-E /tmp/{trace_name}.ssh.log", "-vvv", "-oLogLevel=DEBUG3"])
+        parts.extend(
+            [
+                "-oServerAliveInterval=5",
+                "-oServerAliveCountMax=12",
+                f"-i {key_path}",
+                "-o StrictHostKeyChecking=no",
+                "-o UserKnownHostsFile=/dev/null",
+                "-p 2222",
+            ]
         )
+        return " ".join(parts)
+
+    def ssh_clone_env_words(trace_name, key_path="/tmp/alice_key"):
+        ssh_cmd = ssh_cmd_words(key_path=key_path, trace_name=trace_name)
         return " ".join(
             [
                 f"GIT_TRACE={shlex.quote(f'/tmp/{trace_name}.git.trace.log')}",
@@ -300,6 +310,9 @@ pkgs.testers.runNixOSTest {
             f"env {ssh_clone_env_words(trace_name, key_path=key_path)} "
             f"git clone {extra}git@proxy:{repo}.git {dest}"
         )
+
+    def ssh_clone_plain_env_words(key_path="/tmp/alice_key"):
+        return f"GIT_SSH_COMMAND={shlex.quote(ssh_cmd_words(key_path=key_path))}"
 
     def dump_clone_debug(trace_name):
         print(
@@ -325,6 +338,20 @@ pkgs.testers.runNixOSTest {
                 "if [ -f \"$pack_file\" ]; then "
                 "  wc -c \"$pack_file\"; "
                 "  sha256sum \"$pack_file\"; "
+                "else "
+                "  echo '(missing)'; "
+                "fi"
+            )
+        )
+
+    def dump_file_tail(path, label, lines=200):
+        print(
+            client.succeed(
+                "set -eu; "
+                f"file={shlex.quote(path)}; "
+                f"echo '---- {label} ({path}) ----'; "
+                "if [ -f \"$file\" ]; then "
+                f"  tail -n {lines} \"$file\"; "
                 "else "
                 "  echo '(missing)'; "
                 "fi"
@@ -848,7 +875,7 @@ pkgs.testers.runNixOSTest {
         proxy.succeed(f"rm -rf {live_repo} {live_generation_dir} {live_tee_dir}")
         client.succeed("rm -rf /tmp/repo-stream-live /tmp/repo-stream-live.log /tmp/repo-stream-live.pid")
         client.succeed(
-            f"env {ssh_clone_env_words('repo-stream-live')} "
+            f"env {ssh_clone_plain_env_words()} "
             "sh -c '"
             "set -e; "
             "git clone --progress git@proxy:octocat/repo-stream-live.git /tmp/repo-stream-live "
@@ -862,7 +889,14 @@ pkgs.testers.runNixOSTest {
         )
         proxy.succeed(f"! test -e {live_repo}")
         client.succeed("kill -0 $(cat /tmp/repo-stream-live.pid)")
-        client.wait_until_succeeds("! kill -0 $(cat /tmp/repo-stream-live.pid) 2>/dev/null")
+        try:
+            client.wait_until_succeeds(
+                "! kill -0 $(cat /tmp/repo-stream-live.pid) 2>/dev/null",
+                timeout=120,
+            )
+        except Exception:
+            dump_file_tail("/tmp/repo-stream-live.log", "repo-stream-live clone log")
+            raise
         client.succeed("test -f /tmp/repo-stream-live/blob-32.bin")
         proxy.wait_until_succeeds(
             "journalctl -u forgeproxy.service --no-pager "
