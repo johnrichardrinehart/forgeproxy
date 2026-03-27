@@ -214,7 +214,7 @@ pkgs.testers.runNixOSTest {
           enable = true;
           package = pkgs.forgeproxy;
           configFile = testConfigYaml;
-          logLevel = "forgeproxy=debug,info";
+          logLevel = "info";
           allowEnvSecretFallback = true;
         };
 
@@ -276,12 +276,10 @@ pkgs.testers.runNixOSTest {
 
     start_all()
 
-    def ssh_cmd_words(*, key_path="/tmp/alice_key", trace_name=None):
-        parts = ["ssh"]
-        if trace_name is not None:
-            parts.extend([f"-E /tmp/{trace_name}.ssh.log", "-vvv", "-oLogLevel=DEBUG3"])
-        parts.extend(
+    def ssh_cmd_words(*, key_path="/tmp/alice_key"):
+        return " ".join(
             [
+                "ssh",
                 "-oServerAliveInterval=5",
                 "-oServerAliveCountMax=12",
                 f"-i {key_path}",
@@ -290,19 +288,9 @@ pkgs.testers.runNixOSTest {
                 "-p 2222",
             ]
         )
-        return " ".join(parts)
 
     def ssh_clone_env_words(trace_name, key_path="/tmp/alice_key"):
-        ssh_cmd = ssh_cmd_words(key_path=key_path, trace_name=trace_name)
-        return " ".join(
-            [
-                f"GIT_TRACE={shlex.quote(f'/tmp/{trace_name}.git.trace.log')}",
-                f"GIT_TRACE_PACKET={shlex.quote(f'/tmp/{trace_name}.packet.trace.log')}",
-                f"GIT_TRACE_PACKFILE={shlex.quote(f'/tmp/{trace_name}.pack.trace')}",
-                f"GIT_TRACE2_EVENT={shlex.quote(f'/tmp/{trace_name}.trace2.json')}",
-                f"GIT_SSH_COMMAND={shlex.quote(ssh_cmd)}",
-            ]
-        )
+        return f"GIT_SSH_COMMAND={shlex.quote(ssh_cmd_words(key_path=key_path))}"
 
     def ssh_clone_cmd(trace_name, repo, dest, *, key_path="/tmp/alice_key", extra_args=""):
         extra = f"{extra_args} " if extra_args else ""
@@ -320,6 +308,7 @@ pkgs.testers.runNixOSTest {
                 "set -eu; "
                 f"trace_base=/tmp/{trace_name}; "
                 "echo '==== clone debug artifacts ===='; "
+                "echo '(normal ssh-authz mode keeps clone tracing disabled)'; "
                 "for suffix in "
                 ".git.trace.log "
                 ".packet.trace.log "
