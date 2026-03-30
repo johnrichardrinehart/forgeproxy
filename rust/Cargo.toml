@@ -16,8 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 # SSH server
-russh = { version = "0.46", features = [] }
-russh-keys = "0.46"
+russh = { git = "https://github.com/johnrichardrinehart/russh.git", branch = "forgeproxy-russh-046-channel-drain", package = "russh", features = [] }
+russh-keys = { git = "https://github.com/johnrichardrinehart/russh.git", branch = "forgeproxy-russh-046-channel-drain", package = "russh-keys" }
 
 # HTTP framework
 axum = { version = "0.8", features = ["macros"] }
