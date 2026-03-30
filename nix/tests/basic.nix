@@ -49,7 +49,7 @@ let
 
     exporters:
       debug:
-        verbosity: detailed
+        verbosity: normal
 
     service:
       telemetry:
@@ -620,7 +620,7 @@ pkgs.testers.runNixOSTest {
     with subtest("Forgeproxy traces egress over OTLP"):
         proxy.wait_until_succeeds(
             "journalctl -u otlp-test-sink.service --no-pager -o cat"
-            " | grep -F 'Name           : tick_with_summary'"
+            " | grep -F 'tick_with_summary'"
         )
 
     # ── HTTPS clone through the proxy ─────────────────────────────────────
