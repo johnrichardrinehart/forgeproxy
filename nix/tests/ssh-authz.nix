@@ -353,18 +353,12 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             "journalctl -u forgeproxy --since '5m ago' --no-pager "
             f"| grep -F {shlex.quote(repo_match)} "
-            "| grep -F 'awaiting SSH client channel close before sending server close'"
-        )
-        proxy.wait_until_succeeds(
-            "journalctl -u forgeproxy --since '5m ago' --no-pager "
-            f"| grep -F {shlex.quote(repo_match)} "
-            "| grep -E '\"close_reason\":\"(client-close|grace-timeout)\"' "
             "| grep -F 'SSH upload-pack close sent'"
         )
         handshake_log = proxy.succeed(
             "journalctl -u forgeproxy --since '5m ago' --no-pager "
             f"| grep -F {shlex.quote(repo_match)} "
-            "| grep -E 'SSH upload-pack exit-status sent|SSH upload-pack EOF sent|awaiting SSH client channel close before sending server close|SSH client channel close observed|SSH upload-pack close sent'"
+            "| grep -E 'SSH upload-pack exit-status sent|SSH upload-pack EOF sent|SSH client channel close observed|SSH upload-pack close sent'"
         )
         lines = handshake_log.splitlines()
 
@@ -376,9 +370,8 @@ pkgs.testers.runNixOSTest {
 
         exit_status_index = find_index("SSH upload-pack exit-status sent")
         eof_index = find_index("SSH upload-pack EOF sent")
-        await_index = find_index("awaiting SSH client channel close before sending server close")
         close_index = find_index("SSH upload-pack close sent")
-        assert exit_status_index < eof_index < await_index < close_index, handshake_log
+        assert exit_status_index < eof_index < close_index, handshake_log
 
         client_close_indices = [
             index
@@ -386,11 +379,7 @@ pkgs.testers.runNixOSTest {
             if "SSH client channel close observed" in line
         ]
         if client_close_indices:
-            client_close_index = client_close_indices[0]
-            if client_close_index > close_index:
-                assert '"close_reason":"grace-timeout"' in lines[close_index], handshake_log
-            else:
-                assert await_index < client_close_index <= close_index, handshake_log
+            assert '"close_reason":"client-close-already-seen"' in lines[close_index] or '"close_reason":"server-close"' in lines[close_index], handshake_log
 
     def ssh_clone_succeed(trace_name, repo, dest, *, key_path="/tmp/alice_key", extra_args=""):
         try:
