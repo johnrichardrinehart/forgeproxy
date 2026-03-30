@@ -487,9 +487,10 @@ pub struct CloneConfig {
     /// removed by the background janitor.
     #[serde(default = "default_tee_retention_secs")]
     pub tee_retention_secs: u64,
-    /// Maximum time forgeproxy will wait for the SSH client to close an
-    /// upload-pack channel after exit-status and EOF before forgeproxy sends
-    /// its own close.
+    /// Maximum time forgeproxy will wait for russh to flush pending upload-pack
+    /// channel data before it sends exit-status, EOF, and CHANNEL_CLOSE.
+    ///
+    /// The field name is kept for config compatibility.
     #[serde(default = "default_ssh_upload_pack_close_grace_secs")]
     pub ssh_upload_pack_close_grace_secs: u64,
 }
@@ -543,7 +544,7 @@ fn default_tee_retention_secs() -> u64 {
 }
 
 fn default_ssh_upload_pack_close_grace_secs() -> u64 {
-    60
+    5
 }
 
 fn default_max_concurrent_upstream_clones() -> usize {
