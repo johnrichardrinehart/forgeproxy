@@ -15,7 +15,7 @@ use std::time::Instant;
 use anyhow::Result;
 use base64::Engine as _;
 use russh::server::{Auth, Handler, Msg, Session};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId, ChannelStream, CryptoVec};
 use russh_keys::PublicKeyBase64;
 use russh_keys::key::PublicKey;
 use sha2::{Digest, Sha256};
@@ -187,7 +187,7 @@ fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32
 async fn finalize_upload_pack_channel(
     owner_repo: &str,
     handle: &russh::server::Handle,
-    stream_channel: Option<&Channel<Msg>>,
+    stream_channel: Option<&mut ChannelStream<Msg>>,
     channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     channel_id: ChannelId,
     exit_status: u32,
@@ -258,7 +258,7 @@ async fn finalize_upload_pack_channel(
     };
 
     let eof_sent = match if let Some(stream_channel) = stream_channel {
-        stream_channel.eof().await.map_err(|_| ())
+        stream_channel.shutdown().await.map_err(|_| ())
     } else {
         handle.eof(channel_id).await
     } {
@@ -294,11 +294,7 @@ async fn finalize_upload_pack_channel(
         };
 
     let close_sent = if client_close_seen {
-        match if let Some(stream_channel) = stream_channel {
-            stream_channel.close().await.map_err(|_| ())
-        } else {
-            handle.close(channel_id).await
-        } {
+        match handle.close(channel_id).await {
             Ok(()) => {
                 if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
                     state.close_sent = true;
@@ -423,8 +419,7 @@ async fn send_channel_response_data(
     data: &[u8],
 ) -> Result<(), ()> {
     let result = if let Some(stream_channel) = stream_channel {
-        let mut writer = stream_channel.make_writer();
-        writer.write_all(data).await.map_err(|_| ())
+        stream_channel.write_all(data).await.map_err(|_| ())
     } else {
         send_channel_data_chunks(handle, channel_id, data).await
     };
@@ -486,7 +481,7 @@ async fn serve_local_upload_pack_once(
         handle,
         channel_states,
         channel_id,
-        stream_channel,
+        mut stream_channel,
         should_close_channel,
     } = response;
 
@@ -582,7 +577,7 @@ async fn serve_local_upload_pack_once(
                 if send_channel_response_data(
                     &handle,
                     channel_id,
-                    stream_channel.as_ref(),
+                    stream_channel.as_mut(),
                     &channel_states,
                     chunk,
                 )
@@ -664,7 +659,7 @@ async fn serve_local_upload_pack_once(
         finalize_upload_pack_channel(
             owner_repo,
             &handle,
-            stream_channel.as_ref(),
+            stream_channel.as_mut(),
             &channel_states,
             channel_id,
             exit_status,
@@ -1591,7 +1586,7 @@ impl Handler for SshSession {
                             let channel_states = Arc::clone(&self.upstream_proxy_channels);
                             let repo_for_stream = repo.clone();
                             let state_for_stream = Arc::clone(&self.state);
-                            let stream_channel = channel;
+                            let stream_channel = channel.into_stream();
                             let close_grace_secs =
                                 self.state.config.clone.ssh_upload_pack_close_grace_secs;
                             let metric_username = crate::metrics::clone_metric_username(
@@ -1606,6 +1601,7 @@ impl Handler for SshSession {
                                 let _generation_lease = generation_lease;
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
+                                let mut stream_channel = stream_channel;
                                 let mut disconnected = false;
                                 let mut total_bytes: u64 = 0;
                                 let clone_started = clone_started;
@@ -1630,7 +1626,7 @@ impl Handler for SshSession {
                                             if send_channel_response_data(
                                                 &handle,
                                                 channel_id,
-                                                Some(&stream_channel),
+                                                Some(&mut stream_channel),
                                                 &channel_states,
                                                 &stdout_buf[..read],
                                             )
@@ -1702,7 +1698,7 @@ impl Handler for SshSession {
                                     finalize_upload_pack_channel(
                                         &repo_for_stream,
                                         &handle,
-                                        Some(&stream_channel),
+                                        Some(&mut stream_channel),
                                         &channel_states,
                                         channel_id,
                                         exit_code,
@@ -2114,7 +2110,7 @@ async fn proxy_upstream_upload_pack(
         }
     }
 
-    let stream_channel = stream_channel;
+    let mut stream_channel = stream_channel;
     match super::upstream::post_upload_pack_stream(
         &state,
         &owner_repo,
@@ -2288,7 +2284,7 @@ async fn proxy_upstream_upload_pack(
                         if send_channel_response_data(
                             &handle,
                             channel_id,
-                            stream_channel.as_ref(),
+                            stream_channel.as_mut(),
                             &channel_states,
                             &chunk,
                         )
@@ -2350,7 +2346,7 @@ async fn proxy_upstream_upload_pack(
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
-                        stream_channel.as_ref(),
+                        stream_channel.as_mut(),
                         &channel_states,
                         channel_id,
                         1,
@@ -2575,7 +2571,7 @@ async fn proxy_upstream_upload_pack(
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
-                        stream_channel.as_ref(),
+                        stream_channel.as_mut(),
                         &channel_states,
                         channel_id,
                         0,
@@ -2620,7 +2616,7 @@ async fn proxy_upstream_upload_pack(
                 finalize_upload_pack_channel(
                     &owner_repo,
                     &handle,
-                    stream_channel.as_ref(),
+                    stream_channel.as_mut(),
                     &channel_states,
                     channel_id,
                     1,
