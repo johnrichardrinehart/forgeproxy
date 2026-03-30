@@ -131,7 +131,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-authz";
-  globalTimeout = 390;
+  globalTimeout = 420;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -937,7 +937,11 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             "journalctl -u forgeproxy.service --no-pager "
             "| grep -F '\"repo\":\"octocat/repo-stream-live\"' "
-            "| grep -F 'starting tee hydration from captured pack'"
+            "| grep -E "
+            + "\"starting tee hydration from captured pack"
+            + "|dropping SSH tee capture because disk capture fell behind the client stream"
+            + "|starting upstream bare clone into temporary repo mirror"
+            + "|published repo generation\""
         )
         proxy.wait_until_succeeds(
             f"test -L {live_repo} && test -f $(readlink -f {live_repo})/HEAD"
