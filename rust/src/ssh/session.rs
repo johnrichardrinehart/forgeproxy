@@ -233,6 +233,63 @@ async fn finalize_upload_pack_channel(
         );
     }
 
+    let drain_deadline = Instant::now() + close_grace_period;
+    let mut pending_data_polls = 0u32;
+    let mut pending_data_cleared = false;
+
+    info!(
+        repo = %owner_repo,
+        ?channel_id,
+        total_bytes,
+        drain_wait_secs = close_grace_period.as_secs(),
+        "awaiting russh channel drain before sending SSH upload-pack exit-status and EOF"
+    );
+
+    loop {
+        match handle.has_pending_data(channel_id).await {
+            Ok(false) => {
+                pending_data_cleared = true;
+                break;
+            }
+            Ok(true) => {
+                pending_data_polls += 1;
+                if Instant::now() >= drain_deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    ?channel_id,
+                    total_bytes,
+                    error = ?error,
+                    "failed to query russh pending channel data before SSH upload-pack EOF"
+                );
+                break;
+            }
+        }
+    }
+
+    if pending_data_cleared {
+        info!(
+            repo = %owner_repo,
+            ?channel_id,
+            total_bytes,
+            pending_data_polls,
+            "russh channel drain completed before SSH upload-pack EOF"
+        );
+    } else {
+        warn!(
+            repo = %owner_repo,
+            ?channel_id,
+            total_bytes,
+            pending_data_polls,
+            drain_wait_secs = close_grace_period.as_secs(),
+            "russh channel drain did not complete before SSH upload-pack EOF"
+        );
+    }
+
     let exit_status_sent = match handle.exit_status_request(channel_id, exit_status).await {
         Ok(()) => {
             info!(
