@@ -43,6 +43,9 @@ struct UpstreamProxyChannelState {
     owner_repo: Option<String>,
     output_lock: Arc<Mutex<()>>,
     close_notify: Arc<Notify>,
+    first_write_completed_at: Option<Instant>,
+    last_write_completed_at: Option<Instant>,
+    bytes_written_to_client: u64,
     stream_finished: bool,
     exit_status_sent: bool,
     eof_sent: bool,
@@ -57,6 +60,9 @@ impl Default for UpstreamProxyChannelState {
             owner_repo: None,
             output_lock: Arc::new(Mutex::new(())),
             close_notify: Arc::new(Notify::new()),
+            first_write_completed_at: None,
+            last_write_completed_at: None,
+            bytes_written_to_client: 0,
             stream_finished: false,
             exit_status_sent: false,
             eof_sent: false,
@@ -189,12 +195,26 @@ async fn finalize_upload_pack_channel(
     close_grace_period: Duration,
 ) {
     let pre_finalize_state = channel_states.lock().await.get(&channel_id).cloned();
+    let finalize_started_at = Instant::now();
     if let Some(state) = pre_finalize_state.as_ref() {
+        let first_write_completed_ms_ago = state.first_write_completed_at.map(|at| {
+            finalize_started_at
+                .saturating_duration_since(at)
+                .as_millis() as u64
+        });
+        let last_write_completed_ms_ago = state.last_write_completed_at.map(|at| {
+            finalize_started_at
+                .saturating_duration_since(at)
+                .as_millis() as u64
+        });
         info!(
             repo = %owner_repo,
             ?channel_id,
             total_bytes,
             exit_status,
+            bytes_written_to_client = state.bytes_written_to_client,
+            first_write_completed_ms_ago,
+            last_write_completed_ms_ago,
             client_eof_seen = state.client_eof_seen,
             client_close_seen = state.client_close_seen,
             stream_finished = state.stream_finished,
@@ -399,14 +419,28 @@ async fn send_channel_response_data(
     handle: &russh::server::Handle,
     channel_id: ChannelId,
     stream_channel: Option<&Arc<Channel<Msg>>>,
+    channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     data: &[u8],
 ) -> Result<(), ()> {
-    if let Some(stream_channel) = stream_channel {
+    let result = if let Some(stream_channel) = stream_channel {
         let mut writer = stream_channel.make_writer();
         writer.write_all(data).await.map_err(|_| ())
     } else {
         send_channel_data_chunks(handle, channel_id, data).await
+    };
+
+    if result.is_ok() {
+        let now = Instant::now();
+        if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+            state.bytes_written_to_client += data.len() as u64;
+            state.last_write_completed_at = Some(now);
+            if state.first_write_completed_at.is_none() {
+                state.first_write_completed_at = Some(now);
+            }
+        }
     }
+
+    result
 }
 
 async fn output_lock_for_channel(
@@ -545,9 +579,15 @@ async fn serve_local_upload_pack_once(
             Ok(0) => break,
             Ok(read) => {
                 let chunk = &stdout_buf[..read];
-                if send_channel_response_data(&handle, channel_id, stream_channel.as_ref(), chunk)
-                    .await
-                    .is_err()
+                if send_channel_response_data(
+                    &handle,
+                    channel_id,
+                    stream_channel.as_ref(),
+                    &channel_states,
+                    chunk,
+                )
+                .await
+                .is_err()
                 {
                     warn!(
                         repo = %owner_repo,
@@ -1591,6 +1631,7 @@ impl Handler for SshSession {
                                                 &handle,
                                                 channel_id,
                                                 Some(&stream_channel),
+                                                &channel_states,
                                                 &stdout_buf[..read],
                                             )
                                             .await
@@ -2248,6 +2289,7 @@ async fn proxy_upstream_upload_pack(
                             &handle,
                             channel_id,
                             stream_channel.as_ref(),
+                            &channel_states,
                             &chunk,
                         )
                         .await
