@@ -38,8 +38,6 @@ use crate::metrics::{
 /// Keeping frames at or below 32 KiB avoids relying on library-side
 /// fragmentation behavior for large buffers while streaming big packfiles.
 const SSH_DATA_CHUNK_SIZE: usize = 32 * 1024;
-const SSH_UPLOAD_PACK_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
-
 #[derive(Debug, Clone)]
 struct UpstreamProxyChannelState {
     owner_repo: Option<String>,
@@ -179,6 +177,7 @@ fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32
 /// send SSH EOF on our behalf before the exit-status request is queued, so the
 /// response stream itself is copied with `write_all()` only and EOF is sent
 /// explicitly here.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_upload_pack_channel(
     owner_repo: &str,
     handle: &russh::server::Handle,
@@ -187,6 +186,7 @@ async fn finalize_upload_pack_channel(
     channel_id: ChannelId,
     exit_status: u32,
     total_bytes: u64,
+    close_grace_period: Duration,
 ) {
     let pre_finalize_state = channel_states.lock().await.get(&channel_id).cloned();
     if let Some(state) = pre_finalize_state.as_ref() {
@@ -309,19 +309,16 @@ async fn finalize_upload_pack_channel(
             repo = %owner_repo,
             ?channel_id,
             total_bytes,
-            grace_period_secs = SSH_UPLOAD_PACK_CLOSE_GRACE_PERIOD.as_secs(),
+            grace_period_secs = close_grace_period.as_secs(),
             "awaiting SSH client channel close before sending server close"
         );
         let owner_repo = owner_repo.to_owned();
         let channel_states = Arc::clone(channel_states);
         let handle = handle.clone();
         tokio::spawn(async move {
-            let close_reason = if tokio::time::timeout(
-                SSH_UPLOAD_PACK_CLOSE_GRACE_PERIOD,
-                close_notify.notified(),
-            )
-            .await
-            .is_ok()
+            let close_reason = if tokio::time::timeout(close_grace_period, close_notify.notified())
+                .await
+                .is_ok()
             {
                 "client-close"
             } else {
@@ -632,6 +629,7 @@ async fn serve_local_upload_pack_once(
             channel_id,
             exit_status,
             total_bytes,
+            Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
         )
         .await;
     }
@@ -1554,6 +1552,8 @@ impl Handler for SshSession {
                             let repo_for_stream = repo.clone();
                             let state_for_stream = Arc::clone(&self.state);
                             let stream_channel = channel;
+                            let close_grace_secs =
+                                self.state.config.clone.ssh_upload_pack_close_grace_secs;
                             let metric_username = crate::metrics::clone_metric_username(
                                 self.username.as_deref(),
                                 true,
@@ -1666,6 +1666,7 @@ impl Handler for SshSession {
                                         channel_id,
                                         exit_code,
                                         total_bytes,
+                                        Duration::from_secs(close_grace_secs),
                                     )
                                     .await;
                                 }
@@ -1741,6 +1742,7 @@ impl Handler for SshSession {
                     let handle = session.handle();
                     let repo_bg = repo.clone();
                     let git_protocol = self.git_protocol.clone();
+                    let close_grace_secs = self.state.config.clone.ssh_upload_pack_close_grace_secs;
                     let metric_username =
                         crate::metrics::clone_metric_username(self.username.as_deref(), true);
                     tokio::spawn(async move {
@@ -1812,6 +1814,7 @@ impl Handler for SshSession {
                                     channel_id,
                                     1,
                                     0,
+                                    Duration::from_secs(close_grace_secs),
                                 )
                                 .await;
                             }
@@ -2310,6 +2313,7 @@ async fn proxy_upstream_upload_pack(
                         channel_id,
                         1,
                         total_bytes,
+                        Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
                     )
                     .await;
                 }
@@ -2534,6 +2538,7 @@ async fn proxy_upstream_upload_pack(
                         channel_id,
                         0,
                         total_bytes,
+                        Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
                     )
                     .await;
                 }
@@ -2578,6 +2583,7 @@ async fn proxy_upstream_upload_pack(
                     channel_id,
                     1,
                     0,
+                    Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
                 )
                 .await;
             }

@@ -94,6 +94,7 @@ let
       lock_ttl: 60
       lock_wait_timeout: 120
       request_wait_for_local_catch_up_secs: 60
+      ssh_upload_pack_close_grace_secs: 5
       max_concurrent_upstream_clones: 5
       max_concurrent_upstream_fetches: 10
       max_concurrent_upstream_clones_per_repo_across_instances: 4
