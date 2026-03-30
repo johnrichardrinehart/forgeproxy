@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use fred::interfaces::{ClientLike, HashesInterface};
+use fred::interfaces::{ClientLike, HashesInterface, KeysInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, TryAcquireError};
@@ -327,6 +327,13 @@ pub struct CloneHydrationPermits {
 
 fn normalize_owner_repo(owner_repo: &str) -> &str {
     owner_repo.strip_suffix(".git").unwrap_or(owner_repo)
+}
+
+fn clone_hydration_semaphore_key(owner_repo: &str) -> String {
+    format!(
+        "forgeproxy:semaphore:clone:{}",
+        normalize_owner_repo(owner_repo)
+    )
 }
 
 pub async fn try_acquire_clone_hydration_permits(
@@ -2659,10 +2666,31 @@ pub async fn wait_for_local_catch_up(
         return Ok(initial_decision);
     }
 
-    let should_start_refresh = get_repo_info(&state.valkey, &owner_repo)
-        .await?
-        .map(|info| info.hydrating_node_id.is_empty())
-        .unwrap_or(true);
+    let has_published_repo = state.cache_manager.has_repo(&owner_repo);
+    let repo_info = get_repo_info(&state.valkey, &owner_repo).await?;
+    let should_start_refresh = if let Some(info) = repo_info {
+        if !info.hydrating_node_id.is_empty() && !has_published_repo {
+            let semaphore_key = clone_hydration_semaphore_key(&owner_repo);
+            let hydration_lease_count: i64 = state.valkey.exists(semaphore_key.clone()).await?;
+            if hydration_lease_count == 0 {
+                warn!(
+                    repo = %owner_repo,
+                    hydrating_node = %info.hydrating_node_id,
+                    hydrating_since_ts = info.hydrating_since_ts,
+                    semaphore_key,
+                    "clearing stale hydration state because the published generation is missing and no active clone lease exists"
+                );
+                clear_hydration_state(state, &owner_repo, "missing").await?;
+                true
+            } else {
+                false
+            }
+        } else {
+            info.hydrating_node_id.is_empty()
+        }
+    } else {
+        true
+    };
     let mut refresh_handle = if should_start_refresh {
         let state = state.clone();
         let owner = owner.to_string();
@@ -2689,7 +2717,7 @@ pub async fn wait_for_local_catch_up(
         repo = %owner_repo,
         timeout_secs = timeout.as_secs(),
         started_refresh = should_start_refresh,
-        has_published_repo = state.cache_manager.has_repo(&owner_repo),
+        has_published_repo,
         has_repo_mirror = state.cache_manager.has_repo_mirror(&owner_repo),
         "waiting for local published-generation catch-up before deciding whether to proxy upstream"
     );
