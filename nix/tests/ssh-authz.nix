@@ -1027,6 +1027,8 @@ pkgs.testers.runNixOSTest {
         client.succeed("git -C /tmp/repo-stream-live-drain fsck --no-dangling")
         proxy.wait_until_succeeds("! kill -0 $(cat /tmp/forgeproxy-restart.pid) 2>/dev/null")
         proxy.succeed("systemctl is-active forgeproxy | grep -qx active")
+        proxy.wait_until_succeeds("curl -sf http://127.0.0.1:8080/healthz >/dev/null")
+        proxy.wait_for_open_port(2222)
 
     # ── Subtest 5f: Uncached clone publishes a symlinked generation cleanly ──
     with subtest("Uncached clone publishes a generation symlink and cleans tee capture"):
