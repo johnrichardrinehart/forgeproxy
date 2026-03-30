@@ -1110,6 +1110,10 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             f"test -d {invariant_mirror} && test -f {invariant_mirror}/HEAD"
         )
+        proxy.wait_until_succeeds(
+            "test \"$(redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-generations' status)\" = ready "
+            "&& test -z \"$(redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-generations' hydrating_node_id)\""
+        )
         proxy.succeed(f"rm -rf {invariant_mirror}")
         proxy.succeed(
             f"test -L {invariant_repo} && "
