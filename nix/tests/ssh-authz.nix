@@ -347,6 +347,50 @@ pkgs.testers.runNixOSTest {
             )
         )
 
+    def wait_for_close_handshake(repo):
+        repo_match = f'"repo":"{repo}"'
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --since '5m ago' --no-pager "
+            f"| grep -F {shlex.quote(repo_match)} "
+            "| grep -F 'awaiting SSH client channel close before sending server close'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --since '5m ago' --no-pager "
+            f"| grep -F {shlex.quote(repo_match)} "
+            "| grep -E '\"close_reason\":\"(client-close|grace-timeout)\"' "
+            "| grep -F 'SSH upload-pack close sent'"
+        )
+        handshake_log = proxy.succeed(
+            "journalctl -u forgeproxy --since '5m ago' --no-pager "
+            f"| grep -F {shlex.quote(repo_match)} "
+            "| grep -E 'SSH upload-pack exit-status sent|SSH upload-pack EOF sent|awaiting SSH client channel close before sending server close|SSH client channel close observed|SSH upload-pack close sent'"
+        )
+        lines = handshake_log.splitlines()
+
+        def find_index(fragment):
+            for index, line in enumerate(lines):
+                if fragment in line:
+                    return index
+            raise Exception(f"missing log fragment for {repo}: {fragment}\n{handshake_log}")
+
+        exit_status_index = find_index("SSH upload-pack exit-status sent")
+        eof_index = find_index("SSH upload-pack EOF sent")
+        await_index = find_index("awaiting SSH client channel close before sending server close")
+        close_index = find_index("SSH upload-pack close sent")
+        assert exit_status_index < eof_index < await_index < close_index, handshake_log
+
+        client_close_indices = [
+            index
+            for index, line in enumerate(lines)
+            if "SSH client channel close observed" in line
+        ]
+        if client_close_indices:
+            client_close_index = client_close_indices[0]
+            if client_close_index > close_index:
+                assert '"close_reason":"grace-timeout"' in lines[close_index], handshake_log
+            else:
+                assert await_index < client_close_index <= close_index, handshake_log
+
     def ssh_clone_succeed(trace_name, repo, dest, *, key_path="/tmp/alice_key", extra_args=""):
         try:
             client.succeed(
@@ -823,6 +867,7 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-stream/blob-24.bin")
         client.succeed("git -C /tmp/repo-stream rev-parse HEAD")
         client.succeed("git -C /tmp/repo-stream fsck --no-dangling")
+        wait_for_close_handshake("octocat/repo-stream")
 
     # ── Subtest 5b: Uncached shallow clone via upstream proxy stream ───────
     with subtest("Uncached shallow clone succeeds via upstream proxy stream"):
@@ -854,6 +899,7 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -f /tmp/repo-stream-second/blob-24.bin")
         client.succeed("git -C /tmp/repo-stream-second rev-parse HEAD")
         client.succeed("git -C /tmp/repo-stream-second fsck --no-dangling")
+        wait_for_close_handshake("octocat/repo-stream")
 
     # ── Subtest 5d: Client receives streamed data before hydration publishes ──
     with subtest("Cache-miss clone streams to client before local hydration publishes"):

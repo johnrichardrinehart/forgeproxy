@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -21,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::AppState;
@@ -37,11 +38,13 @@ use crate::metrics::{
 /// Keeping frames at or below 32 KiB avoids relying on library-side
 /// fragmentation behavior for large buffers while streaming big packfiles.
 const SSH_DATA_CHUNK_SIZE: usize = 32 * 1024;
+const SSH_UPLOAD_PACK_CLOSE_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 struct UpstreamProxyChannelState {
     owner_repo: Option<String>,
     output_lock: Arc<Mutex<()>>,
+    close_notify: Arc<Notify>,
     stream_finished: bool,
     exit_status_sent: bool,
     eof_sent: bool,
@@ -55,6 +58,7 @@ impl Default for UpstreamProxyChannelState {
         Self {
             owner_repo: None,
             output_lock: Arc::new(Mutex::new(())),
+            close_notify: Arc::new(Notify::new()),
             stream_finished: false,
             exit_status_sent: false,
             eof_sent: false,
@@ -259,38 +263,113 @@ async fn finalize_upload_pack_channel(
         }
     };
 
-    let close_sent = match if let Some(stream_channel) = stream_channel {
-        stream_channel.close().await.map_err(|_| ())
-    } else {
-        handle.close(channel_id).await
-    } {
-        Ok(()) => {
-            info!(
-                repo = %owner_repo,
-                ?channel_id,
-                total_bytes,
-                "SSH upload-pack close sent"
-            );
-            true
-        }
-        Err(error) => {
-            warn!(
-                repo = %owner_repo,
-                ?channel_id,
-                total_bytes,
-                error = ?error,
-                "SSH upload-pack close failed"
-            );
-            false
-        }
-    };
+    let (client_close_seen, close_notify) =
+        if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+            state.stream_finished = true;
+            state.exit_status_sent = exit_status_sent;
+            state.eof_sent = eof_sent;
+            (state.client_close_seen, Arc::clone(&state.close_notify))
+        } else {
+            (false, Arc::new(Notify::new()))
+        };
 
-    if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
-        state.stream_finished = true;
-        state.exit_status_sent = exit_status_sent;
-        state.eof_sent = eof_sent;
-        state.close_sent = close_sent;
-    }
+    let close_sent = if client_close_seen {
+        match if let Some(stream_channel) = stream_channel {
+            stream_channel.close().await.map_err(|_| ())
+        } else {
+            handle.close(channel_id).await
+        } {
+            Ok(()) => {
+                if let Some(state) = channel_states.lock().await.get_mut(&channel_id) {
+                    state.close_sent = true;
+                }
+                info!(
+                    repo = %owner_repo,
+                    ?channel_id,
+                    total_bytes,
+                    close_reason = "client-close-already-seen",
+                    "SSH upload-pack close sent"
+                );
+                true
+            }
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    ?channel_id,
+                    total_bytes,
+                    close_reason = "client-close-already-seen",
+                    error = ?error,
+                    "SSH upload-pack close failed"
+                );
+                false
+            }
+        }
+    } else {
+        info!(
+            repo = %owner_repo,
+            ?channel_id,
+            total_bytes,
+            grace_period_secs = SSH_UPLOAD_PACK_CLOSE_GRACE_PERIOD.as_secs(),
+            "awaiting SSH client channel close before sending server close"
+        );
+        let owner_repo = owner_repo.to_owned();
+        let channel_states = Arc::clone(channel_states);
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let close_reason = if tokio::time::timeout(
+                SSH_UPLOAD_PACK_CLOSE_GRACE_PERIOD,
+                close_notify.notified(),
+            )
+            .await
+            .is_ok()
+            {
+                "client-close"
+            } else {
+                "grace-timeout"
+            };
+
+            let should_send_close = {
+                let mut states = channel_states.lock().await;
+                if let Some(state) = states.get_mut(&channel_id) {
+                    if state.close_sent {
+                        false
+                    } else {
+                        state.close_sent = true;
+                        true
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if !should_send_close {
+                return;
+            }
+
+            match handle.close(channel_id).await {
+                Ok(()) => {
+                    info!(
+                        repo = %owner_repo,
+                        ?channel_id,
+                        total_bytes,
+                        close_reason,
+                        "SSH upload-pack close sent"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        repo = %owner_repo,
+                        ?channel_id,
+                        total_bytes,
+                        close_reason,
+                        error = ?error,
+                        "SSH upload-pack close failed"
+                    );
+                }
+            }
+        });
+        false
+    };
 
     info!(
         repo = %owner_repo,
@@ -1207,11 +1286,22 @@ impl Handler for SshSession {
             let mut channels = self.upstream_proxy_channels.lock().await;
             if let Some(state) = channels.get_mut(&channel_id) {
                 state.client_close_seen = true;
+                state.close_notify.notify_waiters();
                 close_state = Some(state.clone());
             }
         }
 
         if let Some(state) = close_state {
+            info!(
+                repo = state.owner_repo.as_deref().unwrap_or("<unknown>"),
+                channel = ?channel_id,
+                stream_finished = state.stream_finished,
+                exit_status_sent = state.exit_status_sent,
+                eof_sent = state.eof_sent,
+                close_sent = state.close_sent,
+                client_eof_seen = state.client_eof_seen,
+                "SSH client channel close observed"
+            );
             if !state.stream_finished {
                 warn!(
                     repo = state.owner_repo.as_deref().unwrap_or("<unknown>"),
