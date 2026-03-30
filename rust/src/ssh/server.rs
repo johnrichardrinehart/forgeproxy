@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use russh::MethodSet;
+use russh::keys::ssh_key::rand_core::OsRng;
+use russh::keys::{self, Algorithm, PrivateKey};
 use russh::server::{self, Server};
-use russh_keys::key::KeyPair;
+use russh::{MethodKind, MethodSet};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -49,7 +50,7 @@ impl server::Server for SshServer {
 
 /// Attempt to load the SSH host key from the Linux kernel keyring.  Falls back
 /// to generating an ephemeral Ed25519 key if the keyring entry is absent.
-fn load_or_generate_host_key() -> KeyPair {
+fn load_or_generate_host_key() -> PrivateKey {
     // Try the kernel keyring first.
     match load_host_key_from_keyring() {
         Ok(kp) => {
@@ -61,14 +62,15 @@ fn load_or_generate_host_key() -> KeyPair {
                 error = %e,
                 "failed to load SSH host key from kernel keyring; generating ephemeral Ed25519 key",
             );
-            KeyPair::generate_ed25519()
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
+                .expect("failed to generate ephemeral Ed25519 host key")
         }
     }
 }
 
 /// Try to read a PEM-encoded private key stored in the user keyring under
 /// the well-known description `forgeproxy:ssh_host_key`.
-fn load_host_key_from_keyring() -> Result<KeyPair> {
+fn load_host_key_from_keyring() -> Result<PrivateKey> {
     use linux_keyutils::{KeyRing, KeyRingIdentifier};
 
     let ring = KeyRing::from_special_id(KeyRingIdentifier::User, false)
@@ -84,8 +86,7 @@ fn load_host_key_from_keyring() -> Result<KeyPair> {
 
     let pem = std::str::from_utf8(&buf).context("SSH host key payload is not valid UTF-8")?;
 
-    russh_keys::decode_secret_key(pem, None)
-        .context("failed to decode SSH host key from keyring payload")
+    keys::decode_secret_key(pem, None).context("failed to decode SSH host key from keyring payload")
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +112,7 @@ pub async fn start_ssh_server(
 
     let config = Arc::new(server::Config {
         keys: vec![host_key],
-        methods: MethodSet::PUBLICKEY,
+        methods: MethodSet::from(&[MethodKind::PublicKey][..]),
         // Preferred algorithms -- FIPS-aligned choices where available.
         preferred: russh::Preferred::DEFAULT,
         inactivity_timeout: Some(Duration::from_secs(600)),

@@ -30,11 +30,10 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ../rust/Cargo.lock;
     outputHashes = {
-      "pageant-0.0.1-beta.3" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
-      "russh-0.46.0" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
-      "russh-cryptovec-0.7.3" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
-      "russh-keys-0.46.0" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
-      "russh-util-0.46.0" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
+      "pageant-0.2.0" = "sha256-bWcaN8euCiW3eOjzsULiw5OKrRvTLi8n+V5rSz/IAH4=";
+      "russh-0.58.0" = "sha256-bWcaN8euCiW3eOjzsULiw5OKrRvTLi8n+V5rSz/IAH4=";
+      "russh-cryptovec-0.58.0" = "sha256-bWcaN8euCiW3eOjzsULiw5OKrRvTLi8n+V5rSz/IAH4=";
+      "russh-util-0.52.0" = "sha256-bWcaN8euCiW3eOjzsULiw5OKrRvTLi8n+V5rSz/IAH4=";
     };
   };
 
