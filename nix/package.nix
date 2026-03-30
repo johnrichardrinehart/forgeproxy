@@ -27,7 +27,16 @@ rustPlatform.buildRustPackage {
   };
   sourceRoot = "source/rust";
 
-  cargoLock.lockFile = ../rust/Cargo.lock;
+  cargoLock = {
+    lockFile = ../rust/Cargo.lock;
+    outputHashes = {
+      "pageant-0.0.1-beta.3" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
+      "russh-0.46.0" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
+      "russh-cryptovec-0.7.3" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
+      "russh-keys-0.46.0" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
+      "russh-util-0.46.0" = "sha256-791tlOrQc8nSjSvVfSlk0T1smk/H7I7SvmLvQSvqdhA=";
+    };
+  };
 
   nativeBuildInputs = [
     pkg-config
