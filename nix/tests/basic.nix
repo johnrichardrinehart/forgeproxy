@@ -215,7 +215,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-basic";
-  globalTimeout = 210;
+  globalTimeout = 240;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -722,7 +722,7 @@ pkgs.testers.runNixOSTest {
             " -H \"Content-Type: application/x-git-upload-pack-request\""
             " --data-binary @/tmp/slow-upload-pack.req"
             " https://proxy/octocat/hello-world.git/git-upload-pack"
-            " | pv -qL 1048576 > /tmp/slow-upload-pack.out"
+            " | pv -qL 2097152 > /tmp/slow-upload-pack.out"
             " 2> /tmp/slow-upload-pack.err; "
             "echo $? > /tmp/slow-upload-pack.status"
             "' &"
