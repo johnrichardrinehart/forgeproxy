@@ -138,6 +138,7 @@ let
     clone:
       lock_ttl: 60
       lock_wait_timeout: 120
+      ssh_upload_pack_close_grace_secs: 5
       max_concurrent_upstream_clones: 5
       max_concurrent_upstream_fetches: 10
 
