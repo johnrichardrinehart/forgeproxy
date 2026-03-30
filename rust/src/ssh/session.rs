@@ -1,4 +1,4 @@
-//! SSH session handler implementing the `russh` 0.46 [`Handler`] trait.
+//! SSH session handler implementing the `russh` [`Handler`] trait.
 //!
 //! Each inbound SSH connection is served by a dedicated [`SshSession`].  The
 //! handler performs public-key authentication (with an upstream forge API fallback and
@@ -14,10 +14,9 @@ use std::time::Instant;
 
 use anyhow::Result;
 use base64::Engine as _;
+use russh::keys::{PublicKey, PublicKeyBase64};
 use russh::server::{Auth, Handler, Msg, Session};
-use russh::{Channel, ChannelId, ChannelStream, CryptoVec};
-use russh_keys::PublicKeyBase64;
-use russh_keys::key::PublicKey;
+use russh::{Channel, ChannelId, ChannelStream};
 use sha2::{Digest, Sha256};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -169,9 +168,9 @@ impl SshSession {
 /// signals; omitting exit-status or EOF causes the client to treat the channel
 /// close as a transport failure ("the remote end hung up unexpectedly").
 fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32) {
-    session.exit_status_request(channel_id, exit_status);
-    session.eof(channel_id);
-    session.close(channel_id);
+    let _ = session.exit_status_request(channel_id, exit_status);
+    let _ = session.eof(channel_id);
+    let _ = session.close(channel_id);
 }
 
 /// Finalize upload-pack in RFC 4254 order after the response stream has been
@@ -398,7 +397,7 @@ async fn send_channel_data_chunks(
 ) -> Result<(), ()> {
     for part in data.chunks(SSH_DATA_CHUNK_SIZE) {
         handle
-            .data(channel_id, CryptoVec::from_slice(part))
+            .data(channel_id, part.to_vec())
             .await
             .map_err(|_| ())?;
     }
@@ -922,7 +921,6 @@ fn fingerprint_of(key: &PublicKey) -> String {
 // Handler implementation
 // ---------------------------------------------------------------------------
 
-#[async_trait::async_trait]
 impl Handler for SshSession {
     type Error = anyhow::Error;
 
@@ -969,6 +967,7 @@ impl Handler for SshSession {
                 warn!(fingerprint = %fp, "SSH key unresolved; rejecting");
                 Ok(Auth::Reject {
                     proceed_with_methods: None,
+                    partial_success: false,
                 })
             }
             Err(e) => {
@@ -979,6 +978,7 @@ impl Handler for SshSession {
                 );
                 Ok(Auth::Reject {
                     proceed_with_methods: None,
+                    partial_success: false,
                 })
             }
         }
@@ -1378,13 +1378,11 @@ impl Handler for SshSession {
         match parse_git_command(&raw_cmd) {
             Some((GitCommand::ReceivePack, repo)) => {
                 warn!(repo = %repo, "rejected SSH git-receive-pack (push)");
-                session.extended_data(
+                let _ = session.extended_data(
                     channel_id,
                     1,
-                    CryptoVec::from_slice(
-                        b"ERROR: Push (git-receive-pack) is not supported through the caching proxy.\n\
-                          Please push directly to the upstream forge.\n",
-                    ),
+                    &b"ERROR: Push (git-receive-pack) is not supported through the caching proxy.\n\
+                      Please push directly to the upstream forge.\n"[..],
                 );
                 finish_channel(session, channel_id, 1);
                 Ok(())
@@ -1394,10 +1392,10 @@ impl Handler for SshSession {
                 // ── Path validation ──────────────────────────────────
                 if repo.contains("..") || repo.contains('\0') {
                     warn!(repo = %repo, "rejected SSH exec with path traversal attempt");
-                    session.extended_data(
+                    let _ = session.extended_data(
                         channel_id,
                         1,
-                        CryptoVec::from_slice(b"ERROR: Invalid repository path.\n"),
+                        &b"ERROR: Invalid repository path.\n"[..],
                     );
                     finish_channel(session, channel_id, 1);
                     return Ok(());
@@ -1410,12 +1408,10 @@ impl Handler for SshSession {
                         let username = match self.username.as_deref() {
                             Some(u) => u,
                             None => {
-                                session.extended_data(
+                                let _ = session.extended_data(
                                     channel_id,
                                     1,
-                                    CryptoVec::from_slice(
-                                        b"ERROR: SSH identity could not be resolved.\n",
-                                    ),
+                                    &b"ERROR: SSH identity could not be resolved.\n"[..],
                                 );
                                 finish_channel(session, channel_id, 1);
                                 return Ok(());
@@ -1437,15 +1433,13 @@ impl Handler for SshSession {
                                     repo = %repo,
                                     "SSH repo access denied"
                                 );
-                                session.extended_data(
+                                let _ = session.extended_data(
                                     channel_id,
                                     1,
-                                    CryptoVec::from_slice(
-                                        format!(
-                                            "ERROR: Access denied to repository {owner}/{repo_name}\n"
-                                        )
-                                        .as_bytes(),
-                                    ),
+                                    format!(
+                                        "ERROR: Access denied to repository {owner}/{repo_name}\n"
+                                    )
+                                    .into_bytes(),
                                 );
                                 finish_channel(session, channel_id, 1);
                                 return Ok(());
@@ -1457,15 +1451,13 @@ impl Handler for SshSession {
                                     error = %e,
                                     "SSH repo access check failed"
                                 );
-                                session.extended_data(
+                                let _ = session.extended_data(
                                     channel_id,
                                     1,
-                                    CryptoVec::from_slice(
-                                        format!(
-                                            "ERROR: Failed to verify access to repository {owner}/{repo_name}: {e}\n"
-                                        )
-                                        .as_bytes(),
-                                    ),
+                                    format!(
+                                        "ERROR: Failed to verify access to repository {owner}/{repo_name}: {e}\n"
+                                    )
+                                    .into_bytes(),
                                 );
                                 finish_channel(session, channel_id, 1);
                                 return Ok(());
@@ -1477,12 +1469,10 @@ impl Handler for SshSession {
                     }
                     Err(e) => {
                         warn!(repo = %repo, error = %e, "failed to parse owner/repo from slug");
-                        session.extended_data(
+                        let _ = session.extended_data(
                             channel_id,
                             1,
-                            CryptoVec::from_slice(
-                                format!("ERROR: Invalid repository path: {repo}\n").as_bytes(),
-                            ),
+                            format!("ERROR: Invalid repository path: {repo}\n").into_bytes(),
                         );
                         finish_channel(session, channel_id, 1);
                         return Ok(());
@@ -1516,12 +1506,10 @@ impl Handler for SshSession {
                                     error = %error,
                                     "failed to acquire published generation lease for direct SSH upload-pack"
                                 );
-                                session.extended_data(
+                                let _ = session.extended_data(
                                     channel_id,
                                     1,
-                                    CryptoVec::from_slice(
-                                        b"ERROR: Published repo generation is unavailable.\n",
-                                    ),
+                                    &b"ERROR: Published repo generation is unavailable.\n"[..],
                                 );
                                 finish_channel(session, channel_id, 1);
                                 return Ok(());
@@ -1529,10 +1517,10 @@ impl Handler for SshSession {
                         };
                     let Some(channel) = self.channels.get(&channel_id).cloned() else {
                         error!(repo = %repo, channel = ?channel_id, "missing SSH channel handle for cached upload-pack");
-                        session.extended_data(
+                        let _ = session.extended_data(
                             channel_id,
                             1,
-                            CryptoVec::from_slice(b"ERROR: Internal SSH channel state missing.\n"),
+                            &b"ERROR: Internal SSH channel state missing.\n"[..],
                         );
                         finish_channel(session, channel_id, 1);
                         return Ok(());
@@ -1571,7 +1559,7 @@ impl Handler for SshSession {
                             // until it receives SSH_MSG_CHANNEL_SUCCESS for the
                             // exec request.  Send it now, before the background
                             // task starts streaming upload-pack stdout.
-                            session.channel_success(channel_id);
+                            let _ = session.channel_success(channel_id);
 
                             // Obtain an async Handle for sending data from the
                             // background task (the sync Session methods cannot
@@ -1678,13 +1666,8 @@ impl Handler for SshSession {
                                         "git upload-pack error: {}\n",
                                         String::from_utf8_lossy(&stderr_buf).trim(),
                                     );
-                                    let _ = handle
-                                        .extended_data(
-                                            channel_id,
-                                            1,
-                                            CryptoVec::from_slice(msg.as_bytes()),
-                                        )
-                                        .await;
+                                    let _ =
+                                        handle.extended_data(channel_id, 1, msg.into_bytes()).await;
                                 }
 
                                 // RFC 4254: exit-status → EOF → close.
@@ -1711,12 +1694,10 @@ impl Handler for SshSession {
                                 repo = %repo, error = %e,
                                 "failed to spawn git upload-pack"
                             );
-                            session.extended_data(
+                            let _ = session.extended_data(
                                 channel_id,
                                 1,
-                                CryptoVec::from_slice(
-                                    format!("Failed to start git upload-pack: {e}\n").as_bytes(),
-                                ),
+                                format!("Failed to start git upload-pack: {e}\n").into_bytes(),
                             );
                             finish_channel(session, channel_id, 1);
                         }
@@ -1765,7 +1746,7 @@ impl Handler for SshSession {
                     // receives SSH_MSG_CHANNEL_SUCCESS.  Send it now so the
                     // client starts reading before the background task writes
                     // the ref advertisement (avoids TCP deadlock).
-                    session.channel_success(channel_id);
+                    let _ = session.channel_success(channel_id);
 
                     let state = Arc::clone(&self.state);
                     let channel_states = Arc::clone(&self.upstream_proxy_channels);
@@ -1830,13 +1811,7 @@ impl Handler for SshSession {
                                      Try cloning directly from the upstream forge.\n",
                                     repo_bg, e,
                                 );
-                                let _ = handle
-                                    .extended_data(
-                                        channel_id,
-                                        1,
-                                        CryptoVec::from_slice(msg.as_bytes()),
-                                    )
-                                    .await;
+                                let _ = handle.extended_data(channel_id, 1, msg.into_bytes()).await;
                                 finalize_upload_pack_channel(
                                     &repo_bg,
                                     &handle,
@@ -1858,12 +1833,10 @@ impl Handler for SshSession {
 
             None => {
                 warn!(command = %raw_cmd, "unrecognised SSH exec command");
-                session.extended_data(
+                let _ = session.extended_data(
                     channel_id,
                     1,
-                    CryptoVec::from_slice(
-                        b"ERROR: Unknown command. Only git-upload-pack is supported.\n",
-                    ),
+                    &b"ERROR: Unknown command. Only git-upload-pack is supported.\n"[..],
                 );
                 finish_channel(session, channel_id, 1);
                 Ok(())
@@ -2603,9 +2576,7 @@ async fn proxy_upstream_upload_pack(
                  Try cloning directly from the upstream forge.\n",
                 owner_repo, e,
             );
-            let _ = handle
-                .extended_data(channel_id, 1, CryptoVec::from_slice(msg.as_bytes()))
-                .await;
+            let _ = handle.extended_data(channel_id, 1, msg.into_bytes()).await;
             if behavior.should_close_channel {
                 finalize_upload_pack_channel(
                     &owner_repo,
@@ -2705,8 +2676,12 @@ mod tests {
 
     #[test]
     fn fingerprint_has_sha256_prefix() {
-        let keypair = russh_keys::key::KeyPair::generate_ed25519();
-        let pubkey = keypair.clone_public_key().unwrap();
+        let keypair = russh::keys::PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pubkey = keypair.public_key().clone();
         let fp = fingerprint_of(&pubkey);
         assert!(
             fp.starts_with("SHA256:"),
@@ -2716,8 +2691,12 @@ mod tests {
 
     #[test]
     fn fingerprint_is_deterministic() {
-        let keypair = russh_keys::key::KeyPair::generate_ed25519();
-        let pubkey = keypair.clone_public_key().unwrap();
+        let keypair = russh::keys::PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pubkey = keypair.public_key().clone();
         let fp1 = fingerprint_of(&pubkey);
         let fp2 = fingerprint_of(&pubkey);
         assert_eq!(
@@ -2728,8 +2707,12 @@ mod tests {
 
     #[test]
     fn fingerprint_has_correct_length() {
-        let keypair = russh_keys::key::KeyPair::generate_ed25519();
-        let pubkey = keypair.clone_public_key().unwrap();
+        let keypair = russh::keys::PrivateKey::random(
+            &mut russh::keys::ssh_key::rand_core::OsRng,
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let pubkey = keypair.public_key().clone();
         let fp = fingerprint_of(&pubkey);
         // SHA256: prefix (7 chars) + 43 base64-no-pad chars = 50 total
         assert_eq!(
