@@ -200,6 +200,8 @@ pkgs.testers.runNixOSTest {
         # Prevent auto-start so we can inject the token into the keyring
         # via an ExecStartPre *after* Gitea has been seeded.
         systemd.services.forgeproxy.wantedBy = lib.mkForce [ ];
+        systemd.services.forgeproxy.serviceConfig.Restart = lib.mkForce "no";
+        systemd.services.forgeproxy.unitConfig.ConditionPathExists = "/run/forgeproxy-enable";
 
         # Dummy AWS credentials to prevent SDK timeout reaching IMDS
         systemd.services.forgeproxy.environment = {
@@ -336,6 +338,7 @@ pkgs.testers.runNixOSTest {
             f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user forgeproxy:octocat_pat @u'\n"
             f"UNIT"
         )
+        proxy.succeed("touch /run/forgeproxy-enable")
         proxy.succeed("systemctl daemon-reload")
         proxy.succeed("systemctl start forgeproxy")
 

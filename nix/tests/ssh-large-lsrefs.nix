@@ -194,6 +194,8 @@ pkgs.testers.runNixOSTest {
         };
 
         systemd.services.forgeproxy.wantedBy = lib.mkForce [ ];
+        systemd.services.forgeproxy.serviceConfig.Restart = lib.mkForce "no";
+        systemd.services.forgeproxy.unitConfig.ConditionPathExists = "/run/forgeproxy-enable";
         systemd.services.forgeproxy.environment = {
           AWS_ACCESS_KEY_ID = "minioadmin";
           AWS_SECRET_ACCESS_KEY = "minioadmin";
@@ -329,6 +331,7 @@ pkgs.testers.runNixOSTest {
             f"ExecStartPre=/bin/sh -c 'echo -n \"{TOKEN}\" | keyctl padd user FORGE_ADMIN_TOKEN @u >/dev/null'\n"
             f"UNIT"
         )
+        proxy.succeed("touch /run/forgeproxy-enable")
         proxy.succeed("systemctl daemon-reload")
         proxy.succeed("systemctl start forgeproxy")
         proxy.wait_for_open_port(2222)
