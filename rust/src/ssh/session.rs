@@ -16,7 +16,7 @@ use anyhow::Result;
 use base64::Engine as _;
 use russh::keys::{PublicKey, PublicKeyBase64};
 use russh::server::{Auth, Handler, Msg, Session};
-use russh::{Channel, ChannelId, ChannelStream};
+use russh::{Channel, ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
 use sha2::{Digest, Sha256};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -92,7 +92,7 @@ struct UpstreamUploadPackContext {
     capture_metadata: Arc<Mutex<HashMap<ChannelId, UpstreamCaptureMetadata>>>,
     handle: russh::server::Handle,
     channel_id: ChannelId,
-    stream_channel: Option<Arc<Channel<Msg>>>,
+    stream_channel: Option<Arc<ChannelWriteHalf<Msg>>>,
     output_lock: Arc<Mutex<()>>,
 }
 
@@ -121,7 +121,7 @@ pub struct SshSession {
     /// Session channels opened for this connection, keyed by channel id.
     /// We retain the handles for the lifetime of the SSH channel so protocol
     /// v2 ls-refs and fetch both use the same window-aware writer.
-    channels: HashMap<ChannelId, Arc<Channel<Msg>>>,
+    channels: HashMap<ChannelId, Arc<ChannelWriteHalf<Msg>>>,
     /// `GIT_PROTOCOL` value sent by the client via SSH env request.
     git_protocol: Option<String>,
     /// For PAT-mode upstream proxy (uncached repos):
@@ -181,10 +181,83 @@ fn finish_channel(session: &mut Session, channel_id: ChannelId, exit_status: u32
 /// response stream itself is copied with `write_all()` only and EOF is sent
 /// explicitly here.
 #[allow(clippy::too_many_arguments)]
+async fn wait_for_channel_drain(
+    owner_repo: &str,
+    handle: &russh::server::Handle,
+    channel_id: ChannelId,
+    total_bytes: u64,
+    wait_timeout: Duration,
+    reason: &str,
+) -> bool {
+    let drain_deadline = Instant::now() + wait_timeout;
+    let mut pending_data_polls = 0u32;
+    let mut pending_data_cleared = false;
+
+    info!(
+        repo = %owner_repo,
+        ?channel_id,
+        total_bytes,
+        drain_wait_secs = wait_timeout.as_secs(),
+        reason,
+        "awaiting russh channel drain"
+    );
+
+    loop {
+        match handle.has_pending_data(channel_id).await {
+            Ok(false) => {
+                pending_data_cleared = true;
+                break;
+            }
+            Ok(true) => {
+                pending_data_polls += 1;
+                if Instant::now() >= drain_deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    ?channel_id,
+                    total_bytes,
+                    error = ?error,
+                    reason,
+                    "failed to query russh pending channel data"
+                );
+                break;
+            }
+        }
+    }
+
+    if pending_data_cleared {
+        info!(
+            repo = %owner_repo,
+            ?channel_id,
+            total_bytes,
+            pending_data_polls,
+            reason,
+            "russh channel drain completed"
+        );
+    } else {
+        warn!(
+            repo = %owner_repo,
+            ?channel_id,
+            total_bytes,
+            pending_data_polls,
+            drain_wait_secs = wait_timeout.as_secs(),
+            reason,
+            "russh channel drain did not complete"
+        );
+    }
+
+    pending_data_cleared
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn finalize_upload_pack_channel(
     owner_repo: &str,
     handle: &russh::server::Handle,
-    stream_channel: Option<&mut ChannelStream<Msg>>,
+    stream_channel: Option<&Arc<ChannelWriteHalf<Msg>>>,
     channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     channel_id: ChannelId,
     exit_status: u32,
@@ -230,62 +303,15 @@ async fn finalize_upload_pack_channel(
         );
     }
 
-    let drain_deadline = Instant::now() + close_grace_period;
-    let mut pending_data_polls = 0u32;
-    let mut pending_data_cleared = false;
-
-    info!(
-        repo = %owner_repo,
-        ?channel_id,
+    let _pending_data_cleared = wait_for_channel_drain(
+        owner_repo,
+        handle,
+        channel_id,
         total_bytes,
-        drain_wait_secs = close_grace_period.as_secs(),
-        "awaiting russh channel drain before sending SSH upload-pack exit-status and EOF"
-    );
-
-    loop {
-        match handle.has_pending_data(channel_id).await {
-            Ok(false) => {
-                pending_data_cleared = true;
-                break;
-            }
-            Ok(true) => {
-                pending_data_polls += 1;
-                if Instant::now() >= drain_deadline {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Err(error) => {
-                warn!(
-                    repo = %owner_repo,
-                    ?channel_id,
-                    total_bytes,
-                    error = ?error,
-                    "failed to query russh pending channel data before SSH upload-pack EOF"
-                );
-                break;
-            }
-        }
-    }
-
-    if pending_data_cleared {
-        info!(
-            repo = %owner_repo,
-            ?channel_id,
-            total_bytes,
-            pending_data_polls,
-            "russh channel drain completed before SSH upload-pack EOF"
-        );
-    } else {
-        warn!(
-            repo = %owner_repo,
-            ?channel_id,
-            total_bytes,
-            pending_data_polls,
-            drain_wait_secs = close_grace_period.as_secs(),
-            "russh channel drain did not complete before SSH upload-pack EOF"
-        );
-    }
+        close_grace_period,
+        "before sending SSH upload-pack exit-status and EOF",
+    )
+    .await;
 
     let exit_status_sent = match handle.exit_status_request(channel_id, exit_status).await {
         Ok(()) => {
@@ -312,7 +338,7 @@ async fn finalize_upload_pack_channel(
     };
 
     let eof_sent = match if let Some(stream_channel) = stream_channel {
-        stream_channel.shutdown().await.map_err(|_| ())
+        stream_channel.eof().await.map_err(|_| ())
     } else {
         handle.eof(channel_id).await
     } {
@@ -408,12 +434,14 @@ async fn send_channel_data_chunks(
 async fn send_channel_response_data(
     handle: &russh::server::Handle,
     channel_id: ChannelId,
-    stream_channel: Option<&Arc<Channel<Msg>>>,
+    stream_channel: Option<&Arc<ChannelWriteHalf<Msg>>>,
     channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     data: &[u8],
 ) -> Result<(), ()> {
     let result = if let Some(stream_channel) = stream_channel {
-        stream_channel.write_all(data).await.map_err(|_| ())
+        let mut writer = stream_channel.make_writer();
+        writer.write_all(data).await.map_err(|_| ())?;
+        writer.flush().await.map_err(|_| ())
     } else {
         send_channel_data_chunks(handle, channel_id, data).await
     };
@@ -432,6 +460,16 @@ async fn send_channel_response_data(
     result
 }
 
+fn spawn_channel_read_drain(mut read_half: ChannelReadHalf) {
+    tokio::spawn(async move {
+        while let Some(msg) = read_half.wait().await {
+            if matches!(msg, ChannelMsg::Close) {
+                break;
+            }
+        }
+    });
+}
+
 async fn output_lock_for_channel(
     channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     channel_id: ChannelId,
@@ -448,7 +486,7 @@ struct LocalUploadPackResponseContext {
     handle: russh::server::Handle,
     channel_states: Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     channel_id: ChannelId,
-    stream_channel: Option<Arc<Channel<Msg>>>,
+    stream_channel: Option<Arc<ChannelWriteHalf<Msg>>>,
     should_close_channel: bool,
 }
 
@@ -475,7 +513,7 @@ async fn serve_local_upload_pack_once(
         handle,
         channel_states,
         channel_id,
-        mut stream_channel,
+        stream_channel,
         should_close_channel,
     } = response;
 
@@ -571,7 +609,7 @@ async fn serve_local_upload_pack_once(
                 if send_channel_response_data(
                     &handle,
                     channel_id,
-                    stream_channel.as_mut(),
+                    stream_channel.as_ref(),
                     &channel_states,
                     chunk,
                 )
@@ -653,7 +691,7 @@ async fn serve_local_upload_pack_once(
         finalize_upload_pack_channel(
             owner_repo,
             &handle,
-            stream_channel.as_mut(),
+            stream_channel.as_ref(),
             &channel_states,
             channel_id,
             exit_status,
@@ -764,6 +802,7 @@ fn complete_v2_request_kind(buf: &[u8]) -> Option<V2RequestKind> {
     }
 }
 
+#[cfg(test)]
 fn summarize_pkt_lines(buf: &[u8]) -> String {
     const MAX_SUMMARY_LINES: usize = 12;
     const MAX_TOTAL_CHARS: usize = 512;
@@ -990,7 +1029,10 @@ impl Handler for SshSession {
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        self.channels.insert(channel.id(), Arc::new(channel));
+        let channel_id = channel.id();
+        let (read_half, write_half) = channel.split();
+        spawn_channel_read_drain(read_half);
+        self.channels.insert(channel_id, Arc::new(write_half));
         Ok(true)
     }
 
@@ -1044,30 +1086,17 @@ impl Handler for SshSession {
         let post_action = if let Some((ref repo, ref mut buf, authenticated, ref git_protocol)) =
             self.upstream_proxy_buf
         {
-            debug!(
-                repo = %repo,
-                incoming_bytes = data.len(),
-                total_buffered = buf.len() + data.len(),
-                "DIAG: upstream proxy received client data"
-            );
             buf.extend_from_slice(data);
             let has_done = buf.windows(9).any(|w| w == b"0009done\n");
-            let ends_with_flush = buf.ends_with(b"0000");
             // Shallow/no-negotiation (protocol v1): wants followed by flush, no haves.
             // This exact request shape should POST immediately instead of
             // waiting for channel EOF, which Git does not send before reading
             // the packfile.
-            let pkt_summary = if self.git_protocol.as_deref() == Some("version=2") {
-                Some(summarize_pkt_lines(buf))
-            } else {
-                None
-            };
             let has_flush_after_wants = if self.git_protocol.as_deref() == Some("version=2") {
                 false
             } else {
                 is_single_round_fetch_request(buf)
             };
-            let mut v2_request_kind = None;
             if self.git_protocol.as_deref() == Some("version=2") {
                 while let Some((kind, req_len)) = split_next_complete_v2_request(buf) {
                     let remaining = buf.split_off(req_len);
@@ -1079,22 +1108,11 @@ impl Handler for SshSession {
                         authenticated,
                         git_protocol.clone(),
                     ));
-                    v2_request_kind = Some(kind);
                     if kind == V2RequestKind::Fetch {
                         break;
                     }
                 }
             }
-            debug!(
-                repo = %repo,
-                git_protocol = ?self.git_protocol,
-                has_done,
-                ends_with_flush,
-                has_flush_after_wants,
-                v2_request_kind = ?v2_request_kind,
-                pkt_summary = ?pkt_summary,
-                "DIAG: upstream proxy request completion check"
-            );
             if self.git_protocol.as_deref() == Some("version=2") {
                 None
             } else if has_done || has_flush_after_wants {
@@ -1232,12 +1250,6 @@ impl Handler for SshSession {
         // Cached path: dropping ChildStdin closes the pipe → child exits.
         self.child_stdin.take();
 
-        debug!(
-            channel = ?channel_id,
-            has_upstream_buf = self.upstream_proxy_buf.is_some(),
-            "DIAG: channel_eof fired"
-        );
-
         if let Some(state) = self
             .upstream_proxy_channels
             .lock()
@@ -1252,7 +1264,6 @@ impl Handler for SshSession {
             self.upstream_proxy_buf.take()
         {
             let stream_channel = self.channels.get(&channel_id).cloned();
-            debug!(repo = %owner_repo, want_have_bytes = want_have.len(), authenticated, "upstream proxy: channel_eof received, POSTing to upstream");
             let state = Arc::clone(&self.state);
             let channel_states = Arc::clone(&self.upstream_proxy_channels);
             let capture_metadata = Arc::clone(&self.upstream_capture_metadata);
@@ -1328,18 +1339,6 @@ impl Handler for SshSession {
                     client_eof_seen = state.client_eof_seen,
                     client_close_seen = state.client_close_seen,
                     "SSH channel closed before forgeproxy marked upload-pack stream finished"
-                );
-            } else {
-                debug!(
-                    repo = state.owner_repo.as_deref().unwrap_or("<unknown>"),
-                    channel = ?channel_id,
-                    stream_finished = state.stream_finished,
-                    exit_status_sent = state.exit_status_sent,
-                    eof_sent = state.eof_sent,
-                    close_sent = state.close_sent,
-                    client_eof_seen = state.client_eof_seen,
-                    client_close_seen = state.client_close_seen,
-                    "DIAG: channel_close fired"
                 );
             }
         }
@@ -1568,7 +1567,7 @@ impl Handler for SshSession {
                             let channel_states = Arc::clone(&self.upstream_proxy_channels);
                             let repo_for_stream = repo.clone();
                             let state_for_stream = Arc::clone(&self.state);
-                            let stream_channel = channel.into_stream();
+                            let stream_channel = channel;
                             let close_grace_secs =
                                 self.state.config.clone.ssh_upload_pack_close_grace_secs;
                             let metric_username = crate::metrics::clone_metric_username(
@@ -1583,7 +1582,6 @@ impl Handler for SshSession {
                                 let _generation_lease = generation_lease;
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
-                                let mut stream_channel = stream_channel;
                                 let mut disconnected = false;
                                 let mut total_bytes: u64 = 0;
                                 let clone_started = clone_started;
@@ -1608,7 +1606,7 @@ impl Handler for SshSession {
                                             if send_channel_response_data(
                                                 &handle,
                                                 channel_id,
-                                                Some(&mut stream_channel),
+                                                Some(&stream_channel),
                                                 &channel_states,
                                                 &stdout_buf[..read],
                                             )
@@ -1675,7 +1673,7 @@ impl Handler for SshSession {
                                     finalize_upload_pack_channel(
                                         &repo_for_stream,
                                         &handle,
-                                        Some(&mut stream_channel),
+                                        Some(&stream_channel),
                                         &channel_states,
                                         channel_id,
                                         exit_code,
@@ -1755,6 +1753,7 @@ impl Handler for SshSession {
                     let repo_bg = repo.clone();
                     let git_protocol = self.git_protocol.clone();
                     let close_grace_secs = self.state.config.clone.ssh_upload_pack_close_grace_secs;
+                    let stream_channel = self.channels.get(&channel_id).cloned();
                     let metric_username =
                         crate::metrics::clone_metric_username(self.username.as_deref(), true);
                     tokio::spawn(async move {
@@ -1787,15 +1786,21 @@ impl Handler for SshSession {
                                         repo: repo_bg.clone(),
                                     })
                                     .inc_by(advert.len() as u64);
-                                // Forward ref advertisement; channel stays open
-                                // for want/have — `channel_eof` will POST.
-                                debug!(repo = %repo_bg, bytes = advert.len(), "DIAG: sending ref advertisement via handle.data");
-                                match send_channel_data_chunks(&handle, channel_id, &advert).await {
-                                    Ok(()) => {
-                                        debug!(repo = %repo_bg, "DIAG: handle.data returned Ok")
-                                    }
+                                // Forward the initial protocol-v2 advertisement
+                                // through the retained SSH channel writer so the
+                                // entire session uses a single window-aware path.
+                                match send_channel_response_data(
+                                    &handle,
+                                    channel_id,
+                                    stream_channel.as_ref(),
+                                    &channel_states,
+                                    &advert,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {}
                                     Err(_) => {
-                                        warn!(repo = %repo_bg, "DIAG: handle.data returned Err — session receiver dropped")
+                                        warn!(repo = %repo_bg, "failed to send SSH ref advertisement")
                                     }
                                 }
                             }
@@ -2077,7 +2082,7 @@ async fn proxy_upstream_upload_pack(
         }
     }
 
-    let mut stream_channel = stream_channel;
+    let stream_channel = stream_channel;
     match super::upstream::post_upload_pack_stream(
         &state,
         &owner_repo,
@@ -2251,7 +2256,7 @@ async fn proxy_upstream_upload_pack(
                         if send_channel_response_data(
                             &handle,
                             channel_id,
-                            stream_channel.as_mut(),
+                            stream_channel.as_ref(),
                             &channel_states,
                             &chunk,
                         )
@@ -2313,7 +2318,7 @@ async fn proxy_upstream_upload_pack(
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
-                        stream_channel.as_mut(),
+                        stream_channel.as_ref(),
                         &channel_states,
                         channel_id,
                         1,
@@ -2538,7 +2543,7 @@ async fn proxy_upstream_upload_pack(
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
-                        stream_channel.as_mut(),
+                        stream_channel.as_ref(),
                         &channel_states,
                         channel_id,
                         0,
@@ -2581,7 +2586,7 @@ async fn proxy_upstream_upload_pack(
                 finalize_upload_pack_channel(
                     &owner_repo,
                     &handle,
-                    stream_channel.as_mut(),
+                    stream_channel.as_ref(),
                     &channel_states,
                     channel_id,
                     1,

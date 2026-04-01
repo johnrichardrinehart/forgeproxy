@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use fred::interfaces::{ClientLike, HashesInterface, KeysInterface, SortedSetsInterface};
+use fred::interfaces::{ClientLike, HashesInterface, KeysInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, TryAcquireError};
