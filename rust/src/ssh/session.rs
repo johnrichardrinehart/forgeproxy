@@ -19,7 +19,7 @@ use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
 use sha2::{Digest, Sha256};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -257,7 +257,6 @@ async fn wait_for_channel_drain(
 async fn finalize_upload_pack_channel(
     owner_repo: &str,
     handle: &russh::server::Handle,
-    stream_channel: Option<&Arc<ChannelWriteHalf<Msg>>>,
     channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     channel_id: ChannelId,
     exit_status: u32,
@@ -337,11 +336,7 @@ async fn finalize_upload_pack_channel(
         }
     };
 
-    let eof_sent = match if let Some(stream_channel) = stream_channel {
-        stream_channel.eof().await.map_err(|_| ())
-    } else {
-        handle.eof(channel_id).await
-    } {
+    let eof_sent = match handle.eof(channel_id).await {
         Ok(()) => {
             info!(
                 repo = %owner_repo,
@@ -431,17 +426,18 @@ async fn send_channel_data_chunks(
     Ok(())
 }
 
-async fn send_channel_response_data(
+async fn send_channel_response_data<W>(
     handle: &russh::server::Handle,
     channel_id: ChannelId,
-    stream_channel: Option<&Arc<ChannelWriteHalf<Msg>>>,
+    mut stream_writer: Option<&mut W>,
     channel_states: &Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
     data: &[u8],
-) -> Result<(), ()> {
-    let result = if let Some(stream_channel) = stream_channel {
-        let mut writer = stream_channel.make_writer();
-        writer.write_all(data).await.map_err(|_| ())?;
-        writer.flush().await.map_err(|_| ())
+) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let result = if let Some(stream_writer) = stream_writer.as_mut() {
+        stream_writer.write_all(data).await.map_err(|_| ())
     } else {
         send_channel_data_chunks(handle, channel_id, data).await
     };
@@ -588,6 +584,7 @@ async fn serve_local_upload_pack_once(
     let _repo_lease = repo_lease;
 
     let mut total_bytes: u64 = 0;
+    let mut stream_writer = stream_channel.as_ref().map(|channel| channel.make_writer());
     let downstream_counter = state
         .metrics
         .metrics
@@ -609,7 +606,7 @@ async fn serve_local_upload_pack_once(
                 if send_channel_response_data(
                     &handle,
                     channel_id,
-                    stream_channel.as_ref(),
+                    stream_writer.as_mut(),
                     &channel_states,
                     chunk,
                 )
@@ -691,7 +688,6 @@ async fn serve_local_upload_pack_once(
         finalize_upload_pack_channel(
             owner_repo,
             &handle,
-            stream_channel.as_ref(),
             &channel_states,
             channel_id,
             exit_status,
@@ -1584,6 +1580,7 @@ impl Handler for SshSession {
                                 let mut stderr = stderr;
                                 let mut disconnected = false;
                                 let mut total_bytes: u64 = 0;
+                                let mut stream_writer = stream_channel.make_writer();
                                 let clone_started = clone_started;
                                 let downstream_counter = state_for_stream
                                     .metrics
@@ -1606,7 +1603,7 @@ impl Handler for SshSession {
                                             if send_channel_response_data(
                                                 &handle,
                                                 channel_id,
-                                                Some(&stream_channel),
+                                                Some(&mut stream_writer),
                                                 &channel_states,
                                                 &stdout_buf[..read],
                                             )
@@ -1673,7 +1670,6 @@ impl Handler for SshSession {
                                     finalize_upload_pack_channel(
                                         &repo_for_stream,
                                         &handle,
-                                        Some(&stream_channel),
                                         &channel_states,
                                         channel_id,
                                         exit_code,
@@ -1768,6 +1764,8 @@ impl Handler for SshSession {
                         {
                             Ok(advert) => {
                                 let _output_guard = output_lock.lock().await;
+                                let mut stream_writer =
+                                    stream_channel.as_ref().map(|channel| channel.make_writer());
                                 capture_metadata
                                     .lock()
                                     .await
@@ -1792,7 +1790,7 @@ impl Handler for SshSession {
                                 match send_channel_response_data(
                                     &handle,
                                     channel_id,
-                                    stream_channel.as_ref(),
+                                    stream_writer.as_mut(),
                                     &channel_states,
                                     &advert,
                                 )
@@ -1820,7 +1818,6 @@ impl Handler for SshSession {
                                 finalize_upload_pack_channel(
                                     &repo_bg,
                                     &handle,
-                                    None,
                                     &channel_states,
                                     channel_id,
                                     1,
@@ -1890,7 +1887,7 @@ async fn proxy_upstream_upload_pack(
             .collect::<Vec<String>>()
             .join(",");
         let initial_local_decision =
-            match crate::coordination::registry::classify_local_wants_satisfaction(
+            match crate::coordination::registry::classify_local_wants_satisfaction_without_request_restore(
                 &state,
                 &owner_repo,
                 &wants,
@@ -1912,10 +1909,12 @@ async fn proxy_upstream_upload_pack(
                     }
                 }
             };
-        let local_decision = if matches!(
-            initial_local_decision,
-            LocalServeDecision::MissingWantedObjects { .. }
-        ) {
+        let local_decision = if !wants.is_empty()
+            && matches!(
+                initial_local_decision,
+                LocalServeDecision::MissingWantedObjects { .. }
+                    | LocalServeDecision::Unavailable { .. }
+            ) {
             let request_refspecs = if let LocalServeDecision::MissingWantedObjects {
                 missing_wants,
                 ..
@@ -2083,6 +2082,7 @@ async fn proxy_upstream_upload_pack(
     }
 
     let stream_channel = stream_channel;
+    let mut stream_writer = stream_channel.as_ref().map(|channel| channel.make_writer());
     match super::upstream::post_upload_pack_stream(
         &state,
         &owner_repo,
@@ -2256,7 +2256,7 @@ async fn proxy_upstream_upload_pack(
                         if send_channel_response_data(
                             &handle,
                             channel_id,
-                            stream_channel.as_ref(),
+                            stream_writer.as_mut(),
                             &channel_states,
                             &chunk,
                         )
@@ -2318,7 +2318,6 @@ async fn proxy_upstream_upload_pack(
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
-                        stream_channel.as_ref(),
                         &channel_states,
                         channel_id,
                         1,
@@ -2543,7 +2542,6 @@ async fn proxy_upstream_upload_pack(
                     finalize_upload_pack_channel(
                         &owner_repo,
                         &handle,
-                        stream_channel.as_ref(),
                         &channel_states,
                         channel_id,
                         0,
@@ -2586,7 +2584,6 @@ async fn proxy_upstream_upload_pack(
                 finalize_upload_pack_channel(
                     &owner_repo,
                     &handle,
-                    stream_channel.as_ref(),
                     &channel_states,
                     channel_id,
                     1,
