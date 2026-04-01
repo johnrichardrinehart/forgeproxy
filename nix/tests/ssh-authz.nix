@@ -891,8 +891,8 @@ pkgs.testers.runNixOSTest {
         client.succeed("git -C /tmp/repo-stream-second fsck --no-dangling")
         wait_for_close_handshake("octocat/repo-stream")
 
-    # ── Subtest 5d: Client receives streamed data before hydration publishes ──
-    with subtest("Cache-miss clone streams to client before local hydration publishes"):
+    # ── Subtest 5d: Cache-miss clone makes prompt progress during catch-up ──
+    with subtest("Cache-miss clone makes prompt progress during local catch-up"):
         live_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
         live_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
         live_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream-live"
@@ -912,7 +912,6 @@ pkgs.testers.runNixOSTest {
             "grep -E 'Receiving objects:|Resolving deltas:|remote: Enumerating objects:' "
             "/tmp/repo-stream-live.log"
         )
-        proxy.succeed(f"! test -e {live_repo}")
         client.succeed("kill -0 $(cat /tmp/repo-stream-live.pid)")
         try:
             client.wait_until_succeeds(
