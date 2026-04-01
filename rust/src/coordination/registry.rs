@@ -1617,11 +1617,25 @@ async fn try_restore_repo_from_s3(
     repo_path: &Path,
 ) -> Result<bool> {
     let Some(metadata) = latest_published_bundle_metadata(state, owner_repo).await? else {
+        debug!(
+            repo = %owner_repo,
+            path = %repo_path.display(),
+            "no published S3 bundle is available for restore"
+        );
         return Ok(false);
     };
 
+    let restore_started_at = Instant::now();
+    info!(
+        repo = %owner_repo,
+        path = %repo_path.display(),
+        bundle_s3_key = %metadata.bundle_s3_key,
+        "starting S3 bundle restore into local repo"
+    );
+
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for S3 hydration")?;
     let bundle_path = tmp_dir.path().join("hydrate.bundle");
+    let bundle_download_started_at = Instant::now();
     crate::storage::s3::download_to_path(
         &state.s3_client,
         &state.metrics,
@@ -1631,11 +1645,31 @@ async fn try_restore_repo_from_s3(
     )
     .await
     .with_context(|| format!("failed to download S3 bundle for {owner_repo}"))?;
+    info!(
+        repo = %owner_repo,
+        path = %repo_path.display(),
+        bundle_s3_key = %metadata.bundle_s3_key,
+        bundle_path = %bundle_path.display(),
+        elapsed_ms = bundle_download_started_at.elapsed().as_millis(),
+        "downloaded S3 bundle for local restore"
+    );
 
+    let bundle_import_started_at = Instant::now();
     crate::git::commands::git_init_bare(repo_path).await?;
     crate::git::commands::git_fetch_bundle(repo_path, &bundle_path).await?;
 
-    Ok(state.cache_manager.has_repo_at(repo_path))
+    let restored = state.cache_manager.has_repo_at(repo_path);
+    info!(
+        repo = %owner_repo,
+        path = %repo_path.display(),
+        bundle_s3_key = %metadata.bundle_s3_key,
+        restored,
+        import_elapsed_ms = bundle_import_started_at.elapsed().as_millis(),
+        total_elapsed_ms = restore_started_at.elapsed().as_millis(),
+        "finished S3 bundle restore into local repo"
+    );
+
+    Ok(restored)
 }
 
 pub(crate) async fn load_current_node_bundle_metadata(
@@ -2422,6 +2456,7 @@ pub fn derive_request_catch_up_plan_from_info_refs(
 async fn ensure_repo_available_locally_detailed(
     state: &crate::AppState,
     owner_repo: &str,
+    allow_request_time_s3_restore: bool,
 ) -> Result<LocalRepoAvailability> {
     repair_published_without_mirror_invariant(state, owner_repo).await?;
     let had_local_repo_before_check = state.cache_manager.has_repo(owner_repo);
@@ -2451,6 +2486,18 @@ async fn ensure_repo_available_locally_detailed(
             had_local_repo_before_check,
             restored_from_s3_for_request: false,
             available: true,
+        });
+    }
+
+    if !allow_request_time_s3_restore {
+        info!(
+            repo = %owner_repo,
+            "skipping foreground request-time S3 restore while deciding local serveability"
+        );
+        return Ok(LocalRepoAvailability {
+            had_local_repo_before_check,
+            restored_from_s3_for_request: false,
+            available: false,
         });
     }
 
@@ -2575,10 +2622,11 @@ async fn ensure_repo_available_locally_detailed(
     Ok(availability)
 }
 
-pub async fn classify_local_wants_satisfaction(
+async fn classify_local_wants_satisfaction_inner(
     state: &crate::AppState,
     owner_repo: &str,
     wants: &[String],
+    allow_request_time_s3_restore: bool,
 ) -> Result<LocalServeDecision> {
     if wants.is_empty() {
         return Ok(LocalServeDecision::Unavailable {
@@ -2587,7 +2635,9 @@ pub async fn classify_local_wants_satisfaction(
         });
     }
 
-    let availability = ensure_repo_available_locally_detailed(state, owner_repo).await?;
+    let availability =
+        ensure_repo_available_locally_detailed(state, owner_repo, allow_request_time_s3_restore)
+            .await?;
     if !availability.available {
         return Ok(LocalServeDecision::Unavailable {
             had_local_repo_before_check: availability.had_local_repo_before_check,
@@ -2641,6 +2691,14 @@ pub async fn classify_local_wants_satisfaction(
     }
 }
 
+pub async fn classify_local_wants_satisfaction_without_request_restore(
+    state: &crate::AppState,
+    owner_repo: &str,
+    wants: &[String],
+) -> Result<LocalServeDecision> {
+    classify_local_wants_satisfaction_inner(state, owner_repo, wants, false).await
+}
+
 pub async fn wait_for_local_catch_up(
     state: &crate::AppState,
     owner: &str,
@@ -2653,11 +2711,10 @@ pub async fn wait_for_local_catch_up(
     let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
     let owner_repo = format!("{owner}/{repo_clean}");
 
-    let initial_decision = classify_local_wants_satisfaction(state, &owner_repo, wants).await?;
-    if !matches!(
-        initial_decision,
-        LocalServeDecision::MissingWantedObjects { .. }
-    ) {
+    let initial_decision =
+        classify_local_wants_satisfaction_without_request_restore(state, &owner_repo, wants)
+            .await?;
+    if matches!(initial_decision, LocalServeDecision::SatisfiesWants { .. }) {
         return Ok(initial_decision);
     }
     if timeout.is_zero() {
@@ -2690,6 +2747,11 @@ pub async fn wait_for_local_catch_up(
         true
     };
     let mut refresh_handle = if should_start_refresh {
+        info!(
+            repo = %owner_repo,
+            request_refspec_count = request_refspecs.as_ref().map_or(0, Vec::len),
+            "starting request-time local catch-up task"
+        );
         let state = state.clone();
         let owner = owner.to_string();
         let repo = repo_clean.to_string();
@@ -2746,7 +2808,9 @@ pub async fn wait_for_local_catch_up(
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let decision = classify_local_wants_satisfaction(state, &owner_repo, wants).await?;
+        let decision =
+            classify_local_wants_satisfaction_without_request_restore(state, &owner_repo, wants)
+                .await?;
         if matches!(decision, LocalServeDecision::SatisfiesWants { .. }) {
             info!(
                 repo = %owner_repo,

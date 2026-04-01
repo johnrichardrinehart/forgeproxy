@@ -420,7 +420,7 @@ async fn handle_upload_pack(
         .collect::<Vec<String>>()
         .join(",");
     let initial_local_decision =
-        match crate::coordination::registry::classify_local_wants_satisfaction(
+        match crate::coordination::registry::classify_local_wants_satisfaction_without_request_restore(
             &state, &repo_slug, &wants,
         )
         .await
@@ -440,10 +440,12 @@ async fn handle_upload_pack(
                 }
             }
         };
-    let local_decision = if matches!(
-        initial_local_decision,
-        LocalServeDecision::MissingWantedObjects { .. }
-    ) {
+    let local_decision = if !wants.is_empty()
+        && matches!(
+            initial_local_decision,
+            LocalServeDecision::MissingWantedObjects { .. }
+                | LocalServeDecision::Unavailable { .. }
+        ) {
         let request_refspecs = if let LocalServeDecision::MissingWantedObjects {
             missing_wants,
             ..
