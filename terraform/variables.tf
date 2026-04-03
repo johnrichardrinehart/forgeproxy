@@ -281,6 +281,25 @@ variable "nlb_internal" {
   description = "Whether NLB should be internal (private) vs internet-facing. Set to false to expose via public EIP (corporate internal traffic only, not internet-routable)"
 }
 
+variable "nlb_tls_termination" {
+  type = object({
+    default_certificate_arn     = string
+    additional_certificate_arns = optional(list(string), [])
+    ssl_policy                  = optional(string, "ELBSecurityPolicy-TLS13-1-2-2021-06")
+  })
+  default     = null
+  description = "Optional TLS termination configuration for the NLB HTTPS listener. When null, port 443 remains TCP passthrough to the instances. When set, the NLB terminates client TLS with the supplied default ACM/IAM certificate ARN, can attach additional SNI certificates, and re-encrypts traffic to nginx on the instances."
+
+  validation {
+    condition = var.nlb_tls_termination == null || (
+      trim(var.nlb_tls_termination.default_certificate_arn) != "" &&
+      length(distinct(var.nlb_tls_termination.additional_certificate_arns)) == length(var.nlb_tls_termination.additional_certificate_arns) &&
+      !contains(var.nlb_tls_termination.additional_certificate_arns, var.nlb_tls_termination.default_certificate_arn)
+    )
+    error_message = "nlb_tls_termination must include a non-empty default_certificate_arn, additional_certificate_arns must be unique, and the default certificate ARN must not be repeated in additional_certificate_arns."
+  }
+}
+
 variable "nlb_ssh_listen_port" {
   type        = number
   default     = 2222
