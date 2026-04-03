@@ -24,6 +24,8 @@ force_destroy      = false
 # Instance types and counts
 forgeproxy_instance_type = "t3.large"
 forgeproxy_count         = 1
+# forgeproxy_ssh_host_key_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:shared/forgeproxy-ssh-host-key-AbCdEf"
+# forgeproxy_ssh_host_key_kms_key_arn = "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555"
 valkey_instance_type      = "r6i.large"
 
 # Volume sizes (GB)
@@ -51,6 +53,13 @@ private_subnet_cidr = "10.0.2.0/24"
 
 # Network Load Balancer configuration
 nlb_internal = true  # Set to false to expose NLB via public EIP (corporate internal traffic only)
+nlb_tls_termination = {
+  default_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-555555555555"
+  additional_certificate_arns = [
+    "arn:aws:acm:us-east-1:123456789012:certificate/66666666-7777-8888-9999-000000000000",
+  ]
+  ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+}
 
 # Access control
 allowed_client_cidrs = ["0.0.0.0/0"]  # Restrict this in production

@@ -1,7 +1,7 @@
 # Terraform Reference Deployment for forgeproxy
 
 This directory contains Terraform infrastructure-as-code for a fully dynamic, runtime-configured deployment of forgeproxy with:
-- Network Load Balancer for multi-instance support (TCP passthrough on ports 443/2222)
+- Network Load Balancer for multi-instance support (optional TLS termination with SNI on 443, TCP on 2222)
 - Scalable forgeproxy instances (count-based)
 - Valkey instance for distributed caching
 - Optional ghe-key-lookup sidecar fleet (AMI + internal NLB + runtime config via Secrets Manager)
@@ -23,9 +23,23 @@ vim terraform.tfvars  # Edit with your values
 - `upstream_api_url` - Forge API endpoint (e.g., `https://ghe.example.com/api/v3`)
 - `proxy_fqdn` - Fully-qualified domain name for the forgeproxy proxy
 - `bundle_bucket_name` - Globally unique S3 bucket name for bundles
+- `nlb_tls_termination.default_certificate_arn` - ACM/IAM certificate ARN for the NLB HTTPS listener when terminating TLS at the load balancer
 
 **Optional bucket deletion behavior:**
 - `force_destroy` - Defaults to `false`; set to `true` to allow Terraform to destroy non-empty S3 buckets
+
+**Bring-your-own LB TLS configuration:**
+- Set `nlb_tls_termination` to have the NLB terminate client TLS on port `443`
+- Use `default_certificate_arn` for the fallback certificate
+- Use `additional_certificate_arns` to attach extra SNI certificates for other hostnames
+- Use `ssl_policy` to choose the NLB TLS policy exposed to clients
+- Leave `nlb_tls_termination = null` only if you explicitly want the old TCP passthrough behavior
+
+**Optional shared SSH host identity:**
+- Set `forgeproxy_ssh_host_key_secret_arn` to the ARN of an existing Secrets Manager secret whose `SecretString` is the forgeproxy SSH host private key
+- If that secret uses a customer-managed KMS key, also set `forgeproxy_ssh_host_key_kms_key_arn`
+- Every forgeproxy instance will load that same key, so the SSH server fingerprint stays stable across instance replacements and horizontal scaling
+- Leave it unset to keep the current fallback behavior where each instance generates an ephemeral host key at runtime
 
 **Closure variants:**
 - `closure_variant = "hardened"`: locked-down baseline (default)
@@ -51,7 +65,7 @@ This will:
 1. Build NixOS AMIs for forgeproxy and valkey (and ghe-key-lookup when enabled)
 2. Create VPC, subnets, Internet Gateway, NAT Gateway
 3. Create security groups and NLB
-4. Generate self-signed TLS certificates
+4. Generate internal TLS materials for backend services
 5. Create all AWS Secrets Manager secrets
 6. Launch Valkey and forgeproxy instances
 7. Attach instances to NLB target groups
@@ -151,10 +165,17 @@ Configuration is fetched at boot time via `ExecStartPre` scripts in systemd serv
 - **Organization credentials**: One secret per org under `forgeproxy/creds/<org-name>`
   - Dynamic discovery at startup; no hardcoded org list
   - Add org: create SM secret, update config, restart forgeproxy
+- **SSH host key**: Optional caller-owned secret referenced by `forgeproxy_ssh_host_key_secret_arn`
+  - Secret value should be the PEM/OpenSSH private key text for the shared forgeproxy SSH host identity
+  - The module does not create or rotate this secret for you
 
 ### 3. TLS Configuration
-- **nginx**: Uses self-signed cert from Terraform; suitable for internal deployments
-  - For production: replace with real certs in Secrets Manager
+- **Client-facing TLS on the NLB**: Optional and caller-owned
+  - Set `nlb_tls_termination.default_certificate_arn` to terminate TLS on the load balancer
+  - Add `nlb_tls_termination.additional_certificate_arns` for SNI-based certificate selection across multiple hostnames
+  - The module does not request or import public certificates for you; end users bring their own ACM/IAM certificates
+- **nginx on the instances**: Still uses module-managed TLS for the NLB-to-instance hop when NLB TLS termination is enabled
+  - That backend certificate is internal to the deployment and not the public certificate presented to clients
 - **Valkey**: TLS disabled in reference deployment (plaintext on port 6379 in private subnet)
   - Network isolation via security groups provides security
   - For production: set `services.valkey.tls.enable = true` in flake.nix

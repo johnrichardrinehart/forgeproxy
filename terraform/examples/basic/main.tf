@@ -20,9 +20,11 @@ module "forgeproxy" {
   bundle_bucket_name = var.bundle_bucket_name
   force_destroy      = var.force_destroy
 
-  forgeproxy_instance_type  = var.forgeproxy_instance_type
-  forgeproxy_count          = var.forgeproxy_count
-  forgeproxy_root_volume_gb = var.forgeproxy_root_volume_gb
+  forgeproxy_instance_type            = var.forgeproxy_instance_type
+  forgeproxy_count                    = var.forgeproxy_count
+  forgeproxy_root_volume_gb           = var.forgeproxy_root_volume_gb
+  forgeproxy_ssh_host_key_secret_arn  = var.forgeproxy_ssh_host_key_secret_arn
+  forgeproxy_ssh_host_key_kms_key_arn = var.forgeproxy_ssh_host_key_kms_key_arn
 
   valkey_instance_type  = var.valkey_instance_type
   valkey_root_volume_gb = var.valkey_root_volume_gb
@@ -49,6 +51,7 @@ module "forgeproxy" {
 
   allowed_client_cidrs = var.allowed_client_cidrs
   nlb_internal         = var.nlb_internal
+  nlb_tls_termination  = var.nlb_tls_termination
   metrics_scrape_cidrs = var.metrics_scrape_cidrs
   ec2_key_pair_name    = var.ec2_key_pair_name
 
