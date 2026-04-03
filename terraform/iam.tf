@@ -91,62 +91,82 @@ resource "aws_iam_role_policy" "forgeproxy" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-        ]
-        Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}/*"
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["secretsmanager:ListSecrets"]
-        Resource = "*"
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["s3:ListBucket"]
-        Resource = aws_s3_bucket.bundle.arn
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "s3:GetObject",
-          "s3:PutObject",
-          "s3:DeleteObject",
-        ]
-        Resource = "${aws_s3_bucket.bundle.arn}/*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ssm:UpdateInstanceInformation",
-          "ssmmessages:CreateControlChannel",
-          "ssmmessages:CreateDataChannel",
-          "ssmmessages:OpenControlChannel",
-          "ssmmessages:OpenDataChannel",
-          "ssmmessages:AcknowledgeMessage",
-          "ssmmessages:GetEndpoint",
-          "ssmmessages:GetMessages",
-          "ec2messages:AcknowledgeMessage",
-          "ec2messages:DeleteMessage",
-          "ec2messages:FailMessage",
-          "ec2messages:GetMessages",
-          "ec2messages:SendReply",
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-        ]
-        Resource = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/forgeproxy-*"
-      },
-    ]
+    Statement = concat(
+      [
+        {
+          Effect = "Allow"
+          Action = [
+            "secretsmanager:GetSecretValue",
+          ]
+          Resource = "arn:${data.aws_partition.current.partition}:secretsmanager:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:secret:${var.name_prefix}/*"
+        },
+        {
+          Effect   = "Allow"
+          Action   = ["secretsmanager:ListSecrets"]
+          Resource = "*"
+        },
+        {
+          Effect   = "Allow"
+          Action   = ["s3:ListBucket"]
+          Resource = aws_s3_bucket.bundle.arn
+        },
+        {
+          Effect = "Allow"
+          Action = [
+            "s3:GetObject",
+            "s3:PutObject",
+            "s3:DeleteObject",
+          ]
+          Resource = "${aws_s3_bucket.bundle.arn}/*"
+        },
+        {
+          Effect = "Allow"
+          Action = [
+            "ssm:UpdateInstanceInformation",
+            "ssmmessages:CreateControlChannel",
+            "ssmmessages:CreateDataChannel",
+            "ssmmessages:OpenControlChannel",
+            "ssmmessages:OpenDataChannel",
+            "ssmmessages:AcknowledgeMessage",
+            "ssmmessages:GetEndpoint",
+            "ssmmessages:GetMessages",
+            "ec2messages:AcknowledgeMessage",
+            "ec2messages:DeleteMessage",
+            "ec2messages:FailMessage",
+            "ec2messages:GetMessages",
+            "ec2messages:SendReply",
+          ]
+          Resource = "*"
+        },
+        {
+          Effect = "Allow"
+          Action = [
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+          ]
+          Resource = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/forgeproxy-*"
+        },
+      ],
+      var.forgeproxy_ssh_host_key_secret_arn == null ? [] : [
+        {
+          Effect = "Allow"
+          Action = [
+            "secretsmanager:GetSecretValue",
+          ]
+          Resource = var.forgeproxy_ssh_host_key_secret_arn
+        },
+      ],
+      var.forgeproxy_ssh_host_key_kms_key_arn == null ? [] : [
+        {
+          Effect = "Allow"
+          Action = [
+            "kms:Decrypt",
+          ]
+          Resource = var.forgeproxy_ssh_host_key_kms_key_arn
+        },
+      ]
+    )
   })
 }
 

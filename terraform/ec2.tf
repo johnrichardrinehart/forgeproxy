@@ -50,6 +50,7 @@ resource "aws_instance" "forgeproxy" {
   key_name                    = var.ec2_key_pair_name != "" ? var.ec2_key_pair_name : null
   user_data                   = <<-EOT
     # SM_PREFIX=${var.name_prefix}
+    # FORGEPROXY_SSH_HOST_KEY_SECRET_ARN=${var.forgeproxy_ssh_host_key_secret_arn != null ? var.forgeproxy_ssh_host_key_secret_arn : ""}
     { ... }: {}
   EOT
 

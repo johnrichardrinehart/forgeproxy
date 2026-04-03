@@ -345,6 +345,7 @@
                   _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
                   _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
                   SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
+                  FORGEPROXY_SSH_HOST_KEY_SECRET_ARN=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# FORGEPROXY_SSH_HOST_KEY_SECRET_ARN=//p' | ${pkgs.coreutils}/bin/head -n1)
                   if [ -z "$SM_PREFIX" ]; then
                     SM_PREFIX=$(printf '%s' "$_USER_DATA" | ${pkgs.coreutils}/bin/tr -d '\r\n')
                   fi
@@ -418,6 +419,22 @@
                       echo -n "$SECRET_VALUE" | keyctl padd user "''${SUFFIX_TO_ENV[$SUFFIX]}" @u >/dev/null || true
                     fi
                   done
+
+                  if [ -n "$FORGEPROXY_SSH_HOST_KEY_SECRET_ARN" ]; then
+                    SSH_HOST_KEY=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                      --secret-id "$FORGEPROXY_SSH_HOST_KEY_SECRET_ARN" \
+                      --query 'SecretString' --output text)
+                    if [ -z "$SSH_HOST_KEY" ] || [ "$SSH_HOST_KEY" = "None" ]; then
+                      echo "FATAL: forgeproxy SSH host key secret is empty: $FORGEPROXY_SSH_HOST_KEY_SECRET_ARN" >&2
+                      exit 1
+                    fi
+                    EXISTING_ID=$(${pkgs.keyutils}/bin/keyctl search @u user forgeproxy:ssh_host_key 2>/dev/null || true)
+                    if [ -n "$EXISTING_ID" ]; then
+                      printf %s "$SSH_HOST_KEY" | ${pkgs.keyutils}/bin/keyctl pupdate "$EXISTING_ID"
+                    else
+                      printf %s "$SSH_HOST_KEY" | ${pkgs.keyutils}/bin/keyctl padd user forgeproxy:ssh_host_key @u >/dev/null
+                    fi
+                  fi
                 '';
 
                 awsNginxProvider = pkgs.writeShellScript "forgeproxy-nginx-provider" ''
