@@ -19,6 +19,8 @@ locals {
   create_security_groups       = var.forgeproxy_security_group_id == null
   forgeproxy_security_group_id = local.create_security_groups ? aws_security_group.forgeproxy[0].id : var.forgeproxy_security_group_id
   valkey_security_group_id     = local.create_security_groups ? aws_security_group.valkey[0].id : var.valkey_security_group_id
+  https_listener_protocol      = var.nlb_tls_termination == null ? "TCP" : "TLS"
+  https_target_group_protocol  = var.nlb_tls_termination == null ? "TCP" : "TLS"
 }
 
 # Validate that forgeproxy_security_group_id and valkey_security_group_id are
@@ -297,7 +299,7 @@ resource "aws_lb" "nlb" {
 resource "aws_lb_target_group" "https" {
   name        = "${var.name_prefix}-https-tg"
   port        = 443
-  protocol    = "TCP"
+  protocol    = local.https_target_group_protocol
   vpc_id      = local.vpc_id
   target_type = "instance"
 
@@ -347,11 +349,21 @@ resource "aws_lb_target_group" "ssh" {
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.nlb.arn
   port              = 443
-  protocol          = "TCP"
+  protocol          = local.https_listener_protocol
+  certificate_arn   = var.nlb_tls_termination == null ? null : var.nlb_tls_termination.default_certificate_arn
+  ssl_policy        = var.nlb_tls_termination == null ? null : var.nlb_tls_termination.ssl_policy
+
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.https.arn
   }
+}
+
+resource "aws_lb_listener_certificate" "https_sni" {
+  for_each = var.nlb_tls_termination == null ? toset([]) : toset(var.nlb_tls_termination.additional_certificate_arns)
+
+  listener_arn    = aws_lb_listener.https.arn
+  certificate_arn = each.value
 }
 
 # ── Listener: SSH Git ─────────────────────────────────────────────────────
