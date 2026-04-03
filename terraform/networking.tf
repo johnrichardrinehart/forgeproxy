@@ -40,6 +40,13 @@ check "private_subnet_required" {
   }
 }
 
+check "forgeproxy_ssh_host_key_inputs_consistent" {
+  assert {
+    condition     = var.forgeproxy_ssh_host_key_secret_arn != null || var.forgeproxy_ssh_host_key_kms_key_arn == null
+    error_message = "forgeproxy_ssh_host_key_kms_key_arn can only be set when forgeproxy_ssh_host_key_secret_arn is also set."
+  }
+}
+
 # A public subnet is only required when the NLB is internet-facing; an
 # internal NLB can be placed in the private subnet.
 check "public_subnet_required_for_external_nlb" {

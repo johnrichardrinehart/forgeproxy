@@ -93,6 +93,18 @@ variable "forgeproxy_count" {
   }
 }
 
+variable "forgeproxy_ssh_host_key_secret_arn" {
+  type        = string
+  default     = null
+  description = "Optional ARN of an existing AWS Secrets Manager secret whose SecretString contains the shared forgeproxy SSH host private key. When set, every forgeproxy instance loads that key into the kernel keyring as the common SSH server identity."
+}
+
+variable "forgeproxy_ssh_host_key_kms_key_arn" {
+  type        = string
+  default     = null
+  description = "Optional customer-managed KMS key ARN used to encrypt forgeproxy_ssh_host_key_secret_arn. Set this when the shared SSH host key secret does not use the default aws/secretsmanager key so forgeproxy instances can decrypt it."
+}
+
 variable "valkey_instance_type" {
   type        = string
   default     = "r6i.large"
