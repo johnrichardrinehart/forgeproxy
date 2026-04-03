@@ -78,6 +78,18 @@ variable "forgeproxy_count" {
   description = "Number of forgeproxy instances"
 }
 
+variable "forgeproxy_ssh_host_key_secret_arn" {
+  type        = string
+  default     = null
+  description = "Optional ARN of an existing AWS Secrets Manager secret that stores the shared forgeproxy SSH host private key."
+}
+
+variable "forgeproxy_ssh_host_key_kms_key_arn" {
+  type        = string
+  default     = null
+  description = "Optional customer-managed KMS key ARN used to encrypt forgeproxy_ssh_host_key_secret_arn."
+}
+
 variable "valkey_instance_type" {
   type        = string
   default     = "r6i.large"
@@ -215,6 +227,16 @@ variable "nlb_internal" {
   type        = bool
   default     = true
   description = "Whether NLB should be internal (private) vs internet-facing"
+}
+
+variable "nlb_tls_termination" {
+  type = object({
+    default_certificate_arn     = string
+    additional_certificate_arns = optional(list(string), [])
+    ssl_policy                  = optional(string, "ELBSecurityPolicy-TLS13-1-2-2021-06")
+  })
+  default     = null
+  description = "Optional TLS termination configuration for the NLB HTTPS listener."
 }
 
 variable "metrics_scrape_cidrs" {
