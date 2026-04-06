@@ -297,7 +297,7 @@ variable "nlb_tls_cert_arns_by_hostname" {
       length(var.nlb_tls_cert_arns_by_hostname) > 0 &&
       alltrue([
         for hostname, cert_arn in var.nlb_tls_cert_arns_by_hostname :
-        trim(hostname) != "" && trim(cert_arn) != ""
+        trimspace(hostname) != "" && trimspace(cert_arn) != ""
       ])
     )
     error_message = "nlb_tls_cert_arns_by_hostname must contain at least one non-empty hostname => certificate ARN entry."
