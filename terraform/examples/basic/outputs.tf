@@ -1,6 +1,6 @@
 output "nlb_dns_name" {
   value       = module.forgeproxy.nlb_dns_name
-  description = "DNS name of the Network Load Balancer"
+  description = "DNS name of the Network Load Balancer for use with your DNS provider, such as MarkMonitor, Infoblox, Route 53, Google Cloud DNS, Azure DNS, etc."
 }
 
 output "nlb_eip" {

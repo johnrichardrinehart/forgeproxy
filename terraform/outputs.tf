@@ -1,6 +1,6 @@
 output "nlb_dns_name" {
   value       = aws_lb.nlb.dns_name
-  description = "DNS name of the Network Load Balancer (use with CNAME to proxy_fqdn)"
+  description = "DNS name of the Network Load Balancer for use when configuring your DNS provider, such as MarkMonitor, Infoblox, Route 53, Google Cloud DNS, Azure DNS, etc."
 }
 
 output "nlb_eip" {

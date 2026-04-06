@@ -108,7 +108,7 @@ aws secretsmanager put-secret-value \
 ### 6. Verify the deployment
 
 ```bash
-# Get NLB DNS name and EIP
+# Get the NLB endpoint details needed by your DNS provider, such as MarkMonitor, Infoblox, Route 53, Google Cloud DNS, Azure DNS, etc.
 terraform output nlb_dns_name
 terraform output nlb_eip
 
@@ -333,10 +333,11 @@ curl -k http://127.0.0.1:8080/healthz
 
 ## Next Steps
 
-1. **DNS**: Create CNAME records pointing `var.proxy_fqdn` to the NLB DNS name
+1. **DNS**: Configure `var.proxy_fqdn` with your DNS provider so it resolves to the forgeproxy NLB
    ```bash
    terraform output nlb_dns_name
    ```
+   This project does not manage public DNS records. Use your enterprise DNS workflow and DNS provider of record, such as MarkMonitor, Infoblox, Route 53, Google Cloud DNS, Azure DNS, etc.
 
 2. **TLS for production**: Replace self-signed certificates with real certs
    - Update `terraform/tls.tf` or
