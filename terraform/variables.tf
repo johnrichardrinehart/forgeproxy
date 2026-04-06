@@ -290,7 +290,7 @@ variable "nlb_internal" {
 
 variable "nlb_tls_cert_arns_by_hostname" {
   type        = map(string)
-  description = "Map of client-facing DNS hostnames to ACM/IAM certificate ARNs for the NLB TLS listener. The module always terminates client TLS at the NLB and derives the default and SNI certificates from this map."
+  description = "Map of client-facing DNS hostnames to distinct ACM/IAM certificate ARNs for the NLB TLS listener. The module always terminates client TLS at the NLB and derives the default and SNI certificates from this map."
 
   validation {
     condition = (
@@ -298,9 +298,13 @@ variable "nlb_tls_cert_arns_by_hostname" {
       alltrue([
         for hostname, cert_arn in var.nlb_tls_cert_arns_by_hostname :
         trimspace(hostname) != "" && trimspace(cert_arn) != ""
-      ])
+      ]) &&
+      length(distinct([
+        for cert_arn in values(var.nlb_tls_cert_arns_by_hostname) :
+        trimspace(cert_arn)
+      ])) == length(var.nlb_tls_cert_arns_by_hostname)
     )
-    error_message = "nlb_tls_cert_arns_by_hostname must contain at least one non-empty hostname => certificate ARN entry."
+    error_message = "nlb_tls_cert_arns_by_hostname must contain at least one non-empty hostname => certificate ARN entry, and each hostname must map to a distinct certificate ARN."
   }
 }
 

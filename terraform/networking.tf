@@ -20,12 +20,13 @@ locals {
   forgeproxy_security_group_id = local.create_security_groups ? aws_security_group.forgeproxy[0].id : var.forgeproxy_security_group_id
   valkey_security_group_id     = local.create_security_groups ? aws_security_group.valkey[0].id : var.valkey_security_group_id
   configured_proxy_hostnames   = sort(keys(var.nlb_tls_cert_arns_by_hostname))
-  ordered_nlb_certificate_arns = [for hostname in local.configured_proxy_hostnames : var.nlb_tls_cert_arns_by_hostname[hostname]]
-  default_nlb_certificate_arn  = local.ordered_nlb_certificate_arns[0]
-  additional_nlb_certificate_arns = distinct([
-    for cert_arn in slice(local.ordered_nlb_certificate_arns, 1, length(local.ordered_nlb_certificate_arns)) :
-    cert_arn if cert_arn != local.default_nlb_certificate_arn
-  ])
+  default_proxy_hostname       = local.configured_proxy_hostnames[0]
+  default_nlb_certificate_arn  = var.nlb_tls_cert_arns_by_hostname[local.default_proxy_hostname]
+  # Additional SNI hostnames keyed by hostname (static) so for_each is plan-safe.
+  additional_nlb_cert_arns_by_hostname = {
+    for hostname in slice(local.configured_proxy_hostnames, 1, length(local.configured_proxy_hostnames)) :
+    hostname => var.nlb_tls_cert_arns_by_hostname[hostname]
+  }
   https_listener_protocol     = "TLS"
   https_target_group_protocol = "TLS"
 }
@@ -374,7 +375,7 @@ resource "aws_lb_listener" "https" {
 }
 
 resource "aws_lb_listener_certificate" "https_sni" {
-  for_each = toset(local.additional_nlb_certificate_arns)
+  for_each = local.additional_nlb_cert_arns_by_hostname
 
   listener_arn    = aws_lb_listener.https.arn
   certificate_arn = each.value
