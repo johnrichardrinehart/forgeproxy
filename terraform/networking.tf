@@ -19,8 +19,15 @@ locals {
   create_security_groups       = var.forgeproxy_security_group_id == null
   forgeproxy_security_group_id = local.create_security_groups ? aws_security_group.forgeproxy[0].id : var.forgeproxy_security_group_id
   valkey_security_group_id     = local.create_security_groups ? aws_security_group.valkey[0].id : var.valkey_security_group_id
-  https_listener_protocol      = var.nlb_tls_termination == null ? "TCP" : "TLS"
-  https_target_group_protocol  = var.nlb_tls_termination == null ? "TCP" : "TLS"
+  configured_proxy_hostnames   = sort(keys(var.nlb_tls_cert_arns_by_hostname))
+  ordered_nlb_certificate_arns = [for hostname in local.configured_proxy_hostnames : var.nlb_tls_cert_arns_by_hostname[hostname]]
+  default_nlb_certificate_arn  = local.ordered_nlb_certificate_arns[0]
+  additional_nlb_certificate_arns = distinct([
+    for cert_arn in slice(local.ordered_nlb_certificate_arns, 1, length(local.ordered_nlb_certificate_arns)) :
+    cert_arn if cert_arn != local.default_nlb_certificate_arn
+  ])
+  https_listener_protocol     = "TLS"
+  https_target_group_protocol = "TLS"
 }
 
 # Validate that forgeproxy_security_group_id and valkey_security_group_id are
@@ -357,8 +364,8 @@ resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.nlb.arn
   port              = 443
   protocol          = local.https_listener_protocol
-  certificate_arn   = var.nlb_tls_termination == null ? null : var.nlb_tls_termination.default_certificate_arn
-  ssl_policy        = var.nlb_tls_termination == null ? null : var.nlb_tls_termination.ssl_policy
+  certificate_arn   = local.default_nlb_certificate_arn
+  ssl_policy        = var.nlb_tls_ssl_policy
 
   default_action {
     type             = "forward"
@@ -367,7 +374,7 @@ resource "aws_lb_listener" "https" {
 }
 
 resource "aws_lb_listener_certificate" "https_sni" {
-  for_each = var.nlb_tls_termination == null ? toset([]) : toset(var.nlb_tls_termination.additional_certificate_arns)
+  for_each = toset(local.additional_nlb_certificate_arns)
 
   listener_arn    = aws_lb_listener.https.arn
   certificate_arn = each.value

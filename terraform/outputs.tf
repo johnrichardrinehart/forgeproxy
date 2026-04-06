@@ -72,12 +72,20 @@ output "secrets_to_populate" {
   description = "List of actual Secrets Manager secret names that must be populated before first use"
 }
 
-output "connection_string" {
-  value       = "https://${var.proxy_fqdn}/"
-  description = "Connection string for the forgeproxy proxy"
+output "configured_proxy_hostnames" {
+  value       = local.configured_proxy_hostnames
+  description = "Configured client-facing DNS hostnames for the forgeproxy NLB TLS listener"
 }
 
-output "ssh_connection_string" {
-  value       = var.nlb_ssh_listen_port == 22 ? "git@${var.proxy_fqdn}" : "ssh://git@${var.proxy_fqdn}:${var.nlb_ssh_listen_port}"
-  description = "SSH connection string for Git cloning"
+output "https_connection_strings" {
+  value       = { for hostname in local.configured_proxy_hostnames : hostname => "https://${hostname}/" }
+  description = "HTTPS clone base URLs keyed by configured client-facing hostname"
+}
+
+output "ssh_connection_strings" {
+  value = {
+    for hostname in local.configured_proxy_hostnames :
+    hostname => (var.nlb_ssh_listen_port == 22 ? "git@${hostname}" : "ssh://git@${hostname}:${var.nlb_ssh_listen_port}")
+  }
+  description = "SSH clone connection strings keyed by configured client-facing hostname"
 }

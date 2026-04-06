@@ -66,11 +66,6 @@ variable "backend_type" {
   description = "Type of backend forge (github-enterprise, gitea, etc.)"
 }
 
-variable "proxy_fqdn" {
-  type        = string
-  description = "FQDN of the proxy (for certificate SAN and config)"
-}
-
 variable "bundle_bucket_name" {
   type        = string
   description = "S3 bucket name for bundle storage (must be globally unique)"
@@ -293,23 +288,26 @@ variable "nlb_internal" {
   description = "Whether NLB should be internal (private) vs internet-facing. Set to false to expose via public EIP (corporate internal traffic only, not internet-routable)"
 }
 
-variable "nlb_tls_termination" {
-  type = object({
-    default_certificate_arn     = string
-    additional_certificate_arns = optional(list(string), [])
-    ssl_policy                  = optional(string, "ELBSecurityPolicy-TLS13-1-2-2021-06")
-  })
-  default     = null
-  description = "Optional TLS termination configuration for the NLB HTTPS listener. When null, port 443 remains TCP passthrough to the instances. When set, the NLB terminates client TLS with the supplied default ACM/IAM certificate ARN, can attach additional SNI certificates, and re-encrypts traffic to nginx on the instances."
+variable "nlb_tls_cert_arns_by_hostname" {
+  type        = map(string)
+  description = "Map of client-facing DNS hostnames to ACM/IAM certificate ARNs for the NLB TLS listener. The module always terminates client TLS at the NLB and derives the default and SNI certificates from this map."
 
   validation {
-    condition = var.nlb_tls_termination == null || (
-      trim(var.nlb_tls_termination.default_certificate_arn) != "" &&
-      length(distinct(var.nlb_tls_termination.additional_certificate_arns)) == length(var.nlb_tls_termination.additional_certificate_arns) &&
-      !contains(var.nlb_tls_termination.additional_certificate_arns, var.nlb_tls_termination.default_certificate_arn)
+    condition = (
+      length(var.nlb_tls_cert_arns_by_hostname) > 0 &&
+      alltrue([
+        for hostname, cert_arn in var.nlb_tls_cert_arns_by_hostname :
+        trim(hostname) != "" && trim(cert_arn) != ""
+      ])
     )
-    error_message = "nlb_tls_termination must include a non-empty default_certificate_arn, additional_certificate_arns must be unique, and the default certificate ARN must not be repeated in additional_certificate_arns."
+    error_message = "nlb_tls_cert_arns_by_hostname must contain at least one non-empty hostname => certificate ARN entry."
   }
+}
+
+variable "nlb_tls_ssl_policy" {
+  type        = string
+  default     = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  description = "TLS policy exposed to clients by the NLB HTTPS listener."
 }
 
 variable "nlb_ssh_listen_port" {

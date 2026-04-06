@@ -16,7 +16,6 @@ module "forgeproxy" {
   upstream_git_url_base = var.upstream_git_url_base
   backend_type          = var.backend_type
 
-  proxy_fqdn         = var.proxy_fqdn
   bundle_bucket_name = var.bundle_bucket_name
   force_destroy      = var.force_destroy
 
@@ -49,11 +48,12 @@ module "forgeproxy" {
   public_subnet_cidr  = var.public_subnet_cidr
   private_subnet_cidr = var.private_subnet_cidr
 
-  allowed_client_cidrs = var.allowed_client_cidrs
-  nlb_internal         = var.nlb_internal
-  nlb_tls_termination  = var.nlb_tls_termination
-  metrics_scrape_cidrs = var.metrics_scrape_cidrs
-  ec2_key_pair_name    = var.ec2_key_pair_name
+  allowed_client_cidrs          = var.allowed_client_cidrs
+  nlb_internal                  = var.nlb_internal
+  nlb_tls_cert_arns_by_hostname = var.nlb_tls_cert_arns_by_hostname
+  nlb_tls_ssl_policy            = var.nlb_tls_ssl_policy
+  metrics_scrape_cidrs          = var.metrics_scrape_cidrs
+  ec2_key_pair_name             = var.ec2_key_pair_name
 
   local_cache_max_bytes = var.local_cache_max_bytes
   eviction_policy       = var.eviction_policy

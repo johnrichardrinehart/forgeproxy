@@ -123,8 +123,6 @@ let
     proxy:
       ssh_listen: "0.0.0.0:2222"
       http_listen: "127.0.0.1:8080"
-      bundle_uri_base_url: "https://proxy/bundles"
-
     valkey:
       endpoint: "valkey:6379"
       tls: false

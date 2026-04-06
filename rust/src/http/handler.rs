@@ -222,6 +222,24 @@ struct InfoRefsQuery {
     service: Option<String>,
 }
 
+fn request_scheme(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http")
+}
+
+fn request_host(headers: &HeaderMap) -> Result<&str, AppError> {
+    headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("missing Host header".to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -324,8 +342,11 @@ async fn handle_info_refs(
         .context("failed to read upstream info/refs body")?;
 
     let bundle_list_url = format!(
-        "{}/bundles/{}/{}/bundle-list",
-        state.config.proxy.bundle_uri_base_url, owner, repo,
+        "{}://{}/bundles/{}/{}/bundle-list",
+        request_scheme(&headers),
+        request_host(&headers)?,
+        owner,
+        repo,
     );
 
     let modified_body =
@@ -1303,6 +1324,8 @@ async fn proxy_upload_pack_to_upstream(
 pub enum AppError {
     /// The caller is not authenticated or not authorised.
     Unauthorized(String),
+    /// The request is malformed.
+    BadRequest(String),
     /// Upstream rate limit reached — include `Retry-After` header.
     RateLimited { retry_after_secs: u64 },
     /// An unexpected internal error.
@@ -1318,6 +1341,7 @@ impl IntoResponse for AppError {
                 msg,
             )
                 .into_response(),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             AppError::RateLimited { retry_after_secs } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 [(

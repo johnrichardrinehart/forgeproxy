@@ -143,7 +143,7 @@ pub fn decode_pkt_lines(data: &[u8]) -> Vec<PktLine> {
 // ---------------------------------------------------------------------------
 
 /// Inject the `bundle-uri` capability into a Git protocol v2 info/refs
-/// response, pointing clients at `bundle_list_url`.
+/// response.
 ///
 /// The info/refs response for protocol v2 has the structure:
 ///
@@ -293,7 +293,10 @@ mod tests {
         wire.extend_from_slice(&encode_pkt_line(b"server-option\n"));
         wire.extend_from_slice(b"0000");
 
-        let result = inject_bundle_uri(&wire, "https://proxy.example.com/bundles/o/r/bundle-list");
+        let result = inject_bundle_uri(
+            &wire,
+            "https://dynamic-host.example/bundles/o/r/bundle-list",
+        );
         let packets = decode_pkt_lines(&result);
 
         // Should have the original 5 data packets + 1 injected + 1 flush = 7
@@ -318,7 +321,10 @@ mod tests {
         wire.extend_from_slice(b"0000");
 
         let original_len = wire.len();
-        let result = inject_bundle_uri(&wire, "https://proxy.example.com/bundles/o/r/bundle-list");
+        let result = inject_bundle_uri(
+            &wire,
+            "https://dynamic-host.example/bundles/o/r/bundle-list",
+        );
         assert_eq!(
             result.len(),
             original_len,
@@ -334,7 +340,10 @@ mod tests {
         wire.extend_from_slice(b"0000");
 
         let original = wire.clone();
-        let result = inject_bundle_uri(&wire, "https://proxy.example.com/bundles/o/r/bundle-list");
+        let result = inject_bundle_uri(
+            &wire,
+            "https://dynamic-host.example/bundles/o/r/bundle-list",
+        );
         assert_eq!(result, original, "should not modify non-v2 responses");
     }
 }

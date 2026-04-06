@@ -1,7 +1,7 @@
 # Terraform Reference Deployment for forgeproxy
 
 This directory contains Terraform infrastructure-as-code for a fully dynamic, runtime-configured deployment of forgeproxy with:
-- Network Load Balancer for multi-instance support (optional TLS termination with SNI on 443, TCP on 2222)
+- Network Load Balancer for multi-instance support (TLS termination with SNI on 443, TCP on 2222)
 - Scalable forgeproxy instances (count-based)
 - Valkey instance for distributed caching
 - Optional ghe-key-lookup sidecar fleet (AMI + internal NLB + runtime config via Secrets Manager)
@@ -21,19 +21,17 @@ vim terraform.tfvars  # Edit with your values
 **Required variables:**
 - `upstream_hostname` - Git forge hostname (e.g., `ghe.example.com`)
 - `upstream_api_url` - Forge API endpoint (e.g., `https://ghe.example.com/api/v3`)
-- `proxy_fqdn` - Fully-qualified domain name for the forgeproxy proxy
 - `bundle_bucket_name` - Globally unique S3 bucket name for bundles
-- `nlb_tls_termination.default_certificate_arn` - ACM/IAM certificate ARN for the NLB HTTPS listener when terminating TLS at the load balancer
+- `nlb_tls_cert_arns_by_hostname` - Map of client-facing hostnames to ACM/IAM certificate ARNs for the NLB HTTPS listener
 
 **Optional bucket deletion behavior:**
 - `force_destroy` - Defaults to `false`; set to `true` to allow Terraform to destroy non-empty S3 buckets
 
 **Bring-your-own LB TLS configuration:**
-- Set `nlb_tls_termination` to have the NLB terminate client TLS on port `443`
-- Use `default_certificate_arn` for the fallback certificate
-- Use `additional_certificate_arns` to attach extra SNI certificates for other hostnames
-- Use `ssl_policy` to choose the NLB TLS policy exposed to clients
-- Leave `nlb_tls_termination = null` only if you explicitly want the old TCP passthrough behavior
+- Set `nlb_tls_cert_arns_by_hostname` to the full set of client-facing DNS names the NLB should accept
+- Each map key is a DNS hostname and each map value is the ACM/IAM certificate ARN to attach for that hostname
+- The module derives the listener's default certificate and additional SNI certificates from that map
+- Use `nlb_tls_ssl_policy` to choose the NLB TLS policy exposed to clients
 
 **Optional shared SSH host identity:**
 - Set `forgeproxy_ssh_host_key_secret_arn` to the ARN of an existing Secrets Manager secret whose `SecretString` is the forgeproxy SSH host private key
@@ -170,11 +168,10 @@ Configuration is fetched at boot time via `ExecStartPre` scripts in systemd serv
   - The module does not create or rotate this secret for you
 
 ### 3. TLS Configuration
-- **Client-facing TLS on the NLB**: Optional and caller-owned
-  - Set `nlb_tls_termination.default_certificate_arn` to terminate TLS on the load balancer
-  - Add `nlb_tls_termination.additional_certificate_arns` for SNI-based certificate selection across multiple hostnames
+- **Client-facing TLS on the NLB**: Required and caller-owned
+  - Set `nlb_tls_cert_arns_by_hostname` to the hostnames and certificate ARNs the listener should accept
   - The module does not request or import public certificates for you; end users bring their own ACM/IAM certificates
-- **nginx on the instances**: Still uses module-managed TLS for the NLB-to-instance hop when NLB TLS termination is enabled
+- **nginx on the instances**: Uses module-managed TLS only for the NLB-to-instance hop
   - That backend certificate is internal to the deployment and not the public certificate presented to clients
 - **Valkey**: TLS disabled in reference deployment (plaintext on port 6379 in private subnet)
   - Network isolation via security groups provides security
@@ -333,9 +330,10 @@ curl -k http://127.0.0.1:8080/healthz
 
 ## Next Steps
 
-1. **DNS**: Configure `var.proxy_fqdn` with your DNS provider so it resolves to the forgeproxy NLB
+1. **DNS**: Configure every hostname in `var.nlb_tls_cert_arns_by_hostname` with your DNS provider so it resolves to the forgeproxy NLB
    ```bash
    terraform output nlb_dns_name
+   terraform output configured_proxy_hostnames
    ```
    This project does not manage public DNS records. Use your enterprise DNS workflow and DNS provider of record, such as MarkMonitor, Infoblox, Route 53, Google Cloud DNS, Azure DNS, etc.
 

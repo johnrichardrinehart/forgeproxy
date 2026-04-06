@@ -56,11 +56,6 @@ variable "backend_type" {
   description = "Type of backend forge (github-enterprise, gitea, etc.)"
 }
 
-variable "proxy_fqdn" {
-  type        = string
-  description = "FQDN of the proxy (for certificate SAN and config)"
-}
-
 variable "bundle_bucket_name" {
   type        = string
   description = "S3 bucket name for bundle storage (must be globally unique)"
@@ -235,14 +230,15 @@ variable "nlb_internal" {
   description = "Whether NLB should be internal (private) vs internet-facing"
 }
 
-variable "nlb_tls_termination" {
-  type = object({
-    default_certificate_arn     = string
-    additional_certificate_arns = optional(list(string), [])
-    ssl_policy                  = optional(string, "ELBSecurityPolicy-TLS13-1-2-2021-06")
-  })
-  default     = null
-  description = "Optional TLS termination configuration for the NLB HTTPS listener."
+variable "nlb_tls_cert_arns_by_hostname" {
+  type        = map(string)
+  description = "Map of client-facing DNS hostnames to ACM/IAM certificate ARNs for the NLB TLS listener."
+}
+
+variable "nlb_tls_ssl_policy" {
+  type        = string
+  default     = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  description = "TLS policy exposed to clients by the NLB HTTPS listener."
 }
 
 variable "metrics_scrape_cidrs" {

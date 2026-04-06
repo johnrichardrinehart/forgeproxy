@@ -61,8 +61,6 @@ let
     proxy:
       ssh_listen: "0.0.0.0:2222"
       http_listen: "0.0.0.0:8080"
-      bundle_uri_base_url: "http://proxy:8080/bundles"
-
     valkey:
       endpoint: "valkey:6379"
       tls: false

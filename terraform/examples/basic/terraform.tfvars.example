@@ -2,7 +2,9 @@
 
 upstream_hostname  = "ghe.example.com"
 upstream_api_url   = "https://ghe.example.com/api/v3"
-proxy_fqdn         = "forgeproxy.example.com"
+nlb_tls_cert_arns_by_hostname = {
+  "forgeproxy.example.com" = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-555555555555"
+}
 bundle_bucket_name = "my-forgeproxy-bundles"
 force_destroy      = false
 
@@ -19,4 +21,5 @@ force_destroy      = false
 # ghe_key_lookup_ssh_target_endpoint = "ghe.example.com"
 # ghe_key_lookup_ghe_url   = "https://ghe.example.com"
 # nlb_internal             = true
+# nlb_tls_ssl_policy       = "ELBSecurityPolicy-TLS13-1-2-2021-06"
 # log_level                = "info"

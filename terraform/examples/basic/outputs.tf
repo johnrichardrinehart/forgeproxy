@@ -58,12 +58,17 @@ output "secrets_to_populate" {
   description = "List of Secrets Manager secrets that must be populated before first use"
 }
 
-output "connection_string" {
-  value       = module.forgeproxy.connection_string
-  description = "Connection string for the forgeproxy proxy"
+output "configured_proxy_hostnames" {
+  value       = module.forgeproxy.configured_proxy_hostnames
+  description = "Configured client-facing DNS hostnames for the forgeproxy NLB TLS listener"
 }
 
-output "ssh_connection_string" {
-  value       = module.forgeproxy.ssh_connection_string
-  description = "SSH connection information"
+output "https_connection_strings" {
+  value       = module.forgeproxy.https_connection_strings
+  description = "HTTPS clone base URLs keyed by configured client-facing hostname"
+}
+
+output "ssh_connection_strings" {
+  value       = module.forgeproxy.ssh_connection_strings
+  description = "SSH clone connection strings keyed by configured client-facing hostname"
 }

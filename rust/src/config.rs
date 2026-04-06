@@ -376,8 +376,6 @@ pub struct ProxyConfig {
     pub ssh_listen: String,
     /// Socket address for the HTTP listener (e.g. `0.0.0.0:8443`).
     pub http_listen: String,
-    /// Public base URL served by the bundle-URI endpoint.
-    pub bundle_uri_base_url: String,
 }
 
 // ---------------------------------------------------------------------------

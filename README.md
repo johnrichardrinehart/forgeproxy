@@ -93,7 +93,7 @@ Top-level sections:
 | `upstream`             | Forge hostname, API URL, admin token env var                   |
 | `backend_type`         | Forge flavour (`github-enterprise`, `github`, `gitlab`, etc.)  |
 | `upstream_credentials` | Default credential mode and per-org overrides (PAT / SSH)      |
-| `proxy`                | SSH and HTTP listen addresses, bundle-URI base URL             |
+| `proxy`                | SSH and HTTP listen addresses                                  |
 | `valkey`               | Valkey/Redis endpoint, TLS, auth token                          |
 | `auth`                 | SSH/HTTP auth cache TTLs, webhook secret env var               |
 | `clone`                | Freshness threshold, lock TTLs, concurrency semaphores         |

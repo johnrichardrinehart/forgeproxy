@@ -82,7 +82,7 @@ resource "tls_self_signed_cert" "nginx" {
   private_key_pem = tls_private_key.nginx.private_key_pem
 
   subject {
-    common_name         = var.proxy_fqdn
+    common_name         = aws_lb.nlb.dns_name
     organization        = "Forgeproxy"
     organizational_unit = "Engineering"
     country             = "US"
@@ -96,9 +96,8 @@ resource "tls_self_signed_cert" "nginx" {
     "server_auth",
   ]
 
-  # Include the proxy FQDN and NLB DNS name as SANs
+  # This certificate is only for the internal NLB-to-nginx hop.
   dns_names = [
-    var.proxy_fqdn,
     aws_lb.nlb.dns_name,
     "localhost",
   ]

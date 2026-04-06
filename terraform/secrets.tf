@@ -23,7 +23,6 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     upstream_api_url       = var.upstream_api_url
     upstream_git_url_base  = coalesce(var.upstream_git_url_base, "https://${var.upstream_hostname}")
     backend_type           = var.backend_type
-    proxy_fqdn             = var.proxy_fqdn
     valkey_private_ip      = aws_instance.valkey.private_ip
     valkey_enable_tls      = local.valkey_tls_enable
     backend_port           = local.backend_port
