@@ -1214,7 +1214,6 @@ async fn proxy_upload_pack_to_upstream(
             } else {
                 None
             };
-        let mut stream_completed = true;
         let mut hydration = UpstreamHydrationTracker::start(
             &state,
             &owner,
@@ -1234,16 +1233,18 @@ async fn proxy_upload_pack_to_upstream(
                 Ok(chunk) => {
                     let chunk_len = chunk.len() as u64;
                     upstream_counter.inc_by(chunk_len);
-                    if let Some(response_buf) = ls_refs_response.as_mut() {
-                        response_buf.extend_from_slice(&chunk);
-                    }
-                    hydration.record_response_chunk(chunk.clone()).await;
+                    let capture_chunk = chunk.clone();
 
                     if tx.send(Ok(chunk)).await.is_err() {
-                        stream_completed = false;
-                        break;
+                        hydration.handle_stream_error().await;
+                        return;
                     }
                     downstream_counter.inc_by(chunk_len);
+
+                    if let Some(response_buf) = ls_refs_response.as_mut() {
+                        response_buf.extend_from_slice(&capture_chunk);
+                    }
+                    hydration.record_response_chunk(capture_chunk).await;
                 }
                 Err(e) => {
                     hydration.handle_stream_error().await;
@@ -1252,7 +1253,7 @@ async fn proxy_upload_pack_to_upstream(
                 }
             }
         }
-        if stream_completed && let Some(ls_refs_response) = ls_refs_response {
+        if let Some(ls_refs_response) = ls_refs_response {
             state
                 .merge_recent_advertised_refs(
                     owner_repo_for_cache,
