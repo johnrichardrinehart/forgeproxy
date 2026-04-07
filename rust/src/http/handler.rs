@@ -1224,7 +1224,7 @@ async fn proxy_upload_pack_to_upstream(
             UpstreamHydrationRequest {
                 advertised_refs: advertised_refs.as_ref(),
                 request_body: &capture_body,
-                enable_hydration: true,
+                enable_hydration: request_phase.expects_local_pack_serve(),
             },
         )
         .await;

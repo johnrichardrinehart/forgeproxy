@@ -161,6 +161,11 @@ in
               proxy_buffering off;
               proxy_request_buffering off;
               client_max_body_size 0;
+              client_body_timeout 15m;
+              proxy_connect_timeout 30s;
+              proxy_read_timeout 15m;
+              proxy_send_timeout 15m;
+              send_timeout 15m;
             '';
           };
 
@@ -176,6 +181,11 @@ in
               proxy_buffering off;
               proxy_request_buffering off;
               client_max_body_size 0;
+              client_body_timeout 15m;
+              proxy_connect_timeout 30s;
+              proxy_read_timeout 15m;
+              proxy_send_timeout 15m;
+              send_timeout 15m;
             '';
           };
 
