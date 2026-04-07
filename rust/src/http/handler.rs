@@ -515,6 +515,7 @@ async fn handle_upload_pack(
     } else {
         CacheStatus::Cold
     };
+    let expects_local_pack_serve = request_metadata.request_phase.expects_local_pack_serve();
 
     if !local_authz_confirmed {
         match &local_decision {
@@ -588,14 +589,16 @@ async fn handle_upload_pack(
                 had_local_repo_before_check,
                 restored_from_s3_for_request,
             } => {
-                info!(
-                    repo = %repo_slug,
-                    wants = wants.len(),
-                    want_sample,
-                    had_local_repo_before_check = *had_local_repo_before_check,
-                    restored_from_s3_for_request = *restored_from_s3_for_request,
-                    "cannot serve upload-pack from local disk; no local published repo or request-time S3 restore is available"
-                );
+                if expects_local_pack_serve {
+                    info!(
+                        repo = %repo_slug,
+                        wants = wants.len(),
+                        want_sample,
+                        had_local_repo_before_check = *had_local_repo_before_check,
+                        restored_from_s3_for_request = *restored_from_s3_for_request,
+                        "cannot serve upload-pack from local disk; no local published repo or request-time S3 restore is available"
+                    );
+                }
             }
             LocalServeDecision::MissingWantedObjects {
                 had_local_repo_before_check,

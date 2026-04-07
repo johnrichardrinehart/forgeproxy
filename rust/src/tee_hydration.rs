@@ -271,6 +271,10 @@ impl UploadPackRequestPhase {
             Self::Unknown => Cow::Borrowed("unknown"),
         }
     }
+
+    pub fn expects_local_pack_serve(&self) -> bool {
+        matches!(self, Self::V2Fetch | Self::LegacyUploadPack)
+    }
 }
 
 impl fmt::Display for UploadPackRequestPhase {
@@ -502,9 +506,11 @@ fn parse_captured_fetch_request(
     let mut v2_command = None;
     let mut agent = None;
     let mut client_session_id = None;
+    let mut saw_data_packet = false;
 
     for_each_pkt_line(bytes, |payload| {
         let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
+        saw_data_packet = true;
         if let Some(rest) = payload.strip_prefix(b"command=") {
             v2_command = Some(String::from_utf8_lossy(rest).into_owned());
         }
@@ -538,7 +544,7 @@ fn parse_captured_fetch_request(
         Some("ls-refs") => UploadPackRequestPhase::V2LsRefs,
         Some("fetch") => UploadPackRequestPhase::V2Fetch,
         Some(command) => UploadPackRequestPhase::V2Command(command.to_string()),
-        None if !bytes.is_empty() && git_protocol != Some("version=2") => {
+        None if saw_data_packet && git_protocol != Some("version=2") => {
             UploadPackRequestPhase::LegacyUploadPack
         }
         None => UploadPackRequestPhase::Unknown,
