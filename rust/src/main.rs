@@ -193,6 +193,36 @@ impl AppState {
         );
     }
 
+    pub async fn merge_recent_advertised_refs(
+        &self,
+        owner_repo: impl Into<String>,
+        client_fingerprint: impl AsRef<str>,
+        session_id: impl Into<String>,
+        advertised_refs: crate::coordination::registry::RequestAdvertisedRefs,
+    ) {
+        let cache_key = format!("{}|{}", owner_repo.into(), client_fingerprint.as_ref());
+        let session_id = session_id.into();
+        let mut recent = self.recent_advertised_refs.lock().await;
+        let entry = recent
+            .entry(cache_key)
+            .or_insert_with(|| RecentAdvertisedRefs {
+                captured_at: Instant::now(),
+                session_id: session_id.clone(),
+                advertised_refs: crate::coordination::registry::RequestAdvertisedRefs::default(),
+            });
+        entry.captured_at = Instant::now();
+        entry.session_id = session_id;
+        if advertised_refs.info_refs_advertisement.is_some() {
+            entry.advertised_refs.info_refs_advertisement = advertised_refs.info_refs_advertisement;
+        }
+        if advertised_refs.ls_refs_request.is_some() {
+            entry.advertised_refs.ls_refs_request = advertised_refs.ls_refs_request;
+        }
+        if advertised_refs.ls_refs_response.is_some() {
+            entry.advertised_refs.ls_refs_response = advertised_refs.ls_refs_response;
+        }
+    }
+
     pub async fn recent_advertised_refs(
         &self,
         owner_repo: &str,

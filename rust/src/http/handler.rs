@@ -638,6 +638,9 @@ async fn handle_upload_pack(
             metric_repo: repo_slug,
         },
         &headers,
+        request_metadata,
+        git_session_id,
+        client_fingerprint,
     )
     .await?;
 
@@ -1028,6 +1031,9 @@ async fn proxy_upload_pack_to_upstream(
     body: Bytes,
     completion: CloneCompletion,
     request_headers: &HeaderMap,
+    request_metadata: crate::tee_hydration::CapturedFetchMetadata,
+    git_session_id: String,
+    client_fingerprint: String,
 ) -> Result<Response, AppError> {
     let upstream_url = format!(
         "https://{}/{}/{}/git-upload-pack",
@@ -1074,7 +1080,10 @@ async fn proxy_upload_pack_to_upstream(
     let state = state.clone();
     let owner = owner.to_string();
     let repo = repo.to_string();
+    let owner_repo_for_cache = owner_repo.clone();
     let auth_header = auth_header.map(ToOwned::to_owned);
+    let request_phase = request_metadata.request_phase.clone();
+    let ls_refs_request_body = capture_body.clone();
     let upstream_counter = state
         .metrics
         .metrics
@@ -1114,6 +1123,13 @@ async fn proxy_upload_pack_to_upstream(
         .map(|recent| recent.advertised_refs.clone());
     tokio::spawn(async move {
         let mut stream = upstream_resp.bytes_stream();
+        let mut ls_refs_response =
+            if request_phase == crate::tee_hydration::UploadPackRequestPhase::V2LsRefs {
+                Some(Vec::new())
+            } else {
+                None
+            };
+        let mut stream_completed = true;
         let mut hydration = UpstreamHydrationTracker::start(
             &state,
             &owner,
@@ -1133,9 +1149,13 @@ async fn proxy_upload_pack_to_upstream(
                 Ok(chunk) => {
                     let chunk_len = chunk.len() as u64;
                     upstream_counter.inc_by(chunk_len);
+                    if let Some(response_buf) = ls_refs_response.as_mut() {
+                        response_buf.extend_from_slice(&chunk);
+                    }
                     hydration.record_response_chunk(chunk.clone()).await;
 
                     if tx.send(Ok(chunk)).await.is_err() {
+                        stream_completed = false;
                         break;
                     }
                     downstream_counter.inc_by(chunk_len);
@@ -1146,6 +1166,20 @@ async fn proxy_upload_pack_to_upstream(
                     return;
                 }
             }
+        }
+        if stream_completed && let Some(ls_refs_response) = ls_refs_response {
+            state
+                .merge_recent_advertised_refs(
+                    owner_repo_for_cache,
+                    client_fingerprint,
+                    git_session_id,
+                    crate::coordination::registry::RequestAdvertisedRefs {
+                        ls_refs_request: Some(ls_refs_request_body.to_vec()),
+                        ls_refs_response: Some(ls_refs_response),
+                        ..Default::default()
+                    },
+                )
+                .await;
         }
         hydration.finish().await;
     });
