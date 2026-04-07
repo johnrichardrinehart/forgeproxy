@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
+use std::{borrow::Cow, fmt};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -245,6 +246,37 @@ pub struct CapturedRefMetadata {
 pub struct CapturedFetchMetadata {
     pub want_oids: Vec<String>,
     pub uses_shallow: bool,
+    pub request_phase: UploadPackRequestPhase,
+    pub agent: Option<String>,
+    pub client_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UploadPackRequestPhase {
+    V2LsRefs,
+    V2Fetch,
+    V2Command(String),
+    LegacyUploadPack,
+    #[default]
+    Unknown,
+}
+
+impl UploadPackRequestPhase {
+    pub fn log_label(&self) -> Cow<'_, str> {
+        match self {
+            Self::V2LsRefs => Cow::Borrowed("v2-ls-refs"),
+            Self::V2Fetch => Cow::Borrowed("v2-fetch"),
+            Self::V2Command(command) => Cow::Owned(format!("v2-{command}")),
+            Self::LegacyUploadPack => Cow::Borrowed("legacy-upload-pack"),
+            Self::Unknown => Cow::Borrowed("unknown"),
+        }
+    }
+}
+
+impl fmt::Display for UploadPackRequestPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.log_label().as_ref())
+    }
 }
 
 async fn write_capture_artifact(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
@@ -340,7 +372,7 @@ pub async fn extract_captured_fetch_metadata(capture_dir: &Path) -> Result<Captu
         let request = tokio::fs::read(&request_path)
             .await
             .with_context(|| format!("read tee request {}", request_path.display()))?;
-        metadata = parse_captured_fetch_request(&request)
+        metadata = parse_captured_fetch_request(&request, None)
             .with_context(|| format!("parse tee request {}", request_path.display()))?;
     }
 
@@ -461,12 +493,27 @@ fn looks_like_oid(text: &str) -> bool {
     text.len() == 40 && text.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
-fn parse_captured_fetch_request(bytes: &[u8]) -> Result<CapturedFetchMetadata> {
+fn parse_captured_fetch_request(
+    bytes: &[u8],
+    git_protocol: Option<&str>,
+) -> Result<CapturedFetchMetadata> {
     let mut wants = BTreeSet::new();
     let mut uses_shallow = false;
+    let mut v2_command = None;
+    let mut agent = None;
+    let mut client_session_id = None;
 
     for_each_pkt_line(bytes, |payload| {
         let payload = payload.strip_suffix(b"\n").unwrap_or(payload);
+        if let Some(rest) = payload.strip_prefix(b"command=") {
+            v2_command = Some(String::from_utf8_lossy(rest).into_owned());
+        }
+        if let Some(rest) = payload.strip_prefix(b"agent=") {
+            agent = Some(String::from_utf8_lossy(rest).into_owned());
+        }
+        if let Some(rest) = payload.strip_prefix(b"session-id=") {
+            client_session_id = Some(String::from_utf8_lossy(rest).into_owned());
+        }
         if let Some(rest) = payload.strip_prefix(b"want ") {
             let mut fields = rest.split(|b| *b == b' ');
             if let Some(oid) = fields.next()
@@ -487,14 +534,34 @@ fn parse_captured_fetch_request(bytes: &[u8]) -> Result<CapturedFetchMetadata> {
         }
     })?;
 
+    let request_phase = match v2_command.as_deref() {
+        Some("ls-refs") => UploadPackRequestPhase::V2LsRefs,
+        Some("fetch") => UploadPackRequestPhase::V2Fetch,
+        Some(command) => UploadPackRequestPhase::V2Command(command.to_string()),
+        None if !bytes.is_empty() && git_protocol != Some("version=2") => {
+            UploadPackRequestPhase::LegacyUploadPack
+        }
+        None => UploadPackRequestPhase::Unknown,
+    };
+
     Ok(CapturedFetchMetadata {
         want_oids: wants.into_iter().collect(),
         uses_shallow,
+        request_phase,
+        agent,
+        client_session_id,
     })
 }
 
 pub fn parse_fetch_request_metadata(bytes: &[u8]) -> Result<CapturedFetchMetadata> {
-    parse_captured_fetch_request(bytes)
+    parse_captured_fetch_request(bytes, None)
+}
+
+pub fn parse_upload_pack_request_metadata(
+    bytes: &[u8],
+    git_protocol: Option<&str>,
+) -> Result<CapturedFetchMetadata> {
+    parse_captured_fetch_request(bytes, git_protocol)
 }
 
 fn parse_response_mentions_shallow(bytes: &[u8]) -> Result<bool> {

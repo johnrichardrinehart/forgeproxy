@@ -12,6 +12,10 @@
 
 use std::sync::Arc;
 use std::time::Instant;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
 
 use anyhow::Context as _;
 use axum::{
@@ -33,6 +37,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, instrument, warn};
+use uuid::Uuid;
 
 use crate::AppState;
 use crate::clone_support::{
@@ -202,6 +207,35 @@ struct InfoRefsQuery {
     service: Option<String>,
 }
 
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+}
+
+fn http_git_client_fingerprint(
+    headers: &HeaderMap,
+    metric_username: &str,
+    owner: &str,
+    repo: &str,
+) -> String {
+    let forwarded_for = header_value(headers, "x-forwarded-for").unwrap_or("");
+    let real_ip = header_value(headers, "x-real-ip").unwrap_or("");
+    let user_agent = header_value(headers, "user-agent").unwrap_or("");
+    let git_protocol = header_value(headers, "Git-Protocol").unwrap_or("");
+
+    let mut hasher = DefaultHasher::new();
+    owner.hash(&mut hasher);
+    repo.hash(&mut hasher);
+    metric_username.hash(&mut hasher);
+    forwarded_for.hash(&mut hasher);
+    real_ip.hash(&mut hasher);
+    user_agent.hash(&mut hasher);
+    git_protocol.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 fn request_scheme(headers: &HeaderMap) -> &str {
     headers
         .get("x-forwarded-proto")
@@ -233,7 +267,17 @@ fn request_host(headers: &HeaderMap) -> Result<&str, AppError> {
 ///
 /// For `git-upload-pack` requests the response is
 /// intercepted so that we can inject the `bundle-uri` protocol-v2 capability.
-#[instrument(skip(state, headers), fields(%owner, %repo))]
+#[instrument(
+    skip(state, headers),
+    fields(
+        %owner,
+        %repo,
+        git_request_id = tracing::field::Empty,
+        git_session_id = tracing::field::Empty,
+        git_phase = tracing::field::Empty,
+        client_fingerprint = tracing::field::Empty,
+    )
+)]
 async fn handle_info_refs(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
@@ -268,6 +312,17 @@ async fn handle_info_refs(
         auth_header.as_deref(),
     )
     .await;
+    let client_fingerprint = http_git_client_fingerprint(&headers, &metric_username, &owner, &repo);
+    let git_request_id = format!("http-{}", Uuid::new_v4().simple());
+    let git_session_id = format!("http-{}", Uuid::new_v4().simple());
+    let span = tracing::Span::current();
+    span.record("git_request_id", tracing::field::display(&git_request_id));
+    span.record("git_session_id", tracing::field::display(&git_session_id));
+    span.record("git_phase", tracing::field::display("info-refs"));
+    span.record(
+        "client_fingerprint",
+        tracing::field::display(&client_fingerprint),
+    );
 
     // Proxy the info/refs request to the upstream forge.
     let upstream_url = format!(
@@ -337,6 +392,8 @@ async fn handle_info_refs(
     state
         .remember_recent_advertised_refs(
             format!("{owner}/{repo}"),
+            &client_fingerprint,
+            &git_session_id,
             crate::coordination::registry::RequestAdvertisedRefs {
                 info_refs_advertisement: Some(upstream_bytes.to_vec()),
                 ..Default::default()
@@ -359,7 +416,19 @@ async fn handle_info_refs(
 /// read-access probe confirms the presented client credentials may clone the
 /// repo. Otherwise it proxies the request to the upstream forge and preserves
 /// the upstream HTTP response semantics.
-#[instrument(skip(state, headers, body), fields(%owner, %repo))]
+#[instrument(
+    skip(state, headers, body),
+    fields(
+        %owner,
+        %repo,
+        git_request_id = tracing::field::Empty,
+        git_session_id = tracing::field::Empty,
+        git_phase = tracing::field::Empty,
+        client_fingerprint = tracing::field::Empty,
+        client_session_id = tracing::field::Empty,
+        git_client_agent = tracing::field::Empty,
+    )
+)]
 async fn handle_upload_pack(
     State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
@@ -384,9 +453,10 @@ async fn handle_upload_pack(
         .get("Git-Protocol")
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
-    let wants = crate::tee_hydration::parse_fetch_request_metadata(&body)
-        .map(|meta| meta.want_oids)
-        .unwrap_or_default();
+    let request_metadata =
+        crate::tee_hydration::parse_upload_pack_request_metadata(&body, git_protocol.as_deref())
+            .unwrap_or_default();
+    let wants = request_metadata.want_oids.clone();
     let want_sample = wants
         .iter()
         .take(5)
@@ -395,7 +465,41 @@ async fn handle_upload_pack(
         .join(",");
     let local_authz_confirmed =
         local_http_clone_access_confirmed(&state, auth_header.as_deref(), &owner, &repo).await;
-    let advertised_refs = state.recent_advertised_refs(&repo_slug).await;
+    let client_fingerprint = http_git_client_fingerprint(&headers, &metric_username, &owner, &repo);
+    let recent_advertised_refs = state
+        .recent_advertised_refs(&repo_slug, &client_fingerprint)
+        .await;
+    let advertised_refs = recent_advertised_refs
+        .as_ref()
+        .map(|recent| recent.advertised_refs.clone());
+    let git_request_id = format!("http-{}", Uuid::new_v4().simple());
+    let git_session_id = recent_advertised_refs
+        .as_ref()
+        .map(|recent| recent.session_id.clone())
+        .unwrap_or_else(|| format!("http-{}", Uuid::new_v4().simple()));
+    let request_phase = request_metadata.request_phase.to_string();
+    let span = tracing::Span::current();
+    span.record("git_request_id", tracing::field::display(&git_request_id));
+    span.record("git_session_id", tracing::field::display(&git_session_id));
+    span.record("git_phase", tracing::field::display(&request_phase));
+    span.record(
+        "client_fingerprint",
+        tracing::field::display(&client_fingerprint),
+    );
+    span.record(
+        "client_session_id",
+        tracing::field::display(request_metadata.client_session_id.as_deref().unwrap_or("")),
+    );
+    span.record(
+        "git_client_agent",
+        tracing::field::display(request_metadata.agent.as_deref().unwrap_or("")),
+    );
+    info!(
+        repo = %repo_slug,
+        wants = wants.len(),
+        want_sample,
+        "received git-upload-pack request"
+    );
     let local_decision = crate::coordination::registry::resolve_local_fetch_serveability(
         &state,
         &repo_slug,
@@ -994,7 +1098,20 @@ async fn proxy_upload_pack_to_upstream(
             repo: owner_repo.clone(),
         })
         .clone();
-    let advertised_refs = state.recent_advertised_refs(&owner_repo).await;
+    let recent_advertised_refs = state
+        .recent_advertised_refs(
+            &owner_repo,
+            &http_git_client_fingerprint(
+                request_headers,
+                &completion.metric_username,
+                &owner,
+                &repo,
+            ),
+        )
+        .await;
+    let advertised_refs = recent_advertised_refs
+        .as_ref()
+        .map(|recent| recent.advertised_refs.clone());
     tokio::spawn(async move {
         let mut stream = upstream_resp.bytes_stream();
         let mut hydration = UpstreamHydrationTracker::start(

@@ -142,6 +142,7 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct RecentAdvertisedRefs {
     pub captured_at: Instant,
+    pub session_id: String,
     pub advertised_refs: crate::coordination::registry::RequestAdvertisedRefs,
 }
 
@@ -178,12 +179,15 @@ impl AppState {
     pub async fn remember_recent_advertised_refs(
         &self,
         owner_repo: impl Into<String>,
+        client_fingerprint: impl AsRef<str>,
+        session_id: impl Into<String>,
         advertised_refs: crate::coordination::registry::RequestAdvertisedRefs,
     ) {
         self.recent_advertised_refs.lock().await.insert(
-            owner_repo.into(),
+            format!("{}|{}", owner_repo.into(), client_fingerprint.as_ref()),
             RecentAdvertisedRefs {
                 captured_at: Instant::now(),
+                session_id: session_id.into(),
                 advertised_refs,
             },
         );
@@ -192,16 +196,17 @@ impl AppState {
     pub async fn recent_advertised_refs(
         &self,
         owner_repo: &str,
-    ) -> Option<crate::coordination::registry::RequestAdvertisedRefs> {
+        client_fingerprint: &str,
+    ) -> Option<RecentAdvertisedRefs> {
         self.recent_advertised_refs
             .lock()
             .await
-            .get(owner_repo)
+            .get(&format!("{owner_repo}|{client_fingerprint}"))
             .and_then(|recent_advertised_refs| {
                 if recent_advertised_refs.captured_at.elapsed() > Duration::from_secs(60) {
                     None
                 } else {
-                    Some(recent_advertised_refs.advertised_refs.clone())
+                    Some(recent_advertised_refs.clone())
                 }
             })
     }
