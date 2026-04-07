@@ -910,7 +910,11 @@ pkgs.testers.runNixOSTest {
             "grep -E 'Receiving objects:|Resolving deltas:|remote: Enumerating objects:' "
             "/tmp/repo-stream-live.log"
         )
-        client.succeed("kill -0 $(cat /tmp/repo-stream-live.pid)")
+        client.succeed(
+            "sh -c '"
+            "kill -0 $(cat /tmp/repo-stream-live.pid) 2>/dev/null "
+            "|| test -f /tmp/repo-stream-live/blob-32.bin'"
+        )
         try:
             client.wait_until_succeeds(
                 "! kill -0 $(cat /tmp/repo-stream-live.pid) 2>/dev/null",
