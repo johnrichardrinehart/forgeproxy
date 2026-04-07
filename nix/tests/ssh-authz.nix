@@ -1197,7 +1197,8 @@ pkgs.testers.runNixOSTest {
             "journalctl -u forgeproxy.service"
             f" --since '{since}' --no-pager"
             " | grep -F '\"repo\":\"octocat/repo-many-wants\"'"
-            " | grep -F 'request-time SSH catch-up will fetch only advertised refs that match the missing wants'"
+            " | grep -F '\"protocol\":\"ssh\"'"
+            " | grep -F 'request-time catch-up will fetch only advertised refs that match the missing wants'"
         )
         proxy.wait_until_succeeds(
             "journalctl -u forgeproxy.service"

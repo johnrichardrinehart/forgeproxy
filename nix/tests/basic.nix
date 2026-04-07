@@ -663,26 +663,12 @@ pkgs.testers.runNixOSTest {
             "journalctl -u otlp-test-sink.service --no-pager -o cat"
             " | grep -F 'system.cpu.time'"
         )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_clone_total{'"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_clone_upstream_bytes_total{'"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_clone_downstream_bytes_total{'"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_cache_repos_total '"
-        )
-        proxy.succeed(
-            "curl -sf http://localhost:8080/metrics"
-            " | grep -q '^forgeproxy_upstream_api_rate_limit_remaining '"
-        )
+        metrics = proxy.succeed("curl -sf http://localhost:8080/metrics")
+        assert "forgeproxy_clone_total{" in metrics, metrics
+        assert "forgeproxy_clone_upstream_bytes_total{" in metrics, metrics
+        assert "forgeproxy_clone_downstream_bytes_total{" in metrics, metrics
+        assert "forgeproxy_cache_repos_total " in metrics, metrics
+        assert "forgeproxy_upstream_api_rate_limit_remaining " in metrics, metrics
 
     with subtest("Pinned fetch still uses cache after waiting"):
         client.succeed("sleep 6")
@@ -693,7 +679,7 @@ pkgs.testers.runNixOSTest {
             "git -C /tmp/pinnedfetch fetch origin main"
         )
         proxy.wait_until_succeeds(
-            "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack directly from local disk'"
+            "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack directly from local disk' | grep -F '\"protocol\":\"http\"' >/dev/null"
         )
 
     with subtest("Mutable ref updates publish a new generation while leased readers keep the old one alive"):
@@ -729,7 +715,7 @@ pkgs.testers.runNixOSTest {
             "pgrep -af 'git upload-pack --stateless-rpc --strict .*/hello-world' >/dev/null"
         )
         proxy.wait_until_succeeds(
-            "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack directly from local disk' >/dev/null"
+            "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack directly from local disk' | grep -F '\"protocol\":\"http\"' >/dev/null"
         )
         old_generation = proxy.succeed(
             "readlink -f /var/cache/forgeproxy/repos/octocat/hello-world.git"

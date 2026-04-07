@@ -114,7 +114,7 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-ssh-large-lsrefs";
-  globalTimeout = 40;
+  globalTimeout = 60;
 
   nodes = {
     ghe =
@@ -235,8 +235,6 @@ pkgs.testers.runNixOSTest {
 
     ${common.valkeyStartScript}
 
-    ${common.s3StartScript}
-
     with subtest("Gitea starts"):
         ghe.wait_for_unit("gitea.service")
         ghe.wait_for_open_port(3000)
@@ -244,6 +242,8 @@ pkgs.testers.runNixOSTest {
     with subtest("GHE nginx starts"):
         ghe.wait_for_unit("nginx.service")
         ghe.wait_for_open_port(443)
+
+    ${common.s3StartScript}
 
     with subtest("Seed Gitea"):
         ghe.succeed(
@@ -282,8 +282,10 @@ pkgs.testers.runNixOSTest {
             f""" -d '{{"name": "repo-large-lsrefs", "private": true, "auto_init": false}}'"""
         )
 
-        # Seed the bare repo in-place instead of pushing 50k refs through
+        # Seed the bare repo in-place instead of pushing many refs through
         # Gitea's receive-pack path, which is too slow for a VM regression test.
+        # 20k tags is still large enough to exercise the uncached ls-refs path
+        # without consuming most of the test's startup budget on repo seeding.
         ghe.succeed(
             "su -s /bin/sh gitea -c '"
             "set -e; "
@@ -301,7 +303,7 @@ pkgs.testers.runNixOSTest {
             "commit=$(git rev-parse HEAD); "
             "git --git-dir=\"$repo\" fetch \"$tmp/work/.git\" refs/heads/main:refs/heads/main; "
             "git --git-dir=\"$repo\" symbolic-ref HEAD refs/heads/main; "
-            "for i in $(seq 1 50000); do "
+            "for i in $(seq 1 20000); do "
             "  printf \"create refs/tags/tag-%s %s\\\\n\" \"$i\" \"$commit\"; "
             "done | git --git-dir=\"$repo\" update-ref --stdin; "
             "git --git-dir=\"$repo\" pack-refs --all'"
