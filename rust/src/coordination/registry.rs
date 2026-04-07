@@ -864,11 +864,75 @@ async fn try_ensure_repo_cloned_inner(
             mirror = %mirror_path.display(),
             "starting initial repo mirror hydration"
         );
+        if clone_hydration_permits.is_none() {
+            clone_hydration_permits =
+                acquire_clone_hydration_permits(state, &owner_repo).await?;
+        }
+        if clone_hydration_permits.is_none() {
+            if let Some(capture_dir) = tee_capture_dir.as_ref() {
+                cleanup_tee_capture_dir(capture_dir).await?;
+            }
+            info!(
+                repo = %owner_repo,
+                per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
+                cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
+                lease_ttl_secs = state.config.clone.lock_ttl,
+                "skipping initial hydration because the repo clone semaphore is saturated"
+            );
+            return Ok(());
+        }
+        let hydrate_started_at = chrono::Utc::now().timestamp();
+        let mut info = get_repo_info(&state.valkey, &owner_repo)
+            .await?
+            .unwrap_or_default();
+        if !info.hydrating_node_id.is_empty() && info.hydrating_node_id != node_id {
+            warn!(
+                repo = %owner_repo,
+                previous_node = %info.hydrating_node_id,
+                previous_started_at = info.hydrating_since_ts,
+                "recording hydration activity while another node is already marked as hydrator"
+            );
+        }
+        info.status = "hydrating".to_string();
+        info.hydrating_node_id = node_id.clone();
+        info.hydrating_since_ts = hydrate_started_at;
+        info.bootstrap_bundle_pending = false;
+        set_repo_info(&state.valkey, &owner_repo, &info).await?;
+
         match try_restore_repo_from_s3(state, &owner_repo, &mirror_path).await {
-            Ok(true) => {
-                info!(repo = %owner_repo, path = %mirror_path.display(), "restored repo mirror from S3 bundle");
+            Ok(Some(restored_repo_path)) => {
+                info!(
+                    repo = %owner_repo,
+                    restored = %restored_repo_path.display(),
+                    mirror = %mirror_path.display(),
+                    "restored repo into a temporary local mirror from S3 bundle"
+                );
                 let _repo_generation_guard =
                     acquire_local_repo_publish_guard(state, &owner_repo).await;
+                if state.cache_manager.has_repo_mirror(&owner_repo) {
+                    info!(
+                        repo = %owner_repo,
+                        restored = %restored_repo_path.display(),
+                        mirror = %mirror_path.display(),
+                        "discarding temporary S3-restored repo because a writer-owned mirror already exists"
+                    );
+                    tokio::fs::remove_dir_all(&restored_repo_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove redundant temporary S3-restored repo at {}",
+                                restored_repo_path.display()
+                            )
+                        })?;
+                } else {
+                    info!(
+                        repo = %owner_repo,
+                        restored = %restored_repo_path.display(),
+                        mirror = %mirror_path.display(),
+                        "promoting temporary S3-restored repo into the writer-owned mirror"
+                    );
+                    promote_initial_repo_clone(&restored_repo_path, &mirror_path).await?;
+                }
                 ensure_bare_head_ref(&mirror_path)
                     .await
                     .with_context(|| format!("failed to set bare HEAD after S3 restore for {owner_repo}"))?;
@@ -902,7 +966,7 @@ async fn try_ensure_repo_cloned_inner(
                 );
                 return Ok::<(), anyhow::Error>(());
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(error) => {
                 info!(
                     %owner_repo,
@@ -921,41 +985,6 @@ async fn try_ensure_repo_cloned_inner(
                 }
             }
         }
-
-        if clone_hydration_permits.is_none() {
-            clone_hydration_permits =
-                acquire_clone_hydration_permits(state, &owner_repo).await?;
-        }
-        if clone_hydration_permits.is_none() {
-            if let Some(capture_dir) = tee_capture_dir.as_ref() {
-                cleanup_tee_capture_dir(capture_dir).await?;
-            }
-            info!(
-                repo = %owner_repo,
-                per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
-                cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
-                lease_ttl_secs = state.config.clone.lock_ttl,
-                "skipping upstream hydration because the repo clone semaphore is saturated"
-            );
-            return Ok(());
-        }
-        let hydrate_started_at = chrono::Utc::now().timestamp();
-        let mut info = get_repo_info(&state.valkey, &owner_repo)
-            .await?
-            .unwrap_or_default();
-        if !info.hydrating_node_id.is_empty() && info.hydrating_node_id != node_id {
-            warn!(
-                repo = %owner_repo,
-                previous_node = %info.hydrating_node_id,
-                previous_started_at = info.hydrating_since_ts,
-                "recording hydration activity while another node is already marked as hydrator"
-            );
-        }
-        info.status = "hydrating".to_string();
-        info.hydrating_node_id = node_id.clone();
-        info.hydrating_since_ts = hydrate_started_at;
-        info.bootstrap_bundle_pending = false;
-        set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
         let env_vars: Vec<(String, String)> =
             vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
@@ -1626,7 +1655,7 @@ async fn fetch_delta_into_repo_mirror(
     result
 }
 
-async fn try_restore_repo_from_s3(
+async fn restore_repo_from_s3_into_path(
     state: &crate::AppState,
     owner_repo: &str,
     repo_path: &Path,
@@ -1685,6 +1714,59 @@ async fn try_restore_repo_from_s3(
     );
 
     Ok(restored)
+}
+
+async fn try_restore_repo_from_s3(
+    state: &crate::AppState,
+    owner_repo: &str,
+    mirror_path: &Path,
+) -> Result<Option<PathBuf>> {
+    try_restore_repo_into_temporary_path(mirror_path, |restored_repo_path| async move {
+        restore_repo_from_s3_into_path(state, owner_repo, &restored_repo_path).await
+    })
+    .await
+}
+
+async fn try_restore_repo_into_temporary_path<F, Fut>(
+    mirror_path: &Path,
+    restore_repo: F,
+) -> Result<Option<PathBuf>>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let restored_repo_path = create_temporary_initial_repo_clone_path(mirror_path)?;
+    reset_partial_repo_path_if_needed(&restored_repo_path).await?;
+
+    match restore_repo(restored_repo_path.clone()).await {
+        Ok(true) => Ok(Some(restored_repo_path)),
+        Ok(false) => {
+            if restored_repo_path.exists() {
+                tokio::fs::remove_dir_all(&restored_repo_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove unused temporary S3 restore at {}",
+                            restored_repo_path.display()
+                        )
+                    })?;
+            }
+            Ok(None)
+        }
+        Err(error) => {
+            if restored_repo_path.exists() {
+                tokio::fs::remove_dir_all(&restored_repo_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to remove failed temporary S3 restore at {}",
+                            restored_repo_path.display()
+                        )
+                    })?;
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(crate) async fn load_current_node_bundle_metadata(
@@ -2585,14 +2667,36 @@ async fn ensure_repo_available_locally_detailed(
     let restore_result = try_restore_repo_from_s3(state, owner_repo, &mirror_path).await;
 
     let availability = match restore_result {
-        Ok(true) => {
+        Ok(Some(restored_repo_path)) => {
             if state.cache_manager.has_repo(owner_repo) {
+                if restored_repo_path.exists() {
+                    tokio::fs::remove_dir_all(&restored_repo_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove redundant temporary request-time S3 restore at {}",
+                                restored_repo_path.display()
+                            )
+                        })?;
+                }
                 LocalRepoAvailability {
                     had_local_repo_before_check,
                     restored_from_s3_for_request: false,
                     available: true,
                 }
             } else {
+                if state.cache_manager.has_repo_mirror(owner_repo) {
+                    tokio::fs::remove_dir_all(&restored_repo_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to remove redundant temporary request-time S3 restore at {}",
+                                restored_repo_path.display()
+                            )
+                        })?;
+                } else {
+                    promote_initial_repo_clone(&restored_repo_path, &mirror_path).await?;
+                }
                 ensure_bare_head_ref(&mirror_path).await.with_context(|| {
                     format!("failed to set bare HEAD after S3 restore for {owner_repo}")
                 })?;
@@ -2625,7 +2729,7 @@ async fn ensure_repo_available_locally_detailed(
                 }
             }
         }
-        Ok(false) => LocalRepoAvailability {
+        Ok(None) => LocalRepoAvailability {
             had_local_repo_before_check,
             restored_from_s3_for_request: false,
             available: false,
@@ -3016,6 +3120,17 @@ pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    fn create_usable_bare_repo(path: &Path) {
+        std::fs::create_dir_all(path.join("refs").join("heads")).unwrap();
+        std::fs::write(path.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            path.join("refs").join("heads").join("main"),
+            b"0123456789012345678901234567890123456789\n",
+        )
+        .unwrap();
+    }
 
     #[test]
     fn repo_info_round_trip_preserves_hydration_fields() {
@@ -3079,5 +3194,36 @@ mod tests {
                 "+refs/tags/v1:refs/tags/v1".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn temporary_s3_restore_path_survives_concurrent_mirror_promotion() {
+        let tmp = tempdir().unwrap();
+        let mirror_path = tmp.path().join(".mirrors").join("acme").join("widgets.git");
+
+        let restored_repo_path =
+            try_restore_repo_into_temporary_path(&mirror_path, |restore_path| {
+                let mirror_path = mirror_path.clone();
+                async move {
+                    std::fs::create_dir_all(&restore_path).unwrap();
+
+                    let promotable_repo_path =
+                        create_temporary_initial_repo_clone_path(&mirror_path).unwrap();
+                    create_usable_bare_repo(&promotable_repo_path);
+                    promote_initial_repo_clone(&promotable_repo_path, &mirror_path)
+                        .await
+                        .unwrap();
+
+                    assert!(restore_path.exists());
+                    Ok(true)
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(restored_repo_path, mirror_path);
+        assert!(restored_repo_path.exists());
+        assert!(crate::cache::manager::is_usable_bare_repo(&mirror_path));
     }
 }
