@@ -15,7 +15,7 @@ use crate::auth::middleware::Permission;
 use crate::config::Config;
 
 use super::rate_limit::RateLimitState;
-use super::{ForgeBackend, WebhookEvent};
+use super::{AuthError, ForgeBackend, UpstreamRateLimitResponse, WebhookEvent};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -118,7 +118,7 @@ impl ForgeBackend for GitHubBackend {
         owner: &str,
         repo: &str,
         rate_limit: &RateLimitState,
-    ) -> Result<Permission> {
+    ) -> std::result::Result<Permission, AuthError> {
         let url = format!("{}/repos/{owner}/{repo}", self.api_url);
 
         let mut req = http_client.get(&url).header("Accept", self.accept);
@@ -133,6 +133,16 @@ impl ForgeBackend for GitHubBackend {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            if super::rate_limit::is_rate_limited_response(status, resp.headers()) {
+                let forwarded_headers =
+                    super::rate_limit::forwarded_rate_limit_headers(resp.headers());
+                let body = resp.text().await.unwrap_or_default();
+                return Err(AuthError::RateLimited(UpstreamRateLimitResponse {
+                    status,
+                    headers: forwarded_headers,
+                    body,
+                }));
+            }
             warn!(%owner, %repo, %status, "upstream API returned non-success for repo check");
             return Ok(Permission::None);
         }
@@ -140,7 +150,8 @@ impl ForgeBackend for GitHubBackend {
         let body: serde_json::Value = resp
             .json()
             .await
-            .context("failed to parse upstream API response")?;
+            .context("failed to parse upstream API response")
+            .map_err(AuthError::from)?;
 
         Ok(permission_from_repo_response(&body))
     }

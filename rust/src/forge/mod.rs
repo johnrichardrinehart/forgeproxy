@@ -11,12 +11,31 @@ pub mod gitlab;
 pub mod rate_limit;
 
 use anyhow::Result;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 
 use crate::auth::middleware::Permission;
 use crate::config::Config;
 
 use self::rate_limit::RateLimitState;
+
+#[derive(Debug, Clone)]
+pub struct UpstreamRateLimitResponse {
+    pub status: StatusCode,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+#[derive(Debug)]
+pub enum AuthError {
+    RateLimited(UpstreamRateLimitResponse),
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for AuthError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Other(err)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Webhook event
@@ -58,7 +77,7 @@ pub trait ForgeBackend: Send + Sync {
         owner: &str,
         repo: &str,
         rate_limit: &RateLimitState,
-    ) -> Result<Permission>;
+    ) -> std::result::Result<Permission, AuthError>;
 
     /// Resolve the authenticated HTTP caller to a forge username/login.
     ///

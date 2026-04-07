@@ -12,7 +12,7 @@ use crate::auth::middleware::Permission;
 use crate::config::Config;
 
 use super::rate_limit::RateLimitState;
-use super::{ForgeBackend, WebhookEvent};
+use super::{AuthError, ForgeBackend, UpstreamRateLimitResponse, WebhookEvent};
 
 // ---------------------------------------------------------------------------
 // Backend struct
@@ -116,7 +116,7 @@ impl ForgeBackend for GitLabBackend {
         owner: &str,
         repo: &str,
         rate_limit: &RateLimitState,
-    ) -> Result<Permission> {
+    ) -> std::result::Result<Permission, AuthError> {
         // GitLab uses URL-encoded `namespace/project` as the project id.
         let project_path = format!("{owner}%2F{repo}");
         let url = format!("{}/projects/{project_path}", self.api_url);
@@ -131,6 +131,16 @@ impl ForgeBackend for GitLabBackend {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            if super::rate_limit::is_rate_limited_response(status, resp.headers()) {
+                let forwarded_headers =
+                    super::rate_limit::forwarded_rate_limit_headers(resp.headers());
+                let body = resp.text().await.unwrap_or_default();
+                return Err(AuthError::RateLimited(UpstreamRateLimitResponse {
+                    status,
+                    headers: forwarded_headers,
+                    body,
+                }));
+            }
             warn!(%owner, %repo, %status, "GitLab API returned non-success for project check");
             return Ok(Permission::None);
         }
@@ -138,7 +148,8 @@ impl ForgeBackend for GitLabBackend {
         let body: serde_json::Value = resp
             .json()
             .await
-            .context("failed to parse GitLab API response")?;
+            .context("failed to parse GitLab API response")
+            .map_err(AuthError::from)?;
 
         Ok(permission_from_project_response(&body))
     }

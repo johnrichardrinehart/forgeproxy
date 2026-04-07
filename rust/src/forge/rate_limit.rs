@@ -123,6 +123,49 @@ impl RateLimitState {
     }
 }
 
+pub fn is_rate_limited_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> bool {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return true;
+    }
+
+    headers
+        .get("Retry-After")
+        .is_some_and(|value| value.to_str().ok().is_some())
+        || headers
+            .get("X-RateLimit-Remaining")
+            .or_else(|| headers.get("RateLimit-Remaining"))
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(0)
+}
+
+pub fn forwarded_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    const NAMES: &[&str] = &[
+        "Retry-After",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+        "X-RateLimit-Used",
+        "RateLimit-Limit",
+        "RateLimit-Remaining",
+        "RateLimit-Reset",
+        "RateLimit-Policy",
+    ];
+
+    NAMES
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| ((*name).to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +217,41 @@ mod tests {
         let state = RateLimitState::new();
         state.reset_at.store(0, Ordering::Relaxed);
         assert_eq!(state.retry_after_secs(), 0);
+    }
+
+    #[test]
+    fn detect_github_style_rate_limit_response() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("X-RateLimit-Remaining", "0".parse().unwrap());
+        assert!(is_rate_limited_response(
+            reqwest::StatusCode::FORBIDDEN,
+            &headers
+        ));
+    }
+
+    #[test]
+    fn forward_selected_rate_limit_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Retry-After", "120".parse().unwrap());
+        headers.insert("X-RateLimit-Remaining", "0".parse().unwrap());
+        headers.insert("X-RateLimit-Reset", "12345".parse().unwrap());
+
+        let forwarded = forwarded_rate_limit_headers(&headers);
+        assert_eq!(forwarded.len(), 3);
+        assert!(
+            forwarded
+                .iter()
+                .any(|(name, value)| name == "Retry-After" && value == "120")
+        );
+        assert!(
+            forwarded
+                .iter()
+                .any(|(name, value)| name == "X-RateLimit-Remaining" && value == "0")
+        );
+        assert!(
+            forwarded
+                .iter()
+                .any(|(name, value)| name == "X-RateLimit-Reset" && value == "12345")
+        );
     }
 }

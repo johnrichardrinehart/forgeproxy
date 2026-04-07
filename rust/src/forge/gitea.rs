@@ -14,7 +14,7 @@ use crate::auth::middleware::Permission;
 use crate::config::{BackendType, Config};
 
 use super::rate_limit::RateLimitState;
-use super::{ForgeBackend, WebhookEvent};
+use super::{AuthError, ForgeBackend, UpstreamRateLimitResponse, WebhookEvent};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -134,7 +134,7 @@ impl ForgeBackend for GiteaBackend {
         owner: &str,
         repo: &str,
         rate_limit: &RateLimitState,
-    ) -> Result<Permission> {
+    ) -> std::result::Result<Permission, AuthError> {
         // Gitea uses the same GitHub-compatible repo endpoint.
         let url = format!("{}/repos/{owner}/{repo}", self.api_url);
 
@@ -150,6 +150,16 @@ impl ForgeBackend for GiteaBackend {
 
         if !resp.status().is_success() {
             let status = resp.status();
+            if super::rate_limit::is_rate_limited_response(status, resp.headers()) {
+                let forwarded_headers =
+                    super::rate_limit::forwarded_rate_limit_headers(resp.headers());
+                let body = resp.text().await.unwrap_or_default();
+                return Err(AuthError::RateLimited(UpstreamRateLimitResponse {
+                    status,
+                    headers: forwarded_headers,
+                    body,
+                }));
+            }
             warn!(%owner, %repo, %status, "Gitea API returned non-success for repo check");
             return Ok(Permission::None);
         }
@@ -157,7 +167,8 @@ impl ForgeBackend for GiteaBackend {
         let body: serde_json::Value = resp
             .json()
             .await
-            .context("failed to parse Gitea API response")?;
+            .context("failed to parse Gitea API response")
+            .map_err(AuthError::from)?;
 
         Ok(permission_from_repo_response(&body))
     }

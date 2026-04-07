@@ -64,11 +64,7 @@ pub async fn handle_archive(
     // ---------- auth ----------
     let auth_header = extract_optional_auth_header(&headers);
     crate::auth::http_validator::validate_http_auth(&state, auth_header.as_deref(), &owner, &repo)
-        .await
-        .map_err(|e| {
-            warn!(error = %e, "archive auth validation failed");
-            AppError::Unauthorized(e.to_string())
-        })?;
+        .await?;
 
     // ---------- parse rest → (ref_name, ext) ----------
     let (ref_name, ext) = parse_archive_rest(&rest)

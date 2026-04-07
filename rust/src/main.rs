@@ -2,6 +2,7 @@ mod auth;
 mod build_info;
 mod bundleuri;
 mod cache;
+mod clone_support;
 mod config;
 mod coordination;
 mod credentials;
@@ -129,20 +130,19 @@ pub struct AppState {
             std::collections::HashMap<String, std::collections::HashMap<std::path::PathBuf, usize>>,
         >,
     >,
-    /// Most recent upstream `info/refs` advertisement we proxied for a repo.
-    /// HTTP clones do not give us a stable request-scoped handle across the
-    /// advertisement and fetch POST, so we keep a short-lived in-memory copy.
-    pub recent_info_refs_advertisements:
-        Arc<Mutex<std::collections::HashMap<String, RecentInfoRefsAdvertisement>>>,
+    /// Most recent advertised ref metadata we proxied for a repo. HTTP clones
+    /// do not give us a stable request-scoped handle across the advertisement
+    /// and fetch POST, so we keep a short-lived in-memory copy.
+    pub recent_advertised_refs: Arc<Mutex<std::collections::HashMap<String, RecentAdvertisedRefs>>>,
     pub active_https_connections: Arc<AtomicI64>,
     pub active_ssh_connections: Arc<AtomicI64>,
     pub draining: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
-pub struct RecentInfoRefsAdvertisement {
+pub struct RecentAdvertisedRefs {
     pub captured_at: Instant,
-    pub payload: Vec<u8>,
+    pub advertised_refs: crate::coordination::registry::RequestAdvertisedRefs,
 }
 
 impl AppState {
@@ -173,6 +173,37 @@ impl AppState {
             &self.metrics,
             self.rate_limit.remaining(),
         );
+    }
+
+    pub async fn remember_recent_advertised_refs(
+        &self,
+        owner_repo: impl Into<String>,
+        advertised_refs: crate::coordination::registry::RequestAdvertisedRefs,
+    ) {
+        self.recent_advertised_refs.lock().await.insert(
+            owner_repo.into(),
+            RecentAdvertisedRefs {
+                captured_at: Instant::now(),
+                advertised_refs,
+            },
+        );
+    }
+
+    pub async fn recent_advertised_refs(
+        &self,
+        owner_repo: &str,
+    ) -> Option<crate::coordination::registry::RequestAdvertisedRefs> {
+        self.recent_advertised_refs
+            .lock()
+            .await
+            .get(owner_repo)
+            .and_then(|recent_advertised_refs| {
+                if recent_advertised_refs.captured_at.elapsed() > Duration::from_secs(60) {
+                    None
+                } else {
+                    Some(recent_advertised_refs.advertised_refs.clone())
+                }
+            })
     }
 }
 
@@ -982,7 +1013,7 @@ async fn build_app_state(
         published_generation_leases: Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
-        recent_info_refs_advertisements: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        recent_advertised_refs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         active_https_connections: Arc::new(AtomicI64::new(0)),
         active_ssh_connections: Arc::new(AtomicI64::new(0)),
         draining: Arc::new(AtomicBool::new(false)),

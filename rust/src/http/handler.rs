@@ -18,7 +18,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -29,13 +29,16 @@ use prometheus_client::metrics::counter::Counter;
 use serde::Deserialize;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::AppState;
+use crate::clone_support::{
+    CloneCompletion, LocalUploadPackMode, UpstreamHydrationRequest, UpstreamHydrationTracker,
+    spawn_local_upload_pack, wait_for_local_upload_pack_exit,
+};
 use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoLease, LocalServeRepoSource,
 };
@@ -99,22 +102,11 @@ where
     }
 }
 
-#[derive(Clone)]
-struct CloneCompletion {
-    cache_status: CacheStatus,
-    started_at: Instant,
-    metric_username: String,
-    metric_repo: String,
-}
-
 struct CloneCompletionStream<S> {
     inner: S,
     metrics: crate::metrics::MetricsRegistry,
     protocol: Protocol,
-    cache_status: CacheStatus,
-    started_at: Instant,
-    metric_username: String,
-    metric_repo: String,
+    completion: CloneCompletion,
     recorded: bool,
 }
 
@@ -123,19 +115,13 @@ impl<S> CloneCompletionStream<S> {
         inner: S,
         metrics: crate::metrics::MetricsRegistry,
         protocol: Protocol,
-        cache_status: CacheStatus,
-        started_at: Instant,
-        metric_username: String,
-        metric_repo: String,
+        completion: CloneCompletion,
     ) -> Self {
         Self {
             inner,
             metrics,
             protocol,
-            cache_status,
-            started_at,
-            metric_username,
-            metric_repo,
+            completion,
             recorded: false,
         }
     }
@@ -145,14 +131,8 @@ impl<S> CloneCompletionStream<S> {
             return;
         }
         self.recorded = true;
-        crate::metrics::record_clone_completion(
-            &self.metrics,
-            self.protocol.clone(),
-            self.cache_status.clone(),
-            &self.metric_username,
-            &self.metric_repo,
-            self.started_at.elapsed(),
-        );
+        self.completion
+            .record_success(&self.metrics, self.protocol.clone());
     }
 }
 
@@ -246,8 +226,12 @@ fn request_host(headers: &HeaderMap) -> Result<&str, AppError> {
 
 /// `GET /:owner/:repo/info/refs?service=git-upload-pack`
 ///
-/// Validates authentication, rejects pushes, and proxies info/refs from the
-/// upstream forge.  For `git-upload-pack` requests the response is
+/// Rejects pushes, proxies `info/refs` from the upstream forge, and only
+/// rewrites successful `git-upload-pack` advertisements to inject the
+/// `bundle-uri` protocol-v2 capability. Upstream authentication challenges
+/// and non-success responses are forwarded transparently.
+///
+/// For `git-upload-pack` requests the response is
 /// intercepted so that we can inject the `bundle-uri` protocol-v2 capability.
 #[instrument(skip(state, headers), fields(%owner, %repo))]
 async fn handle_info_refs(
@@ -260,29 +244,6 @@ async fn handle_info_refs(
     // 1. Validate path segments.
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
-
-    // 2. Validate auth (optional for public repos).
-    let auth_header = extract_optional_auth_header(&headers);
-    let auth_context = crate::auth::http_validator::validate_http_auth_with_context(
-        &state,
-        auth_header.as_deref(),
-        &owner,
-        &repo,
-    )
-    .await
-    .map_err(|e| {
-        // If rate-limited, return 503 with Retry-After.
-        let remaining = state.rate_limit.remaining();
-        if remaining < state.config.upstream.api_rate_limit_buffer as u64 && remaining != u64::MAX {
-            let retry = state.rate_limit.retry_after_secs();
-            warn!(error = %e, retry_after = retry, "auth failed due to rate limiting");
-            return AppError::RateLimited {
-                retry_after_secs: retry,
-            };
-        }
-        warn!(error = %e, "auth validation failed");
-        AppError::Unauthorized(e.to_string())
-    })?;
 
     let service = query.service.unwrap_or_default();
     if service == "git-receive-pack" {
@@ -301,6 +262,13 @@ async fn handle_info_refs(
             .into_response());
     }
 
+    let auth_header = extract_optional_auth_header(&headers);
+    let metric_username = crate::auth::http_validator::metric_username_for_http_request(
+        &state,
+        auth_header.as_deref(),
+    )
+    .await;
+
     // Proxy the info/refs request to the upstream forge.
     let upstream_url = format!(
         "https://{}/{}/{}/info/refs?service=git-upload-pack",
@@ -309,13 +277,8 @@ async fn handle_info_refs(
 
     debug!(%upstream_url, "proxying info/refs to upstream forge");
 
-    let mut upstream_req = state
-        .http_client
-        .get(&upstream_url)
-        .header("Git-Protocol", "version=2");
-    if let Some(header) = auth_header.as_deref() {
-        upstream_req = upstream_req.header(header::AUTHORIZATION, header);
-    }
+    let upstream_req =
+        apply_forwarded_request_headers(state.http_client.get(&upstream_url), &headers);
     let upstream_resp = upstream_req
         .send()
         .await
@@ -323,17 +286,12 @@ async fn handle_info_refs(
 
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status();
-        let body = upstream_resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("<unreadable>"));
         warn!(%status, "upstream forge returned error for info/refs");
-        return Ok((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            body,
-        )
-            .into_response());
+        return forward_upstream_response(upstream_resp).await;
     }
+
+    let status = upstream_resp.status();
+    let forwarded_headers = collect_forwarded_response_headers(upstream_resp.headers());
 
     // 4. Read the upstream body and inject bundle-uri capability.
     let upstream_bytes = upstream_resp
@@ -359,7 +317,7 @@ async fn handle_info_refs(
         .get_or_create(&CloneUpstreamBytesLabels {
             protocol: Protocol::Https,
             phase: ClonePhase::InfoRefs,
-            username: auth_context.metric_username.clone(),
+            username: metric_username.clone(),
             repo: format!("{owner}/{repo}"),
         })
         .inc_by(upstream_bytes.len() as u64);
@@ -371,37 +329,36 @@ async fn handle_info_refs(
             protocol: Protocol::Https,
             phase: ClonePhase::InfoRefs,
             source: CloneSource::Upstream,
-            username: auth_context.metric_username,
+            username: metric_username,
             repo: format!("{owner}/{repo}"),
         })
         .inc_by(modified_body.len() as u64);
 
-    state.recent_info_refs_advertisements.lock().await.insert(
-        format!("{owner}/{repo}"),
-        crate::RecentInfoRefsAdvertisement {
-            captured_at: std::time::Instant::now(),
-            payload: upstream_bytes.to_vec(),
-        },
-    );
+    state
+        .remember_recent_advertised_refs(
+            format!("{owner}/{repo}"),
+            crate::coordination::registry::RequestAdvertisedRefs {
+                info_refs_advertisement: Some(upstream_bytes.to_vec()),
+                ..Default::default()
+            },
+        )
+        .await;
 
     // 5. Return the modified response.
-    Ok((
-        StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "application/x-git-upload-pack-advertisement",
-        )],
-        modified_body,
-    )
-        .into_response())
+    Ok(response_from_upstream_parts(
+        status,
+        forwarded_headers,
+        Body::from(modified_body),
+    ))
 }
 
 /// `POST /:owner/:repo/git-upload-pack`
 ///
 /// If the repository is cached locally and contains the requested objects,
-/// runs a local `git upload-pack` process. Otherwise proxies the request to
-/// the upstream forge and spawns a background task to clone the repo for
-/// future requests.
+/// runs a local `git upload-pack` process after a lightweight upstream
+/// read-access probe confirms the presented client credentials may clone the
+/// repo. Otherwise it proxies the request to the upstream forge and preserves
+/// the upstream HTTP response semantics.
 #[instrument(skip(state, headers, body), fields(%owner, %repo))]
 async fn handle_upload_pack(
     State(state): State<Arc<AppState>>,
@@ -415,16 +372,12 @@ async fn handle_upload_pack(
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
 
-    // 2. Validate auth (optional for public repos).
     let auth_header = extract_optional_auth_header(&headers);
-    let auth_context = crate::auth::http_validator::validate_http_auth_with_context(
+    let metric_username = crate::auth::http_validator::metric_username_for_http_request(
         &state,
         auth_header.as_deref(),
-        &owner,
-        &repo,
     )
-    .await
-    .map_err(|e| AppError::Unauthorized(e.to_string()))?;
+    .await;
 
     let repo_slug = format!("{}/{}", owner, repo);
     let git_protocol = headers
@@ -440,171 +393,129 @@ async fn handle_upload_pack(
         .map(|want| want.chars().take(12).collect::<String>())
         .collect::<Vec<String>>()
         .join(",");
-    let initial_local_decision =
-        match crate::coordination::registry::classify_local_wants_satisfaction_without_request_restore(
-            &state, &repo_slug, &wants,
-        )
-        .await
-        {
-            Ok(decision) => decision,
-            Err(error) => {
-                warn!(
-                    repo = %repo_slug,
-                    wants = wants.len(),
-                    want_sample,
-                    error = %error,
-                    "failed to classify local upload-pack serveability; proxying upstream"
-                );
-                LocalServeDecision::Unavailable {
-                    had_local_repo_before_check: state.cache_manager.has_repo(&repo_slug),
-                    restored_from_s3_for_request: false,
-                }
-            }
-        };
-    let local_decision = if !wants.is_empty()
-        && matches!(
-            initial_local_decision,
-            LocalServeDecision::MissingWantedObjects { .. }
-                | LocalServeDecision::Unavailable { .. }
-        ) {
-        let request_refspecs = if let LocalServeDecision::MissingWantedObjects {
-            missing_wants,
-            ..
-        } = &initial_local_decision
-        {
-            let recent_info_refs = state
-                .recent_info_refs_advertisements
-                .lock()
-                .await
-                .get(&repo_slug)
-                .cloned();
-            recent_info_refs.and_then(|recent_info_refs| {
-                if recent_info_refs.captured_at.elapsed() > std::time::Duration::from_secs(60) {
-                    return None;
-                }
-                let plan =
-                    crate::coordination::registry::derive_request_catch_up_plan_from_info_refs(
-                        &recent_info_refs.payload,
-                        missing_wants,
-                    );
-                if plan.refspecs.is_empty() {
-                    info!(
-                        repo = %repo_slug,
-                        missing_wants = missing_wants.len(),
-                        matched_wants = plan.matched_wants,
-                        unmatched_wants = plan.unmatched_wants,
-                        "request-time HTTP catch-up could not map missing wants to advertised refs; using full ref refresh"
-                    );
-                    None
-                } else {
-                    info!(
-                        repo = %repo_slug,
-                        missing_wants = missing_wants.len(),
-                        matched_wants = plan.matched_wants,
-                        unmatched_wants = plan.unmatched_wants,
-                        refspec_count = plan.refspecs.len(),
-                        "request-time HTTP catch-up will fetch only advertised refs that match the missing wants"
-                    );
-                    Some(plan.refspecs)
-                }
-            })
-        } else {
-            None
-        };
-        match crate::coordination::registry::wait_for_local_catch_up(
-            &state,
-            &owner,
-            &repo,
-            auth_header.as_deref(),
-            &wants,
-            request_refspecs,
-        )
-        .await
-        {
-            Ok(decision) => decision,
-            Err(error) => {
-                warn!(
-                    repo = %repo_slug,
-                    wants = wants.len(),
-                    want_sample,
-                    error = %error,
-                    "failed while waiting for local upload-pack catch-up; proxying upstream"
-                );
-                initial_local_decision
-            }
-        }
+    let local_authz_confirmed =
+        local_http_clone_access_confirmed(&state, auth_header.as_deref(), &owner, &repo).await;
+    let advertised_refs = state.recent_advertised_refs(&repo_slug).await;
+    let local_decision = crate::coordination::registry::resolve_local_fetch_serveability(
+        &state,
+        &repo_slug,
+        &wants,
+        auth_header.as_deref(),
+        advertised_refs.as_ref(),
+        "http",
+        local_authz_confirmed,
+    )
+    .await;
+    let effective_cache_status = if local_authz_confirmed {
+        crate::coordination::registry::clone_cache_status(&local_decision)
     } else {
-        initial_local_decision
+        CacheStatus::Cold
     };
 
-    match &local_decision {
-        LocalServeDecision::SatisfiesWants {
-            serve_from,
-            restored_from_s3_for_request,
-            want_count,
-            ..
-        } => {
-            info!(
-                repo = %repo_slug,
-                serve_from = ?serve_from,
-                wants = *want_count,
-                want_sample,
-                restored_from_s3_for_request = *restored_from_s3_for_request,
-                "serving upload-pack directly from local disk"
-            );
-            return serve_local_upload_pack(
-                &state,
-                &owner,
-                &repo,
-                *serve_from,
-                &body,
-                git_protocol.as_deref(),
-                CloneCompletion {
-                    cache_status: crate::coordination::registry::clone_cache_status(
-                        &local_decision,
-                    ),
-                    started_at,
-                    metric_username: auth_context.metric_username.clone(),
-                    metric_repo: repo_slug.clone(),
-                },
-            )
-            .await;
+    if !local_authz_confirmed {
+        match &local_decision {
+            LocalServeDecision::SatisfiesWants {
+                serve_from,
+                restored_from_s3_for_request,
+                want_count,
+                ..
+            } => {
+                info!(
+                    repo = %repo_slug,
+                    serve_from = ?serve_from,
+                    wants = *want_count,
+                    want_sample,
+                    restored_from_s3_for_request = *restored_from_s3_for_request,
+                    "skipping local upload-pack serve because presented HTTP auth was missing or could not be confirmed; proxying upstream"
+                );
+            }
+            LocalServeDecision::MissingWantedObjects {
+                had_local_repo_before_check,
+                restored_from_s3_for_request,
+                want_count,
+                missing_wants,
+            } => {
+                let missing_sample = missing_wants
+                    .iter()
+                    .take(5)
+                    .map(|want| want.chars().take(12).collect::<String>())
+                    .collect::<Vec<String>>()
+                    .join(",");
+                info!(
+                    repo = %repo_slug,
+                    wants = *want_count,
+                    missing_wants = missing_wants.len(),
+                    want_sample,
+                    missing_sample,
+                    had_local_repo_before_check = *had_local_repo_before_check,
+                    restored_from_s3_for_request = *restored_from_s3_for_request,
+                    "skipping local upload-pack catch-up because presented HTTP auth was missing or could not be confirmed; proxying upstream"
+                );
+            }
+            LocalServeDecision::Unavailable { .. } => {}
         }
-        LocalServeDecision::Unavailable {
-            had_local_repo_before_check,
-            restored_from_s3_for_request,
-        } => {
-            info!(
-                repo = %repo_slug,
-                wants = wants.len(),
-                want_sample,
-                had_local_repo_before_check = *had_local_repo_before_check,
-                restored_from_s3_for_request = *restored_from_s3_for_request,
-                "cannot serve upload-pack from local disk; no local published repo or request-time S3 restore is available"
-            );
-        }
-        LocalServeDecision::MissingWantedObjects {
-            had_local_repo_before_check,
-            restored_from_s3_for_request,
-            want_count,
-            missing_wants,
-        } => {
-            let missing_sample = missing_wants
-                .iter()
-                .take(5)
-                .map(|want| want.chars().take(12).collect::<String>())
-                .collect::<Vec<String>>()
-                .join(",");
-            info!(
-                repo = %repo_slug,
-                wants = *want_count,
-                missing_wants = missing_wants.len(),
-                want_sample,
-                missing_sample,
-                had_local_repo_before_check = *had_local_repo_before_check,
-                restored_from_s3_for_request = *restored_from_s3_for_request,
-                "local disk can only partially satisfy upload-pack request; proxying upstream for missing objects or completeness"
-            );
+    }
+
+    if local_authz_confirmed {
+        match &local_decision {
+            LocalServeDecision::SatisfiesWants {
+                serve_from,
+                restored_from_s3_for_request: _,
+                want_count: _,
+                ..
+            } => {
+                return serve_local_upload_pack(
+                    &state,
+                    &owner,
+                    &repo,
+                    *serve_from,
+                    &body,
+                    git_protocol.as_deref(),
+                    CloneCompletion {
+                        cache_status: effective_cache_status.clone(),
+                        started_at,
+                        metric_username: metric_username.clone(),
+                        metric_repo: repo_slug.clone(),
+                    },
+                )
+                .await;
+            }
+            LocalServeDecision::Unavailable {
+                had_local_repo_before_check,
+                restored_from_s3_for_request,
+            } => {
+                info!(
+                    repo = %repo_slug,
+                    wants = wants.len(),
+                    want_sample,
+                    had_local_repo_before_check = *had_local_repo_before_check,
+                    restored_from_s3_for_request = *restored_from_s3_for_request,
+                    "cannot serve upload-pack from local disk; no local published repo or request-time S3 restore is available"
+                );
+            }
+            LocalServeDecision::MissingWantedObjects {
+                had_local_repo_before_check,
+                restored_from_s3_for_request,
+                want_count,
+                missing_wants,
+            } => {
+                let missing_sample = missing_wants
+                    .iter()
+                    .take(5)
+                    .map(|want| want.chars().take(12).collect::<String>())
+                    .collect::<Vec<String>>()
+                    .join(",");
+                info!(
+                    repo = %repo_slug,
+                    wants = *want_count,
+                    missing_wants = missing_wants.len(),
+                    want_sample,
+                    missing_sample,
+                    had_local_repo_before_check = *had_local_repo_before_check,
+                    restored_from_s3_for_request = *restored_from_s3_for_request,
+                    "local disk can only partially satisfy upload-pack request; proxying upstream for missing objects or completeness"
+                );
+            }
         }
     }
 
@@ -617,11 +528,12 @@ async fn handle_upload_pack(
         auth_header.as_deref(),
         body,
         CloneCompletion {
-            cache_status: crate::coordination::registry::clone_cache_status(&local_decision),
+            cache_status: effective_cache_status,
             started_at,
-            metric_username: auth_context.metric_username.clone(),
+            metric_username,
             metric_repo: repo_slug,
         },
+        &headers,
     )
     .await?;
 
@@ -667,7 +579,6 @@ async fn handle_bundle_list(
     let auth_header = extract_optional_auth_header(&headers);
     crate::http::bundle_serve::handle_bundle_list(&state, &owner, &repo, auth_header.as_deref())
         .await
-        .map_err(AppError::Internal)
 }
 
 /// `POST /webhook`
@@ -789,6 +700,134 @@ pub(crate) fn extract_optional_auth_header(headers: &HeaderMap) -> Option<String
         .map(ToOwned::to_owned)
 }
 
+fn is_hop_by_hop_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn should_forward_request_header(name: &HeaderName) -> bool {
+    !is_hop_by_hop_header(name) && *name != header::HOST && *name != header::CONTENT_LENGTH
+}
+
+fn should_forward_response_header(name: &HeaderName) -> bool {
+    !is_hop_by_hop_header(name) && *name != header::CONTENT_LENGTH
+}
+
+fn apply_forwarded_request_headers(
+    mut request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    for (name, value) in headers {
+        if should_forward_request_header(name) {
+            request = request.header(name, value);
+        }
+    }
+    request
+}
+
+fn collect_forwarded_response_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Vec<(HeaderName, HeaderValue)> {
+    headers
+        .iter()
+        .filter(|(name, _)| should_forward_response_header(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+fn response_from_upstream_parts(
+    status: StatusCode,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    body: Body,
+) -> Response {
+    let mut response = (status, body).into_response();
+    for (name, value) in headers {
+        response.headers_mut().append(name, value);
+    }
+    response
+}
+
+async fn forward_upstream_response(upstream_resp: reqwest::Response) -> Result<Response, AppError> {
+    let status = upstream_resp.status();
+    let headers = collect_forwarded_response_headers(upstream_resp.headers());
+    let body = upstream_resp
+        .bytes()
+        .await
+        .context("failed to read upstream response body")?;
+    Ok(response_from_upstream_parts(
+        status,
+        headers,
+        Body::from(body),
+    ))
+}
+
+async fn local_http_clone_access_confirmed(
+    state: &AppState,
+    auth_header: Option<&str>,
+    owner: &str,
+    repo: &str,
+) -> bool {
+    let auth_header = auth_header.filter(|header| !header.trim().is_empty());
+    let auth_kind = if auth_header.is_some() {
+        "presented client Authorization header"
+    } else {
+        "anonymous access"
+    };
+
+    match crate::auth::http_validator::validate_http_auth(state, auth_header, owner, repo).await {
+        Ok(()) => true,
+        Err(AppError::Unauthorized(message)) => {
+            info!(
+                %owner,
+                %repo,
+                %message,
+                auth_kind,
+                "local HTTP clone access probe denied; proxying upstream"
+            );
+            false
+        }
+        Err(AppError::UpstreamRateLimited { status, .. }) => {
+            warn!(
+                %owner,
+                %repo,
+                %status,
+                auth_kind,
+                "local HTTP clone access probe was rate limited; proxying upstream"
+            );
+            false
+        }
+        Err(AppError::Internal(error)) => {
+            warn!(
+                %owner,
+                %repo,
+                %error,
+                auth_kind,
+                "local HTTP clone access probe failed; proxying upstream"
+            );
+            false
+        }
+        Err(AppError::BadRequest(message)) => {
+            warn!(
+                %owner,
+                %repo,
+                %message,
+                auth_kind,
+                "local HTTP clone access probe rejected malformed input; proxying upstream"
+            );
+            false
+        }
+    }
+}
+
 /// Run a local `git upload-pack` process and stream its output as the HTTP
 /// response body.
 async fn serve_local_upload_pack(
@@ -801,43 +840,31 @@ async fn serve_local_upload_pack(
     completion: CloneCompletion,
 ) -> Result<Response, AppError> {
     let owner_repo = format!("{owner}/{repo}");
-    let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease(
+    let mut process = spawn_local_upload_pack(
         state,
         &owner_repo,
+        "http",
         serve_from,
+        LocalUploadPackMode::StatelessRpc,
+        git_protocol,
     )
     .await?;
-    let repo_path = repo_lease.repo_path().to_path_buf();
-
-    let mut cmd = Command::new("git");
-    cmd.arg("upload-pack")
-        .arg("--stateless-rpc")
-        .arg("--strict")
-        .arg(&repo_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if let Some(proto) = git_protocol {
-        cmd.env("GIT_PROTOCOL", proto);
-    }
-
-    let mut child = cmd.spawn().context("failed to spawn git upload-pack")?;
 
     // Write the request body to stdin.
-    if let Some(mut stdin) = child.stdin.take() {
+    if let Some(mut stdin) = process.stdin.take() {
         use tokio::io::AsyncWriteExt;
         stdin.write_all(request_body).await.ok();
         // Drop stdin to signal EOF.
     }
 
-    let stdout = child
+    let stdout = process
         .stdout
-        .take()
         .context("failed to capture git upload-pack stdout")?;
-    let mut stderr = child
+    let mut stderr = process
         .stderr
-        .take()
         .context("failed to capture git upload-pack stderr")?;
+    let mut child = process.child;
+    let repo_lease = process._lease;
 
     // Stream stdout as the response body.
     let downstream_counter = state
@@ -859,24 +886,17 @@ async fn serve_local_upload_pack(
         ),
         state.metrics.clone(),
         Protocol::Https,
-        completion.cache_status,
-        completion.started_at,
-        completion.metric_username,
-        completion.metric_repo,
+        completion,
     );
     let body = Body::from_stream(stream);
 
     // Reap the child in the background so we don't leak processes.
     tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-
-        let mut stderr_buf = Vec::new();
-        let _ = stderr.read_to_end(&mut stderr_buf).await;
-        match child.wait().await {
-            Ok(status) if !status.success() => {
+        match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
+            Ok(exit) if !exit.status.success() => {
                 warn!(
-                    %status,
-                    stderr = %String::from_utf8_lossy(&stderr_buf),
+                    status = %exit.status,
+                    stderr = %String::from_utf8_lossy(&exit.stderr),
                     "git upload-pack exited with non-zero status"
                 );
             }
@@ -903,22 +923,17 @@ async fn proxy_upload_pack_to_upstream(
     auth_header: Option<&str>,
     body: Bytes,
     completion: CloneCompletion,
+    request_headers: &HeaderMap,
 ) -> Result<Response, AppError> {
     let upstream_url = format!(
         "https://{}/{}/{}/git-upload-pack",
         state.config.upstream.hostname, owner, repo,
     );
 
-    let mut req = state.http_client.post(&upstream_url).header(
-        header::CONTENT_TYPE,
-        "application/x-git-upload-pack-request",
-    );
-    if let Some(header) = auth_header {
-        req = req.header(header::AUTHORIZATION, header);
-    }
+    let req =
+        apply_forwarded_request_headers(state.http_client.post(&upstream_url), request_headers);
     let capture_body = body.clone();
     let upstream_resp = req
-        .header("Git-Protocol", "version=2")
         .body(body)
         .send()
         .await
@@ -926,10 +941,6 @@ async fn proxy_upload_pack_to_upstream(
 
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status();
-        let text = upstream_resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("<unreadable>"));
         let owner_repo = format!("{owner}/{repo}");
         let wants = crate::tee_hydration::parse_fetch_request_metadata(&capture_body)
             .map(|meta| meta.want_oids)
@@ -947,110 +958,19 @@ async fn proxy_upload_pack_to_upstream(
             want_sample,
             "cannot satisfy HTTP upload-pack request from local disk and upstream upload-pack failed"
         );
-        return Ok((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            text,
-        )
-            .into_response());
+        return forward_upstream_response(upstream_resp).await;
     }
+
+    let status = upstream_resp.status();
+    let forwarded_headers = collect_forwarded_response_headers(upstream_resp.headers());
 
     let owner_repo = format!("{owner}/{repo}");
-    let mut hydration_permits =
-        match crate::coordination::registry::try_acquire_clone_hydration_permits(state, &owner_repo)
-            .await
-        {
-            Ok(Some(permits)) => Some(permits),
-            Ok(None) => {
-                info!(
-                    repo = %owner_repo,
-                    per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
-                    cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
-                    lease_ttl_secs = state.config.clone.lock_ttl,
-                    "skipping tee hydration because the repo clone semaphore is saturated"
-                );
-                None
-            }
-            Err(e) => {
-                warn!(
-                    repo = %owner_repo,
-                    error = %e,
-                    "failed to acquire clone hydration permits for HTTP miss"
-                );
-                None
-            }
-        };
-
-    let mut capture = if hydration_permits.is_some() {
-        match crate::tee_hydration::TeeCapture::start(
-            &state.cache_manager.base_path,
-            &owner_repo,
-            "https",
-        )
-        .await
-        {
-            Ok(capture) => Some(capture),
-            Err(e) => {
-                warn!(repo = %owner_repo, error = %e, "failed to start tee capture for HTTP miss");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    if let Some(active_capture) = capture.as_ref() {
-        let recent_info_refs = state
-            .recent_info_refs_advertisements
-            .lock()
-            .await
-            .get(&owner_repo)
-            .cloned();
-        if let Some(recent_info_refs) = recent_info_refs
-            && recent_info_refs.captured_at.elapsed() <= std::time::Duration::from_secs(60)
-            && let Err(e) = active_capture
-                .write_info_refs_advertisement(&recent_info_refs.payload)
-                .await
-        {
-            warn!(
-                repo = %owner_repo,
-                error = %e,
-                "failed to record recent HTTP info/refs advertisement in tee capture"
-            );
-        }
-    }
-
-    let request_capture_failed = if let Some(active_capture) = capture.as_mut() {
-        if let Err(e) = active_capture.write_request(&capture_body).await {
-            warn!(repo = %owner_repo, error = %e, "failed to record HTTP tee request");
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if request_capture_failed {
-        capture = None;
-    }
-    let capture = capture.map(crate::tee_hydration::BufferedTeeCapture::new);
-    if capture.is_none()
-        && let Some(permits) = hydration_permits.take()
-        && let Err(e) =
-            crate::coordination::registry::release_clone_hydration_permits(state, permits).await
-    {
-        warn!(
-            repo = %owner_repo,
-            error = %e,
-            "failed to release clone hydration permits after HTTP tee capture setup failure"
-        );
-    }
-
     let (tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(8);
     let completion_metrics = state.metrics.clone();
     let state = state.clone();
     let owner = owner.to_string();
     let repo = repo.to_string();
-    let auth_header = auth_header.map(str::to_string);
+    let auth_header = auth_header.map(ToOwned::to_owned);
     let upstream_counter = state
         .metrics
         .metrics
@@ -1074,35 +994,29 @@ async fn proxy_upload_pack_to_upstream(
             repo: owner_repo.clone(),
         })
         .clone();
+    let advertised_refs = state.recent_advertised_refs(&owner_repo).await;
     tokio::spawn(async move {
         let mut stream = upstream_resp.bytes_stream();
-        let mut capture = capture;
-        let mut hydration_permits = hydration_permits;
+        let mut hydration = UpstreamHydrationTracker::start(
+            &state,
+            &owner,
+            &repo,
+            auth_header.as_deref(),
+            "http",
+            UpstreamHydrationRequest {
+                advertised_refs: advertised_refs.as_ref(),
+                request_body: &capture_body,
+                enable_hydration: true,
+            },
+        )
+        .await;
 
         while let Some(item) = stream.next().await {
             match item {
                 Ok(chunk) => {
                     let chunk_len = chunk.len() as u64;
                     upstream_counter.inc_by(chunk_len);
-                    if let Some(mut active_capture) = capture.take() {
-                        if let Err(e) = active_capture.try_write_response_chunk(chunk.clone()) {
-                            warn!(
-                                repo = %owner_repo,
-                                error = %e,
-                                buffer_bytes = crate::tee_hydration::CAPTURE_BUFFER_BYTES,
-                                "dropping HTTP tee capture because disk capture fell behind the client stream"
-                            );
-                            if let Err(cleanup_error) = active_capture.abort().await {
-                                warn!(
-                                    repo = %owner_repo,
-                                    error = %cleanup_error,
-                                    "failed to clean up aborted HTTP tee capture"
-                                );
-                            }
-                        } else {
-                            capture = Some(active_capture);
-                        }
-                    }
+                    hydration.record_response_chunk(chunk.clone()).await;
 
                     if tx.send(Ok(chunk)).await.is_err() {
                         break;
@@ -1110,209 +1024,27 @@ async fn proxy_upload_pack_to_upstream(
                     downstream_counter.inc_by(chunk_len);
                 }
                 Err(e) => {
-                    if let Some(active_capture) = capture.take()
-                        && let Err(cleanup_error) = active_capture.abort().await
-                    {
-                        warn!(
-                            repo = %owner_repo,
-                            error = %cleanup_error,
-                            "failed to clean up aborted HTTP tee capture after proxy error"
-                        );
-                    }
-                    if let Some(permits) = hydration_permits.take()
-                        && let Err(release_error) =
-                            crate::coordination::registry::release_clone_hydration_permits(
-                                &state, permits,
-                            )
-                            .await
-                    {
-                        warn!(
-                            repo = %owner_repo,
-                            error = %release_error,
-                            "failed to release clone hydration permits after HTTP proxy error"
-                        );
-                    }
+                    hydration.handle_stream_error().await;
                     let _ = tx.send(Err(e)).await;
                     return;
                 }
             }
         }
-
-        if let Some(active_capture) = capture {
-            match active_capture.finish_success().await {
-                Ok(Some(capture_dir)) => {
-                    let state_bg = state.clone();
-                    let owner_bg = owner.clone();
-                    let repo_bg = repo.clone();
-                    let owner_repo_bg = owner_repo.clone();
-                    let auth_bg = auth_header.clone();
-                    if let Some(permits) = hydration_permits.take() {
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::coordination::registry::try_ensure_repo_cloned_from_tee_with_permits(
-                                    &state_bg,
-                                    &owner_bg,
-                                    &repo_bg,
-                                    auth_bg.as_deref(),
-                                    capture_dir,
-                                    permits,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    repo = %owner_repo_bg,
-                                    error = %e,
-                                    error_chain = %format!("{e:#}"),
-                                    "tee hydration after HTTP miss failed"
-                                );
-                            }
-                        });
-                    } else {
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                crate::coordination::registry::try_ensure_repo_cloned_from_tee(
-                                    &state_bg,
-                                    &owner_bg,
-                                    &repo_bg,
-                                    auth_bg.as_deref(),
-                                    capture_dir,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    repo = %owner_repo_bg,
-                                    error = %e,
-                                    error_chain = %format!("{e:#}"),
-                                    "tee hydration after HTTP miss failed"
-                                );
-                            }
-                        });
-                    }
-                }
-                Ok(None) => {
-                    if let Some(permits) = hydration_permits.take()
-                        && let Err(release_error) =
-                            crate::coordination::registry::release_clone_hydration_permits(
-                                &state, permits,
-                            )
-                            .await
-                    {
-                        warn!(
-                            repo = %owner_repo,
-                            error = %release_error,
-                            "failed to release clone hydration permits after dropping HTTP tee capture"
-                        );
-                    }
-                    let state_bg = state.clone();
-                    let owner_bg = owner.clone();
-                    let repo_bg = repo.clone();
-                    let owner_repo_bg = owner_repo.clone();
-                    let auth_bg = auth_header.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::coordination::registry::ensure_repo_cloned_from_upstream(
-                                &state_bg,
-                                &owner_bg,
-                                &repo_bg,
-                                auth_bg.as_deref(),
-                            )
-                            .await
-                        {
-                            warn!(
-                                repo = %owner_repo_bg,
-                                error = %e,
-                                error_chain = %format!("{e:#}"),
-                                "background upstream hydration after HTTP miss completed without tee capture failed"
-                            );
-                        }
-                    });
-                }
-                Err(error) => {
-                    warn!(
-                        repo = %owner_repo,
-                        error = %error,
-                        "failed to finalize buffered HTTP tee capture"
-                    );
-                    if let Some(permits) = hydration_permits.take()
-                        && let Err(release_error) =
-                            crate::coordination::registry::release_clone_hydration_permits(
-                                &state, permits,
-                            )
-                            .await
-                    {
-                        warn!(
-                            repo = %owner_repo,
-                            error = %release_error,
-                            "failed to release clone hydration permits after HTTP tee finalization failure"
-                        );
-                    }
-                    let state_bg = state.clone();
-                    let owner_bg = owner.clone();
-                    let repo_bg = repo.clone();
-                    let owner_repo_bg = owner_repo.clone();
-                    let auth_bg = auth_header.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::coordination::registry::ensure_repo_cloned_from_upstream(
-                                &state_bg,
-                                &owner_bg,
-                                &repo_bg,
-                                auth_bg.as_deref(),
-                            )
-                            .await
-                        {
-                            warn!(
-                                repo = %owner_repo_bg,
-                                error = %e,
-                                error_chain = %format!("{e:#}"),
-                                "background upstream hydration after HTTP tee finalization failure failed"
-                            );
-                        }
-                    });
-                }
-            }
-        } else {
-            let state_bg = state.clone();
-            let owner_bg = owner.clone();
-            let repo_bg = repo.clone();
-            let owner_repo_bg = owner_repo.clone();
-            let auth_bg = auth_header.clone();
-            tokio::spawn(async move {
-                if let Err(e) = crate::coordination::registry::ensure_repo_cloned_from_upstream(
-                    &state_bg,
-                    &owner_bg,
-                    &repo_bg,
-                    auth_bg.as_deref(),
-                )
-                .await
-                {
-                    warn!(
-                        repo = %owner_repo_bg,
-                        error = %e,
-                        error_chain = %format!("{e:#}"),
-                        "background upstream hydration after HTTP miss completed without tee capture failed"
-                    );
-                }
-            });
-        }
+        hydration.finish().await;
     });
 
     let body = Body::from_stream(CloneCompletionStream::new(
         ReceiverStream::new(rx),
         completion_metrics,
         Protocol::Https,
-        completion.cache_status,
-        completion.started_at,
-        completion.metric_username,
-        completion.metric_repo,
+        completion,
     ));
 
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+    Ok(response_from_upstream_parts(
+        status,
+        forwarded_headers,
         body,
-    )
-        .into_response())
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,8 +1058,12 @@ pub enum AppError {
     Unauthorized(String),
     /// The request is malformed.
     BadRequest(String),
-    /// Upstream rate limit reached — include `Retry-After` header.
-    RateLimited { retry_after_secs: u64 },
+    /// Forward an upstream rate-limit response to the client.
+    UpstreamRateLimited {
+        status: StatusCode,
+        headers: Vec<(String, String)>,
+        body: String,
+    },
     /// An unexpected internal error.
     Internal(anyhow::Error),
 }
@@ -1342,15 +1078,28 @@ impl IntoResponse for AppError {
             )
                 .into_response(),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-            AppError::RateLimited { retry_after_secs } => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [(
-                    "Retry-After",
-                    retry_after_secs.to_string().as_str().to_owned(),
-                )],
-                "Upstream API rate limit reached. Please retry later.\n",
-            )
-                .into_response(),
+            AppError::UpstreamRateLimited {
+                status,
+                headers,
+                body,
+            } => {
+                let response_body = if body.trim().is_empty() {
+                    "Upstream API rate limit reached. Please retry later.\n".to_string()
+                } else {
+                    body
+                };
+                let mut response = (status, response_body).into_response();
+                for (name, value) in headers {
+                    let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+                        continue;
+                    };
+                    let Ok(value) = HeaderValue::from_str(&value) else {
+                        continue;
+                    };
+                    response.headers_mut().insert(name, value);
+                }
+                response
+            }
             AppError::Internal(err) => {
                 error!(error = %format!("{err:#}"), "internal server error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error\n").into_response()

@@ -5,18 +5,13 @@
 //! The cache key is derived from a SHA-256 hash of the token so that raw
 //! credentials are never stored.
 
-use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
 use crate::AppState;
 use crate::auth::cache;
 use crate::auth::middleware::Permission;
-
-#[derive(Clone, Debug)]
-pub struct HttpAuthContext {
-    pub metric_username: String,
-}
+use crate::http::handler::AppError;
 
 /// Validate an HTTP `Authorization` header value by forwarding it to the
 /// upstream forge API and caching the result in Valkey.
@@ -28,22 +23,10 @@ pub async fn validate_http_auth(
     auth_header: Option<&str>,
     owner: &str,
     repo: &str,
-) -> Result<()> {
-    validate_http_auth_with_context(state, auth_header, owner, repo)
-        .await
-        .map(|_| ())
-}
-
-pub async fn validate_http_auth_with_context(
-    state: &AppState,
-    auth_header: Option<&str>,
-    owner: &str,
-    repo: &str,
-) -> Result<HttpAuthContext> {
+) -> Result<(), AppError> {
     // Normalise: callers may pass "repo.git" from the URL path.
     let repo = repo.trim_end_matches(".git");
     let auth_header = auth_header.filter(|header| !header.trim().is_empty());
-    let auth_present = auth_header.is_some();
 
     // 1. Hash the token for the cache key (never store raw credentials).
     let token_hash = match auth_header {
@@ -62,25 +45,15 @@ pub async fn validate_http_auth_with_context(
         let perm = Permission::parse(&cached);
         if perm.has_read() {
             debug!(%owner, %repo, permission = %cached, "http auth cache hit (allowed)");
-            let username = resolve_http_user(state, auth_header, &token_hash).await;
-            return Ok(HttpAuthContext {
-                metric_username: crate::metrics::clone_metric_username(
-                    username.as_deref(),
-                    auth_present,
-                ),
-            });
+            return Ok(());
         }
         debug!(%owner, %repo, permission = %cached, "http auth cache hit (denied)");
-        bail!("access denied for {owner}/{repo} (cached)");
+        return Err(AppError::Unauthorized(format!(
+            "access denied for {owner}/{repo} (cached)"
+        )));
     }
 
-    // 3. Self-throttle if approaching the upstream rate limit.
-    state
-        .rate_limit
-        .wait_if_needed(state.config.upstream.api_rate_limit_buffer)
-        .await;
-
-    // 4. Delegate to the forge backend.
+    // 3. Delegate to the forge backend.
     let perm = state
         .forge
         .validate_http_auth(
@@ -90,9 +63,17 @@ pub async fn validate_http_auth_with_context(
             repo,
             &state.rate_limit,
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            crate::forge::AuthError::RateLimited(response) => AppError::UpstreamRateLimited {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+            },
+            crate::forge::AuthError::Other(error) => AppError::Internal(error),
+        })?;
 
-    // 5. Cache the result.
+    // 4. Cache the result.
     let ttl = if perm.has_read() {
         state.config.auth.http_cache_ttl
     } else {
@@ -103,20 +84,37 @@ pub async fn validate_http_auth_with_context(
         .await
         .ok();
 
-    // 6. Decide.
+    // 5. Decide.
     if perm.has_read() {
         debug!(%owner, %repo, permission = perm_str, "http auth validated (allowed)");
-        let username = resolve_http_user(state, auth_header, &token_hash).await;
-        Ok(HttpAuthContext {
-            metric_username: crate::metrics::clone_metric_username(
-                username.as_deref(),
-                auth_present,
-            ),
-        })
+        Ok(())
     } else {
         debug!(%owner, %repo, permission = perm_str, "http auth validated (denied)");
-        bail!("access denied for {owner}/{repo}")
+        Err(AppError::Unauthorized(format!(
+            "access denied for {owner}/{repo}"
+        )))
     }
+}
+
+pub async fn metric_username_for_http_request(
+    state: &AppState,
+    auth_header: Option<&str>,
+) -> String {
+    let auth_header = auth_header.filter(|header| !header.trim().is_empty());
+    let auth_present = auth_header.is_some();
+    let token_hash = auth_header.map(|header| {
+        let mut hasher = Sha256::new();
+        hasher.update(header.as_bytes());
+        hex::encode(hasher.finalize())
+    });
+    let username = match (auth_header, token_hash.as_deref()) {
+        (Some(auth_header), Some(token_hash)) => {
+            resolve_http_user(state, Some(auth_header), token_hash).await
+        }
+        _ => None,
+    };
+
+    crate::metrics::clone_metric_username(username.as_deref(), auth_present)
 }
 
 async fn resolve_http_user(
@@ -131,10 +129,14 @@ async fn resolve_http_user(
         return Some(cached);
     }
 
-    state
-        .rate_limit
-        .wait_if_needed(state.config.upstream.api_rate_limit_buffer)
-        .await;
+    let remaining = state.rate_limit.remaining();
+    if remaining < state.config.upstream.api_rate_limit_buffer as u64 && remaining != u64::MAX {
+        debug!(
+            remaining,
+            "skipping current-user resolution because upstream API rate limit is low"
+        );
+        return None;
+    }
 
     match state
         .forge

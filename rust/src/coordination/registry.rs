@@ -2425,6 +2425,13 @@ pub struct RequestCatchUpPlan {
     pub unmatched_wants: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestAdvertisedRefs {
+    pub ls_refs_response: Option<Vec<u8>>,
+    pub ls_refs_request: Option<Vec<u8>>,
+    pub info_refs_advertisement: Option<Vec<u8>>,
+}
+
 pub fn derive_request_catch_up_plan(
     metadata: &crate::tee_hydration::CapturedRefMetadata,
     wants: &[String],
@@ -2466,6 +2473,24 @@ pub fn derive_request_catch_up_plan_from_info_refs(
     let metadata =
         crate::tee_hydration::parse_info_refs_advertisement_metadata(info_refs_advertisement);
     derive_request_catch_up_plan(&metadata, wants)
+}
+
+pub fn derive_request_catch_up_plan_from_advertised_refs(
+    advertised_refs: &RequestAdvertisedRefs,
+    wants: &[String],
+) -> RequestCatchUpPlan {
+    if let Some(ls_refs_response) = advertised_refs.ls_refs_response.as_deref() {
+        return derive_request_catch_up_plan(
+            &crate::tee_hydration::parse_ls_refs_response_metadata(ls_refs_response),
+            wants,
+        );
+    }
+
+    if let Some(info_refs_advertisement) = advertised_refs.info_refs_advertisement.as_deref() {
+        return derive_request_catch_up_plan_from_info_refs(info_refs_advertisement, wants);
+    }
+
+    RequestCatchUpPlan::default()
 }
 
 async fn ensure_repo_available_locally_detailed(
@@ -2843,6 +2868,113 @@ pub async fn wait_for_local_catch_up(
         "local published-generation catch-up timed out; falling back to upstream proxy"
     );
     Ok(last_decision)
+}
+
+pub async fn resolve_local_fetch_serveability(
+    state: &crate::AppState,
+    owner_repo: &str,
+    wants: &[String],
+    auth_header: Option<&str>,
+    advertised_refs: Option<&RequestAdvertisedRefs>,
+    protocol_label: &'static str,
+    allow_request_time_local_catch_up: bool,
+) -> LocalServeDecision {
+    let want_sample = wants
+        .iter()
+        .take(5)
+        .map(|want| want.chars().take(12).collect::<String>())
+        .collect::<Vec<String>>()
+        .join(",");
+
+    let initial_local_decision =
+        match classify_local_wants_satisfaction_without_request_restore(state, owner_repo, wants)
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    wants = wants.len(),
+                    want_sample,
+                    error = %error,
+                    protocol = protocol_label,
+                    "failed to classify local fetch serveability; proxying upstream"
+                );
+                return LocalServeDecision::Unavailable {
+                    had_local_repo_before_check: state.cache_manager.has_repo(owner_repo),
+                    restored_from_s3_for_request: false,
+                };
+            }
+        };
+
+    if !allow_request_time_local_catch_up
+        || wants.is_empty()
+        || !matches!(
+            initial_local_decision,
+            LocalServeDecision::MissingWantedObjects { .. }
+                | LocalServeDecision::Unavailable { .. }
+        )
+    {
+        return initial_local_decision;
+    }
+
+    let request_refspecs = if let LocalServeDecision::MissingWantedObjects {
+        missing_wants, ..
+    } = &initial_local_decision
+    {
+        advertised_refs.and_then(|advertised_refs| {
+            let plan =
+                derive_request_catch_up_plan_from_advertised_refs(advertised_refs, missing_wants);
+            if plan.refspecs.is_empty() {
+                info!(
+                    repo = %owner_repo,
+                    missing_wants = missing_wants.len(),
+                    matched_wants = plan.matched_wants,
+                    unmatched_wants = plan.unmatched_wants,
+                    protocol = protocol_label,
+                    "request-time catch-up could not map missing wants to advertised refs; using full ref refresh"
+                );
+                None
+            } else {
+                info!(
+                    repo = %owner_repo,
+                    missing_wants = missing_wants.len(),
+                    matched_wants = plan.matched_wants,
+                    unmatched_wants = plan.unmatched_wants,
+                    refspec_count = plan.refspecs.len(),
+                    protocol = protocol_label,
+                    "request-time catch-up will fetch only advertised refs that match the missing wants"
+                );
+                Some(plan.refspecs)
+            }
+        })
+    } else {
+        None
+    };
+
+    let Some((owner, repo)) = owner_repo.split_once('/') else {
+        warn!(
+            repo = %owner_repo,
+            protocol = protocol_label,
+            "failed to split owner/repo while preparing request-time local catch-up; proxying upstream"
+        );
+        return initial_local_decision;
+    };
+
+    match wait_for_local_catch_up(state, owner, repo, auth_header, wants, request_refspecs).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                wants = wants.len(),
+                want_sample,
+                error = %error,
+                protocol = protocol_label,
+                "failed while waiting for local fetch catch-up; proxying upstream"
+            );
+            initial_local_decision
+        }
+    }
 }
 
 /// List all tracked repository names by scanning for `forgeproxy:repo:*` keys

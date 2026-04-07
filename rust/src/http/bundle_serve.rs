@@ -27,7 +27,7 @@
 
 use std::fmt::Write as _;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
@@ -35,6 +35,7 @@ use axum::{
 use tracing::{debug, instrument};
 
 use crate::AppState;
+use crate::http::handler::AppError;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -50,17 +51,21 @@ pub async fn handle_bundle_list(
     owner: &str,
     repo: &str,
     auth_token: Option<&str>,
-) -> Result<Response> {
+) -> Result<Response, AppError> {
     // 1. Validate that the caller has at least read access.
     crate::auth::http_validator::validate_http_auth(state, auth_token, owner, repo)
         .await
-        .context("bundle-list auth validation failed")?;
+        .map_err(|error| {
+            debug!(error = ?error, "bundle-list auth validation failed");
+            error
+        })?;
 
     let owner_repo = format!("{owner}/{repo}");
     let Some(metadata) =
         crate::coordination::registry::load_current_node_bundle_metadata(state, &owner_repo)
             .await
-            .with_context(|| format!("failed to read bundle metadata for {owner_repo}"))?
+            .with_context(|| format!("failed to read bundle metadata for {owner_repo}"))
+            .map_err(AppError::Internal)?
     else {
         debug!(
             repo = %owner_repo,
@@ -82,17 +87,20 @@ pub async fn handle_bundle_list(
         presigned_ttl_secs,
     )
     .await
-    .with_context(|| format!("failed to generate presigned URL for {owner_repo}"))?;
+    .with_context(|| format!("failed to generate presigned URL for {owner_repo}"))
+    .map_err(AppError::Internal)?;
 
     let mut body = String::with_capacity(512);
-    writeln!(body, "[bundle]")?;
-    writeln!(body, "\tversion = 1")?;
-    writeln!(body, "\tmode = all")?;
-    writeln!(body, "\theuristic = creationToken")?;
-    writeln!(body)?;
-    writeln!(body, "[bundle \"{}\"]", metadata.publisher_id)?;
-    writeln!(body, "\turi = {presigned_url}")?;
-    writeln!(body, "\tcreationToken = {}", metadata.creation_token)?;
+    writeln!(body, "[bundle]").map_err(|err| AppError::Internal(err.into()))?;
+    writeln!(body, "\tversion = 1").map_err(|err| AppError::Internal(err.into()))?;
+    writeln!(body, "\tmode = all").map_err(|err| AppError::Internal(err.into()))?;
+    writeln!(body, "\theuristic = creationToken").map_err(|err| AppError::Internal(err.into()))?;
+    writeln!(body).map_err(|err| AppError::Internal(err.into()))?;
+    writeln!(body, "[bundle \"{}\"]", metadata.publisher_id)
+        .map_err(|err| AppError::Internal(err.into()))?;
+    writeln!(body, "\turi = {presigned_url}").map_err(|err| AppError::Internal(err.into()))?;
+    writeln!(body, "\tcreationToken = {}", metadata.creation_token)
+        .map_err(|err| AppError::Internal(err.into()))?;
 
     debug!(
         repo = %owner_repo,
