@@ -15,6 +15,7 @@ use std::time::Instant;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    io::{Cursor, Read},
 };
 
 use anyhow::Context as _;
@@ -27,7 +28,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use brotli::Decompressor;
 use bytes::Bytes;
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use futures::{Stream, StreamExt};
 use prometheus_client::metrics::counter::Counter;
 use serde::Deserialize;
@@ -234,6 +237,82 @@ fn http_git_client_fingerprint(
     user_agent.hash(&mut hasher);
     git_protocol.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn normalized_upload_pack_request_body(
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Bytes, AppError> {
+    let encoding = header_value(headers, "Content-Encoding").unwrap_or("");
+    if encoding.trim().is_empty() {
+        return Ok(body.clone());
+    }
+
+    let encodings = encoding
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|part| !part.is_empty() && part != "identity")
+        .collect::<Vec<_>>();
+    if encodings.is_empty() {
+        return Ok(body.clone());
+    }
+
+    let mut decoded = body.to_vec();
+    for content_coding in encodings.iter().rev() {
+        decoded = decode_upload_pack_body(&decoded, content_coding)?;
+    }
+    Ok(Bytes::from(decoded))
+}
+
+fn decode_upload_pack_body(body: &[u8], content_coding: &str) -> Result<Vec<u8>, AppError> {
+    match content_coding {
+        "gzip" | "x-gzip" => {
+            let mut decoder = GzDecoder::new(Cursor::new(body));
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).map_err(|error| {
+                AppError::BadRequest(format!("invalid gzip upload-pack body: {error}"))
+            })?;
+            Ok(decoded)
+        }
+        "deflate" => {
+            let mut decoded = Vec::new();
+            match ZlibDecoder::new(Cursor::new(body)).read_to_end(&mut decoded) {
+                Ok(_) => Ok(decoded),
+                Err(zlib_error) => {
+                    let mut fallback = Vec::new();
+                    DeflateDecoder::new(Cursor::new(body))
+                        .read_to_end(&mut fallback)
+                        .map_err(|raw_error| {
+                            AppError::BadRequest(format!(
+                                "invalid deflate upload-pack body: zlib={zlib_error}; raw={raw_error}"
+                            ))
+                        })?;
+                    Ok(fallback)
+                }
+            }
+        }
+        "br" => {
+            let mut decoder = Decompressor::new(Cursor::new(body), 4096);
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).map_err(|error| {
+                AppError::BadRequest(format!("invalid brotli upload-pack body: {error}"))
+            })?;
+            Ok(decoded)
+        }
+        "zstd" | "x-zstd" => zstd::decode_all(Cursor::new(body)).map_err(|error| {
+            AppError::BadRequest(format!("invalid zstd upload-pack body: {error}"))
+        }),
+        other => Err(AppError::BadRequest(format!(
+            "unsupported Content-Encoding for upload-pack: {other}"
+        ))),
+    }
 }
 
 fn request_scheme(headers: &HeaderMap) -> &str {
@@ -453,9 +532,12 @@ async fn handle_upload_pack(
         .get("Git-Protocol")
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
-    let request_metadata =
-        crate::tee_hydration::parse_upload_pack_request_metadata(&body, git_protocol.as_deref())
-            .unwrap_or_default();
+    let decoded_body = normalized_upload_pack_request_body(&headers, &body)?;
+    let request_metadata = crate::tee_hydration::parse_upload_pack_request_metadata(
+        &decoded_body,
+        git_protocol.as_deref(),
+    )
+    .unwrap_or_default();
     let wants = request_metadata.want_oids.clone();
     let want_sample = wants
         .iter()
@@ -574,7 +656,7 @@ async fn handle_upload_pack(
                     &owner,
                     &repo,
                     *serve_from,
-                    &body,
+                    &decoded_body,
                     git_protocol.as_deref(),
                     CloneCompletion {
                         cache_status: effective_cache_status.clone(),
@@ -634,6 +716,7 @@ async fn handle_upload_pack(
         &repo,
         auth_header.as_deref(),
         body,
+        decoded_body,
         CloneCompletion {
             cache_status: effective_cache_status,
             started_at,
@@ -1032,6 +1115,7 @@ async fn proxy_upload_pack_to_upstream(
     repo: &str,
     auth_header: Option<&str>,
     body: Bytes,
+    decoded_body: Bytes,
     completion: CloneCompletion,
     request_headers: &HeaderMap,
     request_metadata: crate::tee_hydration::CapturedFetchMetadata,
@@ -1045,7 +1129,7 @@ async fn proxy_upload_pack_to_upstream(
 
     let req =
         apply_forwarded_request_headers(state.http_client.post(&upstream_url), request_headers);
-    let capture_body = body.clone();
+    let capture_body = decoded_body.clone();
     let upstream_resp = req
         .body(body)
         .send()
@@ -1055,9 +1139,7 @@ async fn proxy_upload_pack_to_upstream(
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status();
         let owner_repo = format!("{owner}/{repo}");
-        let wants = crate::tee_hydration::parse_fetch_request_metadata(&capture_body)
-            .map(|meta| meta.want_oids)
-            .unwrap_or_default();
+        let wants = request_metadata.want_oids.clone();
         let want_sample = wants
             .iter()
             .take(5)
@@ -1275,6 +1357,116 @@ impl From<anyhow::Error> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brotli::CompressorWriter;
+    use flate2::Compression;
+    use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
+    use std::io::Write;
+
+    fn sample_v2_fetch_request() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"command=fetch\n",
+        ));
+        body.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"agent=git/2.51.2-Linux\n",
+        ));
+        body.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want 0123456789abcdef0123456789abcdef01234567\n",
+        ));
+        body.extend_from_slice(b"0000");
+        body
+    }
+
+    fn gzip_body(body: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn zlib_body(body: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn deflate_body(body: &[u8]) -> Vec<u8> {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn brotli_body(body: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = CompressorWriter::new(&mut encoded, 4096, 5, 22);
+            encoder.write_all(body).unwrap();
+            encoder.flush().unwrap();
+        }
+        encoded
+    }
+
+    fn assert_decoded_fetch(headers: HeaderMap, encoded: Vec<u8>) {
+        let decoded = normalized_upload_pack_request_body(&headers, &Bytes::from(encoded)).unwrap();
+        let metadata =
+            crate::tee_hydration::parse_upload_pack_request_metadata(&decoded, Some("version=2"))
+                .unwrap();
+
+        assert_eq!(
+            metadata.request_phase,
+            crate::tee_hydration::UploadPackRequestPhase::V2Fetch
+        );
+        assert_eq!(
+            metadata.want_oids,
+            vec!["0123456789abcdef0123456789abcdef01234567".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalized_upload_pack_request_body_decodes_gzip() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Encoding", HeaderValue::from_static("gzip"));
+        assert_decoded_fetch(headers, gzip_body(&sample_v2_fetch_request()));
+    }
+
+    #[test]
+    fn normalized_upload_pack_request_body_decodes_zlib_deflate() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Encoding", HeaderValue::from_static("deflate"));
+        assert_decoded_fetch(headers, zlib_body(&sample_v2_fetch_request()));
+    }
+
+    #[test]
+    fn normalized_upload_pack_request_body_decodes_raw_deflate() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Encoding", HeaderValue::from_static("deflate"));
+        assert_decoded_fetch(headers, deflate_body(&sample_v2_fetch_request()));
+    }
+
+    #[test]
+    fn normalized_upload_pack_request_body_decodes_brotli() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Encoding", HeaderValue::from_static("br"));
+        assert_decoded_fetch(headers, brotli_body(&sample_v2_fetch_request()));
+    }
+
+    #[test]
+    fn normalized_upload_pack_request_body_decodes_zstd() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Encoding", HeaderValue::from_static("zstd"));
+        assert_decoded_fetch(
+            headers,
+            zstd::encode_all(Cursor::new(sample_v2_fetch_request()), 1).unwrap(),
+        );
+    }
+
+    #[test]
+    fn normalized_upload_pack_request_body_decodes_stacked_encodings() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Encoding", HeaderValue::from_static("br, gzip"));
+        let once = brotli_body(&sample_v2_fetch_request());
+        let twice = gzip_body(&once);
+        assert_decoded_fetch(headers, twice);
+    }
 
     #[test]
     fn validate_path_segment_rejects_empty() {
