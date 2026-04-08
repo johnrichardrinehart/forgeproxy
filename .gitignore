@@ -3,3 +3,4 @@ target/
 .pre-commit-config.yaml
 result
 /plans
+.omx/
