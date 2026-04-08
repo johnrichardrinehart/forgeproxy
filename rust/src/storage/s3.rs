@@ -6,6 +6,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, instrument};
 
 // ---------------------------------------------------------------------------
@@ -83,19 +84,20 @@ pub async fn download_to_path(
         .await
         .context("S3 GetObject")?;
 
-    let bytes = response
-        .body
-        .collect()
+    let mut file = tokio::fs::File::create(file_path)
         .await
-        .context("read S3 object body")?
-        .into_bytes();
+        .with_context(|| format!("create downloaded object at {}", file_path.display()))?;
 
-    tokio::fs::write(file_path, &bytes)
+    let mut reader = response.body.into_async_read();
+    let total_bytes = tokio::io::copy(&mut reader, &mut file)
         .await
-        .with_context(|| format!("write downloaded object to {}", file_path.display()))?;
+        .context("stream S3 object body to disk")?;
+    file.flush()
+        .await
+        .with_context(|| format!("flush downloaded object to {}", file_path.display()))?;
 
-    metrics.metrics.s3_download_bytes.inc_by(bytes.len() as u64);
-    debug!(path = %file_path.display(), bytes = bytes.len(), "S3 object downloaded");
+    metrics.metrics.s3_download_bytes.inc_by(total_bytes);
+    debug!(path = %file_path.display(), bytes = total_bytes, "S3 object downloaded");
     Ok(())
 }
 
