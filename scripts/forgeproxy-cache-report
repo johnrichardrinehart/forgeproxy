@@ -10,6 +10,7 @@ use Cwd qw(realpath);
 
 my $cache_root = "/var/cache/forgeproxy";
 my $format = "table";
+my $help = 0;
 my %layout = (
     published_root => "published",
     mirrors_root => "mirrors",
@@ -20,12 +21,57 @@ my %layout = (
     state_tee_root => File::Spec->catdir(".state", "tee"),
 );
 
-my $usage = "usage: forgeproxy-cache-report [--cache-root PATH] [--format table|json] [owner/repo]\n";
+my $usage = <<'EOF';
+usage: forgeproxy-cache-report [--cache-root PATH] [--format table|json] [owner/repo]
+
+Reports forgeproxy cache disk usage.
+
+Without owner/repo:
+  reports all discovered repos
+  table output adds a repo column
+  json output changes to:
+    {
+      cache_root,
+      repo_count,
+      total_reported_unique_size_bytes,
+      repos: [...]
+    }
+
+With owner/repo:
+  reports one repo and includes:
+    published_path
+    published_generation_path
+    total_unique_size_bytes
+    components
+
+Component meanings:
+  published_path         Stable reader-facing path under published/
+  published_generation   Current immutable generation selected by published_path
+  mirror                 Writer-owned mutable mirror under mirrors/
+  retained_generations   All retained immutable generations under .state/generations/
+  delta                  Delta workspaces under .state/delta/
+  tee                    Tee captures under .state/tee/
+  snapshots              Archive snapshot files under snapshots/
+
+Size meanings:
+  apparent   Sum of file sizes found under the component paths
+  unique     Bytes only owned by that component within the report scope
+  shared     apparent - unique
+
+total_unique_size_bytes / total_reported_unique_size_bytes:
+  Best estimate of real filesystem cost within the report scope.
+EOF
 
 GetOptions(
     "cache-root=s" => \$cache_root,
     "format=s" => \$format,
+    "help|h" => \$help,
 ) or die $usage;
+
+if ($help) {
+    print $usage;
+    exit 0;
+}
 
 die "--format must be table or json\n" unless $format eq "table" || $format eq "json";
 die $usage if @ARGV > 1;
