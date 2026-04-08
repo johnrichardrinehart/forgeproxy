@@ -2612,7 +2612,7 @@ async fn ensure_repo_available_locally_detailed(
     }
 
     if !allow_request_time_s3_restore {
-        info!(
+        debug!(
             repo = %owner_repo,
             "skipping foreground request-time S3 restore while deciding local serveability"
         );
