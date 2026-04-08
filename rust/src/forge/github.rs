@@ -67,6 +67,12 @@ fn extract_current_user_login(body: &serde_json::Value) -> Option<String> {
         .map(|login| login.to_string())
 }
 
+fn extract_default_branch(body: &serde_json::Value) -> Option<String> {
+    body.get("default_branch")
+        .and_then(|branch| branch.as_str())
+        .map(str::to_string)
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementation
 // ---------------------------------------------------------------------------
@@ -377,6 +383,46 @@ impl ForgeBackend for GitHubBackend {
             .and_then(|s| s.as_str())
             .map(|s| s.to_string()))
     }
+
+    async fn resolve_default_branch(
+        &self,
+        http_client: &reqwest::Client,
+        owner: &str,
+        repo: &str,
+        auth_header: Option<&str>,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>> {
+        let url = format!("{}/repos/{owner}/{repo}", self.api_url);
+
+        let mut req = http_client.get(&url).header("Accept", self.accept);
+        if let Some(header) = auth_header
+            && !header.trim().is_empty()
+        {
+            req = req.header("Authorization", header);
+        }
+        let resp = req
+            .send()
+            .await
+            .context("upstream API request failed for default branch resolution")?;
+
+        rate_limit.record_response("GET /repos/{owner}/{repo}", resp.headers());
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            warn!(%owner, %repo, %status, "upstream API returned non-success for default branch resolution");
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("failed to parse default branch resolution response")?;
+
+        Ok(extract_default_branch(&body))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +464,18 @@ mod tests {
             "permissions": {"admin": false, "push": true, "pull": true}
         });
         assert_eq!(crate::forge::extract_permission(&body), Permission::Write);
+    }
+
+    #[test]
+    fn extract_default_branch_found() {
+        let body = serde_json::json!({ "default_branch": "main" });
+        assert_eq!(extract_default_branch(&body), Some("main".to_string()));
+    }
+
+    #[test]
+    fn extract_default_branch_missing() {
+        let body = serde_json::json!({});
+        assert_eq!(extract_default_branch(&body), None);
     }
 
     #[test]

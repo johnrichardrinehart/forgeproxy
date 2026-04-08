@@ -138,6 +138,19 @@ pub trait ForgeBackend: Send + Sync {
         auth_header: Option<&str>,
         rate_limit: &RateLimitState,
     ) -> Result<Option<String>>;
+
+    /// Resolve the repository default branch name.
+    ///
+    /// Returns `Ok(Some(branch))` if it can be determined, `Ok(None)` if the
+    /// repository is not found or inaccessible, or an error on API failure.
+    async fn resolve_default_branch(
+        &self,
+        http_client: &reqwest::Client,
+        owner: &str,
+        repo: &str,
+        auth_header: Option<&str>,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>>;
 }
 
 // ---------------------------------------------------------------------------

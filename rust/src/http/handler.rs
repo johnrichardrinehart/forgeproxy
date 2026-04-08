@@ -189,6 +189,38 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/{owner}/{repo}/archive/{*rest}",
             get(super::archive::handle_archive),
         )
+        .route(
+            "/repos/{owner}/{repo}/tarball",
+            get(super::archive::handle_tarball_redirect_without_ref),
+        )
+        .route(
+            "/repos/{owner}/{repo}/tarball/{*git_ref}",
+            get(super::archive::handle_tarball_redirect_with_ref),
+        )
+        .route(
+            "/repos/{owner}/{repo}/zipball",
+            get(super::archive::handle_zipball_redirect_without_ref),
+        )
+        .route(
+            "/repos/{owner}/{repo}/zipball/{*git_ref}",
+            get(super::archive::handle_zipball_redirect_with_ref),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/tarball",
+            get(super::archive::handle_tarball_redirect_without_ref),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/tarball/{*git_ref}",
+            get(super::archive::handle_tarball_redirect_with_ref),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/zipball",
+            get(super::archive::handle_zipball_redirect_without_ref),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/zipball/{*git_ref}",
+            get(super::archive::handle_zipball_redirect_with_ref),
+        )
         // Webhook, health, metrics
         .route("/webhook", post(handle_webhook))
         .route("/healthz", get(handle_health))
@@ -1018,6 +1050,16 @@ async fn local_http_clone_access_confirmed(
             );
             false
         }
+        Err(AppError::NotFound(message)) => {
+            info!(
+                %owner,
+                %repo,
+                %message,
+                auth_kind,
+                "local HTTP clone access probe found no upstream repo metadata; proxying upstream"
+            );
+            false
+        }
     }
 }
 
@@ -1293,6 +1335,8 @@ async fn proxy_upload_pack_to_upstream(
 pub enum AppError {
     /// The caller is not authenticated or not authorised.
     Unauthorized(String),
+    /// The requested resource does not exist.
+    NotFound(String),
     /// The request is malformed.
     BadRequest(String),
     /// Forward an upstream rate-limit response to the client.
@@ -1314,6 +1358,7 @@ impl IntoResponse for AppError {
                 msg,
             )
                 .into_response(),
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             AppError::UpstreamRateLimited {
                 status,

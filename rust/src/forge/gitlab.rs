@@ -29,6 +29,12 @@ fn extract_current_username(body: &serde_json::Value) -> Option<String> {
         .map(|username| username.to_string())
 }
 
+fn extract_default_branch(body: &serde_json::Value) -> Option<String> {
+    body.get("default_branch")
+        .and_then(|branch| branch.as_str())
+        .map(str::to_string)
+}
+
 fn apply_gitlab_api_auth(
     req: reqwest::RequestBuilder,
     auth_header: Option<&str>,
@@ -361,6 +367,45 @@ impl ForgeBackend for GitLabBackend {
             .map(|s| s.to_string()))
     }
 
+    async fn resolve_default_branch(
+        &self,
+        http_client: &reqwest::Client,
+        owner: &str,
+        repo: &str,
+        auth_header: Option<&str>,
+        rate_limit: &RateLimitState,
+    ) -> Result<Option<String>> {
+        let project_path = format!("{owner}%2F{repo}");
+        let url = format!("{}/projects/{project_path}", self.api_url);
+
+        let req = apply_gitlab_api_auth(
+            http_client.get(&url).header("Accept", "application/json"),
+            auth_header,
+        );
+        let resp = req
+            .send()
+            .await
+            .context("GitLab API request failed for default branch resolution")?;
+
+        rate_limit.record_response("GET /projects/{owner}%2F{repo}", resp.headers());
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            warn!(%owner, %repo, %status, "GitLab API returned non-success for default branch resolution");
+            return Ok(None);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("failed to parse GitLab default branch response")?;
+
+        Ok(extract_default_branch(&body))
+    }
+
     fn parse_webhook_payload(&self, event_type: &str, payload: &serde_json::Value) -> WebhookEvent {
         match event_type {
             // GitLab sends "Member Hook" for group member changes.
@@ -636,5 +681,17 @@ mod tests {
     fn extract_current_username_missing() {
         let body = serde_json::json!({ "id": 1 });
         assert_eq!(extract_current_username(&body), None);
+    }
+
+    #[test]
+    fn extract_default_branch_found() {
+        let body = serde_json::json!({ "default_branch": "main" });
+        assert_eq!(extract_default_branch(&body), Some("main".to_string()));
+    }
+
+    #[test]
+    fn extract_default_branch_missing() {
+        let body = serde_json::json!({});
+        assert_eq!(extract_default_branch(&body), None);
     }
 }
