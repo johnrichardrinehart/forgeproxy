@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-pub(crate) const GENERATIONS_ROOT_DIR: &str = "generations";
+pub(crate) const GENERATIONS_ROOT_DIR: &str = "published";
 pub(crate) const MIRRORS_ROOT_DIR: &str = "mirrors";
 pub(crate) const SNAPSHOTS_ROOT_DIR: &str = "snapshots";
 pub(crate) const STATE_ROOT_DIR: &str = ".state";

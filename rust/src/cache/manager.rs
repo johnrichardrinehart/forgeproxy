@@ -1,7 +1,7 @@
 //! On-disk bare-repo cache manager with water-mark-based eviction.
 //!
 //! Repos are exposed to readers under
-//! `{base_path}/generations/{owner}/{repo}.git`, with mutable mirrors and other
+//! `{base_path}/published/{owner}/{repo}.git`, with mutable mirrors and other
 //! operational state stored in sibling subtrees. When disk usage exceeds the configured
 //! high-water mark, the least-frequently-used repos (that have an S3 bundle
 //! backup) are evicted until usage drops below the low-water mark.
@@ -544,7 +544,7 @@ impl CacheManager {
 
     /// List all `owner/repo` slugs currently present in the local cache.
     ///
-    /// Scans `{base_path}/generations/{owner}/{repo}.git` directories.
+    /// Scans `{base_path}/published/{owner}/{repo}.git` directories.
     pub fn list_repos(&self) -> Result<Vec<String>> {
         let mut repos = Vec::new();
         for (owner_repo, repo_path) in self.list_repo_dirs()? {
@@ -558,7 +558,7 @@ impl CacheManager {
 
     /// List all on-disk bare repo directory candidates, including partial repos.
     ///
-    /// Scans `{base_path}/generations/{owner}/{repo}.git` directories and returns any repo
+    /// Scans `{base_path}/published/{owner}/{repo}.git` directories and returns any repo
     /// directory with a `.git` suffix, regardless of current validity.
     pub fn list_repo_dirs(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut repos = Vec::new();
@@ -818,7 +818,7 @@ mod tests {
         let path = mgr.repo_path("acme-corp/my-service");
         assert_eq!(
             path,
-            PathBuf::from("/var/cache/forgeproxy/generations/acme-corp/my-service.git")
+            PathBuf::from("/var/cache/forgeproxy/published/acme-corp/my-service.git")
         );
     }
 
@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(without, with);
         assert_eq!(
             without,
-            PathBuf::from("/var/cache/forgeproxy/generations/acme-corp/my-service.git")
+            PathBuf::from("/var/cache/forgeproxy/published/acme-corp/my-service.git")
         );
     }
 

@@ -37,7 +37,7 @@ let
 in
 rec {
   cacheRoot = root;
-  generationsRoot = "${cacheRoot}/generations";
+  generationsRoot = "${cacheRoot}/published";
   mirrorsRoot = "${cacheRoot}/mirrors";
   snapshotsRoot = "${cacheRoot}/snapshots";
   stateRoot = "${cacheRoot}/.state";

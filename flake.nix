@@ -234,6 +234,7 @@
             default = config.packages.forgeproxy;
             ghe-key-lookup = pkgs.callPackage ./nix/ghe-key-lookup/package.nix { };
             ghe-key-lookup-oci = pkgs.callPackage ./nix/ghe-key-lookup/oci.nix { };
+            forgeproxy-cache-report = pkgs.callPackage ./nix/forgeproxy-cache-report.nix { };
           };
         };
 
@@ -293,6 +294,7 @@
             fipsEnabled = true;
           };
           ghe-key-lookup = final.callPackage ./nix/ghe-key-lookup/package.nix { };
+          forgeproxy-cache-report = final.callPackage ./nix/forgeproxy-cache-report.nix { };
         };
 
         nixosModules = {
@@ -310,6 +312,8 @@
           proxy-host = ./nix/proxy-host.nix;
           valkey-host = ./nix/valkey-host.nix;
           dev = ./nix/dev.nix;
+          dev-tools = ./nix/dev-tools.nix;
+          forgeproxy-cache-report = ./nix/forgeproxy-cache-report.nix;
           ghe-key-lookup = ./nix/ghe-key-lookup/module.nix;
           ghe-key-lookup-host = ./nix/ghe-key-lookup/host.nix;
         };
@@ -682,6 +686,7 @@
         nixosConfigurations.forgeproxy = self.nixosConfigurations.forgeproxy-hardened.extendModules {
           modules = [
             self.nixosModules.dev
+            self.nixosModules.dev-tools
             (
               { pkgs, ... }:
               {
@@ -694,7 +699,10 @@
         };
 
         nixosConfigurations.valkey = self.nixosConfigurations.valkey-hardened.extendModules {
-          modules = [ self.nixosModules.dev ];
+          modules = [
+            self.nixosModules.dev
+            self.nixosModules.dev-tools
+          ];
         };
 
         nixosConfigurations.ghe-key-lookup-hardened = inputs.nixpkgs.lib.nixosSystem {
@@ -791,6 +799,7 @@
             {
               modules = [
                 self.nixosModules.dev
+                self.nixosModules.dev-tools
                 (
                   { lib, ... }:
                   {

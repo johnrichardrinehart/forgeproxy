@@ -37,7 +37,7 @@ auth:
 
 storage:
   local:
-    path: "/var/cache/forgeproxy/repos"
+    path: "/var/cache/forgeproxy"
     max_bytes: ${local_cache_max_bytes}
     eviction_policy: "${eviction_policy}"
   s3:
