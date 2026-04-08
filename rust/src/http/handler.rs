@@ -1,9 +1,9 @@
 //! Main axum router and HTTP request handlers for the caching proxy.
 //!
 //! Routes:
-//! - `GET  /:owner/:repo/info/refs`       - Smart HTTP info/refs (upload-pack only)
+//! - `GET  /:owner/:repo/info/refs`       - Smart HTTP info/refs
 //! - `POST /:owner/:repo/git-upload-pack`  - Pack negotiation / data transfer
-//! - `POST /:owner/:repo/git-receive-pack` - Always rejected (403)
+//! - `POST /:owner/:repo/git-receive-pack` - Proxied write-through push
 //! - `GET  /bundles/:owner/:repo/bundle-list` - Bundle-list for bundle-uri
 //! - `POST /webhook`                       - GitHub webhook receiver
 //! - `GET  /healthz`                       - Liveness check
@@ -369,15 +369,16 @@ fn request_host(headers: &HeaderMap) -> Result<&str, AppError> {
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// `GET /:owner/:repo/info/refs?service=git-upload-pack`
+/// `GET /:owner/:repo/info/refs?service=<git-service>`
 ///
-/// Rejects pushes, proxies `info/refs` from the upstream forge, and only
-/// rewrites successful `git-upload-pack` advertisements to inject the
-/// `bundle-uri` protocol-v2 capability. Upstream authentication challenges
-/// and non-success responses are forwarded transparently.
+/// Proxies `info/refs` from the upstream forge. Successful
+/// `git-upload-pack` advertisements are rewritten to inject the `bundle-uri`
+/// protocol-v2 capability. `git-receive-pack` advertisements are forwarded
+/// transparently so HTTP pushes can flow straight through to the upstream.
+/// Upstream authentication challenges and non-success responses are preserved.
 ///
-/// For `git-upload-pack` requests the response is
-/// intercepted so that we can inject the `bundle-uri` protocol-v2 capability.
+/// `git-upload-pack` responses are intercepted so that we can inject the
+/// `bundle-uri` protocol-v2 capability.
 #[instrument(
     skip(state, headers),
     fields(
@@ -402,11 +403,8 @@ async fn handle_info_refs(
 
     let service = query.service.unwrap_or_default();
     if service == "git-receive-pack" {
-        return Ok((
-            StatusCode::FORBIDDEN,
-            "Push (git-receive-pack) is not supported through the caching proxy",
-        )
-            .into_response());
+        info!(service = %service, "proxying git info/refs request to upstream forge");
+        return proxy_info_refs_to_upstream(&state, &owner, &repo, &service, &headers).await;
     }
 
     if service != "git-upload-pack" {
@@ -437,8 +435,10 @@ async fn handle_info_refs(
 
     // Proxy the info/refs request to the upstream forge.
     let upstream_url = format!(
-        "https://{}/{}/{}/info/refs?service=git-upload-pack",
-        state.config.upstream.hostname, owner, repo,
+        "{}/{}/{}/info/refs?service=git-upload-pack",
+        state.config.upstream.git_url_base(),
+        owner,
+        repo,
     );
 
     debug!(%upstream_url, "proxying info/refs to upstream forge");
@@ -767,26 +767,27 @@ async fn handle_upload_pack(
 
 /// `POST /:owner/:repo/git-receive-pack`
 ///
-/// Pushes are unconditionally rejected.  The proxy is read-only.
-#[instrument(skip(_state, _headers))]
+/// Pushes are written through to the upstream forge without mutating the local
+/// cache or forcing immediate mirror updates.
+#[instrument(skip(state, headers, body))]
 async fn handle_receive_pack(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path((owner, repo)): Path<(String, String)>,
-    _headers: HeaderMap,
-) -> Response {
-    if validate_path_segment(&owner, "owner").is_err()
-        || validate_path_segment(&repo, "repo").is_err()
-    {
-        return (StatusCode::UNAUTHORIZED, "invalid owner or repo").into_response();
-    }
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let _active_connection = state.begin_active_connection(Protocol::Https);
+    validate_path_segment(&owner, "owner")?;
+    validate_path_segment(&repo, "repo")?;
 
-    warn!(%owner, %repo, "rejected git-receive-pack (push)");
-    (
-        StatusCode::FORBIDDEN,
-        "Push (git-receive-pack) is not supported through the caching proxy.\n\
-         Please push directly to the upstream forge.",
-    )
-        .into_response()
+    info!(
+        %owner,
+        %repo,
+        request_bytes = body.len(),
+        "proxying git-receive-pack to upstream forge"
+    );
+
+    proxy_receive_pack_to_upstream(&state, &owner, &repo, body, &headers).await
 }
 
 /// `GET /bundles/:owner/:repo/bundle-list`
@@ -995,6 +996,37 @@ async fn forward_upstream_response(upstream_resp: reqwest::Response) -> Result<R
     ))
 }
 
+fn stream_upstream_response(upstream_resp: reqwest::Response) -> Response {
+    let status = upstream_resp.status();
+    let headers = collect_forwarded_response_headers(upstream_resp.headers());
+    let body = Body::from_stream(upstream_resp.bytes_stream());
+    response_from_upstream_parts(status, headers, body)
+}
+
+async fn proxy_info_refs_to_upstream(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    service: &str,
+    request_headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let upstream_url = format!(
+        "{}/{}/{}/info/refs?service={service}",
+        state.config.upstream.git_url_base(),
+        owner,
+        repo,
+    );
+
+    let upstream_req =
+        apply_forwarded_request_headers(state.http_client.get(&upstream_url), request_headers);
+    let upstream_resp = upstream_req
+        .send()
+        .await
+        .context("failed to reach upstream forge for info/refs")?;
+
+    Ok(stream_upstream_response(upstream_resp))
+}
+
 async fn local_http_clone_access_confirmed(
     state: &AppState,
     auth_header: Option<&str>,
@@ -1151,6 +1183,7 @@ async fn serve_local_upload_pack(
 }
 
 /// Proxy a `git-upload-pack` POST to the upstream forge and stream the response.
+#[allow(clippy::too_many_arguments)]
 async fn proxy_upload_pack_to_upstream(
     state: &AppState,
     owner: &str,
@@ -1165,8 +1198,10 @@ async fn proxy_upload_pack_to_upstream(
     client_fingerprint: String,
 ) -> Result<Response, AppError> {
     let upstream_url = format!(
-        "https://{}/{}/{}/git-upload-pack",
-        state.config.upstream.hostname, owner, repo,
+        "{}/{}/{}/git-upload-pack",
+        state.config.upstream.git_url_base(),
+        owner,
+        repo,
     );
 
     let req =
@@ -1324,6 +1359,31 @@ async fn proxy_upload_pack_to_upstream(
         forwarded_headers,
         body,
     ))
+}
+
+async fn proxy_receive_pack_to_upstream(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    body: Bytes,
+    request_headers: &HeaderMap,
+) -> Result<Response, AppError> {
+    let upstream_url = format!(
+        "{}/{}/{}/git-receive-pack",
+        state.config.upstream.git_url_base(),
+        owner,
+        repo,
+    );
+
+    let upstream_req =
+        apply_forwarded_request_headers(state.http_client.post(&upstream_url), request_headers);
+    let upstream_resp = upstream_req
+        .body(body)
+        .send()
+        .await
+        .context("failed to reach upstream forge for receive-pack")?;
+
+    Ok(stream_upstream_response(upstream_resp))
 }
 
 // ---------------------------------------------------------------------------

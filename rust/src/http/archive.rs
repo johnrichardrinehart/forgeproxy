@@ -55,6 +55,7 @@ fn archive_download_filename(repo: &str, ref_name: &str, ext: &str) -> String {
     format!("{}-{}{}", repo, ref_name.replace('/', "-"), ext)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_archive_response_headers(
     response: &mut Response,
     repo: &str,
@@ -70,12 +71,12 @@ fn apply_archive_response_headers(
         header::CONTENT_TYPE,
         content_type_for_ext(ext).parse().unwrap(),
     );
-    if let Some(length) = content_length {
-        if let Ok(length) = HeaderValue::from_str(&length.to_string()) {
-            response
-                .headers_mut()
-                .insert(header::CONTENT_LENGTH, length);
-        }
+    if let Some(length) = content_length
+        && let Ok(length) = HeaderValue::from_str(&length.to_string())
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, length);
     }
     let disposition = content_disposition.map(str::to_string).unwrap_or_else(|| {
         format!(

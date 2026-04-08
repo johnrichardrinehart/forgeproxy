@@ -69,6 +69,12 @@ fn clone_hydration_semaphore_key(owner_repo: &str) -> String {
     format!("forgeproxy:semaphore:clone:{normalized}")
 }
 
+fn hydration_in_progress_on_this_node(info: &RepoInfo, node_id: &str) -> bool {
+    info.status == "hydrating"
+        && !info.hydrating_node_id.is_empty()
+        && info.hydrating_node_id == node_id
+}
+
 const VALKEY_RETRY_ATTEMPTS: usize = 5;
 const VALKEY_RETRY_BASE_DELAY_MS: u64 = 250;
 
@@ -800,6 +806,19 @@ async fn try_ensure_repo_cloned_inner(
             had_local_repo_at_start || state.cache_manager.has_repo_mirror(&owner_repo);
 
         if has_existing_local_state {
+            let existing_info = get_repo_info(&state.valkey, &owner_repo)
+                .await?
+                .unwrap_or_default();
+            if hydration_in_progress_on_this_node(&existing_info, &node_id) {
+                info!(
+                    repo = %owner_repo,
+                    published = %published_repo_path.display(),
+                    mirror = %mirror_path.display(),
+                    hydrating_since_ts = existing_info.hydrating_since_ts,
+                    "skipping duplicate same-node hydration because this repo is already hydrating locally"
+                );
+                return Ok(());
+            }
             info!(
                 repo = %owner_repo,
                 mirror = %mirror_path.display(),
@@ -885,6 +904,15 @@ async fn try_ensure_repo_cloned_inner(
         let mut info = get_repo_info(&state.valkey, &owner_repo)
             .await?
             .unwrap_or_default();
+        if hydration_in_progress_on_this_node(&info, &node_id) {
+            info!(
+                repo = %owner_repo,
+                mirror = %mirror_path.display(),
+                hydrating_since_ts = info.hydrating_since_ts,
+                "skipping duplicate same-node hydration because this repo is already hydrating locally"
+            );
+            return Ok(());
+        }
         if !info.hydrating_node_id.is_empty() && info.hydrating_node_id != node_id {
             warn!(
                 repo = %owner_repo,
@@ -3153,6 +3181,30 @@ mod tests {
         assert_eq!(round_trip.hydrating_node_id, "node-a");
         assert_eq!(round_trip.hydrating_since_ts, 1234);
         assert!(round_trip.bootstrap_bundle_pending);
+    }
+
+    #[test]
+    fn hydration_in_progress_on_this_node_requires_hydrating_status_and_matching_node() {
+        let hydrating_here = RepoInfo {
+            status: "hydrating".to_string(),
+            hydrating_node_id: "node-a".to_string(),
+            ..Default::default()
+        };
+        assert!(hydration_in_progress_on_this_node(
+            &hydrating_here,
+            "node-a"
+        ));
+        assert!(!hydration_in_progress_on_this_node(
+            &hydrating_here,
+            "node-b"
+        ));
+
+        let ready_here = RepoInfo {
+            status: "ready".to_string(),
+            hydrating_node_id: "node-a".to_string(),
+            ..Default::default()
+        };
+        assert!(!hydration_in_progress_on_this_node(&ready_here, "node-a"));
     }
 
     #[test]

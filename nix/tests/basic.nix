@@ -113,6 +113,8 @@ let
   # forgeproxy configuration YAML for the test environment
   # ---------------------------------------------------------------------------
   testConfigYaml = pkgs.writeText "forgeproxy-test-config.yaml" ''
+    backend_type: "gitea"
+
     upstream:
       hostname: "ghe"
       api_url: "http://ghe:3000/api/v1"
@@ -307,6 +309,8 @@ pkgs.testers.runNixOSTest {
           configFile = testConfigYaml;
           logLevel = "info";
         };
+
+        services.forgeproxy.backend.type = "gitea";
 
         systemd.services.otlp-test-sink = {
           description = "OTLP sink for forgeproxy VM test assertions";
@@ -591,32 +595,6 @@ pkgs.testers.runNixOSTest {
         assert "# EOF" in result or "forgeproxy" in result.lower() or "process" in result.lower(), \
             f"Metrics endpoint did not return expected content: {result[:200]}"
 
-    # ── Push rejection ────────────────────────────────────────────────────
-    with subtest("Push (git-receive-pack) is rejected with 403"):
-        exit_code = proxy.execute(
-            "curl -sf"
-            " -X POST"
-            " -H 'Content-Type: application/x-git-receive-pack-request'"
-            " -H 'Authorization: Basic b2N0b2NhdDpzZWNyZXQxMjM='"
-            " http://localhost:8080/octocat/hello-world/git-receive-pack"
-        )[0]
-        assert exit_code != 0, "Expected curl to fail (non-2xx status)"
-
-        status = proxy.succeed(
-            "curl -s -o /dev/null -w '%{http_code}'"
-            " -X POST"
-            " -H 'Content-Type: application/x-git-receive-pack-request'"
-            " -H 'Authorization: Basic b2N0b2NhdDpzZWNyZXQxMjM='"
-            " http://localhost:8080/octocat/hello-world/git-receive-pack"
-        )
-        assert status.strip().strip("'") == "403", f"Expected HTTP 403, got {status}"
-
-    with subtest("Forgeproxy journald logs egress over OTLP"):
-        proxy.wait_until_succeeds(
-            "journalctl -u otlp-test-sink.service --no-pager -o cat"
-            " | grep -F 'rejected git-receive-pack (push)'"
-        )
-
     with subtest("Forgeproxy traces egress over OTLP"):
         proxy.wait_until_succeeds(
             "journalctl -u otlp-test-sink.service --no-pager -o cat"
@@ -637,6 +615,75 @@ pkgs.testers.runNixOSTest {
         )
         proxy.wait_until_succeeds(
             "find ${cacheLayout.generationDir "octocat/hello-world"} -mindepth 1 -maxdepth 1 -type d | grep -q ."
+        )
+
+    with subtest("API POST through proxy reaches upstream"):
+        status = client.succeed(
+            "curl -sS"
+            " -o /tmp/proxy-api-created.body"
+            " -w '%{http_code}'"
+            " -u octocat:secret123"
+            " -X POST"
+            " -H 'Content-Type: application/json'"
+            " https://proxy/api/v1/user/repos"
+            " -d '{\"name\":\"proxy-api-created\",\"auto_init\":false}'"
+        ).strip()
+        if status != "201":
+            body = client.succeed("cat /tmp/proxy-api-created.body || true")
+            raise Exception(f"expected 201 from proxy API POST, got {status}: {body}")
+        ghe.wait_until_succeeds(
+            "curl -sf"
+            " -u octocat:secret123"
+            " http://localhost:3000/api/v1/repos/octocat/proxy-api-created"
+            " | jq -e '.name == \"proxy-api-created\"'"
+        )
+
+    with subtest("git push through proxy updates upstream refs"):
+        client.succeed(
+            "set -e && "
+            "cd /tmp/repo && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "git checkout -b proxy-write-branch && "
+            "echo 'proxy write branch' >> README.md && "
+            "git add README.md && "
+            "git commit -m 'proxy write branch' && "
+            "git tag proxy-write-tag && "
+            "git push origin proxy-write-branch refs/tags/proxy-write-tag"
+        )
+        ghe.wait_until_succeeds(
+            "git ls-remote http://octocat:secret123@localhost:3000/octocat/hello-world.git refs/heads/proxy-write-branch"
+            " | grep -Eq '^[0-9a-f]{40}[[:space:]]+refs/heads/proxy-write-branch$'"
+        )
+        ghe.wait_until_succeeds(
+            "git ls-remote http://octocat:secret123@localhost:3000/octocat/hello-world.git refs/tags/proxy-write-tag"
+            " | grep -Eq '^[0-9a-f]{40}[[:space:]]+refs/tags/proxy-write-tag$'"
+        )
+        proxy.succeed(
+            "! git --git-dir ${cacheLayout.repoPath "octocat/hello-world"} rev-parse --verify refs/heads/proxy-write-branch"
+        )
+        proxy.succeed(
+            "! git --git-dir ${cacheLayout.repoPath "octocat/hello-world"} rev-parse --verify refs/tags/proxy-write-tag"
+        )
+
+    with subtest("git push through proxy does not update the local mirror or published generation"):
+        proxy.succeed(
+            "! git --git-dir ${cacheLayout.mirrorPath "octocat/hello-world"} rev-parse --verify refs/heads/proxy-write-branch >/dev/null 2>&1"
+        )
+        proxy.succeed(
+            "! git --git-dir ${cacheLayout.mirrorPath "octocat/hello-world"} rev-parse --verify refs/tags/proxy-write-tag >/dev/null 2>&1"
+        )
+        proxy.succeed(
+            "! git --git-dir $(readlink -f ${cacheLayout.repoPath "octocat/hello-world"}) rev-parse --verify refs/heads/proxy-write-branch >/dev/null 2>&1"
+        )
+        proxy.succeed(
+            "! git --git-dir $(readlink -f ${cacheLayout.repoPath "octocat/hello-world"}) rev-parse --verify refs/tags/proxy-write-tag >/dev/null 2>&1"
+        )
+
+    with subtest("Forgeproxy journald logs proxied git-receive-pack over OTLP"):
+        proxy.wait_until_succeeds(
+            "journalctl -u otlp-test-sink.service --no-pager -o cat"
+            " | grep -F 'proxying git-receive-pack to upstream forge'"
         )
 
     with subtest("Forgeproxy metrics are exported at /metrics"):

@@ -202,8 +202,8 @@ in
 
           # ── Archive / tarball downloads (cached) ─────────────────
           "~ ^/(.+)/(archive|tarball|zipball)/" = {
-            proxyPass = "https://forge-upstream";
             extraConfig = ''
+              proxy_pass https://forge-upstream;
               proxy_set_header Authorization $http_authorization;
               proxy_set_header Host $forge_upstream_host;
               proxy_set_header X-Real-IP $remote_addr;
@@ -222,14 +222,23 @@ in
 
           # ── API pass-through ───────────────────────────────────
           "${backendCfg.apiPathPrefix}/" = {
-            proxyPass = "https://forge-upstream${backendCfg.apiPathPrefix}/";
             extraConfig = ''
+              proxy_pass https://forge-upstream${backendCfg.apiPathPrefix}/;
               proxy_set_header Authorization $http_authorization;
               proxy_set_header Host $forge_upstream_host;
               proxy_set_header X-Real-IP $remote_addr;
               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
               proxy_set_header X-Forwarded-Proto $scheme;
               proxy_ssl_server_name on;
+              proxy_ssl_name $forge_upstream_host;
+              proxy_buffering off;
+              proxy_request_buffering off;
+              client_max_body_size 0;
+              client_body_timeout 15m;
+              proxy_connect_timeout 30s;
+              proxy_read_timeout 15m;
+              proxy_send_timeout 15m;
+              send_timeout 15m;
             '';
           };
 
