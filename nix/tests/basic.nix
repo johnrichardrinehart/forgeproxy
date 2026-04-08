@@ -617,6 +617,18 @@ pkgs.testers.runNixOSTest {
             "find ${cacheLayout.generationDir "octocat/hello-world"} -mindepth 1 -maxdepth 1 -type d | grep -q ."
         )
 
+    with subtest("Web root through proxy reaches upstream UI"):
+        client.succeed(
+            "curl -sf https://proxy/ > /tmp/proxy-root.html && "
+            "grep -qi '<html' /tmp/proxy-root.html"
+        )
+
+    with subtest("Repository web page through proxy reaches upstream UI"):
+        client.succeed(
+            "curl -sf https://proxy/octocat/hello-world > /tmp/proxy-repo.html && "
+            "grep -qi 'hello-world' /tmp/proxy-repo.html"
+        )
+
     with subtest("API POST through proxy reaches upstream"):
         status = client.succeed(
             "curl -sS"

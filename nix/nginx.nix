@@ -242,6 +242,20 @@ in
             '';
           };
 
+          # ── Web UI / generic upstream pass-through ───────────────
+          "/" = {
+            extraConfig = ''
+              proxy_pass https://forge-upstream;
+              proxy_set_header Authorization $http_authorization;
+              proxy_set_header Host $forge_upstream_host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_ssl_server_name on;
+              proxy_ssl_name $forge_upstream_host;
+            '';
+          };
+
           # ── Health check (proxied to backend) ────────────────────
           "/healthz" = {
             proxyPass = "http://127.0.0.1:${toString cfg.backendPort}/healthz";
