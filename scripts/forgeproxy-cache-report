@@ -1,0 +1,239 @@
+#!/run/current-system/sw/bin/perl
+use strict;
+use warnings;
+use feature 'say';
+use Getopt::Long qw(GetOptions);
+use JSON::PP qw(encode_json);
+use File::Find;
+use File::Spec;
+use Cwd qw(realpath);
+
+my $cache_root = "/var/cache/forgeproxy";
+my $format = "table";
+my %layout = (
+    generations_root => "generations",
+    mirrors_root => "mirrors",
+    snapshots_root => "snapshots",
+    state_root => ".state",
+    state_generations_root => File::Spec->catdir(".state", "generations"),
+    state_delta_root => File::Spec->catdir(".state", "delta"),
+    state_tee_root => File::Spec->catdir(".state", "tee"),
+);
+
+GetOptions(
+    "cache-root=s" => \$cache_root,
+    "format=s" => \$format,
+) or die "usage: forgeproxy-cache-report [--cache-root PATH] [--format table|json] owner/repo\n";
+
+my $repo_slug = shift @ARGV
+  or die "usage: forgeproxy-cache-report [--cache-root PATH] [--format table|json] owner/repo\n";
+die "repo must be owner/repo\n" unless $repo_slug =~ m{/};
+die "--format must be table or json\n" unless $format eq "table" || $format eq "json";
+
+my ($owner, $repo) = split m{/}, $repo_slug, 2;
+$repo =~ s/\.git$//;
+
+my @component_order = qw(
+  generation_entry
+  generation_target
+  mirror
+  generations
+  delta
+  tee
+  snapshots
+);
+
+sub component_paths {
+    my ($root, $owner_name, $repo_name) = @_;
+    my $generation_entry = File::Spec->catfile(
+        $root,
+        $layout{generations_root},
+        $owner_name,
+        "$repo_name.git",
+    );
+    my @generation_target;
+    if (-l $generation_entry) {
+        my $resolved = realpath($generation_entry);
+        @generation_target = defined $resolved ? ($resolved) : ();
+    }
+
+    my $generations_root = File::Spec->catdir(
+        $root,
+        $layout{state_generations_root},
+        $owner_name,
+        "$repo_name.git",
+    );
+    my @generation_dirs = ();
+    if (-d $generations_root) {
+        opendir(my $dh, $generations_root) or die "opendir $generations_root: $!";
+        @generation_dirs = sort grep { -d File::Spec->catdir($generations_root, $_) && !/^\.\.?$/ } readdir($dh);
+        closedir($dh);
+        @generation_dirs = map { File::Spec->catdir($generations_root, $_) } @generation_dirs;
+    }
+
+    my $delta_root = File::Spec->catdir(
+        $root,
+        $layout{state_delta_root},
+        $owner_name,
+        "$repo_name.git",
+    );
+    my @delta_dirs = ();
+    if (-d $delta_root) {
+        opendir(my $dh, $delta_root) or die "opendir $delta_root: $!";
+        @delta_dirs = sort grep { -d File::Spec->catdir($delta_root, $_) && !/^\.\.?$/ } readdir($dh);
+        closedir($dh);
+        @delta_dirs = map { File::Spec->catdir($delta_root, $_) } @delta_dirs;
+    }
+
+    my $tee_root = File::Spec->catdir($root, $layout{state_tee_root}, $owner_name, $repo_name);
+    my @tee_dirs = ();
+    if (-d $tee_root) {
+        opendir(my $dh, $tee_root) or die "opendir $tee_root: $!";
+        @tee_dirs = sort grep { -d File::Spec->catdir($tee_root, $_) && !/^\.\.?$/ } readdir($dh);
+        closedir($dh);
+        @tee_dirs = map { File::Spec->catdir($tee_root, $_) } @tee_dirs;
+    }
+
+    my $snapshot_root = File::Spec->catdir($root, $layout{snapshots_root}, $owner_name, $repo_name);
+    my @snapshots = ();
+    if (-d $snapshot_root) {
+        opendir(my $dh, $snapshot_root) or die "opendir $snapshot_root: $!";
+        @snapshots = sort grep { !/^\.\.?$/ } readdir($dh);
+        closedir($dh);
+        @snapshots = map { File::Spec->catfile($snapshot_root, $_) } @snapshots;
+    }
+
+    return {
+        generation_entry => [ $generation_entry ],
+        generation_target => \@generation_target,
+        mirror => [ File::Spec->catdir($root, $layout{mirrors_root}, $owner_name, "$repo_name.git") ],
+        generations => \@generation_dirs,
+        delta => \@delta_dirs,
+        tee => \@tee_dirs,
+        snapshots => \@snapshots,
+    };
+}
+
+sub collect_files {
+    my ($path) = @_;
+    my @records;
+    return @records unless -e $path;
+    if (-f $path) {
+        my @stat = stat($path);
+        push @records, {
+            path => $path,
+            size => $stat[7],
+            inode_key => join(":", $stat[0], $stat[1]),
+        };
+        return @records;
+    }
+
+    find(
+        {
+            no_chdir => 1,
+            wanted => sub {
+                return unless -f $_;
+                my @stat = stat($_) or return;
+                push @records, {
+                    path => $_,
+                    size => $stat[7],
+                    inode_key => join(":", $stat[0], $stat[1]),
+                };
+            },
+        },
+        $path,
+    );
+    return @records;
+}
+
+my $paths = component_paths($cache_root, $owner, $repo);
+my %component_records;
+my %inode_components;
+my %inode_sizes;
+
+for my $component (@component_order) {
+    for my $path (@{ $paths->{$component} // [] }) {
+        for my $record (collect_files($path)) {
+            push @{ $component_records{$component} }, $record;
+            $inode_components{ $record->{inode_key} }{$component} = 1;
+            $inode_sizes{ $record->{inode_key} } = $record->{size};
+        }
+    }
+}
+
+my @components;
+my %total_unique_inodes;
+for my $component (@component_order) {
+    my $records = $component_records{$component} // [];
+    my $apparent_size = 0;
+    my $unique_size = 0;
+    my %seen_component_unique;
+
+    for my $record (@$records) {
+        $apparent_size += $record->{size};
+        $total_unique_inodes{ $record->{inode_key} } = 1;
+        my @owners = keys %{ $inode_components{ $record->{inode_key} } };
+        if (@owners == 1 && $owners[0] eq $component && !$seen_component_unique{ $record->{inode_key} }++) {
+            $unique_size += $record->{size};
+        }
+    }
+
+    push @components, {
+        component => $component,
+        path_count => scalar @{ $paths->{$component} // [] },
+        file_count => scalar @$records,
+        apparent_size_bytes => $apparent_size,
+        unique_size_bytes => $unique_size,
+        shared_size_bytes => $apparent_size - $unique_size,
+        paths => $paths->{$component} // [],
+    };
+}
+
+my $generation_entry = $paths->{generation_entry}[0];
+my $generation_target = -l $generation_entry ? realpath($generation_entry) : undef;
+my $total_unique_size = 0;
+$total_unique_size += $inode_sizes{$_} for keys %total_unique_inodes;
+
+my $report = {
+    repo => $repo_slug,
+    cache_root => $cache_root,
+    generation_entry => $generation_entry,
+    generation_target => $generation_target,
+    total_unique_size_bytes => $total_unique_size,
+    components => \@components,
+};
+
+sub human_size {
+    my ($size) = @_;
+    my @units = ("B", "KiB", "MiB", "GiB", "TiB");
+    my $value = $size + 0.0;
+    for my $unit (@units) {
+        return $unit eq "B" ? sprintf("%d%s", $value, $unit) : sprintf("%.1f%s", $value, $unit)
+          if $value < 1024 || $unit eq $units[-1];
+        $value /= 1024.0;
+    }
+    return "${size}B";
+}
+
+if ($format eq "json") {
+    say JSON::PP->new->ascii->pretty->canonical->encode($report);
+    exit 0;
+}
+
+say "repo: $report->{repo}";
+say "cache_root: $report->{cache_root}";
+say "generation_entry: $report->{generation_entry}";
+say "generation_target: $report->{generation_target}" if defined $report->{generation_target};
+say "total_unique_size: " . human_size($report->{total_unique_size_bytes});
+say "";
+printf "%-18s %5s %7s %12s %12s %12s\n", "component", "paths", "files", "apparent", "unique", "shared";
+say "-" x 72;
+for my $component (@components) {
+    printf "%-18s %5d %7d %12s %12s %12s\n",
+      $component->{component},
+      $component->{path_count},
+      $component->{file_count},
+      human_size($component->{apparent_size_bytes}),
+      human_size($component->{unique_size_bytes}),
+      human_size($component->{shared_size_bytes});
+}
