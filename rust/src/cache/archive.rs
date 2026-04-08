@@ -12,6 +12,8 @@ use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
+use crate::cache::layout;
+
 // ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
@@ -58,7 +60,7 @@ pub fn archive_cache_filename(ref_name: &str, sha: &str, ext: &str) -> String {
 
 /// Compute the local disk path for a cached archive.
 ///
-/// Layout: `{base_path}/_archives/{owner}/{repo}/{filename}`
+/// Layout: `{base_path}/snapshots/{owner}/{repo}/{filename}`
 pub fn archive_local_path(
     base_path: &Path,
     owner: &str,
@@ -68,11 +70,7 @@ pub fn archive_local_path(
     ext: &str,
 ) -> PathBuf {
     let filename = archive_cache_filename(ref_name, sha, ext);
-    base_path
-        .join("_archives")
-        .join(owner)
-        .join(repo)
-        .join(filename)
+    layout::snapshot_repo_dir(base_path, owner, repo).join(filename)
 }
 
 /// Compute the S3 object key for a cached archive.
@@ -323,7 +321,7 @@ mod tests {
     #[test]
     fn local_path_construction() {
         let path = archive_local_path(
-            Path::new("/var/cache/forgeproxy/repos"),
+            Path::new("/var/cache/forgeproxy"),
             "acme",
             "widgets",
             "main",
@@ -332,9 +330,7 @@ mod tests {
         );
         assert_eq!(
             path,
-            PathBuf::from(
-                "/var/cache/forgeproxy/repos/_archives/acme/widgets/main-a1b2c3d4e5f6.tar.gz"
-            )
+            PathBuf::from("/var/cache/forgeproxy/snapshots/acme/widgets/main-a1b2c3d4e5f6.tar.gz")
         );
     }
 

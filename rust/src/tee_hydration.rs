@@ -14,6 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use uuid::Uuid;
 
+use crate::cache::layout;
+
 const INFO_REFS_ADVERTISEMENT_FILE: &str = "info_refs_advertisement.bin";
 const LS_REFS_REQUEST_FILE: &str = "ls_refs_request.bin";
 const LS_REFS_RESPONSE_FILE: &str = "ls_refs_response.bin";
@@ -613,15 +615,8 @@ fn for_each_pkt_line(mut bytes: &[u8], mut f: impl FnMut(&[u8])) -> Result<()> {
 }
 
 fn capture_dir(base_path: &Path, owner_repo: &str) -> PathBuf {
-    let mut parts = owner_repo.splitn(2, '/');
-    let owner = parts.next().unwrap_or("_unknown");
-    let repo = parts.next().unwrap_or("_unknown");
     let stamp = format!("{}-{}", Utc::now().timestamp(), Uuid::new_v4());
-    base_path
-        .join("_tee")
-        .join(owner)
-        .join(repo.strip_suffix(".git").unwrap_or(repo))
-        .join(stamp)
+    layout::tee_repo_dir(base_path, owner_repo).join(stamp)
 }
 
 async fn ensure_capture_tree(capture_dir: &Path) -> Result<()> {
@@ -637,7 +632,7 @@ async fn ensure_capture_tree(capture_dir: &Path) -> Result<()> {
         .context("tee capture dir missing owner parent")?;
     let tee_root = owner_dir
         .parent()
-        .context("tee capture dir missing _tee parent")?;
+        .context("tee capture dir missing tee root parent")?;
 
     for dir in [tee_root, owner_dir, repo_dir, capture_dir] {
         ensure_shared_dir(dir, "tee capture dir").await?;
@@ -699,7 +694,7 @@ pub async fn run_tee_cleanup_loop(
 }
 
 pub fn cleanup_stale_captures(base_path: &Path, retention: Duration) -> Result<usize> {
-    let tee_root = base_path.join("_tee");
+    let tee_root = layout::state_tee_root(base_path);
     if !tee_root.exists() {
         return Ok(0);
     }
@@ -780,7 +775,12 @@ mod tests {
         capture.write_response_chunk(b"pack-bytes").await.unwrap();
         capture.finish(true).await.unwrap();
 
-        let tee_root = tmp.path().join("_tee").join("acme").join("widgets");
+        let tee_root = tmp
+            .path()
+            .join(".state")
+            .join("tee")
+            .join("acme")
+            .join("widgets");
         let mut entries = std::fs::read_dir(&tee_root).unwrap();
         let capture_dir = entries.next().unwrap().unwrap().path();
         assert!(capture_dir.join("meta.json").is_file());
@@ -844,7 +844,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let capture_dir = tmp
             .path()
-            .join("_tee")
+            .join(".state")
+            .join("tee")
             .join("acme")
             .join("widgets")
             .join("old-capture");

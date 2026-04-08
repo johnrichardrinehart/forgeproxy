@@ -6,6 +6,7 @@
 
 pub mod archive;
 pub mod hydrator;
+pub(crate) mod layout;
 pub mod lfu;
 pub mod lru;
 pub mod manager;

@@ -7,6 +7,10 @@
 
 let
   cfg = config.services.forgeproxy;
+  cacheLayout = import ./cache-layout.nix {
+    inherit lib;
+    root = cfg.cacheDir;
+  };
   cacheScrubScript = pkgs.writeShellApplication {
     name = "forgeproxy-cache-scrub";
     runtimeInputs = with pkgs; [
@@ -20,8 +24,12 @@ let
       #!/usr/bin/env bash
       set -euo pipefail
 
-      cache_root=${lib.escapeShellArg "${cfg.cacheDir}/repos"}
-      tee_root="$cache_root/_tee"
+      cache_root=${lib.escapeShellArg "${cfg.cacheDir}"}
+      generations_root=${lib.escapeShellArg cacheLayout.generationsRoot}
+      mirrors_root=${lib.escapeShellArg cacheLayout.mirrorsRoot}
+      state_generations_root=${lib.escapeShellArg cacheLayout.stateGenerationsRoot}
+      tee_root=${lib.escapeShellArg cacheLayout.stateTeeRoot}
+      delta_root=${lib.escapeShellArg cacheLayout.stateDeltaRoot}
       tee_max_age_minutes=15
 
       if [[ ! -d "$cache_root" ]]; then
@@ -42,16 +50,28 @@ let
         find "$repo_path/refs" -type f -print -quit | grep -q .
       }
 
+      git_repo_check() {
+        local repo_path=$1
+        shift
+        git -c safe.directory='*' -C "$repo_path" "$@"
+      }
+
       remove_repo_family() {
         local repo_entry=$1
-        local repo_name owner_name generations_dir
+        local repo_name owner_name generations_dir mirror_dir delta_dir tee_dir
 
         repo_name=$(basename "$repo_entry" .git)
         owner_name=$(basename "$(dirname "$repo_entry")")
-        generations_dir="$cache_root/.generations/$owner_name/$repo_name.git"
+        generations_dir="$state_generations_root/$owner_name/$repo_name.git"
+        mirror_dir="$mirrors_root/$owner_name/$repo_name.git"
+        delta_dir="$delta_root/$owner_name/$repo_name.git"
+        tee_dir="$tee_root/$owner_name/$repo_name"
 
         rm -rf "$repo_entry"
         rm -rf "$generations_dir"
+        rm -rf "$mirror_dir"
+        rm -rf "$delta_dir"
+        rm -rf "$tee_dir"
       }
 
       repo_is_active() {
@@ -101,13 +121,13 @@ let
           continue
         fi
 
-        if ! git -C "$repo_target" rev-parse --is-bare-repository >/dev/null 2>&1; then
+        if ! git_repo_check "$repo_target" rev-parse --is-bare-repository >/dev/null 2>&1; then
           echo "forgeproxy-cache-scrub: removing non-bare repo $repo_path" >&2
           remove_repo_family "$repo_path"
           continue
         fi
 
-        if ! git -C "$repo_target" fsck --full >/dev/null 2>&1; then
+        if ! git_repo_check "$repo_target" fsck --full >/dev/null 2>&1; then
           if repo_is_active "$repo_target"; then
             echo "forgeproxy-cache-scrub: skipping invalid-but-active repo $repo_path" >&2
             continue
@@ -115,7 +135,7 @@ let
           echo "forgeproxy-cache-scrub: removing invalid repo $repo_path" >&2
           remove_repo_family "$repo_path"
         fi
-      done < <(find "$cache_root" -mindepth 2 -maxdepth 2 \( -type d -o -type l \) -name '*.git' -print)
+      done < <(find "$generations_root" -mindepth 2 -maxdepth 2 \( -type d -o -type l \) -name '*.git' -print 2>/dev/null)
 
       if [[ -d "$tee_root" ]]; then
         while IFS= read -r capture_dir; do
@@ -303,8 +323,11 @@ in
 
     systemd.tmpfiles.rules = [
       "d ${cfg.cacheDir} 2775 root forgeproxy-cache - -"
-      "d ${cfg.cacheDir}/repos 2775 root forgeproxy-cache - -"
-      "d ${cfg.cacheDir}/repos/_tee 2775 root forgeproxy-cache - -"
+      "d ${cacheLayout.generationsRoot} 2775 root forgeproxy-cache - -"
+      "d ${cacheLayout.mirrorsRoot} 2775 root forgeproxy-cache - -"
+      "d ${cacheLayout.snapshotsRoot} 2775 root forgeproxy-cache - -"
+      "d ${cacheLayout.stateRoot} 2775 root forgeproxy-cache - -"
+      "d ${cacheLayout.stateTeeRoot} 2775 root forgeproxy-cache - -"
     ];
 
     # ── System packages required at runtime ────────────────────────────

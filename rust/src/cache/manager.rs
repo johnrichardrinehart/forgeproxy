@@ -1,7 +1,8 @@
 //! On-disk bare-repo cache manager with water-mark-based eviction.
 //!
-//! Repos are stored as bare Git repositories under
-//! `{base_path}/{owner}/{repo}.git`.  When disk usage exceeds the configured
+//! Repos are exposed to readers under
+//! `{base_path}/generations/{owner}/{repo}.git`, with mutable mirrors and other
+//! operational state stored in sibling subtrees. When disk usage exceeds the configured
 //! high-water mark, the least-frequently-used repos (that have an S3 bundle
 //! backup) are evicted until usage drops below the low-water mark.
 
@@ -13,6 +14,7 @@ use fred::interfaces::HashesInterface;
 use tracing::{debug, info, warn};
 
 use crate::AppState;
+use crate::cache::layout;
 use crate::config::{EvictionPolicy, LocalStorageConfig};
 
 use super::{lfu, lru};
@@ -24,7 +26,7 @@ use super::{lfu, lru};
 /// Manages the local bare-repo cache on EBS-backed storage.
 #[derive(Debug, Clone)]
 pub struct CacheManager {
-    /// Root directory for cached bare repos (e.g. `/var/cache/forgeproxy/repos`).
+    /// Root directory for forgeproxy cache state (e.g. `/var/cache/forgeproxy`).
     pub base_path: PathBuf,
     /// Hard ceiling for total cache usage in bytes.
     pub max_bytes: u64,
@@ -50,52 +52,21 @@ impl CacheManager {
 
     /// Return the on-disk path for a repository identified by `owner/repo`.
     ///
-    /// This is the published entry path exposed to readers. In the
+    /// This is the stable published entry path exposed to readers. In the
     /// generation-based layout it is typically a symlink to an immutable
-    /// generation directory under `.generations/`.
+    /// generation directory under `.state/generations/`.
     pub fn repo_path(&self, owner_repo: &str) -> PathBuf {
-        let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
-        if parts.len() == 2 {
-            // Strip trailing ".git" before appending it, so callers can pass
-            // either "owner/repo" or "owner/repo.git" and get the same path.
-            let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
-            self.base_path.join(parts[0]).join(format!("{repo}.git"))
-        } else {
-            let name = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
-            self.base_path.join(format!("{name}.git"))
-        }
+        layout::reader_repo_path(&self.base_path, owner_repo)
     }
 
     /// Return the directory under which immutable generations are stored for a repo.
     pub fn repo_generations_dir(&self, owner_repo: &str) -> PathBuf {
-        let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
-        if parts.len() == 2 {
-            let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
-            self.base_path
-                .join(".generations")
-                .join(parts[0])
-                .join(format!("{repo}.git"))
-        } else {
-            let name = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
-            self.base_path
-                .join(".generations")
-                .join(format!("{name}.git"))
-        }
+        layout::state_generation_repo_dir(&self.base_path, owner_repo)
     }
 
     /// Return the persistent writer-owned mirror path for a repository.
     pub fn repo_mirror_path(&self, owner_repo: &str) -> PathBuf {
-        let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
-        if parts.len() == 2 {
-            let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
-            self.base_path
-                .join(".mirrors")
-                .join(parts[0])
-                .join(format!("{repo}.git"))
-        } else {
-            let name = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
-            self.base_path.join(".mirrors").join(format!("{name}.git"))
-        }
+        layout::mirror_repo_path(&self.base_path, owner_repo)
     }
 
     /// Create a fresh delta workspace path for an incremental repo update.
@@ -573,7 +544,7 @@ impl CacheManager {
 
     /// List all `owner/repo` slugs currently present in the local cache.
     ///
-    /// Scans `{base_path}/{owner}/{repo}.git` directories.
+    /// Scans `{base_path}/generations/{owner}/{repo}.git` directories.
     pub fn list_repos(&self) -> Result<Vec<String>> {
         let mut repos = Vec::new();
         for (owner_repo, repo_path) in self.list_repo_dirs()? {
@@ -587,19 +558,20 @@ impl CacheManager {
 
     /// List all on-disk bare repo directory candidates, including partial repos.
     ///
-    /// Scans `{base_path}/{owner}/{repo}.git` directories and returns any repo
+    /// Scans `{base_path}/generations/{owner}/{repo}.git` directories and returns any repo
     /// directory with a `.git` suffix, regardless of current validity.
     pub fn list_repo_dirs(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut repos = Vec::new();
+        let published_root = layout::generations_root(&self.base_path);
 
-        if !self.base_path.exists() {
+        if !published_root.exists() {
             return Ok(repos);
         }
 
-        let owners = std::fs::read_dir(&self.base_path).with_context(|| {
+        let owners = std::fs::read_dir(&published_root).with_context(|| {
             format!(
-                "failed to read cache directory: {}",
-                self.base_path.display()
+                "failed to read reader-visible generation directory: {}",
+                published_root.display()
             )
         })?;
 
@@ -633,7 +605,7 @@ impl CacheManager {
         Ok(repos)
     }
 
-    /// Evict archived files from `{base_path}/_archives/` until disk usage
+    /// Evict snapshot files from `{base_path}/snapshots/` until disk usage
     /// drops below the low-water mark.
     ///
     /// Files are sorted by modification time (oldest first) and deleted in
@@ -642,7 +614,7 @@ impl CacheManager {
     ///
     /// Returns the number of files evicted.
     pub async fn run_archive_eviction(&self) -> Result<usize> {
-        let archive_dir = self.base_path.join("_archives");
+        let archive_dir = layout::snapshots_root(&self.base_path);
         if !archive_dir.exists() {
             return Ok(0);
         }
@@ -725,19 +697,7 @@ impl CacheManager {
     }
 
     fn repo_delta_dir(&self, owner_repo: &str) -> PathBuf {
-        let parts: Vec<&str> = owner_repo.splitn(2, '/').collect();
-        if parts.len() == 2 {
-            let repo = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
-            self.base_path
-                .join(".delta-work")
-                .join(parts[0])
-                .join(format!("{repo}.git"))
-        } else {
-            let name = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
-            self.base_path
-                .join(".delta-work")
-                .join(format!("{name}.git"))
-        }
+        layout::delta_repo_dir(&self.base_path, owner_repo)
     }
 }
 
@@ -853,18 +813,18 @@ mod tests {
 
     #[test]
     fn repo_path_splits_owner_and_repo() {
-        let mgr = test_manager(Path::new("/var/cache/forgeproxy/repos"));
+        let mgr = test_manager(Path::new("/var/cache/forgeproxy"));
 
         let path = mgr.repo_path("acme-corp/my-service");
         assert_eq!(
             path,
-            PathBuf::from("/var/cache/forgeproxy/repos/acme-corp/my-service.git")
+            PathBuf::from("/var/cache/forgeproxy/generations/acme-corp/my-service.git")
         );
     }
 
     #[test]
     fn repo_path_normalizes_git_suffix() {
-        let mgr = test_manager(Path::new("/var/cache/forgeproxy/repos"));
+        let mgr = test_manager(Path::new("/var/cache/forgeproxy"));
 
         // With and without .git should resolve to the same path.
         let without = mgr.repo_path("acme-corp/my-service");
@@ -872,7 +832,7 @@ mod tests {
         assert_eq!(without, with);
         assert_eq!(
             without,
-            PathBuf::from("/var/cache/forgeproxy/repos/acme-corp/my-service.git")
+            PathBuf::from("/var/cache/forgeproxy/generations/acme-corp/my-service.git")
         );
     }
 
