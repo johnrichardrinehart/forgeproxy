@@ -6,6 +6,7 @@
 
 let
   common = import ./common.nix { inherit pkgs lib; };
+  cacheLayout = import ./cache-layout.nix { inherit lib; };
 
   testCerts =
     pkgs.runCommand "ssh-large-lsrefs-test-certs"
@@ -98,7 +99,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgeproxy/repos"
+        path: "${cacheLayout.cacheRoot}"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75
@@ -342,10 +343,10 @@ pkgs.testers.runNixOSTest {
         )
 
     with subtest("Cache-miss v2 clone survives a large uncached ls-refs response"):
-        large_lsrefs_repo = "/var/cache/forgeproxy/repos/octocat/repo-large-lsrefs.git"
-        large_lsrefs_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-large-lsrefs.git"
-        large_lsrefs_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-large-lsrefs.git"
-        large_lsrefs_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-large-lsrefs"
+        large_lsrefs_repo = "${cacheLayout.repoPath "octocat/repo-large-lsrefs"}"
+        large_lsrefs_generation_dir = "${cacheLayout.generationDir "octocat/repo-large-lsrefs"}"
+        large_lsrefs_mirror = "${cacheLayout.mirrorPath "octocat/repo-large-lsrefs"}"
+        large_lsrefs_tee_dir = "${cacheLayout.teeDir "octocat/repo-large-lsrefs"}"
 
         proxy.succeed(
             f"rm -rf {large_lsrefs_repo} {large_lsrefs_generation_dir} "

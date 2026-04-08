@@ -6,6 +6,7 @@
 
 let
   common = import ./common.nix { inherit pkgs lib; };
+  cacheLayout = import ./cache-layout.nix { inherit lib; };
 
   # ---------------------------------------------------------------------------
   # Test TLS certificates (generated at Nix eval time)
@@ -91,7 +92,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgeproxy/repos"
+        path: "${cacheLayout.cacheRoot}"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75

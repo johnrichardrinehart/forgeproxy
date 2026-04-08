@@ -6,6 +6,7 @@
 
 let
   common = import ./common.nix { inherit pkgs lib; };
+  cacheLayout = import ./cache-layout.nix { inherit lib; };
   otlpMetricsUser = "metrics-user";
   otlpMetricsPassword = "metrics-password";
   otlpLogsUser = "logs-user";
@@ -154,7 +155,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgeproxy/repos"
+        path: "${cacheLayout.cacheRoot}"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75
@@ -632,10 +633,10 @@ pkgs.testers.runNixOSTest {
 
     with subtest("Initial clone publishes a generation"):
         proxy.wait_until_succeeds(
-            "test -L /var/cache/forgeproxy/repos/octocat/hello-world.git"
+            "test -L ${cacheLayout.repoPath "octocat/hello-world"}"
         )
         proxy.wait_until_succeeds(
-            "find /var/cache/forgeproxy/repos/.generations/octocat/hello-world.git -mindepth 1 -maxdepth 1 -type d | grep -q ."
+            "find ${cacheLayout.generationDir "octocat/hello-world"} -mindepth 1 -maxdepth 1 -type d | grep -q ."
         )
 
     with subtest("Forgeproxy metrics are exported at /metrics"):
@@ -718,7 +719,7 @@ pkgs.testers.runNixOSTest {
             "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack directly from local disk' | grep -F '\"protocol\":\"http\"' >/dev/null"
         )
         old_generation = proxy.succeed(
-            "readlink -f /var/cache/forgeproxy/repos/octocat/hello-world.git"
+            "readlink -f ${cacheLayout.repoPath "octocat/hello-world"}"
         ).strip()
         ghe.succeed(
             "set -e && "
@@ -737,16 +738,16 @@ pkgs.testers.runNixOSTest {
         ).strip()
         client.succeed("git -C /tmp/repo fetch origin main")
         proxy.wait_until_succeeds(
-            f"test \"$(readlink -f /var/cache/forgeproxy/repos/octocat/hello-world.git)\" != '{old_generation}'"
+            f"test \"$(readlink -f ${cacheLayout.repoPath "octocat/hello-world"})\" != '{old_generation}'"
         )
         proxy.wait_until_succeeds(
-            f"git --git-dir /var/cache/forgeproxy/repos/octocat/hello-world.git rev-parse refs/heads/main | grep -Fx '{updated_rev}'"
+            f"git --git-dir ${cacheLayout.repoPath "octocat/hello-world"} rev-parse refs/heads/main | grep -Fx '{updated_rev}'"
         )
         client.wait_until_succeeds("test -f /tmp/slow-upload-pack.status")
         client.succeed("grep -qx 0 /tmp/slow-upload-pack.status")
         proxy.wait_until_succeeds(f"! test -d '{old_generation}'")
         proxy.wait_until_succeeds(
-            "test $(find /var/cache/forgeproxy/repos/.generations/octocat/hello-world.git -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1"
+            "test $(find ${cacheLayout.generationDir "octocat/hello-world"} -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1"
         )
 
     with subtest("Shallow-first clone still results in a stored generation"):
@@ -755,16 +756,16 @@ pkgs.testers.runNixOSTest {
             "git clone --depth=1 https://octocat:secret123@proxy/octocat/shallow-only.git /tmp/shallow-only"
         )
         proxy.wait_until_succeeds(
-            "test -L /var/cache/forgeproxy/repos/octocat/shallow-only.git"
+            "test -L ${cacheLayout.repoPath "octocat/shallow-only"}"
         )
         proxy.wait_until_succeeds(
-            "find /var/cache/forgeproxy/repos/.generations/octocat/shallow-only.git -mindepth 1 -maxdepth 1 -type d | grep -q ."
+            "find ${cacheLayout.generationDir "octocat/shallow-only"} -mindepth 1 -maxdepth 1 -type d | grep -q ."
         )
 
     with subtest("Successful clone cleans tee capture"):
         proxy.wait_until_succeeds(
-            "! test -d /var/cache/forgeproxy/repos/_tee/octocat/hello-world || "
-            "find /var/cache/forgeproxy/repos/_tee/octocat/hello-world -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
+            "! test -d ${cacheLayout.teeDir "octocat/hello-world"} || "
+            "find ${cacheLayout.teeDir "octocat/hello-world"} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
         )
   '';
 }

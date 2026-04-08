@@ -6,6 +6,7 @@
 
 let
   common = import ./common.nix { inherit pkgs lib; };
+  cacheLayout = import ./cache-layout.nix { inherit lib; };
 
   # ---------------------------------------------------------------------------
   # Test TLS certificates (generated at Nix eval time)
@@ -112,7 +113,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgeproxy/repos"
+        path: "${cacheLayout.cacheRoot}"
         max_bytes: 1073741824
         high_water_mark: 0.90
         low_water_mark: 0.75
@@ -731,7 +732,11 @@ pkgs.testers.runNixOSTest {
             f"[Service]\n"
             f"EnvironmentFile=/run/forgeproxy-admin-token.env\n"
             f"ExecStartPre=/bin/sh -c 'test -n \"$FORGE_ADMIN_TOKEN\"'\n"
-            f"ExecStartPre=/bin/sh -c 'mkdir -p /var/cache/forgeproxy/repos/octocat && test -d /var/cache/forgeproxy/repos/octocat/repo-cached.git || git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git /var/cache/forgeproxy/repos/octocat/repo-cached.git'\n"
+            f"ExecStartPre=/bin/sh -c '"
+            f"mkdir -p ${cacheLayout.mirrorsRoot}/octocat ${cacheLayout.generationsRoot}/octocat && "
+            f"test -d ${cacheLayout.mirrorPath "octocat/repo-cached"} || "
+            f"git clone --bare http://octocat:secret123@ghe:3000/octocat/repo-cached.git ${cacheLayout.mirrorPath "octocat/repo-cached"} && "
+            f"ln -sfn ${cacheLayout.mirrorPath "octocat/repo-cached"} ${cacheLayout.repoPath "octocat/repo-cached"}'\n"
             f"UNIT"
         )
         proxy.succeed(
@@ -795,7 +800,7 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 1b: Uncached SSH access populates local cache ──────────────
     with subtest("Uncached SSH access triggers background cache clone"):
-        proxy.wait_until_succeeds("test -L /var/cache/forgeproxy/repos/octocat/repo-uncached.git")
+        proxy.wait_until_succeeds("test -L ${cacheLayout.repoPath "octocat/repo-uncached"}")
         proxy.wait_until_succeeds(
             "redis-cli -h valkey HGET 'forgeproxy:repo:octocat/repo-uncached' status"
             " | grep -qx ready"
@@ -847,8 +852,8 @@ pkgs.testers.runNixOSTest {
         # this point in history, successful full-clone transport is the
         # regression we care about; local cache publication is covered later.
         proxy.succeed(
-            "rm -rf /var/cache/forgeproxy/repos/octocat/repo-stream.git && "
-            "mkdir -p /var/cache/forgeproxy/repos/octocat/repo-stream.git"
+            "rm -rf ${cacheLayout.repoPath "octocat/repo-stream"} && "
+            "mkdir -p ${cacheLayout.repoPath "octocat/repo-stream"}"
         )
         client.succeed("rm -rf /tmp/repo-stream")
         ssh_clone_succeed("repo-stream-full", "octocat/repo-stream", "/tmp/repo-stream")
@@ -860,8 +865,8 @@ pkgs.testers.runNixOSTest {
     # ── Subtest 5b: Uncached shallow clone via upstream proxy stream ───────
     with subtest("Uncached shallow clone succeeds via upstream proxy stream"):
         proxy.succeed(
-            "rm -rf /var/cache/forgeproxy/repos/octocat/repo-stream.git && "
-            "mkdir -p /var/cache/forgeproxy/repos/octocat/repo-stream.git"
+            "rm -rf ${cacheLayout.repoPath "octocat/repo-stream"} && "
+            "mkdir -p ${cacheLayout.repoPath "octocat/repo-stream"}"
         )
         client.succeed("rm -rf /tmp/repo-stream-shallow")
         ssh_clone_succeed(
@@ -891,9 +896,9 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5d: Cache-miss clone makes prompt progress during catch-up ──
     with subtest("Cache-miss clone makes prompt progress during local catch-up"):
-        live_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
-        live_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
-        live_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream-live"
+        live_repo = "${cacheLayout.repoPath "octocat/repo-stream-live"}"
+        live_generation_dir = "${cacheLayout.generationDir "octocat/repo-stream-live"}"
+        live_tee_dir = "${cacheLayout.teeDir "octocat/repo-stream-live"}"
 
         proxy.succeed(f"rm -rf {live_repo} {live_generation_dir} {live_tee_dir}")
         client.succeed("rm -rf /tmp/repo-stream-live /tmp/repo-stream-live.log /tmp/repo-stream-live.pid")
@@ -943,9 +948,9 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5e: Restart drains an in-flight SSH clone cleanly ───────────
     with subtest("systemctl restart drains an in-flight SSH clone"):
-        drain_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
-        drain_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
-        drain_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream-live"
+        drain_repo = "${cacheLayout.repoPath "octocat/repo-stream-live"}"
+        drain_generation_dir = "${cacheLayout.generationDir "octocat/repo-stream-live"}"
+        drain_tee_dir = "${cacheLayout.teeDir "octocat/repo-stream-live"}"
 
         proxy.succeed(f"rm -rf {drain_repo} {drain_generation_dir} {drain_tee_dir}")
         client.succeed(
@@ -1026,10 +1031,10 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5f: Uncached clone publishes a symlinked generation cleanly ──
     with subtest("Uncached clone publishes a generation symlink and cleans tee capture"):
-        stream_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream.git"
-        stream_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream.git"
-        stream_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-stream.git"
-        stream_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream"
+        stream_repo = "${cacheLayout.repoPath "octocat/repo-stream"}"
+        stream_generation_dir = "${cacheLayout.generationDir "octocat/repo-stream"}"
+        stream_mirror = "${cacheLayout.mirrorPath "octocat/repo-stream"}"
+        stream_tee_dir = "${cacheLayout.teeDir "octocat/repo-stream"}"
 
         proxy.succeed(
             f"rm -rf {stream_repo} {stream_generation_dir} {stream_mirror} {stream_tee_dir}"
@@ -1056,10 +1061,10 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5g: Generations converge after concurrent uncached clones ──
     with subtest("Concurrent uncached clones fold into one published generation"):
-        generation_repo = "/var/cache/forgeproxy/repos/octocat/repo-generations.git"
-        generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-generations.git"
-        generation_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-generations.git"
-        generation_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-generations"
+        generation_repo = "${cacheLayout.repoPath "octocat/repo-generations"}"
+        generation_dir = "${cacheLayout.generationDir "octocat/repo-generations"}"
+        generation_mirror = "${cacheLayout.mirrorPath "octocat/repo-generations"}"
+        generation_tee_dir = "${cacheLayout.teeDir "octocat/repo-generations"}"
 
         proxy.succeed(
             f"rm -rf {generation_repo} {generation_dir} {generation_mirror} {generation_tee_dir}"
@@ -1100,9 +1105,9 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5h: Published snapshots are invalid without a mirror ──────
     with subtest("Published generations are scrubbed when the mirror is missing"):
-        invariant_repo = "/var/cache/forgeproxy/repos/octocat/repo-generations.git"
-        invariant_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-generations.git"
-        invariant_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-generations.git"
+        invariant_repo = "${cacheLayout.repoPath "octocat/repo-generations"}"
+        invariant_generation_dir = "${cacheLayout.generationDir "octocat/repo-generations"}"
+        invariant_mirror = "${cacheLayout.mirrorPath "octocat/repo-generations"}"
 
         client.succeed("rm -rf /tmp/repo-generations-invariant")
         proxy.wait_until_succeeds(
@@ -1149,9 +1154,9 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5i: Large stale want sets catch up locally before timeout ──
     with subtest("Large stale fetch resolves many missing wants locally before timeout"):
-        many_wants_repo = "/var/cache/forgeproxy/repos/octocat/repo-many-wants.git"
-        many_wants_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-many-wants.git"
-        many_wants_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-many-wants.git"
+        many_wants_repo = "${cacheLayout.repoPath "octocat/repo-many-wants"}"
+        many_wants_generation_dir = "${cacheLayout.generationDir "octocat/repo-many-wants"}"
+        many_wants_mirror = "${cacheLayout.mirrorPath "octocat/repo-many-wants"}"
 
         proxy.succeed(
             f"rm -rf {many_wants_repo} {many_wants_generation_dir} {many_wants_mirror}"
@@ -1207,7 +1212,7 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             "journalctl -u forgeproxy.service"
             f" --since '{since}' --no-pager"
-            " | grep -F '\"repo\":\"/var/cache/forgeproxy/repos/.delta-work/octocat/repo-many-wants.git'"
+            " | grep -F '\"repo\":\"${cacheLayout.deltaDir "octocat/repo-many-wants"}'"
             " | grep -F '\"refspec_mode\":\"selected\"'"
         )
         proxy.wait_until_succeeds(
@@ -1231,9 +1236,9 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5j: Requests must not serve directly from the mutable mirror ──
     with subtest("SSH fetch does not serve directly from a fresher mirror when publish lags"):
-        mirror_serve_repo = "/var/cache/forgeproxy/repos/octocat/repo-mirror-serve.git"
-        mirror_serve_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-mirror-serve.git"
-        mirror_serve_mirror = "/var/cache/forgeproxy/repos/.mirrors/octocat/repo-mirror-serve.git"
+        mirror_serve_repo = "${cacheLayout.repoPath "octocat/repo-mirror-serve"}"
+        mirror_serve_generation_dir = "${cacheLayout.generationDir "octocat/repo-mirror-serve"}"
+        mirror_serve_mirror = "${cacheLayout.mirrorPath "octocat/repo-mirror-serve"}"
 
         proxy.succeed(
             f"rm -rf {mirror_serve_repo} {mirror_serve_generation_dir} {mirror_serve_mirror}"
@@ -1307,9 +1312,9 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5k: Concurrent uncached hydrations complete and drain semaphore ──
     with subtest("Concurrent uncached clones release the repo semaphore"):
-        semaphore_repo = "/var/cache/forgeproxy/repos/octocat/repo-stream-live.git"
-        semaphore_generation_dir = "/var/cache/forgeproxy/repos/.generations/octocat/repo-stream-live.git"
-        semaphore_tee_dir = "/var/cache/forgeproxy/repos/_tee/octocat/repo-stream-live"
+        semaphore_repo = "${cacheLayout.repoPath "octocat/repo-stream-live"}"
+        semaphore_generation_dir = "${cacheLayout.generationDir "octocat/repo-stream-live"}"
+        semaphore_tee_dir = "${cacheLayout.teeDir "octocat/repo-stream-live"}"
         semaphore_key = "forgeproxy:semaphore:clone:octocat/repo-stream-live"
         proxy.succeed(
             f"rm -rf {semaphore_repo} {semaphore_generation_dir} {semaphore_tee_dir} && "
@@ -1360,8 +1365,8 @@ pkgs.testers.runNixOSTest {
         )
         proxy.succeed("systemctl is-active forgeproxy-cache-scrub.timer | grep -qx active")
         proxy.succeed(
-            "! test -d /var/cache/forgeproxy/repos/_tee/octocat/repo-generations || "
-            "find /var/cache/forgeproxy/repos/_tee/octocat/repo-generations -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
+            "! test -d ${cacheLayout.teeDir "octocat/repo-generations"} || "
+            "find ${cacheLayout.teeDir "octocat/repo-generations"} -mindepth 1 -maxdepth 1 -type d | wc -l | grep -qx 0"
         )
         client.succeed("rm -rf /tmp/repo-generations-scrubbed")
         ssh_clone_succeed(

@@ -6,6 +6,7 @@
 
 let
   common = import ./common.nix { inherit pkgs lib; };
+  cacheLayout = import ./cache-layout.nix { inherit lib; };
 
   # ---------------------------------------------------------------------------
   # Test TLS certificates (generated at Nix eval time)
@@ -82,7 +83,7 @@ let
 
     storage:
       local:
-        path: "/var/cache/forgeproxy/repos"
+        path: "${cacheLayout.cacheRoot}"
         max_bytes: 10485760
         high_water_mark: 0.50
         low_water_mark: 0.25
@@ -341,8 +342,8 @@ pkgs.testers.runNixOSTest {
         # writes cannot clobber the values this test is trying to assert.
         for r in ["repo-a", "repo-b", "repo-c"]:
             proxy.wait_until_succeeds(
-                f"test -L /var/cache/forgeproxy/repos/octocat/{r}.git && "
-                f"test -f $(readlink -f /var/cache/forgeproxy/repos/octocat/{r}.git)/HEAD"
+                f"test -L ${cacheLayout.generationsRoot}/octocat/{r}.git && "
+                f"test -f $(readlink -f ${cacheLayout.generationsRoot}/octocat/{r}.git)/HEAD"
             )
         proxy.succeed("systemctl stop forgeproxy")
 
