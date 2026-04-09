@@ -75,6 +75,7 @@ resource "aws_instance" "forgeproxy" {
     null_resource.build_forgeproxy_ami,
     aws_instance.valkey,
     aws_secretsmanager_secret_version.forgeproxy_config,
+    aws_secretsmanager_secret_version.forgeproxy_otel_collector_config,
     aws_secretsmanager_secret_version.forge_admin_token,
     aws_secretsmanager_secret_version.valkey_auth_token,
     aws_secretsmanager_secret_version.webhook_secret,

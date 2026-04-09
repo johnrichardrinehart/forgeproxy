@@ -142,19 +142,21 @@ Additional NixOS modules are available for companion services:
 Prometheus metrics are exposed at `GET /metrics`. A health check endpoint is
 available at `GET /healthz`.
 
-When the shared `config.yaml` includes any
-`observability.exporters.otlp.<signal>` stanza, the forgeproxy host also runs a
-local OpenTelemetry Collector. There is still only one operator-managed config
-file. The collector's runtime config is derived from that same `config.yaml`;
-there is no separate collector config surface to maintain.
+When forgeproxy's local observability config and the collector-specific OTLP
+config enable any signal export, the forgeproxy host also runs a local
+OpenTelemetry Collector. Forgeproxy and the collector now have separate config
+surfaces:
+
+- `config.yaml`: forgeproxy-owned observability toggles and local behavior
+- `otel-collector-config.yaml`: collector-owned host metrics and OTLP egress
 
 The signal flow is:
 
 - Metrics: forgeproxy exposes Prometheus/OpenMetrics at `/metrics`; the
   host-local Collector scrapes that endpoint and re-exports it as OTLP. If
-  `observability.metrics.host.enabled` is true, the same Collector also emits
-  host CPU, disk, filesystem, load, memory, network, and paging metrics from
-  the forgeproxy node itself.
+  `metrics.host.enabled` is true in the collector config, the same Collector
+  also emits host CPU, disk, filesystem, load, memory, network, and paging
+  metrics from the forgeproxy node itself.
 - Logs: forgeproxy continues to write structured logs to journald; the
   host-local Collector tails `forgeproxy.service` and exports those logs as
   OTLP.
@@ -177,49 +179,55 @@ are different things:
 
 - Internal endpoint: a private loopback hop used only on the forgeproxy host so
   forgeproxy can hand trace spans to the Collector.
-- External endpoints: the real egress destinations configured under
-  `observability.exporters.otlp.metrics`, `observability.exporters.otlp.logs`,
-  and `observability.exporters.otlp.traces`.
+- External endpoints: the real egress destinations configured in
+  `otel-collector-config.yaml`.
 
-The normal configuration shape is:
+The normal forgeproxy configuration shape is:
 
 ```yaml
 observability:
   metrics:
     prometheus:
       enabled: true
-    host:
-      enabled: false
   logs:
     journald:
       enabled: true
   traces:
     enabled: true
     sample_ratio: 1.0
-  exporters:
-    otlp:
-      metrics:
-        enabled: true
-        endpoint: "https://collector.internal.example/v1/metrics"
-        protocol: "http/protobuf"
-        auth:
-          basic:
-            username: "metrics-user"
-            password: "metrics-password"
-      logs:
-        enabled: true
-        endpoint: "https://logs.internal.example/v1/logs"
-        protocol: "http/protobuf"
-      traces:
-        enabled: true
-        endpoint: "https://traces.internal.example/v1/traces"
-        protocol: "http/protobuf"
+```
+
+The matching collector configuration shape is:
+
+```yaml
+metrics:
+  host:
+    enabled: false
+exporters:
+  otlp:
+    metrics:
+      enabled: true
+      endpoint: "https://collector.internal.example/v1/metrics"
+      protocol: "http/protobuf"
+      auth:
+        basic:
+          username: "metrics-user"
+          password: "metrics-password"
+    logs:
+      enabled: true
+      endpoint: "https://logs.internal.example/v1/logs"
+      protocol: "http/protobuf"
+    traces:
+      enabled: true
+      endpoint: "https://traces.internal.example/v1/traces"
+      protocol: "http/protobuf"
 ```
 
 Each signal can use a different OTLP endpoint, protocol, and basic-auth
-credential pair. That is the intended way to point forgeproxy at an internal
-Collector or auth proxy which then forwards to the final backend, such as a
-VictoriaMetrics metrics ingest URL plus different log/trace backends.
+credential pair in the collector config. That is the intended way to point the
+on-host Collector at an internal Collector or auth proxy which then forwards to
+the final backend, such as a VictoriaMetrics metrics ingest URL plus different
+log/trace backends.
 
 The Collector also upserts these runtime resource attributes onto metrics,
 logs, and traces when it exports them:
@@ -236,9 +244,11 @@ endpoint:
 
 - `observability.metrics.prometheus.enabled`: expose forgeproxy application
   metrics locally at `/metrics` so the on-host Collector can scrape them.
-- `observability.metrics.host.enabled`: collect host-level system metrics from
-  the forgeproxy node through the Collector's `hostmetrics` receiver.
-- `observability.exporters.otlp.metrics.enabled`: actually export whichever
+- `metrics.host.enabled` in `otel-collector-config.yaml`: collect host-level
+  system metrics from the forgeproxy node through the Collector's
+  `hostmetrics` receiver.
+- `exporters.otlp.metrics.enabled` in `otel-collector-config.yaml`: actually
+  export whichever
   metrics sources were enabled above.
 
 The current host metrics include CPU, disk I/O, filesystem capacity and usage,

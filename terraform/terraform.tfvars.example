@@ -89,6 +89,11 @@ org_creds = [
 ]
 
 # OpenTelemetry configuration (optional)
+metrics_enabled = true
+logs_enabled = true
+traces_enabled = false
+traces_sample_ratio = 1.0
+
 otlp_metrics = {
   endpoint             = ""
   protocol             = "grpc"

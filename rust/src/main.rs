@@ -768,9 +768,7 @@ async fn main() -> Result<()> {
     }
 
     // ---- Config ----
-    let loaded_config = config::load_config(&cli.config)?;
-    let ignored_config_fields = loaded_config.ignored_fields.clone();
-    let config = Arc::new(loaded_config.config);
+    let config = Arc::new(config::load_config(&cli.config)?);
     let runtime_resource_detection =
         crate::runtime_resource::load_or_detect_runtime_resource_attributes(
             std::path::Path::new(&cli.runtime_resource_file),
@@ -781,13 +779,6 @@ async fn main() -> Result<()> {
     // ---- Tracing ----
     let trace_provider = init_tracing(config.as_ref(), &runtime_resource_detection.attributes)?;
 
-    for ignored_field in &ignored_config_fields {
-        tracing::warn!(
-            config_path = %cli.config,
-            ignored_field = %ignored_field,
-            "unknown config field ignored during startup"
-        );
-    }
     for warning in &runtime_resource_detection.warnings {
         tracing::warn!(
             runtime_resource_file = %cli.runtime_resource_file,

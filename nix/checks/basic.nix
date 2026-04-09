@@ -178,49 +178,56 @@ let
       metrics:
         prometheus:
           enabled: true
-        host:
-          enabled: true
       logs:
         journald:
           enabled: true
       traces:
         enabled: true
         sample_ratio: 1.0
-      exporters:
-        otlp:
-          metrics:
-            enabled: true
-            endpoint: "http://127.0.0.1:${toString otlpMetricsIngressPort}/v1/metrics"
-            protocol: "http/protobuf"
-            export_interval_secs: 15
-            auth:
-              basic:
-                username: "${otlpMetricsUser}"
-                password: "${otlpMetricsPassword}"
-          logs:
-            enabled: true
-            endpoint: "http://127.0.0.1:${toString otlpLogsIngressPort}/v1/logs"
-            protocol: "http/protobuf"
-            export_interval_secs: 15
-            auth:
-              basic:
-                username: "${otlpLogsUser}"
-                password: "${otlpLogsPassword}"
-          traces:
-            enabled: true
-            endpoint: "http://127.0.0.1:${toString otlpTracesIngressPort}/v1/traces"
-            protocol: "http/protobuf"
-            export_interval_secs: 15
-            auth:
-              basic:
-                username: "${otlpTracesUser}"
-                password: "${otlpTracesPassword}"
+  '';
+
+  otelCollectorConfigYaml = pkgs.writeText "forgeproxy-test-otel-collector-config.yaml" ''
+    metrics:
+      host:
+        enabled: true
+    exporters:
+      otlp:
+        metrics:
+          enabled: true
+          endpoint: "http://127.0.0.1:${toString otlpMetricsIngressPort}/v1/metrics"
+          protocol: "http/protobuf"
+          export_interval_secs: 15
+          auth:
+            basic:
+              username: "${otlpMetricsUser}"
+              password: "${otlpMetricsPassword}"
+        logs:
+          enabled: true
+          endpoint: "http://127.0.0.1:${toString otlpLogsIngressPort}/v1/logs"
+          protocol: "http/protobuf"
+          export_interval_secs: 15
+          auth:
+            basic:
+              username: "${otlpLogsUser}"
+              password: "${otlpLogsPassword}"
+        traces:
+          enabled: true
+          endpoint: "http://127.0.0.1:${toString otlpTracesIngressPort}/v1/traces"
+          protocol: "http/protobuf"
+          export_interval_secs: 15
+          auth:
+            basic:
+              username: "${otlpTracesUser}"
+              password: "${otlpTracesPassword}"
   '';
 
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-basic";
-  globalTimeout = 240;
+  # This scenario now exercises full OTLP wiring plus late-stage generation
+  # lease assertions. Give it enough headroom to reach the final subtests on
+  # slower builders without weakening the behavior being checked.
+  globalTimeout = 420;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -313,6 +320,8 @@ pkgs.testers.runNixOSTest {
           configFile = testConfigYaml;
           logLevel = "info";
         };
+
+        services.forgeproxy-otel-collector.sourceConfigFile = otelCollectorConfigYaml;
 
         services.forgeproxy.backend.type = "gitea";
 
@@ -553,7 +562,7 @@ pkgs.testers.runNixOSTest {
         assert f'"service_instance_id": "{machine_id}"' in runtime_attrs, runtime_attrs
         assert f'"service_machine_id": "{machine_id}"' in runtime_attrs, runtime_attrs
 
-    with subtest("Shared config enables the on-host OTLP collector"):
+    with subtest("Forgeproxy and collector configs enable the on-host OTLP collector"):
         proxy.wait_for_unit("otlp-test-sink.service")
         proxy.wait_for_unit("forgeproxy-otlp-collector.service")
         rendered = proxy.succeed("cat /run/forgeproxy-otelcol/config.yaml")

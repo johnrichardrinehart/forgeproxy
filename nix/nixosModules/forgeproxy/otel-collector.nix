@@ -25,12 +25,13 @@ let
       set -euo pipefail
 
       mode=''${1:-}
-      source_config=${lib.escapeShellArg cfg.sourceConfigFile}
+      forgeproxy_config=${lib.escapeShellArg cfg.forgeproxyConfigFile}
+      collector_config=${lib.escapeShellArg cfg.sourceConfigFile}
       runtime_config=${lib.escapeShellArg cfg.generatedConfigFile}
       runtime_resource_file=${lib.escapeShellArg cfg.resourceAttributesFile}
 
-      if [[ ! -f "$source_config" ]]; then
-        echo "forgeproxy-otlp-collector: missing source config $source_config" >&2
+      if [[ ! -f "$forgeproxy_config" ]]; then
+        echo "forgeproxy-otlp-collector: missing forgeproxy config $forgeproxy_config" >&2
         exit 1
       fi
 
@@ -54,13 +55,22 @@ let
 
       read_config() {
         local path=$1
-        ${yq}/bin/yq -r "$path" "$source_config"
+        ${yq}/bin/yq -r "$path" "$forgeproxy_config"
       }
 
       read_signal_field() {
         local signal=$1
         local suffix=$2
-        read_config ".observability.exporters.otlp.''${signal}.''${suffix}"
+        read_collector_config ".exporters.otlp.''${signal}.''${suffix}"
+      }
+
+      read_collector_config() {
+        local path=$1
+        if [[ ! -f "$collector_config" ]]; then
+          printf '\n'
+          return 0
+        fi
+        ${yq}/bin/yq -r "$path" "$collector_config"
       }
 
       read_runtime_attr() {
@@ -144,10 +154,10 @@ let
       }
 
       prometheus_enabled=$(read_config '.observability.metrics.prometheus.enabled // true')
-      host_metrics_enabled=$(read_config '.observability.metrics.host.enabled // false')
       journald_enabled=$(read_config '.observability.logs.journald.enabled // true')
       traces_enabled=$(read_config '.observability.traces.enabled // false')
       scrape_target=$(read_config '.proxy.http_listen // ""')
+      host_metrics_enabled=$(read_collector_config '.metrics.host.enabled // false')
 
       metrics_enabled=$(read_signal_field metrics 'enabled // false')
       # shellcheck disable=SC2034
@@ -173,6 +183,28 @@ let
       traces_auth_username=$(read_signal_field traces 'auth.basic.username // ""')
       traces_auth_password=$(read_signal_field traces 'auth.basic.password // ""')
 
+      host_metrics_enabled=''${host_metrics_enabled:-false}
+      metrics_enabled=''${metrics_enabled:-false}
+      metrics_endpoint=''${metrics_endpoint:-}
+      metrics_protocol=''${metrics_protocol:-grpc}
+      metrics_interval=''${metrics_interval:-60}
+      metrics_auth_username=''${metrics_auth_username:-}
+      metrics_auth_password=''${metrics_auth_password:-}
+
+      logs_enabled=''${logs_enabled:-false}
+      logs_endpoint=''${logs_endpoint:-}
+      logs_protocol=''${logs_protocol:-grpc}
+      logs_interval=''${logs_interval:-60}
+      logs_auth_username=''${logs_auth_username:-}
+      logs_auth_password=''${logs_auth_password:-}
+
+      traces_export_enabled=''${traces_export_enabled:-false}
+      traces_endpoint=''${traces_endpoint:-}
+      traces_protocol=''${traces_protocol:-grpc}
+      traces_interval=''${traces_interval:-60}
+      traces_auth_username=''${traces_auth_username:-}
+      traces_auth_password=''${traces_auth_password:-}
+
       any_enabled=false
       if [[ "$metrics_enabled" == "true" || "$logs_enabled" == "true" || "$traces_export_enabled" == "true" ]]; then
         any_enabled=true
@@ -185,15 +217,17 @@ let
           ;;
         render)
           ;;
+        validate)
+          ;;
         *)
-          echo "usage: forgeproxy-otlp-collector-config {check-enabled|render}" >&2
+          echo "usage: forgeproxy-otlp-collector-config {check-enabled|render|validate}" >&2
           exit 64
           ;;
       esac
 
       if [[ "$metrics_enabled" == "true" ]]; then
         if [[ "$prometheus_enabled" != "true" && "$host_metrics_enabled" != "true" ]]; then
-          echo "forgeproxy-otlp-collector: observability.exporters.otlp.metrics.enabled requires observability.metrics.prometheus.enabled and/or observability.metrics.host.enabled" >&2
+          echo "forgeproxy-otlp-collector: exporters.otlp.metrics.enabled requires observability.metrics.prometheus.enabled and/or metrics.host.enabled" >&2
           exit 1
         fi
         if [[ "$prometheus_enabled" == "true" && ( -z "$scrape_target" || "$scrape_target" == "null" ) ]]; then
@@ -203,31 +237,35 @@ let
       fi
 
       if [[ "$host_metrics_enabled" == "true" && "$metrics_enabled" != "true" ]]; then
-        echo "forgeproxy-otlp-collector: observability.metrics.host.enabled requires observability.exporters.otlp.metrics.enabled" >&2
+        echo "forgeproxy-otlp-collector: metrics.host.enabled requires exporters.otlp.metrics.enabled" >&2
         exit 1
       fi
 
       if [[ "$logs_enabled" == "true" && "$journald_enabled" != "true" ]]; then
-        echo "forgeproxy-otlp-collector: observability.exporters.otlp.logs.enabled requires observability.logs.journald.enabled" >&2
+        echo "forgeproxy-otlp-collector: exporters.otlp.logs.enabled requires observability.logs.journald.enabled" >&2
         exit 1
       fi
 
       if [[ "$traces_enabled" == "true" && "$traces_export_enabled" != "true" ]]; then
-        echo "forgeproxy-otlp-collector: observability.traces.enabled requires observability.exporters.otlp.traces.enabled" >&2
+        echo "forgeproxy-otlp-collector: observability.traces.enabled requires exporters.otlp.traces.enabled" >&2
         exit 1
       fi
 
-      validate_protocol "observability.exporters.otlp.metrics.protocol" "$metrics_protocol"
-      validate_protocol "observability.exporters.otlp.logs.protocol" "$logs_protocol"
-      validate_protocol "observability.exporters.otlp.traces.protocol" "$traces_protocol"
+      validate_protocol "exporters.otlp.metrics.protocol" "$metrics_protocol"
+      validate_protocol "exporters.otlp.logs.protocol" "$logs_protocol"
+      validate_protocol "exporters.otlp.traces.protocol" "$traces_protocol"
 
-      validate_positive_integer "observability.exporters.otlp.metrics.export_interval_secs" "$metrics_interval"
-      validate_positive_integer "observability.exporters.otlp.logs.export_interval_secs" "$logs_interval"
-      validate_positive_integer "observability.exporters.otlp.traces.export_interval_secs" "$traces_interval"
+      validate_positive_integer "exporters.otlp.metrics.export_interval_secs" "$metrics_interval"
+      validate_positive_integer "exporters.otlp.logs.export_interval_secs" "$logs_interval"
+      validate_positive_integer "exporters.otlp.traces.export_interval_secs" "$traces_interval"
 
-      validate_basic_auth_pair "observability.exporters.otlp.metrics.auth.basic" "$metrics_auth_username" "$metrics_auth_password"
-      validate_basic_auth_pair "observability.exporters.otlp.logs.auth.basic" "$logs_auth_username" "$logs_auth_password"
-      validate_basic_auth_pair "observability.exporters.otlp.traces.auth.basic" "$traces_auth_username" "$traces_auth_password"
+      validate_basic_auth_pair "exporters.otlp.metrics.auth.basic" "$metrics_auth_username" "$metrics_auth_password"
+      validate_basic_auth_pair "exporters.otlp.logs.auth.basic" "$logs_auth_username" "$logs_auth_password"
+      validate_basic_auth_pair "exporters.otlp.traces.auth.basic" "$traces_auth_username" "$traces_auth_password"
+
+      if [[ "$mode" == "validate" ]]; then
+        exit 0
+      fi
 
       mkdir -p "$(dirname "$runtime_config")"
       umask 077
@@ -519,13 +557,22 @@ in
       description = "OpenTelemetry Collector package used to export forgeproxy metrics, logs, and traces.";
     };
 
-    sourceConfigFile = lib.mkOption {
+    forgeproxyConfigFile = lib.mkOption {
       type = lib.types.path;
       default = forgeproxyCfg.configFile;
       defaultText = lib.literalExpression "config.services.forgeproxy.configFile";
       description = ''
-        Shared forgeproxy configuration file. The collector derives its runtime
-        config from this file so operators only manage one config surface.
+        Forgeproxy configuration file. The collector reads only the app-local
+        observability toggles from this file.
+      '';
+    };
+
+    sourceConfigFile = lib.mkOption {
+      type = lib.types.path;
+      default = "/run/forgeproxy/otel-collector-config.yaml";
+      description = ''
+        Collector-specific source configuration file containing host metrics
+        and OTLP exporter egress settings.
       '';
     };
 
@@ -548,6 +595,10 @@ in
   };
 
   config = lib.mkIf (forgeproxyCfg.enable && cfg.enable) {
+    systemd.services.forgeproxy.serviceConfig.ExecStartPre = lib.mkAfter [
+      "${renderConfigScript}/bin/forgeproxy-otlp-collector-config validate"
+    ];
+
     systemd.services.forgeproxy-otlp-collector = {
       description = "OpenTelemetry Collector for forgeproxy metrics, logs, and traces";
       after = [

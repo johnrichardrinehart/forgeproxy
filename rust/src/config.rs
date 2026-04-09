@@ -61,8 +61,8 @@ impl BackendType {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(alias = "ghe")]
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub backend_type: BackendType,
@@ -91,6 +91,7 @@ pub struct Config {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -98,25 +99,17 @@ pub struct ObservabilityConfig {
     pub logs: LogSignalConfig,
     #[serde(default)]
     pub traces: TraceConfig,
-    #[serde(default)]
-    pub exporters: ExporterConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     #[serde(default)]
     pub prometheus: PrometheusConfig,
-    #[serde(default)]
-    pub host: HostMetricsConfig,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct HostMetricsConfig {
-    #[serde(default)]
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrometheusConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -131,12 +124,14 @@ impl Default for PrometheusConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogSignalConfig {
     #[serde(default)]
     pub journald: JournaldLogConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JournaldLogConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -151,6 +146,7 @@ impl Default for JournaldLogConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -175,80 +171,12 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ExporterConfig {
-    #[serde(default)]
-    pub otlp: OtlpExporterSetConfig,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct OtlpExporterSetConfig {
-    #[serde(default)]
-    pub metrics: OtlpSignalExporterConfig,
-    #[serde(default)]
-    pub logs: OtlpSignalExporterConfig,
-    #[serde(default)]
-    pub traces: OtlpSignalExporterConfig,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct OtlpSignalExporterConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub endpoint: String,
-    #[serde(default)]
-    pub protocol: OtlpProtocol,
-    #[serde(default = "default_otlp_export_interval_secs")]
-    pub export_interval_secs: u64,
-    #[serde(default)]
-    pub auth: OtlpAuthConfig,
-}
-
-impl Default for OtlpSignalExporterConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint: String::new(),
-            protocol: OtlpProtocol::default(),
-            export_interval_secs: default_otlp_export_interval_secs(),
-            auth: OtlpAuthConfig::default(),
-        }
-    }
-}
-
-fn default_otlp_export_interval_secs() -> u64 {
-    60
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct OtlpAuthConfig {
-    #[serde(default)]
-    pub basic: OtlpBasicAuthConfig,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct OtlpBasicAuthConfig {
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub password: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-pub enum OtlpProtocol {
-    #[default]
-    #[serde(rename = "grpc")]
-    Grpc,
-    #[serde(alias = "http", alias = "http/protobuf", alias = "http_protobuf")]
-    HttpProtobuf,
-}
-
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -271,6 +199,7 @@ fn default_log_level() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     /// Hostname of the upstream forge (e.g. `ghe.corp.example.com`).
     pub hostname: String,
@@ -339,6 +268,7 @@ fn default_log_secret_unmask_chars() -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamCredentials {
     /// Default credential mode used when no per-org override is present.
     #[serde(default = "default_credential_mode")]
@@ -360,6 +290,7 @@ fn default_credential_mode() -> CredentialMode {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OrgCredential {
     pub mode: CredentialMode,
     /// Key name stored in the Linux kernel keyring (`linux-keyutils`).
@@ -371,6 +302,7 @@ pub struct OrgCredential {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// Socket address for the SSH listener (e.g. `0.0.0.0:2222`).
     pub ssh_listen: String,
@@ -383,6 +315,7 @@ pub struct ProxyConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValkeyConfig {
     /// Connection string (e.g. `rediss://valkey.local:6380`).
     pub endpoint: String,
@@ -409,6 +342,7 @@ fn default_valkey_auth_env() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Positive SSH auth cache TTL in seconds.
     #[serde(default = "default_ssh_cache_ttl")]
@@ -456,26 +390,20 @@ fn default_webhook_secret_env() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloneConfig {
     /// TTL (seconds) of the distributed per-repo hydration semaphore lease in
     /// Valkey.
     #[serde(default = "default_lock_ttl")]
     pub lock_ttl: u64,
-    /// Deprecated for initial clone coordination; retained for configuration
-    /// compatibility.
+    /// Deprecated for initial clone coordination.
     #[serde(default = "default_lock_wait_timeout")]
     pub lock_wait_timeout: u64,
     /// Semaphore limit for concurrent full clones against upstream.
-    #[serde(
-        default = "default_max_concurrent_upstream_clones",
-        alias = "max_concurrent_ghe_clones"
-    )]
+    #[serde(default = "default_max_concurrent_upstream_clones")]
     pub max_concurrent_upstream_clones: usize,
     /// Semaphore limit for concurrent fetches against upstream.
-    #[serde(
-        default = "default_max_concurrent_upstream_fetches",
-        alias = "max_concurrent_ghe_fetches"
-    )]
+    #[serde(default = "default_max_concurrent_upstream_fetches")]
     pub max_concurrent_upstream_fetches: usize,
     /// Maximum concurrent upstream hydrations for a single repo across all
     /// forgeproxy instances.
@@ -502,8 +430,6 @@ pub struct CloneConfig {
     pub tee_retention_secs: u64,
     /// Maximum time forgeproxy will wait for russh to flush pending upload-pack
     /// channel data before it sends exit-status, EOF, and CHANNEL_CLOSE.
-    ///
-    /// The field name is kept for config compatibility.
     #[serde(default = "default_ssh_upload_pack_close_grace_secs")]
     pub ssh_upload_pack_close_grace_secs: u64,
 }
@@ -581,6 +507,7 @@ fn default_max_concurrent_upstream_clones_per_repo_per_instance() -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FetchScheduleConfig {
     /// Default interval (seconds) between background re-fetches.
     #[serde(default = "default_fetch_interval")]
@@ -636,6 +563,7 @@ fn default_rolling_window() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BundleConfig {
     /// Minimum number of clones a repo must have received before bundles are
     /// generated for it.
@@ -725,12 +653,14 @@ fn default_pack_threads(available_parallelism: usize, max_concurrent_generations
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub local: LocalStorageConfig,
     pub s3: S3StorageConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalStorageConfig {
     /// Root directory for bare repos and bundles.
     pub path: String,
@@ -767,6 +697,7 @@ fn default_eviction_policy() -> EvictionPolicy {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct S3StorageConfig {
     pub bucket: String,
     #[serde(default = "default_s3_prefix")]
@@ -795,6 +726,7 @@ fn default_presigned_url_ttl() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoOverride {
     /// Override fetch interval (seconds) for this repo.
     pub fetch_interval: Option<u64>,
@@ -806,27 +738,14 @@ pub struct RepoOverride {
 // Loader
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-pub struct LoadedConfig {
-    pub config: Config,
-    pub ignored_fields: Vec<String>,
-}
-
-fn parse_config_str(contents: &str) -> Result<LoadedConfig> {
-    let mut ignored_fields = Vec::new();
-    let deserializer = serde_yml::Deserializer::from_str(contents);
-    let config: Config = serde_ignored::deserialize(deserializer, |path| {
-        ignored_fields.push(path.to_string());
-    })?;
+fn parse_config_str(contents: &str) -> Result<Config> {
+    let config: Config = serde_yml::from_str(contents)?;
     validate_config(&config)?;
-    Ok(LoadedConfig {
-        config,
-        ignored_fields,
-    })
+    Ok(config)
 }
 
 /// Load and validate a [`Config`] from a YAML file at `path`.
-pub fn load_config<P: AsRef<Path>>(path: P) -> Result<LoadedConfig> {
+pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
     let path = path.as_ref();
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
@@ -836,10 +755,6 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<LoadedConfig> {
 
 /// Basic sanity checks that cannot be expressed purely with serde.
 fn validate_config(config: &Config) -> Result<()> {
-    let metrics_exporter = &config.observability.exporters.otlp.metrics;
-    let logs_exporter = &config.observability.exporters.otlp.logs;
-    let traces_exporter = &config.observability.exporters.otlp.traces;
-
     anyhow::ensure!(
         config.storage.local.high_water_mark > config.storage.local.low_water_mark,
         "high_water_mark must be greater than low_water_mark"
@@ -860,67 +775,6 @@ fn validate_config(config: &Config) -> Result<()> {
         (0.0..=1.0).contains(&config.observability.traces.sample_ratio),
         "observability.traces.sample_ratio must be in range [0.0, 1.0]"
     );
-
-    validate_otlp_exporter("observability.exporters.otlp.metrics", metrics_exporter)?;
-    validate_otlp_exporter("observability.exporters.otlp.logs", logs_exporter)?;
-    validate_otlp_exporter("observability.exporters.otlp.traces", traces_exporter)?;
-
-    if metrics_exporter.enabled {
-        anyhow::ensure!(
-            config.observability.metrics.prometheus.enabled
-                || config.observability.metrics.host.enabled,
-            "observability.exporters.otlp.metrics.enabled requires observability.metrics.prometheus.enabled and/or observability.metrics.host.enabled"
-        );
-    }
-
-    if config.observability.metrics.host.enabled {
-        anyhow::ensure!(
-            metrics_exporter.enabled,
-            "observability.metrics.host.enabled requires observability.exporters.otlp.metrics.enabled"
-        );
-    }
-
-    if logs_exporter.enabled {
-        anyhow::ensure!(
-            config.observability.logs.journald.enabled,
-            "observability.exporters.otlp.logs.enabled requires observability.logs.journald.enabled"
-        );
-    }
-
-    if config.observability.traces.enabled {
-        anyhow::ensure!(
-            traces_exporter.enabled,
-            "observability.traces.enabled requires observability.exporters.otlp.traces.enabled"
-        );
-        anyhow::ensure!(
-            !traces_exporter.endpoint.trim().is_empty(),
-            "observability.traces.enabled requires observability.exporters.otlp.traces.endpoint"
-        );
-    }
-    Ok(())
-}
-
-fn validate_otlp_exporter(path: &str, exporter: &OtlpSignalExporterConfig) -> Result<()> {
-    anyhow::ensure!(
-        exporter.export_interval_secs > 0,
-        "{path}.export_interval_secs must be a positive integer"
-    );
-
-    if exporter.enabled {
-        anyhow::ensure!(
-            !exporter.endpoint.trim().is_empty(),
-            "{path}.endpoint must be set when the exporter is enabled"
-        );
-    }
-
-    let basic_auth = &exporter.auth.basic;
-    let has_username = !basic_auth.username.trim().is_empty();
-    let has_password = !basic_auth.password.trim().is_empty();
-    anyhow::ensure!(
-        has_username == has_password,
-        "{path}.auth.basic.username and {path}.auth.basic.password must either both be set or both be empty"
-    );
-
     Ok(())
 }
 
@@ -955,25 +809,45 @@ mod tests {
     }
 
     #[test]
-    fn config_example_has_no_ignored_fields() {
-        let loaded = parse_config_str(include_str!("../../config.example.yaml")).unwrap();
-        assert!(loaded.ignored_fields.is_empty());
+    fn config_example_parses() {
+        parse_config_str(include_str!("../../config.example.yaml")).unwrap();
     }
 
     #[test]
-    fn warns_for_legacy_metrics_otlp_shape() {
+    fn rejects_legacy_metrics_otlp_shape() {
         let config = include_str!("../../config.example.yaml").replace(
             "  metrics:\n    prometheus:\n      enabled: true\n",
             "  metrics:\n    prometheus:\n      enabled: true\n    otlp:\n      enabled: true\n      endpoint: \"https://ingest.metrics.foo.dev/vm/insert/0/opentelemetry/api/v1/push\"\n      protocol: \"http/protobuf\"\n      export_interval_secs: 60\n      auth:\n        basic:\n          username: \"foo\"\n          password: \"bar\"\n",
         );
-        let loaded = parse_config_str(&config).unwrap();
-        assert!(
-            loaded
-                .ignored_fields
-                .iter()
-                .any(|path| path.starts_with("observability.metrics.otlp")),
-            "expected an ignored-field warning for the legacy observability.metrics.otlp shape, got {:?}",
-            loaded.ignored_fields
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_observability_exporters_shape() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  traces:\n    enabled: false\n    sample_ratio: 1.0\n",
+            "  traces:\n    enabled: false\n    sample_ratio: 1.0\n  exporters:\n    otlp:\n      metrics:\n        enabled: true\n        endpoint: \"https://ingest.metrics.foo.dev/vm/insert/0/opentelemetry/api/v1/push\"\n        protocol: \"http/protobuf\"\n        export_interval_secs: 60\n        auth:\n          basic:\n            username: \"foo\"\n            password: \"bar\"\n",
         );
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_ghe_alias() {
+        let config = include_str!("../../config.example.yaml").replace("upstream:", "ghe:");
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_concurrency_aliases() {
+        let config = include_str!("../../config.example.yaml")
+            .replace(
+                "max_concurrent_upstream_clones",
+                "max_concurrent_ghe_clones",
+            )
+            .replace(
+                "max_concurrent_upstream_fetches",
+                "max_concurrent_ghe_fetches",
+            );
+        assert!(parse_config_str(&config).is_err());
     }
 }

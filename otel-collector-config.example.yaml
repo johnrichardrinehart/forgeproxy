@@ -1,0 +1,32 @@
+metrics:
+  host:
+    enabled: false
+exporters:
+  otlp:
+    metrics:
+      enabled: false
+      endpoint: ""
+      protocol: "grpc"
+      export_interval_secs: 60
+      auth:
+        basic:
+          username: ""
+          password: ""
+    logs:
+      enabled: false
+      endpoint: ""
+      protocol: "grpc"
+      export_interval_secs: 60
+      auth:
+        basic:
+          username: ""
+          password: ""
+    traces:
+      enabled: false
+      endpoint: ""
+      protocol: "grpc"
+      export_interval_secs: 60
+      auth:
+        basic:
+          username: ""
+          password: ""

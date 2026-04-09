@@ -62,43 +62,12 @@ observability:
   metrics:
     prometheus:
       enabled: true
-    host:
-      enabled: false
   logs:
     journald:
       enabled: true
   traces:
     enabled: false
     sample_ratio: 1.0
-  exporters:
-    otlp:
-      metrics:
-        enabled: false
-        endpoint: ""
-        protocol: "grpc"
-        export_interval_secs: 60
-        auth:
-          basic:
-            username: ""
-            password: ""
-      logs:
-        enabled: false
-        endpoint: ""
-        protocol: "grpc"
-        export_interval_secs: 60
-        auth:
-          basic:
-            username: ""
-            password: ""
-      traces:
-        enabled: false
-        endpoint: ""
-        protocol: "grpc"
-        export_interval_secs: 60
-        auth:
-          basic:
-            username: ""
-            password: ""
 logging:
   level: "info"
 repo_overrides:

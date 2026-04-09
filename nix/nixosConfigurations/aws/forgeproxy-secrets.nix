@@ -10,19 +10,11 @@ let
     set -euo pipefail
 
     # ── Read SM_PREFIX from EC2 user_data ─────────────────────────────
-    # Supports:
-    # 1) legacy raw prefix payload: "forgeproxy"
-    # 2) amazon-init-safe payload:
-    #      # SM_PREFIX=forgeproxy
-    #      { ... }: {}
     _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
     _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
     SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
     FORGEPROXY_SSH_HOST_KEY_SECRET_ARN=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# FORGEPROXY_SSH_HOST_KEY_SECRET_ARN=//p' | ${pkgs.coreutils}/bin/head -n1)
     if [ -z "$SM_PREFIX" ]; then
-      SM_PREFIX=$(printf '%s' "$_USER_DATA" | ${pkgs.coreutils}/bin/tr -d '\r\n')
-    fi
-    if [ -z "$SM_PREFIX" ] || [ "$SM_PREFIX" = "{ ... }: {}" ]; then
       echo "FATAL: Could not resolve SM_PREFIX from EC2 user_data" >&2
       exit 1
     fi
@@ -43,6 +35,15 @@ let
     ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
       --secret-id "$(resolve service-config)" \
       --query 'SecretString' --output text > /run/forgeproxy/config.yaml
+
+    OTEL_COLLECTOR_CONFIG_SECRET=$(resolve otel-collector-config)
+    if [ "$OTEL_COLLECTOR_CONFIG_SECRET" = "null" ]; then
+      rm -f /run/forgeproxy/otel-collector-config.yaml
+    else
+      ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+        --secret-id "$OTEL_COLLECTOR_CONFIG_SECRET" \
+        --query 'SecretString' --output text > /run/forgeproxy/otel-collector-config.yaml
+    fi
 
     # ── Write Valkey CA cert (for TLS verification) ─────────────────────
     VALKEY_CA_SECRET=$(resolve valkey-tls-ca)

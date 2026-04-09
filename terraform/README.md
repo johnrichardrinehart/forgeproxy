@@ -141,6 +141,7 @@ terraform/
 ├── ec2.tf                         # EC2 instances and NLB attachments
 ├── ghe-key-lookup.tf              # Optional ghe-key-lookup sidecar fleet + internal NLB
 └── templates/
+    ├── otel-collector-config.yaml.tpl # forgeproxy collector config template
     └── service-config.yaml.tpl    # forgeproxy config.yaml template
 ```
 
@@ -158,8 +159,11 @@ Configuration is fetched at boot time via `ExecStartPre` scripts in systemd serv
 - **Upstream hostname/port**: Stored in `forgeproxy/nginx-upstream-hostname` and `forgeproxy/nginx-upstream-port`
   - Changes require restarting nginx: `systemctl restart nginx`
 - **Service config**: Complete `config.yaml` in `forgeproxy/service-config`
-  - Includes `observability.metrics`, `observability.logs`, `observability.traces`, and per-signal `observability.exporters.otlp` settings
+  - Includes only forgeproxy-owned observability toggles such as local metrics exposure, journald log export enablement, and trace sampling
   - Changes require restarting forgeproxy: `systemctl restart forgeproxy`
+- **Collector config**: Complete `otel-collector-config.yaml` in `forgeproxy/otel-collector-config`
+  - Includes host metrics and the per-signal OTLP egress settings used by the on-instance Collector
+  - Changes require restarting forgeproxy and the collector: `systemctl restart forgeproxy forgeproxy-otlp-collector`
 - **Organization credentials**: One secret per org under `forgeproxy/creds/<org-name>`
   - Dynamic discovery at startup; no hardcoded org list
   - Add org: create SM secret, update config, restart forgeproxy
@@ -342,14 +346,15 @@ curl -k http://127.0.0.1:8080/healthz
    - Update Secrets Manager secrets `forgeproxy/nginx-tls-cert` and `forgeproxy/nginx-tls-key`
 
 3. **Monitoring**: Configure OTLP egress or optional direct scraping
+   - Set `metrics_enabled`, `logs_enabled`, `traces_enabled`, and `traces_sample_ratio` to control forgeproxy's local observability behavior
    - Set `otlp_metrics`, `otlp_logs`, and `otlp_traces` to describe the real external destinations for each signal
    - Set `host_metrics_enabled = true` if you also want the on-instance Collector to emit host CPU, disk, filesystem, load, memory, network, and paging metrics
-   - The on-instance Collector derives its runtime config from the same `forgeproxy/service-config` secret as forgeproxy itself; there is still no separate operator-managed collector config file
+   - The on-instance Collector reads its exporter configuration from the separate `forgeproxy/otel-collector-config` secret
    - Metrics and logs always egress through the on-instance Collector:
      - Metrics are scraped from `http://127.0.0.1:8080/metrics`
      - Optional host metrics are read locally from the node through the Collector's `hostmetrics` receiver
      - Logs are tailed from `forgeproxy.service` in journald
-  - Traces also egress through the on-instance Collector:
+   - Traces also egress through the on-instance Collector:
      - forgeproxy sends spans to a fixed loopback OTLP receiver on `127.0.0.1:4317`
      - the on-instance Collector then exports those spans to `otlp_traces.endpoint`
    - At startup, forgeproxy writes shared runtime resource attributes to `/run/forgeproxy/runtime-resource-attributes.json`

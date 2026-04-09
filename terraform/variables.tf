@@ -397,6 +397,35 @@ variable "org_creds" {
   description = "List of organization credentials configurations"
 }
 
+variable "metrics_enabled" {
+  type        = bool
+  default     = true
+  description = "Expose forgeproxy application metrics locally at /metrics for scraping."
+}
+
+variable "logs_enabled" {
+  type        = bool
+  default     = true
+  description = "Allow the on-instance OTEL collector to tail forgeproxy journald logs."
+}
+
+variable "traces_enabled" {
+  type        = bool
+  default     = false
+  description = "Emit forgeproxy tracing spans to the local OTEL collector receiver."
+}
+
+variable "traces_sample_ratio" {
+  type        = number
+  default     = 1.0
+  description = "Trace sampling ratio in the range [0.0, 1.0]."
+
+  validation {
+    condition     = var.traces_sample_ratio >= 0 && var.traces_sample_ratio <= 1
+    error_message = "traces_sample_ratio must be in the range [0.0, 1.0]"
+  }
+}
+
 variable "otlp_metrics" {
   type = object({
     endpoint             = string
@@ -412,7 +441,7 @@ variable "otlp_metrics" {
     basic_auth_username  = ""
     basic_auth_password  = ""
   }
-  description = "OTLP metrics exporter settings written into the shared forgeproxy service config."
+  description = "OTLP metrics exporter settings written into the collector runtime config."
   sensitive   = true
 
   validation {
@@ -455,7 +484,7 @@ variable "otlp_logs" {
     basic_auth_username  = ""
     basic_auth_password  = ""
   }
-  description = "OTLP log exporter settings written into the shared forgeproxy service config."
+  description = "OTLP log exporter settings written into the collector runtime config."
   sensitive   = true
 
   validation {
@@ -492,7 +521,7 @@ variable "otlp_traces" {
     basic_auth_username  = ""
     basic_auth_password  = ""
   }
-  description = "OTLP trace exporter settings written into the shared forgeproxy service config."
+  description = "OTLP trace exporter settings written into the collector runtime config."
   sensitive   = true
 
   validation {
