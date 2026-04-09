@@ -155,19 +155,10 @@ impl CacheManager {
             })?;
 
             if metadata.file_type().is_symlink() {
-            } else if is_usable_bare_repo(&published_path) {
-                let legacy_target = self.create_staging_repo_path(owner_repo)?;
-                std::fs::rename(&published_path, &legacy_target).with_context(|| {
-                    format!(
-                        "failed to migrate legacy published repo {} to {}",
-                        published_path.display(),
-                        legacy_target.display()
-                    )
-                })?;
             } else {
                 std::fs::remove_dir_all(&published_path).with_context(|| {
                     format!(
-                        "failed to remove invalid published repo at {}",
+                        "failed to remove non-symlink published repo at {}",
                         published_path.display()
                     )
                 })?;
@@ -215,8 +206,6 @@ impl CacheManager {
 
         if metadata.file_type().is_symlink() {
             Ok(std::fs::read_link(&published_path).ok())
-        } else if is_usable_bare_repo(&published_path) {
-            Ok(Some(published_path))
         } else {
             Ok(None)
         }
@@ -275,7 +264,7 @@ impl CacheManager {
                     .await
                     .with_context(|| {
                         format!(
-                            "failed to remove published repo directory: {}",
+                            "failed to remove invalid non-symlink published repo path: {}",
                             published_path.display()
                         )
                     })?;
@@ -348,7 +337,7 @@ impl CacheManager {
                     .await
                     .with_context(|| {
                         format!(
-                            "failed to remove published repo directory: {}",
+                            "failed to remove invalid non-symlink published repo path: {}",
                             published_path.display()
                         )
                     })?;
