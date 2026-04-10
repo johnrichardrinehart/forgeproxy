@@ -437,6 +437,16 @@ let
         done
 
         if [[ "$metrics_enabled" == "true" ]]; then
+          # Copy key resource attributes to datapoint attributes so downstream
+          # Prometheus-style metrics backends can query them as labels. The
+          # otlphttp exporter does not accept resource_to_telemetry_conversion.
+          printf '%s\n' \
+            "  transform/resource_to_labels:" \
+            "    metric_statements:" \
+            "      - context: datapoint" \
+            "        statements:" \
+            "          - set(attributes[\"service.name\"], resource.attributes[\"service.name\"]) where resource.attributes[\"service.name\"] != nil" \
+            "          - set(attributes[\"service.instance.id\"], resource.attributes[\"service.instance.id\"]) where resource.attributes[\"service.instance.id\"] != nil"
           printf '%s\n' \
             "  batch/metrics:" \
             "    timeout: ''${metrics_interval}s"
@@ -528,7 +538,7 @@ let
           printf '%s\n' \
             "    metrics:" \
             "      receivers: $(yaml_inline_list "''${metrics_receivers[@]}")" \
-            "      processors: [resource/common, batch/metrics]" \
+            "      processors: [resource/common, transform/resource_to_labels, batch/metrics]" \
             "      exporters: [\"''${metrics_exporter}\"]"
         fi
 

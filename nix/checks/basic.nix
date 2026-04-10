@@ -565,6 +565,9 @@ pkgs.testers.runNixOSTest {
     with subtest("Forgeproxy and collector configs enable the on-host OTLP collector"):
         proxy.wait_for_unit("otlp-test-sink.service")
         proxy.wait_for_unit("forgeproxy-otlp-collector.service")
+        proxy.wait_until_succeeds(
+            "systemctl is-active forgeproxy-otlp-collector.service | grep -qx active"
+        )
         rendered = proxy.succeed("cat /run/forgeproxy-otelcol/config.yaml")
         assert "resource/common:" in rendered, rendered
         assert "key: service.instance.id" in rendered, rendered
@@ -580,7 +583,8 @@ pkgs.testers.runNixOSTest {
         assert 'units: ["forgeproxy.service"]' in rendered, rendered
         assert "logs:" in rendered, rendered
         assert "traces:" in rendered, rendered
-        assert "processors: [resource/common, batch/metrics]" in rendered, rendered
+        assert "transform/resource_to_labels:" in rendered, rendered
+        assert "processors: [resource/common, transform/resource_to_labels, batch/metrics]" in rendered, rendered
         assert "processors: [resource/common, batch/logs]" in rendered, rendered
         assert "processors: [resource/common, batch/traces]" in rendered, rendered
         assert "basicauth/client-metrics" in rendered, rendered
