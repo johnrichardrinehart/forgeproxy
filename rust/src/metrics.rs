@@ -12,6 +12,8 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
+use crate::config::BackendType;
+
 // ---------------------------------------------------------------------------
 // OptionalGauge — omitted from /metrics until explicitly set
 // ---------------------------------------------------------------------------
@@ -145,6 +147,21 @@ pub struct EndpointLabels {
     pub endpoint: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum AuthState {
+    Anonymous,
+    Unresolved,
+    Resolved,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CloneSummaryLabels {
+    pub protocol: Protocol,
+    pub cache_status: CacheStatus,
+    pub auth_state: AuthState,
+    pub backend: String,
+}
+
 // ---------------------------------------------------------------------------
 // Metrics struct
 // ---------------------------------------------------------------------------
@@ -153,6 +170,7 @@ pub struct EndpointLabels {
 pub struct Metrics {
     // -- clone --
     pub clone_total: Family<CloneLabels, Counter>,
+    pub clone_summary_total: Family<CloneSummaryLabels, Counter>,
     pub clone_duration_seconds: Family<CloneDurationLabels, Histogram>,
     pub clone_upstream_bytes: Family<CloneUpstreamBytesLabels, Counter>,
     pub clone_downstream_bytes: Family<CloneDownstreamBytesLabels, Counter>,
@@ -200,6 +218,13 @@ impl Metrics {
             "forgeproxy_clone",
             "Total clone requests by protocol and cache status",
             clone_total.clone(),
+        );
+
+        let clone_summary_total = Family::<CloneSummaryLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_clone_summary",
+            "Total clone requests by protocol, cache status, auth state, and backend",
+            clone_summary_total.clone(),
         );
 
         let clone_duration_seconds =
@@ -347,6 +372,7 @@ impl Metrics {
 
         Self {
             clone_total,
+            clone_summary_total,
             clone_duration_seconds,
             clone_upstream_bytes,
             clone_downstream_bytes,
@@ -380,16 +406,26 @@ impl Metrics {
 pub struct MetricsRegistry {
     pub registry: Arc<Registry>,
     pub metrics: Arc<Metrics>,
+    pub backend_label: Arc<str>,
 }
 
 impl MetricsRegistry {
     /// Build a fresh registry and pre-register all proxy metrics.
     pub fn new() -> Self {
+        Self::with_backend_label("unknown")
+    }
+
+    pub fn with_backend(backend: BackendType) -> Self {
+        Self::with_backend_label(backend.as_label())
+    }
+
+    fn with_backend_label(backend_label: &str) -> Self {
         let mut registry = Registry::default();
         let metrics = Metrics::new(&mut registry);
         Self {
             registry: Arc::new(registry),
             metrics: Arc::new(metrics),
+            backend_label: Arc::<str>::from(backend_label),
         }
     }
 }
@@ -407,9 +443,19 @@ pub fn record_clone_completion(
         .clone_total
         .get_or_create(&CloneLabels {
             protocol: protocol.clone(),
-            cache_status,
+            cache_status: cache_status.clone(),
             username: username.to_string(),
             repo: repo.to_string(),
+        })
+        .inc();
+    metrics
+        .metrics
+        .clone_summary_total
+        .get_or_create(&CloneSummaryLabels {
+            protocol: protocol.clone(),
+            cache_status: cache_status.clone(),
+            auth_state: clone_metric_auth_state(username),
+            backend: metrics.backend_label.to_string(),
         })
         .inc();
     metrics
@@ -421,6 +467,14 @@ pub fn record_clone_completion(
             repo: repo.to_string(),
         })
         .observe(elapsed.as_secs_f64());
+}
+
+pub fn clone_metric_auth_state(metric_username: &str) -> AuthState {
+    match metric_username {
+        "anonymous" => AuthState::Anonymous,
+        "unresolved" => AuthState::Unresolved,
+        _ => AuthState::Resolved,
+    }
 }
 
 pub fn clone_metric_username(resolved_username: Option<&str>, auth_present: bool) -> String {
@@ -526,5 +580,12 @@ mod tests {
         ));
         assert!(encoded.contains("# TYPE forgeproxy_upstream_api_rate_limit_remaining gauge"));
         assert!(encoded.contains("forgeproxy_upstream_api_rate_limit_remaining 42"));
+    }
+
+    #[test]
+    fn clone_metric_auth_state_buckets_usernames() {
+        assert_eq!(clone_metric_auth_state("anonymous"), AuthState::Anonymous);
+        assert_eq!(clone_metric_auth_state("unresolved"), AuthState::Unresolved);
+        assert_eq!(clone_metric_auth_state("octocat"), AuthState::Resolved);
     }
 }

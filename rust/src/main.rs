@@ -11,6 +11,7 @@ mod git;
 mod health;
 mod http;
 mod metrics;
+mod observability;
 mod runtime_resource;
 mod ssh;
 mod storage;
@@ -791,6 +792,16 @@ async fn main() -> Result<()> {
         config_path = %cli.config,
         version = crate::build_info::VERSION,
         git_revision = crate::build_info::GIT_REVISION,
+        host_id = runtime_resource_detection
+            .attributes
+            .host_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        host_name = runtime_resource_detection
+            .attributes
+            .host_name
+            .as_deref()
+            .unwrap_or("unknown"),
         service_instance_id = runtime_resource_detection
             .attributes
             .service_instance_id
@@ -814,6 +825,11 @@ async fn main() -> Result<()> {
         cloud_region = runtime_resource_detection
             .attributes
             .cloud_region
+            .as_deref()
+            .unwrap_or("unknown"),
+        deployment_environment = runtime_resource_detection
+            .attributes
+            .deployment_environment
             .as_deref()
             .unwrap_or("unknown"),
         "starting forgeproxy"
@@ -984,7 +1000,7 @@ async fn build_app_state(
     let valkey = build_valkey_pool(&config).await?;
     let s3 = build_s3_client(&config).await?;
     let http_client = build_http_client()?;
-    let metrics = MetricsRegistry::new();
+    let metrics = MetricsRegistry::with_backend(config.backend_type);
     let cache_manager = cache::CacheManager::new(&config.storage.local);
     let node_id = coordination::node::node_id();
     tracing::info!(%node_id, "node identity established");

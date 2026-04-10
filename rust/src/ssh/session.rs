@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::AppState;
 use crate::cache::CacheManager;
@@ -34,12 +34,36 @@ use crate::metrics::{
     ActiveConnectionGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource,
     CloneUpstreamBytesLabels, Protocol,
 };
+use crate::observability::GitRequestObservation;
 
 /// Upper bound for a single SSH channel data message payload.
 ///
 /// Keeping frames at or below 32 KiB avoids relying on library-side
 /// fragmentation behavior for large buffers while streaming big packfiles.
 const SSH_DATA_CHUNK_SIZE: usize = 32 * 1024;
+
+fn ssh_git_request_observation(
+    state: &AppState,
+    owner_repo: &str,
+    username: Option<&str>,
+    fingerprint: Option<&str>,
+    git_protocol: Option<&str>,
+    git_session_id: Option<String>,
+) -> GitRequestObservation {
+    let (owner, repo) =
+        super::upstream::split_owner_repo(owner_repo).unwrap_or((owner_repo, "<unknown>"));
+    GitRequestObservation::new(
+        &state.config,
+        owner,
+        repo,
+        username.unwrap_or("anonymous"),
+        git_protocol,
+        fingerprint.unwrap_or(""),
+        "ssh",
+        git_session_id,
+    )
+}
+
 #[derive(Debug, Clone)]
 struct UpstreamProxyChannelState {
     owner_repo: Option<String>,
@@ -1098,44 +1122,59 @@ impl Handler for SshSession {
             let output_lock = output_lock_for_channel(&channel_states, channel_id).await;
             let metric_username =
                 crate::metrics::clone_metric_username(self.username.as_deref(), true);
-            tokio::spawn(async move {
-                for (owner_repo, request_kind, want_have, authenticated, git_protocol) in
-                    request_batch
-                {
-                    info!(
-                        repo = %owner_repo,
-                        request_kind = ?request_kind,
-                        want_have_bytes = want_have.len(),
-                        authenticated,
-                        "upstream proxy: request complete, POSTing to upstream"
-                    );
-                    proxy_upstream_upload_pack(
-                        UpstreamUploadPackContext {
-                            state: Arc::clone(&state),
-                            channel_states: Arc::clone(&channel_states),
-                            capture_metadata: Arc::clone(&capture_metadata),
-                            handle: handle.clone(),
-                            channel_id,
-                            stream_channel: stream_channel.clone(),
-                            output_lock: Arc::clone(&output_lock),
-                        },
-                        UpstreamUploadPackRequest {
-                            owner_repo,
-                            want_have,
+            let request_span = ssh_git_request_observation(
+                &state,
+                request_batch
+                    .first()
+                    .map(|(owner_repo, _, _, _, _)| owner_repo.as_str())
+                    .unwrap_or("unknown/<unknown>"),
+                Some(&metric_username),
+                self.fingerprint.as_deref(),
+                self.git_protocol.as_deref(),
+                Some(format!("ssh-channel-{channel_id:?}")),
+            )
+            .make_span("ssh_upload_pack", "post-upload-pack");
+            tokio::spawn(
+                async move {
+                    for (owner_repo, request_kind, want_have, authenticated, git_protocol) in
+                        request_batch
+                    {
+                        info!(
+                            repo = %owner_repo,
+                            request_kind = ?request_kind,
+                            want_have_bytes = want_have.len(),
                             authenticated,
-                            git_protocol,
-                            request_kind,
-                            metric_username: metric_username.clone(),
-                        },
-                        UpstreamUploadPackBehavior {
-                            warn_on_disconnect: true,
-                            should_close_channel: request_kind == V2RequestKind::Fetch,
-                            capture_for_hydration: request_kind == V2RequestKind::Fetch,
-                        },
-                    )
-                    .await;
+                            "upstream proxy: request complete, POSTing to upstream"
+                        );
+                        proxy_upstream_upload_pack(
+                            UpstreamUploadPackContext {
+                                state: Arc::clone(&state),
+                                channel_states: Arc::clone(&channel_states),
+                                capture_metadata: Arc::clone(&capture_metadata),
+                                handle: handle.clone(),
+                                channel_id,
+                                stream_channel: stream_channel.clone(),
+                                output_lock: Arc::clone(&output_lock),
+                            },
+                            UpstreamUploadPackRequest {
+                                owner_repo,
+                                want_have,
+                                authenticated,
+                                git_protocol,
+                                request_kind,
+                                metric_username: metric_username.clone(),
+                            },
+                            UpstreamUploadPackBehavior {
+                                warn_on_disconnect: true,
+                                should_close_channel: request_kind == V2RequestKind::Fetch,
+                                capture_for_hydration: request_kind == V2RequestKind::Fetch,
+                            },
+                        )
+                        .await;
+                    }
                 }
-            });
+                .instrument(request_span),
+            );
         }
 
         if let Some((owner_repo, request_kind, want_have, authenticated, git_protocol)) =
@@ -1159,33 +1198,45 @@ impl Handler for SshSession {
             let output_lock = output_lock_for_channel(&channel_states, channel_id).await;
             let metric_username =
                 crate::metrics::clone_metric_username(self.username.as_deref(), true);
-            tokio::spawn(async move {
-                proxy_upstream_upload_pack(
-                    UpstreamUploadPackContext {
-                        state,
-                        channel_states,
-                        capture_metadata,
-                        handle,
-                        channel_id,
-                        stream_channel,
-                        output_lock,
-                    },
-                    UpstreamUploadPackRequest {
-                        owner_repo,
-                        want_have,
-                        authenticated,
-                        git_protocol,
-                        request_kind,
-                        metric_username,
-                    },
-                    UpstreamUploadPackBehavior {
-                        warn_on_disconnect: true,
-                        should_close_channel: request_kind == V2RequestKind::Fetch,
-                        capture_for_hydration: request_kind == V2RequestKind::Fetch,
-                    },
-                )
-                .await;
-            });
+            let request_span = ssh_git_request_observation(
+                &state,
+                &owner_repo,
+                Some(&metric_username),
+                self.fingerprint.as_deref(),
+                git_protocol.as_deref(),
+                Some(format!("ssh-channel-{channel_id:?}")),
+            )
+            .make_span("ssh_upload_pack", "post-upload-pack");
+            tokio::spawn(
+                async move {
+                    proxy_upstream_upload_pack(
+                        UpstreamUploadPackContext {
+                            state,
+                            channel_states,
+                            capture_metadata,
+                            handle,
+                            channel_id,
+                            stream_channel,
+                            output_lock,
+                        },
+                        UpstreamUploadPackRequest {
+                            owner_repo,
+                            want_have,
+                            authenticated,
+                            git_protocol,
+                            request_kind,
+                            metric_username,
+                        },
+                        UpstreamUploadPackBehavior {
+                            warn_on_disconnect: true,
+                            should_close_channel: request_kind == V2RequestKind::Fetch,
+                            capture_for_hydration: request_kind == V2RequestKind::Fetch,
+                        },
+                    )
+                    .await;
+                }
+                .instrument(request_span),
+            );
         }
 
         Ok(())
@@ -1223,33 +1274,45 @@ impl Handler for SshSession {
             let output_lock = output_lock_for_channel(&channel_states, channel_id).await;
             let metric_username =
                 crate::metrics::clone_metric_username(self.username.as_deref(), true);
-            tokio::spawn(async move {
-                proxy_upstream_upload_pack(
-                    UpstreamUploadPackContext {
-                        state,
-                        channel_states,
-                        capture_metadata,
-                        handle,
-                        channel_id,
-                        stream_channel,
-                        output_lock,
-                    },
-                    UpstreamUploadPackRequest {
-                        owner_repo,
-                        want_have,
-                        authenticated,
-                        git_protocol,
-                        request_kind: V2RequestKind::Fetch,
-                        metric_username,
-                    },
-                    UpstreamUploadPackBehavior {
-                        warn_on_disconnect: false,
-                        should_close_channel: true,
-                        capture_for_hydration: true,
-                    },
-                )
-                .await;
-            });
+            let request_span = ssh_git_request_observation(
+                &state,
+                &owner_repo,
+                Some(&metric_username),
+                self.fingerprint.as_deref(),
+                git_protocol.as_deref(),
+                Some(format!("ssh-channel-{channel_id:?}")),
+            )
+            .make_span("ssh_upload_pack", "channel-eof");
+            tokio::spawn(
+                async move {
+                    proxy_upstream_upload_pack(
+                        UpstreamUploadPackContext {
+                            state,
+                            channel_states,
+                            capture_metadata,
+                            handle,
+                            channel_id,
+                            stream_channel,
+                            output_lock,
+                        },
+                        UpstreamUploadPackRequest {
+                            owner_repo,
+                            want_have,
+                            authenticated,
+                            git_protocol,
+                            request_kind: V2RequestKind::Fetch,
+                            metric_username,
+                        },
+                        UpstreamUploadPackBehavior {
+                            warn_on_disconnect: false,
+                            should_close_channel: true,
+                            capture_for_hydration: true,
+                        },
+                    )
+                    .await;
+                }
+                .instrument(request_span),
+            );
         }
 
         Ok(())
@@ -1429,6 +1492,17 @@ impl Handler for SshSession {
                         return Ok(());
                     }
                 }
+
+                let request_observation = ssh_git_request_observation(
+                    &self.state,
+                    &repo,
+                    self.username.as_deref(),
+                    self.fingerprint.as_deref(),
+                    self.git_protocol.as_deref(),
+                    Some(format!("ssh-channel-{channel_id:?}")),
+                );
+                let request_span = request_observation.make_span("ssh_upload_pack", "exec");
+                let _request_guard = request_span.enter();
 
                 let repo_path = self.cache_manager.repo_path(&repo);
                 debug!(
@@ -1621,7 +1695,8 @@ impl Handler for SshSession {
                                     )
                                     .await;
                                 }
-                            });
+                            }
+                            .instrument(request_span.clone()));
 
                             // Return immediately — the background task handles
                             // the rest of the channel lifecycle.
@@ -1770,7 +1845,8 @@ impl Handler for SshSession {
                                 .await;
                             }
                         }
-                    });
+                    }
+                    .instrument(request_span.clone()));
                 }
 
                 Ok(())

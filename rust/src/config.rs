@@ -54,6 +54,16 @@ impl BackendType {
             Self::Gitlab | Self::Gitea | Self::Forgejo => "application/json",
         }
     }
+
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Self::GithubEnterprise => "github_enterprise",
+            Self::Github => "github",
+            Self::Gitlab => "gitlab",
+            Self::Gitea => "gitea",
+            Self::Forgejo => "forgejo",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

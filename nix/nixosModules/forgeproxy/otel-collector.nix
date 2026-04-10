@@ -274,11 +274,16 @@ let
       resource_service_namespace=$(read_runtime_attr '.service_namespace // ""')
       resource_service_version=$(read_runtime_attr '.service_version // ""')
       resource_service_instance_id=$(read_runtime_attr '.service_instance_id // ""')
+      resource_host_id=$(read_runtime_attr '.host_id // ""')
+      resource_host_name=$(read_runtime_attr '.host_name // ""')
       resource_service_machine_id=$(read_runtime_attr '.service_machine_id // ""')
       resource_service_ip_address=$(read_runtime_attr '.service_ip_address // ""')
       resource_cloud_provider=$(read_runtime_attr '.cloud_provider // ""')
       resource_cloud_platform=$(read_runtime_attr '.cloud_platform // ""')
       resource_cloud_region=$(read_runtime_attr '.cloud_region // ""')
+      resource_deployment_environment=$(read_runtime_attr '.deployment_environment // ""')
+      resource_forge_backend=$(read_config '.backend_type // "github-enterprise"')
+      resource_upstream_hostname=$(read_config '.upstream.hostname // ""')
 
       if [[ -z "$resource_service_name" || "$resource_service_name" == "null" ]]; then
         resource_service_name="forgeproxy"
@@ -409,11 +414,17 @@ let
 
         for attr in \
           "service.instance.id:$resource_service_instance_id" \
+          "host.id:$resource_host_id" \
+          "host.name:$resource_host_name" \
           "service.machine_id:$resource_service_machine_id" \
           "service.ip_address:$resource_service_ip_address" \
           "cloud.provider:$resource_cloud_provider" \
           "cloud.platform:$resource_cloud_platform" \
-          "cloud.region:$resource_cloud_region"
+          "cloud.region:$resource_cloud_region" \
+          "deployment.environment.name:$resource_deployment_environment" \
+          "deployment.environment:$resource_deployment_environment" \
+          "forge.backend:$resource_forge_backend" \
+          "server.address:$resource_upstream_hostname"
         do
           key=''${attr%%:*}
           value=''${attr#*:}

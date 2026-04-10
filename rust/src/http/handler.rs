@@ -39,7 +39,7 @@ use std::task::{Context as TaskContext, Poll};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{Instrument, debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -54,6 +54,7 @@ use crate::metrics::{
     CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource, CloneUpstreamBytesLabels,
     Protocol,
 };
+use crate::observability::GitRequestObservation;
 
 struct LeasedReaderStream<S> {
     inner: S,
@@ -384,6 +385,10 @@ fn request_host(headers: &HeaderMap) -> Result<&str, AppError> {
     fields(
         %owner,
         %repo,
+        owner_repo = tracing::field::Empty,
+        username = tracing::field::Empty,
+        forge_backend = tracing::field::Empty,
+        git_protocol = tracing::field::Empty,
         git_request_id = tracing::field::Empty,
         git_session_id = tracing::field::Empty,
         git_phase = tracing::field::Empty,
@@ -422,16 +427,19 @@ async fn handle_info_refs(
     )
     .await;
     let client_fingerprint = http_git_client_fingerprint(&headers, &metric_username, &owner, &repo);
-    let git_request_id = format!("http-{}", Uuid::new_v4().simple());
-    let git_session_id = format!("http-{}", Uuid::new_v4().simple());
-    let span = tracing::Span::current();
-    span.record("git_request_id", tracing::field::display(&git_request_id));
-    span.record("git_session_id", tracing::field::display(&git_session_id));
-    span.record("git_phase", tracing::field::display("info-refs"));
-    span.record(
-        "client_fingerprint",
-        tracing::field::display(&client_fingerprint),
+    let observation = GitRequestObservation::new(
+        &state.config,
+        &owner,
+        &repo,
+        &metric_username,
+        None,
+        &client_fingerprint,
+        "http",
+        None,
     );
+    let git_session_id = observation.git_session_id.clone();
+    let span = tracing::Span::current();
+    observation.record_span(&span, "info-refs");
 
     // Proxy the info/refs request to the upstream forge.
     let upstream_url = format!(
@@ -532,6 +540,10 @@ async fn handle_info_refs(
     fields(
         %owner,
         %repo,
+        owner_repo = tracing::field::Empty,
+        username = tracing::field::Empty,
+        forge_backend = tracing::field::Empty,
+        git_protocol = tracing::field::Empty,
         git_request_id = tracing::field::Empty,
         git_session_id = tracing::field::Empty,
         git_phase = tracing::field::Empty,
@@ -586,19 +598,28 @@ async fn handle_upload_pack(
     let advertised_refs = recent_advertised_refs
         .as_ref()
         .map(|recent| recent.advertised_refs.clone());
-    let git_request_id = format!("http-{}", Uuid::new_v4().simple());
     let git_session_id = recent_advertised_refs
         .as_ref()
         .map(|recent| recent.session_id.clone())
         .unwrap_or_else(|| format!("http-{}", Uuid::new_v4().simple()));
     let request_phase = request_metadata.request_phase.to_string();
+    let observation = GitRequestObservation::new(
+        &state.config,
+        &owner,
+        &repo,
+        &metric_username,
+        git_protocol.as_deref(),
+        &client_fingerprint,
+        "http",
+        Some(git_session_id.clone()),
+    );
     let span = tracing::Span::current();
-    span.record("git_request_id", tracing::field::display(&git_request_id));
-    span.record("git_session_id", tracing::field::display(&git_session_id));
-    span.record("git_phase", tracing::field::display(&request_phase));
-    span.record(
-        "client_fingerprint",
-        tracing::field::display(&client_fingerprint),
+    observation.record_span(&span, &request_phase);
+    info!(
+        repo = %repo_slug,
+        wants = wants.len(),
+        want_sample,
+        "received git-upload-pack request"
     );
     span.record(
         "client_session_id",
@@ -607,12 +628,6 @@ async fn handle_upload_pack(
     span.record(
         "git_client_agent",
         tracing::field::display(request_metadata.agent.as_deref().unwrap_or("")),
-    );
-    info!(
-        repo = %repo_slug,
-        wants = wants.len(),
-        want_sample,
-        "received git-upload-pack request"
     );
     let local_decision = crate::coordination::registry::resolve_local_fetch_serveability(
         &state,
@@ -1158,21 +1173,24 @@ async fn serve_local_upload_pack(
     let body = Body::from_stream(stream);
 
     // Reap the child in the background so we don't leak processes.
-    tokio::spawn(async move {
-        match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
-            Ok(exit) if !exit.status.success() => {
-                warn!(
-                    status = %exit.status,
-                    stderr = %String::from_utf8_lossy(&exit.stderr),
-                    "git upload-pack exited with non-zero status"
-                );
+    tokio::spawn(
+        async move {
+            match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
+                Ok(exit) if !exit.status.success() => {
+                    warn!(
+                        status = %exit.status,
+                        stderr = %String::from_utf8_lossy(&exit.stderr),
+                        "git upload-pack exited with non-zero status"
+                    );
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to wait on git upload-pack");
+                }
+                _ => {}
             }
-            Err(e) => {
-                error!(error = %e, "failed to wait on git upload-pack");
-            }
-            _ => {}
         }
-    });
+        .instrument(tracing::Span::current()),
+    );
 
     Ok((
         StatusCode::OK,
@@ -1283,69 +1301,72 @@ async fn proxy_upload_pack_to_upstream(
     let advertised_refs = recent_advertised_refs
         .as_ref()
         .map(|recent| recent.advertised_refs.clone());
-    tokio::spawn(async move {
-        let mut stream = upstream_resp.bytes_stream();
-        let mut ls_refs_response =
-            if request_phase == crate::tee_hydration::UploadPackRequestPhase::V2LsRefs {
-                Some(Vec::new())
-            } else {
-                None
-            };
-        let mut hydration = UpstreamHydrationTracker::start(
-            &state,
-            &owner,
-            &repo,
-            auth_header.as_deref(),
-            "http",
-            UpstreamHydrationRequest {
-                advertised_refs: advertised_refs.as_ref(),
-                request_body: &capture_body,
-                enable_hydration: request_phase.expects_local_pack_serve(),
-            },
-        )
-        .await;
+    tokio::spawn(
+        async move {
+            let mut stream = upstream_resp.bytes_stream();
+            let mut ls_refs_response =
+                if request_phase == crate::tee_hydration::UploadPackRequestPhase::V2LsRefs {
+                    Some(Vec::new())
+                } else {
+                    None
+                };
+            let mut hydration = UpstreamHydrationTracker::start(
+                &state,
+                &owner,
+                &repo,
+                auth_header.as_deref(),
+                "http",
+                UpstreamHydrationRequest {
+                    advertised_refs: advertised_refs.as_ref(),
+                    request_body: &capture_body,
+                    enable_hydration: request_phase.expects_local_pack_serve(),
+                },
+            )
+            .await;
 
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(chunk) => {
-                    let chunk_len = chunk.len() as u64;
-                    upstream_counter.inc_by(chunk_len);
-                    let capture_chunk = chunk.clone();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        let chunk_len = chunk.len() as u64;
+                        upstream_counter.inc_by(chunk_len);
+                        let capture_chunk = chunk.clone();
 
-                    if tx.send(Ok(chunk)).await.is_err() {
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            hydration.handle_stream_error().await;
+                            return;
+                        }
+                        downstream_counter.inc_by(chunk_len);
+
+                        if let Some(response_buf) = ls_refs_response.as_mut() {
+                            response_buf.extend_from_slice(&capture_chunk);
+                        }
+                        hydration.record_response_chunk(capture_chunk).await;
+                    }
+                    Err(e) => {
                         hydration.handle_stream_error().await;
+                        let _ = tx.send(Err(e)).await;
                         return;
                     }
-                    downstream_counter.inc_by(chunk_len);
-
-                    if let Some(response_buf) = ls_refs_response.as_mut() {
-                        response_buf.extend_from_slice(&capture_chunk);
-                    }
-                    hydration.record_response_chunk(capture_chunk).await;
-                }
-                Err(e) => {
-                    hydration.handle_stream_error().await;
-                    let _ = tx.send(Err(e)).await;
-                    return;
                 }
             }
+            if let Some(ls_refs_response) = ls_refs_response {
+                state
+                    .merge_recent_advertised_refs(
+                        owner_repo_for_cache,
+                        client_fingerprint,
+                        git_session_id,
+                        crate::coordination::registry::RequestAdvertisedRefs {
+                            ls_refs_request: Some(ls_refs_request_body.to_vec()),
+                            ls_refs_response: Some(ls_refs_response),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            }
+            hydration.finish().await;
         }
-        if let Some(ls_refs_response) = ls_refs_response {
-            state
-                .merge_recent_advertised_refs(
-                    owner_repo_for_cache,
-                    client_fingerprint,
-                    git_session_id,
-                    crate::coordination::registry::RequestAdvertisedRefs {
-                        ls_refs_request: Some(ls_refs_request_body.to_vec()),
-                        ls_refs_response: Some(ls_refs_response),
-                        ..Default::default()
-                    },
-                )
-                .await;
-        }
-        hydration.finish().await;
-    });
+        .instrument(tracing::Span::current()),
+    );
 
     let body = Body::from_stream(CloneCompletionStream::new(
         ReceiverStream::new(rx),

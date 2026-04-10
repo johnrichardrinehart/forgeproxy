@@ -40,7 +40,16 @@ use crate::metrics::{ClonePhase, CloneUpstreamBytesLabels, Protocol};
 ///
 /// Supports PAT (HTTPS) credential mode.  SSH credential mode returns an
 /// error — configure a PAT for uncached repository proxying.
-#[instrument(skip(state), fields(%owner_repo, authenticated))]
+#[instrument(
+    skip(state),
+    fields(
+        %owner_repo,
+        username = %metric_username,
+        git_protocol = git_protocol.unwrap_or(""),
+        forge_backend = %state.config.backend_type.as_label(),
+        authenticated
+    )
+)]
 pub async fn fetch_ref_advertisement(
     state: &AppState,
     owner_repo: &str,
@@ -118,14 +127,24 @@ pub async fn fetch_ref_advertisement(
 ///
 /// `authenticated` must match the value used for phase 1 — it controls
 /// whether a token is embedded in the upstream URL.
-#[instrument(skip(state, want_have), fields(%owner_repo, input_bytes = want_have.len(), authenticated))]
+#[instrument(
+    skip(state, want_have),
+    fields(
+        %owner_repo,
+        username = %metric_username,
+        git_protocol = git_protocol.unwrap_or(""),
+        forge_backend = %state.config.backend_type.as_label(),
+        input_bytes = want_have.len(),
+        authenticated
+    )
+)]
 pub async fn post_upload_pack_stream(
     state: &AppState,
     owner_repo: &str,
     want_have: &[u8],
     authenticated: bool,
     git_protocol: Option<&str>,
-    _metric_username: &str,
+    metric_username: &str,
 ) -> Result<impl Stream<Item = reqwest::Result<bytes::Bytes>>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =

@@ -19,11 +19,14 @@ pub struct RuntimeResourceAttributes {
     #[serde(default)]
     pub service_version: String,
     pub service_instance_id: Option<String>,
+    pub host_id: Option<String>,
+    pub host_name: Option<String>,
     pub service_machine_id: Option<String>,
     pub service_ip_address: Option<String>,
     pub cloud_provider: Option<String>,
     pub cloud_platform: Option<String>,
     pub cloud_region: Option<String>,
+    pub deployment_environment: Option<String>,
 }
 
 impl RuntimeResourceAttributes {
@@ -46,6 +49,12 @@ impl RuntimeResourceAttributes {
         if let Some(value) = &self.service_instance_id {
             attributes.push(KeyValue::new("service.instance.id", value.clone()));
         }
+        if let Some(value) = &self.host_id {
+            attributes.push(KeyValue::new("host.id", value.clone()));
+        }
+        if let Some(value) = &self.host_name {
+            attributes.push(KeyValue::new("host.name", value.clone()));
+        }
         if let Some(value) = &self.service_machine_id {
             attributes.push(KeyValue::new("service.machine_id", value.clone()));
         }
@@ -60,6 +69,10 @@ impl RuntimeResourceAttributes {
         }
         if let Some(value) = &self.cloud_region {
             attributes.push(KeyValue::new("cloud.region", value.clone()));
+        }
+        if let Some(value) = &self.deployment_environment {
+            attributes.push(KeyValue::new("deployment.environment.name", value.clone()));
+            attributes.push(KeyValue::new("deployment.environment", value.clone()));
         }
 
         attributes
@@ -106,13 +119,17 @@ pub async fn detect_runtime_resource_attributes(service_version: &str) -> Runtim
     let mut warnings = Vec::new();
     let mut attributes = RuntimeResourceAttributes::for_forgeproxy(service_version);
 
-    attributes.service_machine_id = read_machine_id()
+    let machine_id = read_machine_id()
         .map_err(|error| {
             warnings.push(format!(
                 "failed to read /etc/machine-id for runtime resource attributes: {error}"
             ));
         })
         .ok();
+    attributes.service_machine_id = machine_id.clone();
+    attributes.host_id = machine_id;
+    attributes.host_name = detect_host_name();
+    attributes.deployment_environment = detect_deployment_environment();
 
     let client = match build_metadata_client() {
         Ok(client) => Some(client),
@@ -160,6 +177,9 @@ pub async fn detect_runtime_resource_attributes(service_version: &str) -> Runtim
             "runtime resource detection could not determine a stable service.instance.id"
                 .to_string(),
         );
+    }
+    if attributes.host_name.is_none() {
+        warnings.push("runtime resource detection could not determine host.name".to_string());
     }
     if attributes.service_ip_address.is_none() {
         warnings
@@ -235,6 +255,24 @@ fn build_metadata_client() -> Result<reqwest::Client> {
         .no_proxy()
         .build()
         .context("build metadata client")
+}
+
+fn detect_host_name() -> Option<String> {
+    let hostname = gethostname::gethostname();
+    let hostname = hostname.to_string_lossy().trim().to_string();
+    (!hostname.is_empty()).then_some(hostname)
+}
+
+fn detect_deployment_environment() -> Option<String> {
+    [
+        "FORGEPROXY_DEPLOYMENT_ENVIRONMENT",
+        "DEPLOYMENT_ENVIRONMENT",
+        "ENVIRONMENT",
+    ]
+    .into_iter()
+    .find_map(|name| std::env::var(name).ok())
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
 }
 
 async fn detect_cloud_metadata(client: &reqwest::Client) -> Result<Option<CloudMetadata>> {
@@ -430,17 +468,23 @@ mod tests {
             service_namespace: "forgeproxy".to_string(),
             service_version: "0.1.0".to_string(),
             service_instance_id: Some("i-1234567890".to_string()),
+            host_id: Some("host-abcdef".to_string()),
+            host_name: Some("forgeproxy-prod-01".to_string()),
             service_machine_id: Some("abcdef".to_string()),
             service_ip_address: Some("10.0.0.12".to_string()),
             cloud_provider: Some("aws".to_string()),
             cloud_platform: Some("aws_ec2".to_string()),
             cloud_region: Some("us-east-1".to_string()),
+            deployment_environment: Some("prod".to_string()),
         };
 
         let encoded = serde_json::to_string(&attrs).unwrap();
         assert!(encoded.contains("\"service_instance_id\":\"i-1234567890\""));
+        assert!(encoded.contains("\"host_id\":\"host-abcdef\""));
+        assert!(encoded.contains("\"host_name\":\"forgeproxy-prod-01\""));
         assert!(encoded.contains("\"service_machine_id\":\"abcdef\""));
         assert!(encoded.contains("\"service_ip_address\":\"10.0.0.12\""));
         assert!(encoded.contains("\"cloud_provider\":\"aws\""));
+        assert!(encoded.contains("\"deployment_environment\":\"prod\""));
     }
 }
