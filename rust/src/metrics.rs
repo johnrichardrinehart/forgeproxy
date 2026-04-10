@@ -1,13 +1,78 @@
+use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
-use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeLabelValue};
+use prometheus_client::metrics::MetricType;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
+
+// ---------------------------------------------------------------------------
+// OptionalGauge — omitted from /metrics until explicitly set
+// ---------------------------------------------------------------------------
+
+/// Shared gauge state that stays completely absent from `/metrics` until
+/// [`OptionalGauge::set`] is called at least once.
+#[derive(Clone)]
+pub struct OptionalGauge {
+    inner: Gauge,
+    has_value: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for OptionalGauge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OptionalGauge")
+            .field("has_value", &self.has_value.load(Ordering::Relaxed))
+            .field("value", &self.inner.get())
+            .finish()
+    }
+}
+
+impl Default for OptionalGauge {
+    fn default() -> Self {
+        Self {
+            inner: Gauge::default(),
+            has_value: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl OptionalGauge {
+    pub fn set(&self, value: i64) {
+        self.inner.set(value);
+        self.has_value.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OptionalGaugeCollector {
+    name: &'static str,
+    help: &'static str,
+    metric: OptionalGauge,
+}
+
+impl OptionalGaugeCollector {
+    fn new(name: &'static str, help: &'static str, metric: OptionalGauge) -> Self {
+        Self { name, help, metric }
+    }
+}
+
+impl Collector for OptionalGaugeCollector {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
+        if !self.metric.has_value.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let mut metric_encoder =
+            encoder.encode_descriptor(self.name, self.help, None, MetricType::Gauge)?;
+        metric_encoder.encode_gauge(&self.metric.inner.get())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Label types
@@ -118,7 +183,7 @@ pub struct Metrics {
     pub upstream_api_calls: Family<EndpointLabels, Counter>,
 
     // -- rate limit --
-    pub upstream_api_rate_limit_remaining: Gauge,
+    pub upstream_api_rate_limit_remaining: OptionalGauge,
 
     // -- gauges --
     pub active_connections: Family<ProtocolLabels, Gauge>,
@@ -252,12 +317,12 @@ impl Metrics {
             upstream_api_calls.clone(),
         );
 
-        let upstream_api_rate_limit_remaining: Gauge = Gauge::default();
-        registry.register(
+        let upstream_api_rate_limit_remaining = OptionalGauge::default();
+        registry.register_collector(Box::new(OptionalGaugeCollector::new(
             "forgeproxy_upstream_api_rate_limit_remaining",
             "Remaining upstream API calls before rate limit",
             upstream_api_rate_limit_remaining.clone(),
-        );
+        )));
 
         let active_connections = Family::<ProtocolLabels, Gauge>::default();
         registry.register(
@@ -380,6 +445,9 @@ pub fn inc_upstream_api_call(metrics: &MetricsRegistry, endpoint: &str) {
 }
 
 pub fn set_upstream_api_rate_limit_remaining(metrics: &MetricsRegistry, remaining: u64) {
+    if remaining == u64::MAX {
+        return; // sentinel for "no API response yet" — keep the metric absent
+    }
     metrics
         .metrics
         .upstream_api_rate_limit_remaining
@@ -430,5 +498,33 @@ impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
         let next = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
         set_active_connections(&self.metrics, self.protocol.clone(), next);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_metrics(registry: &Registry) -> String {
+        let mut encoded = String::new();
+        prometheus_client::encoding::text::encode(&mut encoded, registry).unwrap();
+        encoded
+    }
+
+    #[test]
+    fn upstream_rate_limit_metric_is_fully_absent_until_first_value() {
+        let metrics = MetricsRegistry::new();
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(!encoded.contains("forgeproxy_upstream_api_rate_limit_remaining"));
+
+        set_upstream_api_rate_limit_remaining(&metrics, 42);
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(encoded.contains(
+            "# HELP forgeproxy_upstream_api_rate_limit_remaining Remaining upstream API calls before rate limit"
+        ));
+        assert!(encoded.contains("# TYPE forgeproxy_upstream_api_rate_limit_remaining gauge"));
+        assert!(encoded.contains("forgeproxy_upstream_api_rate_limit_remaining 42"));
     }
 }
