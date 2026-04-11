@@ -837,6 +837,10 @@ async fn try_ensure_repo_cloned_inner(
                 .await?
                 .unwrap_or_default();
             if hydration_in_progress_on_this_node(&existing_info, &node_id) {
+                crate::metrics::inc_hydration_skipped(
+                    &state.metrics,
+                    crate::metrics::HydrationSkipReason::SameNodeDedup,
+                );
                 info!(
                     repo = %owner_repo,
                     published = %published_repo_path.display(),
@@ -860,6 +864,10 @@ async fn try_ensure_repo_cloned_inner(
                 if let Some(capture_dir) = tee_capture_dir.as_ref() {
                     cleanup_tee_capture_dir(capture_dir).await?;
                 }
+                crate::metrics::inc_hydration_skipped(
+                    &state.metrics,
+                    crate::metrics::HydrationSkipReason::SemaphoreSaturated,
+                );
                 info!(
                     repo = %owner_repo,
                     per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
@@ -918,6 +926,10 @@ async fn try_ensure_repo_cloned_inner(
             if let Some(capture_dir) = tee_capture_dir.as_ref() {
                 cleanup_tee_capture_dir(capture_dir).await?;
             }
+            crate::metrics::inc_hydration_skipped(
+                &state.metrics,
+                crate::metrics::HydrationSkipReason::SemaphoreSaturated,
+            );
             info!(
                 repo = %owner_repo,
                 per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
@@ -932,6 +944,10 @@ async fn try_ensure_repo_cloned_inner(
             .await?
             .unwrap_or_default();
         if hydration_in_progress_on_this_node(&info, &node_id) {
+            crate::metrics::inc_hydration_skipped(
+                &state.metrics,
+                crate::metrics::HydrationSkipReason::SameNodeDedup,
+            );
             info!(
                 repo = %owner_repo,
                 mirror = %mirror_path.display(),

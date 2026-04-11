@@ -43,13 +43,14 @@ pub struct LocalUploadPackProcess {
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
+    pub upload_pack_guard: crate::metrics::UploadPackGuard,
     pub _lease: LocalServeRepoLease,
 }
 
 pub async fn spawn_local_upload_pack(
     state: &AppState,
     owner_repo: &str,
-    protocol_name: &'static str,
+    protocol: Protocol,
     serve_from: LocalServeRepoSource,
     mode: LocalUploadPackMode,
     git_protocol: Option<&str>,
@@ -77,6 +78,11 @@ pub async fn spawn_local_upload_pack(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn local git upload-pack for {owner_repo}"))?;
+    let upload_pack_guard = state.begin_upload_pack(protocol.clone());
+    let protocol_name = match protocol {
+        Protocol::Https => "http",
+        Protocol::Ssh => "ssh",
+    };
 
     info!(
         repo = %owner_repo,
@@ -92,6 +98,7 @@ pub async fn spawn_local_upload_pack(
         stdout: child.stdout.take(),
         stderr: child.stderr.take(),
         child,
+        upload_pack_guard,
         _lease: repo_lease,
     })
 }
@@ -176,6 +183,10 @@ impl UpstreamHydrationTracker {
             {
                 Ok(Some(permits)) => Some(permits),
                 Ok(None) => {
+                    crate::metrics::inc_hydration_skipped(
+                        &state.metrics,
+                        crate::metrics::HydrationSkipReason::SemaphoreSaturated,
+                    );
                     info!(
                         repo = %owner_repo,
                         protocol = protocol_name,

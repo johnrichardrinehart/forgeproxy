@@ -530,7 +530,7 @@ async fn serve_local_upload_pack_once(
     let mut process = match spawn_local_upload_pack(
         state,
         owner_repo,
-        "ssh",
+        Protocol::Ssh,
         serve_from,
         LocalUploadPackMode::StatelessRpc,
         git_protocol,
@@ -568,8 +568,13 @@ async fn serve_local_upload_pack_once(
         error!(repo = %owner_repo, "missing stderr from local git upload-pack");
         return;
     };
-    let mut child = process.child;
-    let _repo_lease = process._lease;
+    let crate::clone_support::LocalUploadPackProcess {
+        child,
+        upload_pack_guard: _upload_pack_guard,
+        _lease: _repo_lease,
+        ..
+    } = process;
+    let mut child = child;
 
     let mut total_bytes: u64 = 0;
     let mut stream_writer = stream_channel.as_ref().map(|channel| channel.make_writer());
@@ -653,6 +658,13 @@ async fn serve_local_upload_pack_once(
         };
 
     if completed_successfully {
+        crate::metrics::observe_upload_pack_duration(
+            &state.metrics,
+            Protocol::Ssh,
+            CloneSource::Local,
+            &completion.metric_repo,
+            completion.started_at.elapsed(),
+        );
         completion.record_success(&state.metrics, Protocol::Ssh);
     }
 
@@ -1532,7 +1544,7 @@ impl Handler for SshSession {
                     match spawn_local_upload_pack(
                         &self.state,
                         &repo,
-                        "ssh",
+                        Protocol::Ssh,
                         LocalServeRepoSource::PublishedGeneration,
                         LocalUploadPackMode::Interactive,
                         self.git_protocol.as_deref(),
@@ -1550,8 +1562,13 @@ impl Handler for SshSession {
                                 .stderr
                                 .take()
                                 .expect("child stderr was set to piped");
-                            let mut child = process.child;
-                            let repo_lease = process._lease;
+                            let crate::clone_support::LocalUploadPackProcess {
+                                child,
+                                upload_pack_guard,
+                                _lease: repo_lease,
+                                ..
+                            } = process;
+                            let mut child = child;
 
                             // Store stdin so the `data` and `channel_eof`
                             // callbacks can forward client data / signal EOF.
@@ -1582,6 +1599,7 @@ impl Handler for SshSession {
                             // with explicit `Handle::data()` chunking and then
                             // finalizes the channel in RFC 4254 order.
                             tokio::spawn(async move {
+                                let _upload_pack_guard = upload_pack_guard;
                                 let _repo_lease = repo_lease;
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
@@ -1649,6 +1667,13 @@ impl Handler for SshSession {
                                     {
                                         Ok(exit) => {
                                             if exit.status.success() {
+                                                crate::metrics::observe_upload_pack_duration(
+                                                    &state_for_stream.metrics,
+                                                    Protocol::Ssh,
+                                                    CloneSource::Local,
+                                                    &repo_for_stream,
+                                                    clone_started.elapsed(),
+                                                );
                                                 CloneCompletion {
                                                     cache_status: CacheStatus::Hot,
                                                     started_at: clone_started,
@@ -2141,6 +2166,13 @@ async fn proxy_upstream_upload_pack(
                     && let (Some(cache_status), Some(started_at)) =
                         (fetch_cache_status.clone(), fetch_started_at)
                 {
+                    crate::metrics::observe_upload_pack_duration(
+                        &state.metrics,
+                        Protocol::Ssh,
+                        CloneSource::Upstream,
+                        &owner_repo,
+                        started_at.elapsed(),
+                    );
                     CloneCompletion {
                         cache_status,
                         started_at,

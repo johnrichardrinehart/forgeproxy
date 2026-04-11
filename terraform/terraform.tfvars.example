@@ -33,6 +33,8 @@ valkey_instance_type      = "r6i.large"
 
 # Volume sizes (GB)
 forgeproxy_root_volume_gb = 50
+forgeproxy_root_volume_iops = 3000
+forgeproxy_root_volume_throughput_mbps = 125
 valkey_root_volume_gb      = 50
 
 # Optional ghe-key-lookup sidecar deployment

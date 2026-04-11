@@ -57,6 +57,8 @@ resource "aws_instance" "forgeproxy" {
   root_block_device {
     volume_type           = "gp3"
     volume_size           = var.forgeproxy_root_volume_gb
+    iops                  = var.forgeproxy_root_volume_iops
+    throughput            = var.forgeproxy_root_volume_throughput_mbps
     encrypted             = true
     delete_on_termination = true
     tags = {

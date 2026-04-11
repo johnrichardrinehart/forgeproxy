@@ -118,6 +118,28 @@ variable "forgeproxy_root_volume_gb" {
   description = "Root volume size (GB) for forgeproxy instances"
 }
 
+variable "forgeproxy_root_volume_iops" {
+  type        = number
+  default     = 3000
+  description = "gp3 IOPS for forgeproxy root volumes"
+
+  validation {
+    condition     = var.forgeproxy_root_volume_iops >= 3000
+    error_message = "forgeproxy_root_volume_iops must be at least 3000 for gp3 volumes."
+  }
+}
+
+variable "forgeproxy_root_volume_throughput_mbps" {
+  type        = number
+  default     = 125
+  description = "gp3 throughput in MiB/s for forgeproxy root volumes"
+
+  validation {
+    condition     = var.forgeproxy_root_volume_throughput_mbps >= 125
+    error_message = "forgeproxy_root_volume_throughput_mbps must be at least 125 for gp3 volumes."
+  }
+}
+
 variable "valkey_root_volume_gb" {
   type        = number
   default     = 50

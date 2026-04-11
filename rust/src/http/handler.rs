@@ -116,6 +116,7 @@ struct CloneCompletionStream<S> {
     metrics: crate::metrics::MetricsRegistry,
     protocol: Protocol,
     completion: CloneCompletion,
+    upload_pack_source: Option<CloneSource>,
     recorded: bool,
 }
 
@@ -125,12 +126,14 @@ impl<S> CloneCompletionStream<S> {
         metrics: crate::metrics::MetricsRegistry,
         protocol: Protocol,
         completion: CloneCompletion,
+        upload_pack_source: Option<CloneSource>,
     ) -> Self {
         Self {
             inner,
             metrics,
             protocol,
             completion,
+            upload_pack_source,
             recorded: false,
         }
     }
@@ -140,6 +143,15 @@ impl<S> CloneCompletionStream<S> {
             return;
         }
         self.recorded = true;
+        if let Some(source) = self.upload_pack_source.clone() {
+            crate::metrics::observe_upload_pack_duration(
+                &self.metrics,
+                self.protocol.clone(),
+                source,
+                &self.completion.metric_repo,
+                self.completion.started_at.elapsed(),
+            );
+        }
         self.completion
             .record_success(&self.metrics, self.protocol.clone());
     }
@@ -1124,7 +1136,7 @@ async fn serve_local_upload_pack(
     let mut process = spawn_local_upload_pack(
         state,
         &owner_repo,
-        "http",
+        Protocol::Https,
         serve_from,
         LocalUploadPackMode::StatelessRpc,
         git_protocol,
@@ -1144,8 +1156,13 @@ async fn serve_local_upload_pack(
     let mut stderr = process
         .stderr
         .context("failed to capture git upload-pack stderr")?;
-    let mut child = process.child;
-    let repo_lease = process._lease;
+    let crate::clone_support::LocalUploadPackProcess {
+        child,
+        upload_pack_guard,
+        _lease: repo_lease,
+        ..
+    } = process;
+    let mut child = child;
 
     // Stream stdout as the response body.
     let downstream_counter = state
@@ -1168,12 +1185,14 @@ async fn serve_local_upload_pack(
         state.metrics.clone(),
         Protocol::Https,
         completion,
+        Some(CloneSource::Local),
     );
     let body = Body::from_stream(stream);
 
     // Reap the child in the background so we don't leak processes.
     tokio::spawn(
         async move {
+            let _upload_pack_guard = upload_pack_guard;
             match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
                 Ok(exit) if !exit.status.success() => {
                     warn!(
@@ -1372,6 +1391,7 @@ async fn proxy_upload_pack_to_upstream(
         completion_metrics,
         Protocol::Https,
         completion,
+        Some(CloneSource::Upstream),
     ));
 
     Ok(response_from_upstream_parts(

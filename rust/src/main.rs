@@ -38,7 +38,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::Config;
-use crate::metrics::{ActiveConnectionGuard, MetricsRegistry, Protocol};
+use crate::metrics::{ActiveConnectionGuard, MetricsRegistry, Protocol, UploadPackGuard};
 use crate::runtime_resource::RuntimeResourceAttributes;
 
 const CLONE_CAPTURE_MEMORY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
@@ -137,6 +137,8 @@ pub struct AppState {
     pub recent_advertised_refs: Arc<Mutex<std::collections::HashMap<String, RecentAdvertisedRefs>>>,
     pub active_https_connections: Arc<AtomicI64>,
     pub active_ssh_connections: Arc<AtomicI64>,
+    pub active_https_upload_packs: Arc<AtomicI64>,
+    pub active_ssh_upload_packs: Arc<AtomicI64>,
     pub draining: Arc<AtomicBool>,
 }
 
@@ -154,6 +156,14 @@ impl AppState {
             Protocol::Ssh => Arc::clone(&self.active_ssh_connections),
         };
         ActiveConnectionGuard::new(self.metrics.clone(), protocol, counter)
+    }
+
+    pub fn begin_upload_pack(&self, protocol: Protocol) -> UploadPackGuard {
+        let counter = match protocol {
+            Protocol::Https => Arc::clone(&self.active_https_upload_packs),
+            Protocol::Ssh => Arc::clone(&self.active_ssh_upload_packs),
+        };
+        UploadPackGuard::new(self.metrics.clone(), protocol, counter)
     }
 
     pub fn start_draining(&self) {
@@ -1077,6 +1087,8 @@ async fn build_app_state(
         recent_advertised_refs: Arc::new(Mutex::new(std::collections::HashMap::new())),
         active_https_connections: Arc::new(AtomicI64::new(0)),
         active_ssh_connections: Arc::new(AtomicI64::new(0)),
+        active_https_upload_packs: Arc::new(AtomicI64::new(0)),
+        active_ssh_upload_packs: Arc::new(AtomicI64::new(0)),
         draining: Arc::new(AtomicBool::new(false)),
     };
     state.refresh_live_metrics();

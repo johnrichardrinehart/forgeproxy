@@ -103,6 +103,18 @@ variable "forgeproxy_root_volume_gb" {
   description = "Root volume size (GB) for forgeproxy instances"
 }
 
+variable "forgeproxy_root_volume_iops" {
+  type        = number
+  default     = 3000
+  description = "gp3 IOPS for forgeproxy root volumes"
+}
+
+variable "forgeproxy_root_volume_throughput_mbps" {
+  type        = number
+  default     = 125
+  description = "gp3 throughput in MiB/s for forgeproxy root volumes"
+}
+
 variable "valkey_root_volume_gb" {
   type        = number
   default     = 50

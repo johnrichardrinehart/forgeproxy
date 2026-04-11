@@ -19,11 +19,13 @@ module "forgeproxy" {
   bundle_bucket_name = var.bundle_bucket_name
   force_destroy      = var.force_destroy
 
-  forgeproxy_instance_type            = var.forgeproxy_instance_type
-  forgeproxy_count                    = var.forgeproxy_count
-  forgeproxy_root_volume_gb           = var.forgeproxy_root_volume_gb
-  forgeproxy_ssh_host_key_secret_arn  = var.forgeproxy_ssh_host_key_secret_arn
-  forgeproxy_ssh_host_key_kms_key_arn = var.forgeproxy_ssh_host_key_kms_key_arn
+  forgeproxy_instance_type               = var.forgeproxy_instance_type
+  forgeproxy_count                       = var.forgeproxy_count
+  forgeproxy_root_volume_gb              = var.forgeproxy_root_volume_gb
+  forgeproxy_root_volume_iops            = var.forgeproxy_root_volume_iops
+  forgeproxy_root_volume_throughput_mbps = var.forgeproxy_root_volume_throughput_mbps
+  forgeproxy_ssh_host_key_secret_arn     = var.forgeproxy_ssh_host_key_secret_arn
+  forgeproxy_ssh_host_key_kms_key_arn    = var.forgeproxy_ssh_host_key_kms_key_arn
 
   valkey_instance_type  = var.valkey_instance_type
   valkey_root_volume_gb = var.valkey_root_volume_gb

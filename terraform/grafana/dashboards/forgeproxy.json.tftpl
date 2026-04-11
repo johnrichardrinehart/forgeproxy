@@ -285,7 +285,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Clone Rate by Protocol & Cache Status",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 6 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -318,7 +318,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "Clone Duration Percentiles",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 6 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -359,6 +359,38 @@
       "options": {
         "tooltip": { "mode": "multi", "sort": "desc" },
         "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Local Upload-Pack Subprocesses",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (protocol) (forgeproxy_upload_pack_concurrent{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "{{ protocol }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
       }
     },
 
@@ -854,19 +886,19 @@
         {
           "id": 61,
           "type": "timeseries",
-          "title": "CPU Usage (non-idle)",
+          "title": "CPU Busy %",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
-              "expr": "sum by (service\\.instance\\.id) (rate(system\\.cpu\\.time{state!=\"idle\", service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+              "expr": "sum by (service\\.instance\\.id) (rate(system\\.cpu\\.time{state!~\"idle|iowait\", service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) / clamp_min(sum by (service\\.instance\\.id) (rate(system\\.cpu\\.time{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])), 0.000001) * 100",
               "legendFormat": "{{service.instance.id}}",
               "refId": "A"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "short",
+              "unit": "percent",
               "custom": {
                 "lineWidth": 2,
                 "fillOpacity": 15,
@@ -886,12 +918,12 @@
         {
           "id": 62,
           "type": "timeseries",
-          "title": "Memory Usage",
+          "title": "Memory Breakdown",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
-              "expr": "sum by (service\\.instance\\.id, state) (system\\.memory\\.usage{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"})",
+              "expr": "sum by (service\\.instance\\.id, state) (system\\.memory\\.usage{service\\.name=\"forgeproxy\", state=~\"used|cached|free|slab_reclaimable\", service\\.instance\\.id=~\"$instance\"})",
               "legendFormat": "{{service.instance.id}} {{state}}",
               "refId": "A"
             }
@@ -983,19 +1015,19 @@
         {
           "id": 65,
           "type": "timeseries",
-          "title": "Host Free Space (/)",
+          "title": "I/O Wait %",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
-              "expr": "sum by (service\\.instance\\.id) (system\\.filesystem\\.usage{service\\.name=\"forgeproxy\", state=\"free\", mountpoint=\"/\", service\\.instance\\.id=~\"$instance\"})",
+              "expr": "sum by (service\\.instance\\.id) (rate(system\\.cpu\\.time{state=\"iowait\", service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) / clamp_min(sum by (service\\.instance\\.id) (rate(system\\.cpu\\.time{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])), 0.000001) * 100",
               "legendFormat": "{{service.instance.id}}",
               "refId": "A"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "unit": "bytes",
+              "unit": "percent",
               "custom": {
                 "lineWidth": 2,
                 "fillOpacity": 15,
@@ -1015,24 +1047,14 @@
         {
           "id": 66,
           "type": "timeseries",
-          "title": "Load Average",
+          "title": "Disk Queue Depth",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
-              "expr": "system\\.cpu\\.load_average\\.1m{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}",
-              "legendFormat": "1m",
+              "expr": "sum by (service\\.instance\\.id) (rate(system\\.disk\\.weighted_io_time{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{service.instance.id}}",
               "refId": "A"
-            },
-            {
-              "expr": "system\\.cpu\\.load_average\\.5m{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}",
-              "legendFormat": "5m",
-              "refId": "B"
-            },
-            {
-              "expr": "system\\.cpu\\.load_average\\.15m{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}",
-              "legendFormat": "15m",
-              "refId": "C"
             }
           ],
           "fieldConfig": {
@@ -1042,6 +1064,102 @@
                 "lineWidth": 2,
                 "fillOpacity": 5,
                 "gradientMode": "none",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 67,
+          "type": "timeseries",
+          "title": "Disk Read Latency",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (service\\.instance\\.id) (rate(system\\.disk\\.operation_time{direction=\"read\", service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) / clamp_min(sum by (service\\.instance\\.id) (rate(system\\.disk\\.operations{direction=\"read\", service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])), 0.000001) * 1000",
+              "legendFormat": "{{service.instance.id}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ms",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 68,
+          "type": "timeseries",
+          "title": "Major Page Faults / sec",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 75 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (service\\.instance\\.id) (rate(system\\.paging\\.faults{type=\"major\", service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{service.instance.id}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 69,
+          "type": "timeseries",
+          "title": "Page Cache Size",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 83 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (service\\.instance\\.id) (system\\.memory\\.usage{state=\"cached\", service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"})",
+              "legendFormat": "{{service.instance.id}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "gradientMode": "scheme",
                 "showPoints": "never",
                 "spanNulls": false,
                 "axisBorderShow": false
