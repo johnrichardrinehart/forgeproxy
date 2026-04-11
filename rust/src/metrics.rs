@@ -147,6 +147,16 @@ pub struct EndpointLabels {
     pub endpoint: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RepoLabels {
+    pub repo: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CacheSubtreeLabels {
+    pub subtree: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum AuthState {
     Anonymous,
@@ -207,6 +217,8 @@ pub struct Metrics {
     pub active_connections: Family<ProtocolLabels, Gauge>,
     pub cache_size_bytes: Gauge,
     pub cache_repos_total: Gauge,
+    pub mirror_size_bytes: Family<RepoLabels, Gauge>,
+    pub cache_subtree_size_bytes: Family<CacheSubtreeLabels, Gauge>,
 }
 
 impl Metrics {
@@ -370,6 +382,20 @@ impl Metrics {
             cache_repos_total.clone(),
         );
 
+        let mirror_size_bytes = Family::<RepoLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_mirror_size_bytes",
+            "Current on-disk size in bytes for each mirrored repository",
+            mirror_size_bytes.clone(),
+        );
+
+        let cache_subtree_size_bytes = Family::<CacheSubtreeLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_cache_subtree_size_bytes",
+            "Current on-disk size in bytes for important forgeproxy cache subtrees",
+            cache_subtree_size_bytes.clone(),
+        );
+
         Self {
             clone_total,
             clone_summary_total,
@@ -393,6 +419,8 @@ impl Metrics {
             active_connections,
             cache_size_bytes,
             cache_repos_total,
+            mirror_size_bytes,
+            cache_subtree_size_bytes,
         }
     }
 }
@@ -530,6 +558,33 @@ pub fn set_cache_repos_total(metrics: &MetricsRegistry, repo_count: usize) {
         .set(repo_count.min(i64::MAX as usize) as i64);
 }
 
+pub fn replace_mirror_size_bytes(metrics: &MetricsRegistry, mirror_sizes: &[(String, u64)]) {
+    metrics.metrics.mirror_size_bytes.clear();
+    for (repo, size_bytes) in mirror_sizes {
+        metrics
+            .metrics
+            .mirror_size_bytes
+            .get_or_create(&RepoLabels { repo: repo.clone() })
+            .set((*size_bytes).min(i64::MAX as u64) as i64);
+    }
+}
+
+pub fn replace_cache_subtree_size_bytes(
+    metrics: &MetricsRegistry,
+    subtree_sizes: &[(String, u64)],
+) {
+    metrics.metrics.cache_subtree_size_bytes.clear();
+    for (subtree, size_bytes) in subtree_sizes {
+        metrics
+            .metrics
+            .cache_subtree_size_bytes
+            .get_or_create(&CacheSubtreeLabels {
+                subtree: subtree.clone(),
+            })
+            .set((*size_bytes).min(i64::MAX as u64) as i64);
+    }
+}
+
 pub struct ActiveConnectionGuard {
     metrics: MetricsRegistry,
     protocol: Protocol,
@@ -587,5 +642,37 @@ mod tests {
         assert_eq!(clone_metric_auth_state("anonymous"), AuthState::Anonymous);
         assert_eq!(clone_metric_auth_state("unresolved"), AuthState::Unresolved);
         assert_eq!(clone_metric_auth_state("octocat"), AuthState::Resolved);
+    }
+
+    #[test]
+    fn replacing_cache_size_families_removes_stale_series() {
+        let metrics = MetricsRegistry::new();
+
+        replace_mirror_size_bytes(
+            &metrics,
+            &[
+                ("acme/widgets".to_string(), 12),
+                ("acme/legacy".to_string(), 7),
+            ],
+        );
+        replace_cache_subtree_size_bytes(
+            &metrics,
+            &[("mirrors".to_string(), 12), ("snapshots".to_string(), 4)],
+        );
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(encoded.contains("forgeproxy_mirror_size_bytes{repo=\"acme/widgets\"} 12"));
+        assert!(encoded.contains("forgeproxy_mirror_size_bytes{repo=\"acme/legacy\"} 7"));
+        assert!(encoded.contains("forgeproxy_cache_subtree_size_bytes{subtree=\"mirrors\"} 12"));
+        assert!(encoded.contains("forgeproxy_cache_subtree_size_bytes{subtree=\"snapshots\"} 4"));
+
+        replace_mirror_size_bytes(&metrics, &[("acme/widgets".to_string(), 9)]);
+        replace_cache_subtree_size_bytes(&metrics, &[("mirrors".to_string(), 9)]);
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(encoded.contains("forgeproxy_mirror_size_bytes{repo=\"acme/widgets\"} 9"));
+        assert!(!encoded.contains("forgeproxy_mirror_size_bytes{repo=\"acme/legacy\"}"));
+        assert!(encoded.contains("forgeproxy_cache_subtree_size_bytes{subtree=\"mirrors\"} 9"));
+        assert!(!encoded.contains("forgeproxy_cache_subtree_size_bytes{subtree=\"snapshots\"}"));
     }
 }

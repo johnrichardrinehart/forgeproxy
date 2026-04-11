@@ -123,12 +123,15 @@ pub struct MetricsConfig {
 pub struct PrometheusConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_metrics_refresh_interval_secs")]
+    pub refresh_interval_secs: u64,
 }
 
 impl Default for PrometheusConfig {
     fn default() -> Self {
         Self {
             enabled: default_true(),
+            refresh_interval_secs: default_metrics_refresh_interval_secs(),
         }
     }
 }
@@ -179,6 +182,10 @@ fn default_trace_sample_ratio() -> f64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_metrics_refresh_interval_secs() -> u64 {
+    60
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +792,15 @@ fn validate_config(config: &Config) -> Result<()> {
         (0.0..=1.0).contains(&config.observability.traces.sample_ratio),
         "observability.traces.sample_ratio must be in range [0.0, 1.0]"
     );
+    anyhow::ensure!(
+        config
+            .observability
+            .metrics
+            .prometheus
+            .refresh_interval_secs
+            > 0,
+        "observability.metrics.prometheus.refresh_interval_secs must be greater than 0"
+    );
     Ok(())
 }
 
@@ -821,6 +837,15 @@ mod tests {
     #[test]
     fn config_example_parses() {
         parse_config_str(include_str!("../../config.example.yaml")).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_positive_metrics_refresh_interval() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  metrics:\n    prometheus:\n      enabled: true\n",
+            "  metrics:\n    prometheus:\n      enabled: true\n      refresh_interval_secs: 0\n",
+        );
+        assert!(parse_config_str(&config).is_err());
     }
 
     #[test]

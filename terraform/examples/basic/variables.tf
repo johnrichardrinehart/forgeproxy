@@ -309,6 +309,12 @@ variable "metrics_enabled" {
   description = "Expose forgeproxy application metrics locally at /metrics for scraping."
 }
 
+variable "metrics_refresh_interval_secs" {
+  type        = number
+  default     = 60
+  description = "Refresh interval in seconds for forgeproxy cache usage gauges."
+}
+
 variable "logs_enabled" {
   type        = bool
   default     = true

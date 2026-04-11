@@ -51,6 +51,7 @@ observability:
   metrics:
     prometheus:
       enabled: ${metrics_enabled}
+      refresh_interval_secs: ${metrics_refresh_interval_secs}
   logs:
     journald:
       enabled: ${logs_enabled}

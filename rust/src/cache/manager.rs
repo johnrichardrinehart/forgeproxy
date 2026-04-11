@@ -38,6 +38,14 @@ pub struct CacheManager {
     pub eviction_policy: EvictionPolicy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheMetricsSnapshot {
+    pub total_size_bytes: u64,
+    pub repo_count: usize,
+    pub mirror_sizes: Vec<(String, u64)>,
+    pub subtree_sizes: Vec<(String, u64)>,
+}
+
 impl CacheManager {
     /// Create a new [`CacheManager`] from the local storage configuration.
     pub fn new(config: &LocalStorageConfig) -> Self {
@@ -385,6 +393,40 @@ impl CacheManager {
         dir_size(&self.base_path)
     }
 
+    pub fn metrics_snapshot(&self) -> Result<CacheMetricsSnapshot> {
+        let subtree_paths = [
+            ("mirrors", layout::mirrors_root(&self.base_path)),
+            ("snapshots", layout::snapshots_root(&self.base_path)),
+            (
+                "state_generations",
+                layout::state_generations_root(&self.base_path),
+            ),
+            ("state_delta", layout::state_delta_root(&self.base_path)),
+            ("state_tee", layout::state_tee_root(&self.base_path)),
+        ];
+
+        let mut subtree_sizes = Vec::with_capacity(subtree_paths.len());
+        let mut total_size_bytes = 0_u64;
+        for (subtree, path) in subtree_paths {
+            let size_bytes = dir_size(&path)?;
+            total_size_bytes = total_size_bytes.saturating_add(size_bytes);
+            subtree_sizes.push((subtree.to_string(), size_bytes));
+        }
+
+        let mirror_sizes = self
+            .list_mirror_repo_dirs()?
+            .into_iter()
+            .map(|(owner_repo, repo_path)| dir_size(&repo_path).map(|size| (owner_repo, size)))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(CacheMetricsSnapshot {
+            total_size_bytes,
+            repo_count: self.list_repos()?.len(),
+            mirror_sizes,
+            subtree_sizes,
+        })
+    }
+
     /// Return the current cache usage as a fraction of `max_bytes`.
     pub fn usage_fraction(&self) -> Result<f64> {
         if self.max_bytes == 0 {
@@ -550,48 +592,14 @@ impl CacheManager {
     /// Scans `{base_path}/published/{owner}/{repo}.git` directories and returns any repo
     /// directory with a `.git` suffix, regardless of current validity.
     pub fn list_repo_dirs(&self) -> Result<Vec<(String, PathBuf)>> {
-        let mut repos = Vec::new();
-        let published_root = layout::generations_root(&self.base_path);
+        list_repo_dirs_under(
+            &layout::generations_root(&self.base_path),
+            "reader-visible generation directory",
+        )
+    }
 
-        if !published_root.exists() {
-            return Ok(repos);
-        }
-
-        let owners = std::fs::read_dir(&published_root).with_context(|| {
-            format!(
-                "failed to read reader-visible generation directory: {}",
-                published_root.display()
-            )
-        })?;
-
-        for owner_entry in owners {
-            let owner_entry = owner_entry?;
-            if !owner_entry.file_type()?.is_dir() {
-                continue;
-            }
-            let owner_name = owner_entry.file_name();
-            let owner_str = owner_name.to_string_lossy();
-
-            let repo_entries = std::fs::read_dir(owner_entry.path())?;
-            for repo_entry in repo_entries {
-                let repo_entry = repo_entry?;
-                let repo_path = repo_entry.path();
-                if !repo_path.is_dir() {
-                    continue;
-                }
-                let repo_name = repo_entry.file_name();
-                let repo_str = repo_name.to_string_lossy();
-                if !repo_str.ends_with(".git") {
-                    continue;
-                }
-
-                // Strip the `.git` suffix if present.
-                let repo_clean = repo_str.strip_suffix(".git").unwrap_or(&repo_str);
-                repos.push((format!("{}/{}", owner_str, repo_clean), repo_path));
-            }
-        }
-
-        Ok(repos)
+    pub fn list_mirror_repo_dirs(&self) -> Result<Vec<(String, PathBuf)>> {
+        list_repo_dirs_under(&layout::mirrors_root(&self.base_path), "mirror directory")
     }
 
     /// Evict snapshot files from `{base_path}/snapshots/` until disk usage
@@ -773,6 +781,50 @@ fn has_loose_refs(refs_dir: &Path) -> bool {
     }
 
     false
+}
+
+fn list_repo_dirs_under(root: &Path, root_description: &str) -> Result<Vec<(String, PathBuf)>> {
+    let mut repos = Vec::new();
+    if !root.exists() {
+        return Ok(repos);
+    }
+
+    let owners = std::fs::read_dir(root)
+        .with_context(|| format!("failed to read {root_description}: {}", root.display()))?;
+
+    for owner_entry in owners {
+        let owner_entry = owner_entry?;
+        if !owner_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let owner_name = owner_entry.file_name();
+        let owner_str = owner_name.to_string_lossy();
+
+        let repo_entries = std::fs::read_dir(owner_entry.path()).with_context(|| {
+            format!(
+                "failed to read repo entries under {}",
+                owner_entry.path().display()
+            )
+        })?;
+
+        for repo_entry in repo_entries {
+            let repo_entry = repo_entry?;
+            let repo_path = repo_entry.path();
+            if !repo_path.is_dir() {
+                continue;
+            }
+            let repo_name = repo_entry.file_name();
+            let repo_str = repo_name.to_string_lossy();
+            if !repo_str.ends_with(".git") {
+                continue;
+            }
+
+            let repo_clean = repo_str.strip_suffix(".git").unwrap_or(&repo_str);
+            repos.push((format!("{}/{}", owner_str, repo_clean), repo_path));
+        }
+    }
+
+    Ok(repos)
 }
 
 #[cfg(test)]
@@ -958,5 +1010,86 @@ deadbeef refs/heads/main\n",
         create_minimal_bare_repo(&mirror);
 
         assert!(mgr.has_repo(owner_repo));
+    }
+
+    #[test]
+    fn metrics_snapshot_reports_cache_subtrees_and_mirror_sizes() {
+        let tmp = tempdir().unwrap();
+        let mgr = test_manager(tmp.path());
+        let owner_repo = "acme/widgets";
+
+        let mirror = mgr.ensure_repo_mirror_dir(owner_repo).unwrap();
+        create_minimal_bare_repo(&mirror);
+        fs::create_dir_all(mirror.join("objects")).unwrap();
+        fs::write(mirror.join("objects").join("blob.pack"), vec![0_u8; 11]).unwrap();
+
+        let snapshot_dir = crate::cache::layout::snapshot_repo_dir(tmp.path(), "acme", "widgets");
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(snapshot_dir.join("main.tar.gz"), vec![0_u8; 7]).unwrap();
+
+        let generation_dir = mgr.create_staging_repo_path(owner_repo).unwrap();
+        create_minimal_bare_repo(&generation_dir);
+        fs::create_dir_all(generation_dir.join("objects")).unwrap();
+        fs::write(
+            generation_dir.join("objects").join("pack.pack"),
+            vec![0_u8; 5],
+        )
+        .unwrap();
+
+        let delta_dir = crate::cache::layout::delta_repo_dir(tmp.path(), owner_repo);
+        fs::create_dir_all(&delta_dir).unwrap();
+        fs::write(delta_dir.join("fetch.log"), vec![0_u8; 3]).unwrap();
+
+        let tee_dir = crate::cache::layout::tee_repo_dir(tmp.path(), owner_repo);
+        fs::create_dir_all(&tee_dir).unwrap();
+        fs::write(tee_dir.join("request.bin"), vec![0_u8; 2]).unwrap();
+
+        let snapshot = mgr.metrics_snapshot().unwrap();
+
+        assert_eq!(snapshot.repo_count, 0);
+        assert!(
+            snapshot
+                .mirror_sizes
+                .iter()
+                .any(|(repo, size)| repo == owner_repo && *size >= 11)
+        );
+        assert!(
+            snapshot
+                .subtree_sizes
+                .iter()
+                .any(|(subtree, size)| subtree == "mirrors" && *size >= 11)
+        );
+        assert!(
+            snapshot
+                .subtree_sizes
+                .iter()
+                .any(|(subtree, size)| subtree == "snapshots" && *size >= 7)
+        );
+        assert!(
+            snapshot
+                .subtree_sizes
+                .iter()
+                .any(|(subtree, size)| subtree == "state_generations" && *size >= 5)
+        );
+        assert!(
+            snapshot
+                .subtree_sizes
+                .iter()
+                .any(|(subtree, size)| subtree == "state_delta" && *size >= 3)
+        );
+        assert!(
+            snapshot
+                .subtree_sizes
+                .iter()
+                .any(|(subtree, size)| subtree == "state_tee" && *size >= 2)
+        );
+        assert_eq!(
+            snapshot.total_size_bytes,
+            snapshot
+                .subtree_sizes
+                .iter()
+                .map(|(_, size)| *size)
+                .sum::<u64>()
+        );
     }
 }

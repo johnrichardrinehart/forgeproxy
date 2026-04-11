@@ -189,6 +189,7 @@ observability:
   metrics:
     prometheus:
       enabled: true
+      refresh_interval_secs: 60
   logs:
     journald:
       enabled: true
@@ -244,6 +245,9 @@ endpoint:
 
 - `observability.metrics.prometheus.enabled`: expose forgeproxy application
   metrics locally at `/metrics` so the on-host Collector can scrape them.
+- `observability.metrics.prometheus.refresh_interval_secs`: refresh cache usage
+  gauges such as mirror sizes and cache subtree sizes in the forgeproxy
+  process. Defaults to 60 seconds.
 - `metrics.host.enabled` in `otel-collector-config.yaml`: collect host-level
   system metrics from the forgeproxy node through the Collector's
   `hostmetrics` receiver.

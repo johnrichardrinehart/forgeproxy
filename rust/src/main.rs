@@ -165,11 +165,19 @@ impl AppState {
     }
 
     pub fn refresh_live_metrics(&self) {
-        if let Ok(size_bytes) = self.cache_manager.total_size_bytes() {
-            crate::metrics::set_cache_size_bytes(&self.metrics, size_bytes);
-        }
-        if let Ok(repos) = self.cache_manager.list_repos() {
-            crate::metrics::set_cache_repos_total(&self.metrics, repos.len());
+        match self.cache_manager.metrics_snapshot() {
+            Ok(snapshot) => {
+                crate::metrics::set_cache_size_bytes(&self.metrics, snapshot.total_size_bytes);
+                crate::metrics::set_cache_repos_total(&self.metrics, snapshot.repo_count);
+                crate::metrics::replace_mirror_size_bytes(&self.metrics, &snapshot.mirror_sizes);
+                crate::metrics::replace_cache_subtree_size_bytes(
+                    &self.metrics,
+                    &snapshot.subtree_sizes,
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to refresh cache usage metrics");
+            }
         }
         crate::metrics::set_upstream_api_rate_limit_remaining(
             &self.metrics,
@@ -910,6 +918,15 @@ async fn main() -> Result<()> {
         }
     });
 
+    let metrics_refresh_handle = tokio::spawn({
+        let s = state.clone();
+        async move {
+            if let Err(e) = run_metrics_refresh_loop(s).await {
+                tracing::error!(error = %e, "cache metrics refresh loop failed");
+            }
+        }
+    });
+
     let heartbeat_handle = tokio::spawn({
         let s = state.clone();
         async move {
@@ -925,6 +942,7 @@ async fn main() -> Result<()> {
     let abort_handles = [
         bundle_handle.abort_handle(),
         tee_cleanup_handle.abort_handle(),
+        metrics_refresh_handle.abort_handle(),
         heartbeat_handle.abort_handle(),
         telemetry_handle.abort_handle(),
     ];
@@ -934,6 +952,7 @@ async fn main() -> Result<()> {
         ssh_handle,
         bundle_handle,
         tee_cleanup_handle,
+        metrics_refresh_handle,
         heartbeat_handle,
         telemetry_handle
     );
@@ -1062,4 +1081,22 @@ async fn build_app_state(
     };
     state.refresh_live_metrics();
     Ok(state)
+}
+
+async fn run_metrics_refresh_loop(state: AppState) -> Result<()> {
+    let refresh_interval = Duration::from_secs(
+        state
+            .config
+            .observability
+            .metrics
+            .prometheus
+            .refresh_interval_secs,
+    );
+    let mut ticker = tokio::time::interval(refresh_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        state.refresh_live_metrics();
+    }
 }

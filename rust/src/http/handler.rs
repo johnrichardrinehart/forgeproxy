@@ -873,7 +873,6 @@ async fn handle_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 ///
 /// Returns Prometheus metrics collected by the proxy.
 async fn handle_metrics(State(state): State<Arc<AppState>>) -> Result<Response, AppError> {
-    state.refresh_live_metrics();
     let mut buf = String::new();
     prometheus_client::encoding::text::encode(&mut buf, &state.metrics.registry)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("metrics encoding failed: {e}")))?;

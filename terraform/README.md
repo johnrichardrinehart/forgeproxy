@@ -346,7 +346,7 @@ curl -k http://127.0.0.1:8080/healthz
    - Update Secrets Manager secrets `forgeproxy/nginx-tls-cert` and `forgeproxy/nginx-tls-key`
 
 3. **Monitoring**: Configure OTLP egress or optional direct scraping
-   - Set `metrics_enabled`, `logs_enabled`, `traces_enabled`, and `traces_sample_ratio` to control forgeproxy's local observability behavior
+   - Set `metrics_enabled`, `metrics_refresh_interval_secs`, `logs_enabled`, `traces_enabled`, and `traces_sample_ratio` to control forgeproxy's local observability behavior
    - Set `otlp_metrics`, `otlp_logs`, and `otlp_traces` to describe the real external destinations for each signal
    - Set `host_metrics_enabled = true` if you also want the on-instance Collector to emit host CPU, disk, filesystem, load, memory, network, and paging metrics
    - The on-instance Collector reads its exporter configuration from the separate `forgeproxy/otel-collector-config` secret
