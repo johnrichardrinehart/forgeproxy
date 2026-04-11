@@ -2871,6 +2871,27 @@ pub async fn classify_local_wants_satisfaction_without_request_restore(
     classify_local_wants_satisfaction_inner(state, owner_repo, wants, false).await
 }
 
+fn should_start_request_time_refresh(
+    repo_info: Option<&RepoInfo>,
+    has_published_repo: bool,
+    has_repo_mirror: bool,
+    hydration_lease_count: Option<i64>,
+) -> bool {
+    if has_published_repo || has_repo_mirror {
+        return true;
+    }
+
+    let Some(info) = repo_info else {
+        return true;
+    };
+
+    if info.hydrating_node_id.is_empty() {
+        return true;
+    }
+
+    matches!(hydration_lease_count, Some(0))
+}
+
 pub async fn wait_for_local_catch_up(
     state: &crate::AppState,
     owner: &str,
@@ -2894,30 +2915,39 @@ pub async fn wait_for_local_catch_up(
     }
 
     let has_published_repo = state.cache_manager.has_repo(&owner_repo);
+    let has_repo_mirror = state.cache_manager.has_repo_mirror(&owner_repo);
     let repo_info = get_repo_info(&state.valkey, &owner_repo).await?;
-    let should_start_refresh = if let Some(info) = repo_info {
-        if !info.hydrating_node_id.is_empty() && !has_published_repo {
-            let semaphore_key = clone_hydration_semaphore_key(&owner_repo);
-            let hydration_lease_count: i64 = state.valkey.exists(semaphore_key.clone()).await?;
-            if hydration_lease_count == 0 {
-                warn!(
-                    repo = %owner_repo,
-                    hydrating_node = %info.hydrating_node_id,
-                    hydrating_since_ts = info.hydrating_since_ts,
-                    semaphore_key,
-                    "clearing stale hydration state because the published generation is missing and no active clone lease exists"
-                );
-                clear_hydration_state(state, &owner_repo, "missing").await?;
-                true
-            } else {
-                false
-            }
-        } else {
-            info.hydrating_node_id.is_empty()
+    let hydration_lease_count = if !has_published_repo
+        && !has_repo_mirror
+        && repo_info
+            .as_ref()
+            .is_some_and(|info| !info.hydrating_node_id.is_empty())
+    {
+        let semaphore_key = clone_hydration_semaphore_key(&owner_repo);
+        let hydration_lease_count: i64 = state.valkey.exists(semaphore_key.clone()).await?;
+        if hydration_lease_count == 0 {
+            let info = repo_info
+                .as_ref()
+                .expect("hydrating repo info must exist when checking clone lease count");
+            warn!(
+                repo = %owner_repo,
+                hydrating_node = %info.hydrating_node_id,
+                hydrating_since_ts = info.hydrating_since_ts,
+                semaphore_key,
+                "clearing stale hydration state because the published generation is missing and no active clone lease exists"
+            );
+            clear_hydration_state(state, &owner_repo, "missing").await?;
         }
+        Some(hydration_lease_count)
     } else {
-        true
+        None
     };
+    let should_start_refresh = should_start_request_time_refresh(
+        repo_info.as_ref(),
+        has_published_repo,
+        has_repo_mirror,
+        hydration_lease_count,
+    );
     let mut refresh_handle = if should_start_refresh {
         info!(
             repo = %owner_repo,
@@ -3246,6 +3276,52 @@ mod tests {
                 "+refs/tags/v1:refs/tags/v1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn request_time_refresh_starts_when_local_state_exists_even_if_another_node_is_hydrating() {
+        let remote_hydrator = RepoInfo {
+            status: "hydrating".to_string(),
+            hydrating_node_id: "node-b".to_string(),
+            hydrating_since_ts: 1234,
+            ..Default::default()
+        };
+
+        assert!(should_start_request_time_refresh(
+            Some(&remote_hydrator),
+            true,
+            true,
+            None
+        ));
+        assert!(should_start_request_time_refresh(
+            Some(&remote_hydrator),
+            false,
+            true,
+            None
+        ));
+    }
+
+    #[test]
+    fn request_time_refresh_waits_for_active_remote_hydration_without_local_state() {
+        let remote_hydrator = RepoInfo {
+            status: "hydrating".to_string(),
+            hydrating_node_id: "node-b".to_string(),
+            hydrating_since_ts: 1234,
+            ..Default::default()
+        };
+
+        assert!(!should_start_request_time_refresh(
+            Some(&remote_hydrator),
+            false,
+            false,
+            Some(1)
+        ));
+        assert!(should_start_request_time_refresh(
+            Some(&remote_hydrator),
+            false,
+            false,
+            Some(0)
+        ));
     }
 
     #[tokio::test]
