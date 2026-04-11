@@ -249,7 +249,7 @@ fn fs_capacity_for(_path: &std::path::Path) -> Option<u64> {
 
 fn aggregate_status(checks: &HealthChecks) -> HealthStatus {
     let all_ok = checks.valkey.ok && checks.ghe.ok && checks.disk.ok;
-    let any_critical = !checks.valkey.ok; // Valkey is required for operation
+    let any_critical = !checks.valkey.ok || !checks.ghe.ok; // Valkey and upstream auth are required for operation
 
     if all_ok {
         HealthStatus::Ok
@@ -399,5 +399,16 @@ mod tests {
                 "GET https://ghe.example.test/api/v3/user 200 OK (token EXPIRED 3 days ago, 2026-04-08 00:00:00 UTC)"
             )
         );
+    }
+
+    #[test]
+    fn upstream_failure_is_critical_for_aggregate_status() {
+        let checks = HealthChecks {
+            valkey: CheckResult::healthy(),
+            ghe: CheckResult::unhealthy("upstream auth failed"),
+            disk: CheckResult::healthy(),
+        };
+
+        assert_eq!(aggregate_status(&checks), HealthStatus::Unhealthy);
     }
 }

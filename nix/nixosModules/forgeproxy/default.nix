@@ -227,6 +227,7 @@ in
       path = [
         pkgs.git
         pkgs.keyutils
+        pkgs.openssh
       ];
 
       serviceConfig = {
@@ -334,6 +335,7 @@ in
     environment.systemPackages = with pkgs; [
       git
       keyutils
+      openssh
     ];
 
     # ── AWS Systems Manager agent ──────────────────────────────────────

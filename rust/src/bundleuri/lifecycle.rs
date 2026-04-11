@@ -11,6 +11,7 @@
 //! size observed in the most recent fetch: large deltas shorten the interval,
 //! small deltas lengthen it (exponential backoff up to the configured max).
 
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +19,8 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use fred::interfaces::HashesInterface;
 use futures::{StreamExt, stream};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, warn};
@@ -196,6 +199,131 @@ async fn stop_bundle_lock_heartbeat(
     lease
 }
 
+#[derive(Debug)]
+enum BundleFetchCredential<'a> {
+    Pat(&'a str),
+    SshKey(&'a str),
+}
+
+struct BundleFetchAuthContext {
+    remote_url: String,
+    env_vars: Vec<(String, String)>,
+    ssh_agent: Option<SshAgentSession>,
+}
+
+impl BundleFetchAuthContext {
+    async fn shutdown(self) -> Result<()> {
+        if let Some(agent) = self.ssh_agent {
+            agent.shutdown().await?;
+        }
+        Ok(())
+    }
+}
+
+struct SshAgentSession {
+    env_vars: Vec<(String, String)>,
+}
+
+impl SshAgentSession {
+    async fn start(private_key: &str) -> Result<Self> {
+        let output = Command::new("ssh-agent")
+            .arg("-s")
+            .output()
+            .await
+            .context("failed to start ssh-agent")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "ssh-agent failed (status {}): {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+
+        let stdout =
+            String::from_utf8(output.stdout).context("ssh-agent output is not valid UTF-8")?;
+        let env_vars = parse_ssh_agent_env(&stdout)?;
+
+        let mut child = Command::new("ssh-add")
+            .arg("-")
+            .envs(env_vars.iter().cloned())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start ssh-add")?;
+
+        let mut stdin = child.stdin.take().context("failed to open ssh-add stdin")?;
+        stdin
+            .write_all(private_key.as_bytes())
+            .await
+            .context("failed to write private key to ssh-add")?;
+        drop(stdin);
+
+        let output = child
+            .wait_with_output()
+            .await
+            .context("failed to wait for ssh-add")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = shutdown_ssh_agent_env(&env_vars).await;
+            anyhow::bail!(
+                "ssh-add failed (status {}): {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+
+        Ok(Self { env_vars })
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        shutdown_ssh_agent_env(&self.env_vars).await
+    }
+}
+
+fn parse_ssh_agent_env(stdout: &str) -> Result<Vec<(String, String)>> {
+    let auth_sock = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("SSH_AUTH_SOCK=")
+                .and_then(|rest| rest.split_once(';'))
+                .map(|(value, _)| value.to_string())
+        })
+        .context("ssh-agent did not report SSH_AUTH_SOCK")?;
+    let agent_pid = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("SSH_AGENT_PID=")
+                .and_then(|rest| rest.split_once(';'))
+                .map(|(value, _)| value.to_string())
+        })
+        .context("ssh-agent did not report SSH_AGENT_PID")?;
+
+    Ok(vec![
+        ("SSH_AUTH_SOCK".to_string(), auth_sock),
+        ("SSH_AGENT_PID".to_string(), agent_pid),
+    ])
+}
+
+async fn shutdown_ssh_agent_env(env_vars: &[(String, String)]) -> Result<()> {
+    let output = Command::new("ssh-agent")
+        .arg("-k")
+        .envs(env_vars.iter().cloned())
+        .output()
+        .await
+        .context("failed to stop ssh-agent")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ssh-agent -k failed (status {}): {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Main lifecycle loop
 // ---------------------------------------------------------------------------
@@ -342,15 +470,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
     let mut outcome = RepoTickOutcome::completed();
 
     let fetch_result = if state.cache_manager.has_repo(owner_repo) {
-        // Repo is locally cached -- do an incremental fetch.
-        let url_with_token = resolve_bundle_fetch_url(state, owner_repo).await?;
-        let env_with_auth = vec![
-            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-            ("GIT_ASKPASS".to_string(), "/bin/true".to_string()),
-        ];
-
-        crate::git::commands::git_clone_bare_local(&repo_path, &staged_repo_path).await?;
-        crate::git::commands::git_fetch(&staged_repo_path, &url_with_token, &env_with_auth).await
+        fetch_bundle_remote(state, owner_repo, &repo_path, &staged_repo_path).await
     } else {
         debug!(
             repo = %owner_repo,
@@ -501,26 +621,85 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
     Ok(outcome)
 }
 
-async fn resolve_bundle_fetch_url(state: &AppState, owner_repo: &str) -> Result<String> {
+async fn fetch_bundle_remote(
+    state: &AppState,
+    owner_repo: &str,
+    repo_path: &std::path::Path,
+    staged_repo_path: &std::path::Path,
+) -> Result<crate::git::commands::FetchResult> {
+    let fetch_auth = resolve_bundle_fetch_auth(state, owner_repo).await?;
+    let clone_result =
+        crate::git::commands::git_clone_bare_local(repo_path, staged_repo_path).await;
+    let fetch_result = match clone_result {
+        Ok(()) => {
+            crate::git::commands::git_fetch(
+                staged_repo_path,
+                &fetch_auth.remote_url,
+                &fetch_auth.env_vars,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = fetch_auth.shutdown().await {
+        warn!(
+            repo = %owner_repo,
+            error = %error,
+            "failed to clean up SSH agent after bundle refresh fetch"
+        );
+    }
+    fetch_result
+}
+
+async fn resolve_bundle_fetch_auth(
+    state: &AppState,
+    owner_repo: &str,
+) -> Result<BundleFetchAuthContext> {
     let (owner, _) = crate::ssh::upstream::split_owner_repo(owner_repo)?;
-    let token_key_name =
-        bundle_fetch_pat_key_name(owner, state.config.upstream_credentials.orgs.get(owner))?;
-    let token = crate::credentials::keyring::resolve_secret(token_key_name)
+    let credential =
+        bundle_fetch_credential(owner, state.config.upstream_credentials.orgs.get(owner))?;
+    let key_name = match credential {
+        BundleFetchCredential::Pat(key_name) | BundleFetchCredential::SshKey(key_name) => key_name,
+    };
+    let secret = crate::credentials::keyring::resolve_secret(key_name)
         .await
         .unwrap_or_default();
-    if token.is_empty() {
+    if secret.is_empty() {
         anyhow::bail!(
-            "bundle refresh requires per-org PAT '{}' for org '{}', but it is empty or unavailable",
-            token_key_name,
+            "bundle refresh credential '{}' for org '{}' is empty or unavailable",
+            key_name,
             owner
         );
     }
 
-    Ok(format!(
-        "{}/{}.git",
-        authenticated_git_base_url(state, &format!("x-access-token:{token}")),
-        owner_repo,
-    ))
+    match credential {
+        BundleFetchCredential::Pat(_) => Ok(BundleFetchAuthContext {
+            remote_url: format!(
+                "{}/{}.git",
+                authenticated_git_base_url(state, &format!("x-access-token:{secret}")),
+                owner_repo,
+            ),
+            env_vars: vec![
+                ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+                ("GIT_ASKPASS".to_string(), "/bin/true".to_string()),
+            ],
+            ssh_agent: None,
+        }),
+        BundleFetchCredential::SshKey(_) => {
+            let ssh_agent = SshAgentSession::start(&secret).await?;
+            let mut env_vars = ssh_agent.env_vars.clone();
+            env_vars.push((
+                "GIT_SSH_COMMAND".to_string(),
+                "ssh -o BatchMode=yes".to_string(),
+            ));
+
+            Ok(BundleFetchAuthContext {
+                remote_url: format!("git@{}:{}.git", state.config.upstream.hostname, owner_repo),
+                env_vars,
+                ssh_agent: Some(ssh_agent),
+            })
+        }
+    }
 }
 
 fn authenticated_git_base_url(state: &AppState, userinfo: &str) -> String {
@@ -538,23 +717,24 @@ fn authenticated_git_base_url(state: &AppState, userinfo: &str) -> String {
     }
 }
 
-fn bundle_fetch_pat_key_name<'a>(
+fn bundle_fetch_credential<'a>(
     owner: &str,
     org_credential: Option<&'a OrgCredential>,
-) -> Result<&'a str> {
+) -> Result<BundleFetchCredential<'a>> {
     let Some(org_credential) = org_credential else {
         anyhow::bail!(
-            "bundle refresh requires an explicit per-org PAT credential for org '{}'",
+            "bundle refresh requires an explicit per-org credential for org '{}'",
             owner
         );
     };
 
     match org_credential.mode {
-        CredentialMode::Pat => Ok(org_credential.keyring_key_name.as_str()),
-        CredentialMode::Ssh => anyhow::bail!(
-            "bundle refresh for org '{}' requires PAT mode because background mirror updates use HTTPS fetch",
-            owner
-        ),
+        CredentialMode::Pat => Ok(BundleFetchCredential::Pat(
+            org_credential.keyring_key_name.as_str(),
+        )),
+        CredentialMode::Ssh => Ok(BundleFetchCredential::SshKey(
+            org_credential.keyring_key_name.as_str(),
+        )),
     }
 }
 
@@ -715,28 +895,32 @@ mod tests {
             keyring_key_name: "pat-acme".to_string(),
         };
 
-        let key_name = bundle_fetch_pat_key_name("acme", Some(&credential)).unwrap();
-        assert_eq!(key_name, "pat-acme");
+        match bundle_fetch_credential("acme", Some(&credential)).unwrap() {
+            BundleFetchCredential::Pat(key_name) => assert_eq!(key_name, "pat-acme"),
+            BundleFetchCredential::SshKey(_) => panic!("expected PAT credential"),
+        }
     }
 
     #[test]
     fn bundle_refresh_rejects_missing_org_credential() {
-        let error = bundle_fetch_pat_key_name("acme", None).unwrap_err();
+        let error = bundle_fetch_credential("acme", None).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("requires an explicit per-org PAT credential")
+                .contains("requires an explicit per-org credential")
         );
     }
 
     #[test]
-    fn bundle_refresh_rejects_ssh_mode() {
+    fn bundle_refresh_supports_org_ssh_key_mode() {
         let credential = OrgCredential {
             mode: CredentialMode::Ssh,
             keyring_key_name: "ssh-acme".to_string(),
         };
 
-        let error = bundle_fetch_pat_key_name("acme", Some(&credential)).unwrap_err();
-        assert!(error.to_string().contains("requires PAT mode"));
+        match bundle_fetch_credential("acme", Some(&credential)).unwrap() {
+            BundleFetchCredential::SshKey(key_name) => assert_eq!(key_name, "ssh-acme"),
+            BundleFetchCredential::Pat(_) => panic!("expected SSH credential"),
+        }
     }
 }
