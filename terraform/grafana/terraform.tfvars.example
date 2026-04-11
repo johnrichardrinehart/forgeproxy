@@ -1,0 +1,18 @@
+grafana_url = "https://metrics.example.com"
+
+folder_title = "Forgeproxy"
+
+dashboard_uid         = "forgeproxy-overview"
+dashboard_title       = "Forgeproxy"
+dashboard_refresh     = "30s"
+dashboard_time_from   = "now-6h"
+dashboard_time_to     = "now"
+metrics_datasource_name = "nucleus-vm"
+metrics_datasource_uid  = "nucleus-vm"
+logs_datasource_name    = "nucleus-loki"
+logs_datasource_uid     = "nucleus-loki"
+traces_datasource_name  = "nucleus-tempo"
+traces_datasource_uid   = "nucleus-tempo"
+
+# Set via TF_VAR_grafana_auth or uncomment here.
+# grafana_auth = "glsa_..."

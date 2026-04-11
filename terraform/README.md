@@ -9,6 +9,10 @@ This directory contains Terraform infrastructure-as-code for a fully dynamic, ru
 - Runtime-configurable upstream and secrets via AWS Secrets Manager
 - No hardcoded hostnames, API URLs, or credentials in AMIs
 
+Grafana dashboard management now lives in the sibling [`terraform/grafana`](./grafana)
+directory so dashboard state and datasource wiring can be versioned in-repo
+without coupling Grafana provider state to the AWS deployment root.
+
 ## Quick Start
 
 ### 1. Copy and customize variables

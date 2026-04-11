@@ -1,0 +1,1128 @@
+{
+  "uid": "${dashboard_uid}",
+  "title": "${dashboard_title}",
+  "description": "${dashboard_description}",
+  "tags": ${dashboard_tags_json},
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 0,
+  "refresh": "${dashboard_refresh}",
+  "time": { "from": "${dashboard_time_from}", "to": "${dashboard_time_to}" },
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "editable": true,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Metrics",
+        "current": { "text": "${metrics_datasource_name}", "value": "${metrics_datasource_uid}" },
+        "hide": 0
+      },
+      {
+        "name": "loki",
+        "type": "datasource",
+        "query": "loki",
+        "label": "Logs",
+        "current": { "text": "${logs_datasource_name}", "value": "${logs_datasource_uid}" },
+        "hide": 0
+      },
+      {
+        "name": "tempo",
+        "type": "datasource",
+        "query": "tempo",
+        "label": "Traces",
+        "current": { "text": "${traces_datasource_name}", "value": "${traces_datasource_uid}" },
+        "hide": 0
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "label": "Instance",
+        "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+        "query": "query_result(count by (service\\.instance\\.id) (forgeproxy_cache_repos_total))",
+        "regex": "/service\\.instance\\.id=\"([^\"]+)\"/",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Overview",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Active Connections",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(forgeproxy_active_connections{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "Total",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 100 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Clones / min",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(forgeproxy_clone_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Cache Hit Rate",
+      "description": "Fraction of clones served from hot or warm cache",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(forgeproxy_clone_total{cache_status=~\"hot|warm\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(forgeproxy_clone_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])), 1) * 100",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "green", "value": 80 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "API Rate Limit Remaining",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "min(forgeproxy_upstream_api_rate_limit_remaining{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 500 },
+              { "color": "green", "value": 2000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Total Cache Footprint",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(forgeproxy_cache_size_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 80530636800 },
+              { "color": "red", "value": 96636764160 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Cached Repos",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(forgeproxy_cache_repos_total{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      }
+    },
+
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Clone Operations",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Clone Rate by Protocol & Cache Status",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (protocol, cache_status) (rate(forgeproxy_clone_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "{{ protocol }} / {{ cache_status }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cpm",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" },
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Clone Duration Percentiles",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(forgeproxy_clone_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(forgeproxy_clone_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(forgeproxy_clone_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p99" },
+            "properties": [{ "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }
+      }
+    },
+
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Data Transfer",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Upstream Bytes / sec (fetched from origin)",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (phase) (rate(forgeproxy_clone_upstream_bytes_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{ phase }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" },
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Downstream Bytes / sec (sent to clients)",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (source, phase) (rate(forgeproxy_clone_downstream_bytes_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{ source }} / {{ phase }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" },
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "S3 Transfer Bytes / sec",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(forgeproxy_s3_upload_bytes_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "Upload",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(forgeproxy_s3_download_bytes_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "Download",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Cache & Storage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "collapsed": false
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Forgeproxy Cache Subtrees",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(forgeproxy_mirror_size_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "/var/cache/forgeproxy/mirrors",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"snapshots\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "/var/cache/forgeproxy/snapshots",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"state_generations\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "/var/cache/forgeproxy/.state/generations",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"state_delta\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "/var/cache/forgeproxy/.state/delta",
+          "refId": "D"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"state_tee\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "/var/cache/forgeproxy/.state/tee",
+          "refId": "E"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Largest Mirrors",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "topk(12, forgeproxy_mirror_size_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "{{repo}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Archive Cache Operations / min",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(forgeproxy_archive_cache_hits_local_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Hit (local)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(forgeproxy_archive_cache_hits_s3_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Hit (S3)",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(forgeproxy_archive_cache_misses_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Miss (upstream)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cpm",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" },
+            "axisBorderShow": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Miss (upstream)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+
+    {
+      "id": 40,
+      "type": "row",
+      "title": "Bundle Generation",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "collapsed": false
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Bundle Generations / min",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(forgeproxy_bundle_generation_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Generations",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cpm",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Bundle Generation Duration Percentiles",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(forgeproxy_bundle_generation_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(forgeproxy_bundle_generation_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(forgeproxy_bundle_generation_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }
+      }
+    },
+
+    {
+      "id": 50,
+      "type": "row",
+      "title": "Coordination & Auth",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "collapsed": false
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Distributed Lock Operations / min",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 42 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(forgeproxy_lock_acquisitions_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Acquisitions",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(forgeproxy_lock_waits_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Waits",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(forgeproxy_lock_timeouts_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Timeouts",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cpm",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Timeouts" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Waits" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "GHE API Calls / min & Rate Limit",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 42 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (endpoint) (rate(forgeproxy_ghe_api_calls_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "{{ endpoint }}",
+          "refId": "A"
+        },
+        {
+          "expr": "min(forgeproxy_upstream_api_rate_limit_remaining{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "Rate limit remaining",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Rate limit remaining" },
+            "properties": [
+              { "id": "custom.fillOpacity", "value": 0 },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.axisLabel", "value": "Remaining" }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+    {
+      "id": 53,
+      "type": "timeseries",
+      "title": "Auth Cache / min",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 42 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(forgeproxy_auth_cache_hits_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Hits",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(forgeproxy_auth_cache_misses_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Misses",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cpm",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "scheme",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" },
+            "axisBorderShow": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Misses" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
+
+    {
+      "id": 60,
+      "type": "row",
+      "title": "Host Metrics",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 61,
+          "type": "timeseries",
+          "title": "CPU Usage (non-idle)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (service\\.instance\\.id) (rate(system\\.cpu\\.time{state!=\"idle\", service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{service.instance.id}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "gradientMode": "scheme",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 62,
+          "type": "timeseries",
+          "title": "Memory Usage",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (service\\.instance\\.id, state) (system\\.memory\\.usage{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"})",
+              "legendFormat": "{{service.instance.id}} {{state}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "gradientMode": "scheme",
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": { "mode": "normal", "group": "A" },
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 63,
+          "type": "timeseries",
+          "title": "Disk I/O",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (service\\.instance\\.id, direction) (rate(system\\.disk\\.io{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{service.instance.id}} {{direction}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "Bps",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 64,
+          "type": "timeseries",
+          "title": "Network I/O",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (service\\.instance\\.id, direction) (rate(system\\.network\\.io{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{service.instance.id}} {{direction}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "Bps",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 65,
+          "type": "timeseries",
+          "title": "Host Free Space (/)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (service\\.instance\\.id) (system\\.filesystem\\.usage{service\\.name=\"forgeproxy\", state=\"free\", mountpoint=\"/\", service\\.instance\\.id=~\"$instance\"})",
+              "legendFormat": "{{service.instance.id}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "gradientMode": "scheme",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 66,
+          "type": "timeseries",
+          "title": "Load Average",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "system\\.cpu\\.load_average\\.1m{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}",
+              "legendFormat": "1m",
+              "refId": "A"
+            },
+            {
+              "expr": "system\\.cpu\\.load_average\\.5m{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}",
+              "legendFormat": "5m",
+              "refId": "B"
+            },
+            {
+              "expr": "system\\.cpu\\.load_average\\.15m{service\\.name=\"forgeproxy\", service\\.instance\\.id=~\"$instance\"}",
+              "legendFormat": "15m",
+              "refId": "C"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 5,
+                "gradientMode": "none",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        }
+      ]
+    },
+
+    {
+      "id": 70,
+      "type": "row",
+      "title": "Logs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 71,
+          "type": "logs",
+          "title": "Forgeproxy Logs",
+          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 52 },
+          "datasource": { "type": "loki", "uid": "$${loki}" },
+          "targets": [
+            {
+              "expr": "{service_name=\"forgeproxy\", service_instance_id=~\"$instance\"} |= ``",
+              "refId": "A"
+            }
+          ],
+          "options": {
+            "showTime": true,
+            "showLabels": false,
+            "showCommonLabels": false,
+            "wrapLogMessage": true,
+            "prettifyLogMessage": true,
+            "enableLogDetails": true,
+            "sortOrder": "Descending",
+            "dedupStrategy": "none"
+          }
+        }
+      ]
+    },
+
+    {
+      "id": 80,
+      "type": "row",
+      "title": "Traces",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 81,
+          "type": "table",
+          "title": "Trace Search",
+          "description": "Recent traces from forgeproxy — click a Trace ID to open the trace view",
+          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 53 },
+          "datasource": { "type": "tempo", "uid": "$${tempo}" },
+          "targets": [
+            {
+              "queryType": "traceql",
+              "query": "{resource.service.name = \"forgeproxy\" && resource.service.instance.id =~ \"$instance\"}",
+              "tableType": "traces",
+              "limit": 50,
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "options": {
+            "showHeader": true,
+            "sortBy": [{ "displayName": "Start time", "desc": true }]
+          }
+        }
+      ]
+    }
+  ]
+}
