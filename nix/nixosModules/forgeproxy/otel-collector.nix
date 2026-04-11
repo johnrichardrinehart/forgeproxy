@@ -259,6 +259,11 @@ let
       validate_positive_integer "exporters.otlp.logs.export_interval_secs" "$logs_interval"
       validate_positive_integer "exporters.otlp.traces.export_interval_secs" "$traces_interval"
 
+      metrics_scrape_timeout=$metrics_interval
+      if (( metrics_scrape_timeout > 10 )); then
+        metrics_scrape_timeout=10
+      fi
+
       validate_basic_auth_pair "exporters.otlp.metrics.auth.basic" "$metrics_auth_username" "$metrics_auth_password"
       validate_basic_auth_pair "exporters.otlp.logs.auth.basic" "$logs_auth_username" "$logs_auth_password"
       validate_basic_auth_pair "exporters.otlp.traces.auth.basic" "$traces_auth_username" "$traces_auth_password"
@@ -362,7 +367,7 @@ let
               "    config:" \
               "      global:" \
               "        scrape_interval: ''${metrics_interval}s" \
-              "        scrape_timeout: 10s" \
+              "        scrape_timeout: ''${metrics_scrape_timeout}s" \
               "      scrape_configs:" \
               "        - job_name: forgeproxy" \
               "          metrics_path: /metrics" \

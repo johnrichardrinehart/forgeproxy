@@ -196,7 +196,7 @@ let
           enabled: true
           endpoint: "http://127.0.0.1:${toString otlpMetricsIngressPort}/v1/metrics"
           protocol: "http/protobuf"
-          export_interval_secs: 15
+          export_interval_secs: 5
           auth:
             basic:
               username: "${otlpMetricsUser}"
@@ -574,6 +574,8 @@ pkgs.testers.runNixOSTest {
         assert "key: service.machine_id" in rendered, rendered
         assert "key: service.ip_address" in rendered, rendered
         assert 'targets: ["127.0.0.1:8080"]' in rendered, rendered
+        assert "scrape_interval: 5s" in rendered, rendered
+        assert "scrape_timeout: 5s" in rendered, rendered
         assert "hostmetrics:" in rendered, rendered
         assert 'receivers: ["prometheus", "hostmetrics"]' in rendered, rendered
         assert 'endpoint: "http://127.0.0.1:4318/v1/metrics"' in rendered, rendered
