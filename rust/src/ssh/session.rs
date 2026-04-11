@@ -590,6 +590,8 @@ async fn serve_local_upload_pack_once(
             repo: completion.metric_repo.clone(),
         })
         .clone();
+    let _active_clone_guard =
+        state.begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
     let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
     loop {
         match stdout.read(&mut stdout_buf).await {
@@ -1610,6 +1612,8 @@ impl Handler for SshSession {
                             tokio::spawn(async move {
                                 let _upload_pack_guard = upload_pack_guard;
                                 let _repo_lease = repo_lease;
+                                let _active_clone_guard = state_for_stream
+                                    .begin_active_clone(Protocol::Ssh, CacheStatus::Hot);
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
                                 let mut disconnected = false;
@@ -2101,6 +2105,13 @@ async fn proxy_upstream_upload_pack(
                 },
             )
             .await;
+            let _active_clone_guard = if request_kind == V2RequestKind::Fetch {
+                fetch_cache_status
+                    .clone()
+                    .map(|cache_status| state.begin_active_clone(Protocol::Ssh, cache_status))
+            } else {
+                None
+            };
             while let Some(chunk_result) =
                 std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
             {

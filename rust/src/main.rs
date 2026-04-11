@@ -38,7 +38,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::Config;
-use crate::metrics::{ActiveConnectionGuard, MetricsRegistry, Protocol, UploadPackGuard};
+use crate::metrics::{
+    ActiveCloneGuard, ActiveConnectionGuard, CacheStatus, MetricsRegistry, Protocol,
+    UploadPackGuard,
+};
 use crate::runtime_resource::RuntimeResourceAttributes;
 
 const CLONE_CAPTURE_MEMORY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
@@ -139,6 +142,12 @@ pub struct AppState {
     pub active_ssh_connections: Arc<AtomicI64>,
     pub active_https_upload_packs: Arc<AtomicI64>,
     pub active_ssh_upload_packs: Arc<AtomicI64>,
+    pub active_https_hot_clones: Arc<AtomicI64>,
+    pub active_https_warm_clones: Arc<AtomicI64>,
+    pub active_https_cold_clones: Arc<AtomicI64>,
+    pub active_ssh_hot_clones: Arc<AtomicI64>,
+    pub active_ssh_warm_clones: Arc<AtomicI64>,
+    pub active_ssh_cold_clones: Arc<AtomicI64>,
     pub draining: Arc<AtomicBool>,
 }
 
@@ -164,6 +173,22 @@ impl AppState {
             Protocol::Ssh => Arc::clone(&self.active_ssh_upload_packs),
         };
         UploadPackGuard::new(self.metrics.clone(), protocol, counter)
+    }
+
+    pub fn begin_active_clone(
+        &self,
+        protocol: Protocol,
+        cache_status: CacheStatus,
+    ) -> ActiveCloneGuard {
+        let counter = match (&protocol, &cache_status) {
+            (Protocol::Https, CacheStatus::Hot) => Arc::clone(&self.active_https_hot_clones),
+            (Protocol::Https, CacheStatus::Warm) => Arc::clone(&self.active_https_warm_clones),
+            (Protocol::Https, CacheStatus::Cold) => Arc::clone(&self.active_https_cold_clones),
+            (Protocol::Ssh, CacheStatus::Hot) => Arc::clone(&self.active_ssh_hot_clones),
+            (Protocol::Ssh, CacheStatus::Warm) => Arc::clone(&self.active_ssh_warm_clones),
+            (Protocol::Ssh, CacheStatus::Cold) => Arc::clone(&self.active_ssh_cold_clones),
+        };
+        ActiveCloneGuard::new(self.metrics.clone(), protocol, cache_status, counter)
     }
 
     pub fn start_draining(&self) {
@@ -1089,6 +1114,12 @@ async fn build_app_state(
         active_ssh_connections: Arc::new(AtomicI64::new(0)),
         active_https_upload_packs: Arc::new(AtomicI64::new(0)),
         active_ssh_upload_packs: Arc::new(AtomicI64::new(0)),
+        active_https_hot_clones: Arc::new(AtomicI64::new(0)),
+        active_https_warm_clones: Arc::new(AtomicI64::new(0)),
+        active_https_cold_clones: Arc::new(AtomicI64::new(0)),
+        active_ssh_hot_clones: Arc::new(AtomicI64::new(0)),
+        active_ssh_warm_clones: Arc::new(AtomicI64::new(0)),
+        active_ssh_cold_clones: Arc::new(AtomicI64::new(0)),
         draining: Arc::new(AtomicBool::new(false)),
     };
     state.refresh_live_metrics();

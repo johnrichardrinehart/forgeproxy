@@ -51,8 +51,8 @@ use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoLease, LocalServeRepoSource,
 };
 use crate::metrics::{
-    CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource, CloneUpstreamBytesLabels,
-    Protocol,
+    ActiveCloneGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource,
+    CloneUpstreamBytesLabels, Protocol,
 };
 use crate::observability::GitRequestObservation;
 
@@ -117,6 +117,7 @@ struct CloneCompletionStream<S> {
     protocol: Protocol,
     completion: CloneCompletion,
     upload_pack_source: Option<CloneSource>,
+    _active_clone_guard: ActiveCloneGuard,
     recorded: bool,
 }
 
@@ -127,6 +128,7 @@ impl<S> CloneCompletionStream<S> {
         protocol: Protocol,
         completion: CloneCompletion,
         upload_pack_source: Option<CloneSource>,
+        active_clone_guard: ActiveCloneGuard,
     ) -> Self {
         Self {
             inner,
@@ -134,6 +136,7 @@ impl<S> CloneCompletionStream<S> {
             protocol,
             completion,
             upload_pack_source,
+            _active_clone_guard: active_clone_guard,
             recorded: false,
         }
     }
@@ -1177,6 +1180,8 @@ async fn serve_local_upload_pack(
             repo: completion.metric_repo.clone(),
         })
         .clone();
+    let active_clone_guard =
+        state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
     let stream = CloneCompletionStream::new(
         LeasedReaderStream::new(
             CountingBytesStream::new(ReaderStream::new(stdout), downstream_counter),
@@ -1186,6 +1191,7 @@ async fn serve_local_upload_pack(
         Protocol::Https,
         completion,
         Some(CloneSource::Local),
+        active_clone_guard,
     );
     let body = Body::from_stream(stream);
 
@@ -1275,14 +1281,16 @@ async fn proxy_upload_pack_to_upstream(
     let owner_repo = format!("{owner}/{repo}");
     let (tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(8);
     let completion_metrics = state.metrics.clone();
-    let state = state.clone();
+    let active_clone_guard =
+        state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
+    let state_for_stream = state.clone();
     let owner = owner.to_string();
     let repo = repo.to_string();
     let owner_repo_for_cache = owner_repo.clone();
     let auth_header = auth_header.map(ToOwned::to_owned);
     let request_phase = request_metadata.request_phase.clone();
     let ls_refs_request_body = capture_body.clone();
-    let upstream_counter = state
+    let upstream_counter = state_for_stream
         .metrics
         .metrics
         .clone_upstream_bytes
@@ -1293,7 +1301,7 @@ async fn proxy_upload_pack_to_upstream(
             repo: owner_repo.clone(),
         })
         .clone();
-    let downstream_counter = state
+    let downstream_counter = state_for_stream
         .metrics
         .metrics
         .clone_downstream_bytes
@@ -1305,7 +1313,7 @@ async fn proxy_upload_pack_to_upstream(
             repo: owner_repo.clone(),
         })
         .clone();
-    let recent_advertised_refs = state
+    let recent_advertised_refs = state_for_stream
         .recent_advertised_refs(
             &owner_repo,
             &http_git_client_fingerprint(
@@ -1329,7 +1337,7 @@ async fn proxy_upload_pack_to_upstream(
                     None
                 };
             let mut hydration = UpstreamHydrationTracker::start(
-                &state,
+                &state_for_stream,
                 &owner,
                 &repo,
                 auth_header.as_deref(),
@@ -1368,7 +1376,7 @@ async fn proxy_upload_pack_to_upstream(
                 }
             }
             if let Some(ls_refs_response) = ls_refs_response {
-                state
+                state_for_stream
                     .merge_recent_advertised_refs(
                         owner_repo_for_cache,
                         client_fingerprint,
@@ -1392,6 +1400,7 @@ async fn proxy_upload_pack_to_upstream(
         Protocol::Https,
         completion,
         Some(CloneSource::Upstream),
+        active_clone_guard,
     ));
 
     Ok(response_from_upstream_parts(

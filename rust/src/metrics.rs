@@ -122,6 +122,12 @@ pub struct ProtocolLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ActiveCloneLabels {
+    pub protocol: Protocol,
+    pub cache_status: CacheStatus,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct CloneUpstreamBytesLabels {
     pub protocol: Protocol,
     pub phase: ClonePhase,
@@ -316,6 +322,7 @@ pub struct Metrics {
     // -- gauges --
     pub active_connections: Family<ProtocolLabels, Gauge>,
     pub upload_pack_concurrent: Family<ProtocolLabels, Gauge>,
+    pub active_clones: Family<ActiveCloneLabels, Gauge>,
     pub cache_size_bytes: Gauge,
     pub cache_repos_total: Gauge,
     pub mirror_size_bytes: Family<RepoLabels, Gauge>,
@@ -489,6 +496,13 @@ impl Metrics {
             upload_pack_concurrent.clone(),
         );
 
+        let active_clones = Family::<ActiveCloneLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_active_clones",
+            "Currently active clone streams by protocol and cache status",
+            active_clones.clone(),
+        );
+
         let cache_size_bytes: Gauge = Gauge::default();
         registry.register(
             "forgeproxy_cache_size_bytes",
@@ -547,6 +561,7 @@ impl Metrics {
             upstream_api_rate_limit_remaining,
             active_connections,
             upload_pack_concurrent,
+            active_clones,
             cache_size_bytes,
             cache_repos_total,
             mirror_size_bytes,
@@ -701,6 +716,29 @@ pub fn set_upload_pack_concurrent(metrics: &MetricsRegistry, protocol: Protocol,
         .set(value.max(0));
 }
 
+pub fn set_active_clones(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    cache_status: CacheStatus,
+    value: i64,
+) {
+    let labels = ActiveCloneLabels {
+        protocol,
+        cache_status,
+    };
+    let value = value.max(0);
+    if value == 0 {
+        metrics.metrics.active_clones.remove(&labels);
+        return;
+    }
+
+    metrics
+        .metrics
+        .active_clones
+        .get_or_create(&labels)
+        .set(value);
+}
+
 pub fn set_cache_size_bytes(metrics: &MetricsRegistry, size_bytes: u64) {
     metrics
         .metrics
@@ -797,6 +835,43 @@ impl Drop for UploadPackGuard {
     fn drop(&mut self) {
         let next = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
         set_upload_pack_concurrent(&self.metrics, self.protocol.clone(), next);
+    }
+}
+
+pub struct ActiveCloneGuard {
+    metrics: MetricsRegistry,
+    protocol: Protocol,
+    cache_status: CacheStatus,
+    counter: Arc<AtomicI64>,
+}
+
+impl ActiveCloneGuard {
+    pub fn new(
+        metrics: MetricsRegistry,
+        protocol: Protocol,
+        cache_status: CacheStatus,
+        counter: Arc<AtomicI64>,
+    ) -> Self {
+        let next = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        set_active_clones(&metrics, protocol.clone(), cache_status.clone(), next);
+        Self {
+            metrics,
+            protocol,
+            cache_status,
+            counter,
+        }
+    }
+}
+
+impl Drop for ActiveCloneGuard {
+    fn drop(&mut self) {
+        let next = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
+        set_active_clones(
+            &self.metrics,
+            self.protocol.clone(),
+            self.cache_status.clone(),
+            next,
+        );
     }
 }
 
@@ -935,5 +1010,30 @@ mod tests {
         assert!(encoded.lines().any(|line| {
             line.starts_with("forgeproxy_upload_pack_concurrent{") && line.ends_with(" 0")
         }));
+    }
+
+    #[test]
+    fn active_clone_guard_omits_idle_series() {
+        let metrics = MetricsRegistry::new();
+        let counter = Arc::new(AtomicI64::new(0));
+
+        {
+            let _guard = ActiveCloneGuard::new(
+                metrics.clone(),
+                Protocol::Https,
+                CacheStatus::Warm,
+                Arc::clone(&counter),
+            );
+            let encoded = encode_metrics(&metrics.registry);
+            assert!(encoded.lines().any(|line| {
+                line.starts_with("forgeproxy_active_clones{")
+                    && line.contains("protocol=\"https\"")
+                    && line.contains("cache_status=\"warm\"")
+                    && line.ends_with(" 1")
+            }));
+        }
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(!encoded.contains("forgeproxy_active_clones{"));
     }
 }

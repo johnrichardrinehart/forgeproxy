@@ -134,13 +134,13 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Cache Hit Rate",
-      "description": "Fraction of clones served from hot or warm cache",
+      "title": "Active Cached Clones",
+      "description": "Fraction of currently active clone streams associated with hot or warm cache",
       "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
-          "expr": "sum(rate(forgeproxy_clone_total{cache_status=~\"hot|warm\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(forgeproxy_clone_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])), 1) * 100",
+          "expr": "sum(forgeproxy_active_clones{cache_status=~\"hot|warm\", service\\.instance\\.id=~\"$instance\"}) / sum(forgeproxy_active_clones{service\\.instance\\.id=~\"$instance\"}) * 100",
           "legendFormat": "",
           "refId": "A"
         }
