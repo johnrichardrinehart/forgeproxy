@@ -77,6 +77,10 @@ fn hydration_in_progress_on_this_node(info: &RepoInfo, node_id: &str) -> bool {
 
 const VALKEY_RETRY_ATTEMPTS: usize = 5;
 const VALKEY_RETRY_BASE_DELAY_MS: u64 = 250;
+type RepoPublishMutex = std::sync::Arc<tokio::sync::Mutex<()>>;
+type RepoPublishMutexes = std::sync::Arc<tokio::sync::Mutex<HashMap<String, RepoPublishMutex>>>;
+type PublishedGenerationLeases =
+    std::sync::Arc<std::sync::Mutex<HashMap<String, HashMap<PathBuf, usize>>>>;
 
 async fn retry_valkey_op<T, F, Fut>(owner_repo: &str, operation: &str, mut f: F) -> Result<T>
 where
@@ -573,30 +577,68 @@ async fn acquire_local_repo_publish_guard(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> OwnedMutexGuard<()> {
-    let mutex = {
-        let mut mutexes = state.repo_publish_mutexes.lock().await;
-        mutexes
-            .entry(owner_repo.to_string())
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
-
-    mutex.lock_owned().await
+    acquire_repo_publish_guard(&state.repo_publish_mutexes, owner_repo).await
 }
 
 async fn try_acquire_local_repo_publish_guard(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Option<OwnedMutexGuard<()>> {
-    let mutex = {
-        let mut mutexes = state.repo_publish_mutexes.lock().await;
-        mutexes
-            .entry(owner_repo.to_string())
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
+    try_acquire_repo_publish_guard(&state.repo_publish_mutexes, owner_repo).await
+}
 
-    mutex.try_lock_owned().ok()
+async fn repo_publish_mutex(
+    repo_publish_mutexes: &RepoPublishMutexes,
+    owner_repo: &str,
+) -> RepoPublishMutex {
+    let mut mutexes = repo_publish_mutexes.lock().await;
+    mutexes
+        .entry(owner_repo.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+async fn acquire_repo_publish_guard(
+    repo_publish_mutexes: &RepoPublishMutexes,
+    owner_repo: &str,
+) -> OwnedMutexGuard<()> {
+    repo_publish_mutex(repo_publish_mutexes, owner_repo)
+        .await
+        .lock_owned()
+        .await
+}
+
+async fn try_acquire_repo_publish_guard(
+    repo_publish_mutexes: &RepoPublishMutexes,
+    owner_repo: &str,
+) -> Option<OwnedMutexGuard<()>> {
+    repo_publish_mutex(repo_publish_mutexes, owner_repo)
+        .await
+        .try_lock_owned()
+        .ok()
+}
+
+async fn pin_current_published_generation(
+    cache_manager: &crate::cache::CacheManager,
+    repo_publish_mutexes: &RepoPublishMutexes,
+    published_generation_leases: &PublishedGenerationLeases,
+    owner_repo: &str,
+) -> Result<PathBuf> {
+    let _publish_guard = acquire_repo_publish_guard(repo_publish_mutexes, owner_repo).await;
+    let generation_path = cache_manager
+        .current_repo_target(owner_repo)?
+        .ok_or_else(|| anyhow::anyhow!("published repo generation is not available"))?;
+
+    let mut leases = published_generation_leases.lock().unwrap();
+    let count = leases
+        .entry(owner_repo.to_string())
+        .or_default()
+        .entry(generation_path.clone())
+        .or_insert(0);
+    *count += 1;
+    drop(leases);
+
+    Ok(generation_path)
 }
 
 fn leased_generation_paths(state: &crate::AppState, owner_repo: &str) -> HashSet<PathBuf> {
@@ -637,10 +679,8 @@ pub struct PublishedGenerationLease {
     owner_repo: String,
     generation_path: PathBuf,
     cache_manager: crate::cache::CacheManager,
-    repo_publish_mutexes:
-        std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>>,
-    published_generation_leases:
-        std::sync::Arc<std::sync::Mutex<HashMap<String, HashMap<PathBuf, usize>>>>,
+    repo_publish_mutexes: RepoPublishMutexes,
+    published_generation_leases: PublishedGenerationLeases,
 }
 
 impl PublishedGenerationLease {
@@ -700,14 +740,7 @@ impl Drop for PublishedGenerationLease {
         let repo_publish_mutexes = std::sync::Arc::clone(&self.repo_publish_mutexes);
         let published_generation_leases = std::sync::Arc::clone(&self.published_generation_leases);
         tokio::spawn(async move {
-            let mutex = {
-                let mut mutexes = repo_publish_mutexes.lock().await;
-                mutexes
-                    .entry(owner_repo.clone())
-                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-                    .clone()
-            };
-            let _guard = mutex.lock_owned().await;
+            let _guard = acquire_repo_publish_guard(&repo_publish_mutexes, &owner_repo).await;
 
             let mut retain = published_generation_leases
                 .lock()
@@ -738,23 +771,17 @@ impl Drop for PublishedGenerationLease {
     }
 }
 
-pub fn acquire_published_generation_lease(
+pub async fn acquire_published_generation_lease(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<PublishedGenerationLease> {
-    let generation_path = state
-        .cache_manager
-        .current_repo_target(owner_repo)?
-        .ok_or_else(|| anyhow::anyhow!("published repo generation is not available"))?;
-
-    let mut leases = state.published_generation_leases.lock().unwrap();
-    let count = leases
-        .entry(owner_repo.to_string())
-        .or_default()
-        .entry(generation_path.clone())
-        .or_insert(0);
-    *count += 1;
-    drop(leases);
+    let generation_path = pin_current_published_generation(
+        &state.cache_manager,
+        &state.repo_publish_mutexes,
+        &state.published_generation_leases,
+        owner_repo,
+    )
+    .await?;
 
     Ok(PublishedGenerationLease {
         owner_repo: owner_repo.to_string(),
@@ -772,7 +799,7 @@ pub async fn acquire_local_serve_repo_lease(
 ) -> Result<LocalServeRepoLease> {
     match source {
         LocalServeRepoSource::PublishedGeneration => Ok(LocalServeRepoLease::Published(
-            acquire_published_generation_lease(state, owner_repo)?,
+            acquire_published_generation_lease(state, owner_repo).await?,
         )),
     }
 }
@@ -3190,6 +3217,16 @@ mod tests {
         .unwrap();
     }
 
+    fn test_cache_manager(base_path: &Path) -> crate::cache::CacheManager {
+        crate::cache::CacheManager {
+            base_path: base_path.to_path_buf(),
+            max_bytes: 100_000_000_000,
+            high_water: 0.90,
+            low_water: 0.75,
+            eviction_policy: crate::config::EvictionPolicy::Lfu,
+        }
+    }
+
     #[test]
     fn repo_info_round_trip_preserves_hydration_fields() {
         let info = RepoInfo {
@@ -3322,6 +3359,66 @@ mod tests {
             false,
             Some(0)
         ));
+    }
+
+    #[tokio::test]
+    async fn pin_current_published_generation_waits_for_publish_and_pins_new_target() {
+        let tmp = tempdir().unwrap();
+        let cache_manager = test_cache_manager(tmp.path());
+        let owner_repo = "acme/widgets";
+
+        let first = cache_manager.create_staging_repo_path(owner_repo).unwrap();
+        create_usable_bare_repo(&first);
+        cache_manager
+            .publish_staged_repo(owner_repo, &first)
+            .unwrap();
+
+        let repo_publish_mutexes = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let published_generation_leases =
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let publish_guard = acquire_repo_publish_guard(&repo_publish_mutexes, owner_repo).await;
+        let pinned_generation = {
+            let cache_manager = cache_manager.clone();
+            let repo_publish_mutexes = std::sync::Arc::clone(&repo_publish_mutexes);
+            let published_generation_leases = std::sync::Arc::clone(&published_generation_leases);
+            tokio::spawn(async move {
+                pin_current_published_generation(
+                    &cache_manager,
+                    &repo_publish_mutexes,
+                    &published_generation_leases,
+                    owner_repo,
+                )
+                .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !pinned_generation.is_finished(),
+            "reader should wait while publish work owns the repo mutex"
+        );
+
+        let second = cache_manager.create_staging_repo_path(owner_repo).unwrap();
+        create_usable_bare_repo(&second);
+        cache_manager
+            .publish_staged_repo(owner_repo, &second)
+            .unwrap();
+        cache_manager
+            .prune_generations_except(owner_repo, std::slice::from_ref(&second))
+            .unwrap();
+        assert!(!first.exists());
+
+        drop(publish_guard);
+
+        let pinned_generation = pinned_generation.await.unwrap().unwrap();
+        assert_eq!(pinned_generation, second);
+
+        let leases = published_generation_leases.lock().unwrap();
+        let repo_leases = leases.get(owner_repo).unwrap();
+        assert_eq!(repo_leases.get(&second), Some(&1));
+        assert!(!repo_leases.contains_key(&first));
     }
 
     #[tokio::test]
