@@ -694,6 +694,14 @@ pub enum LocalServeRepoSource {
     PublishedGeneration,
 }
 
+impl std::fmt::Display for LocalServeRepoSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PublishedGeneration => f.write_str("published_generation"),
+        }
+    }
+}
+
 pub enum LocalServeRepoLease {
     Published(PublishedGenerationLease),
 }
@@ -3264,6 +3272,14 @@ mod tests {
         assert_eq!(round_trip.hydrating_node_id, "node-a");
         assert_eq!(round_trip.hydrating_since_ts, 1234);
         assert!(round_trip.bootstrap_bundle_pending);
+    }
+
+    #[test]
+    fn local_serve_repo_source_display_uses_lowercase_labels() {
+        assert_eq!(
+            LocalServeRepoSource::PublishedGeneration.to_string(),
+            "published_generation"
+        );
     }
 
     #[test]

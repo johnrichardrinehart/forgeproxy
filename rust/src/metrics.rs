@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
@@ -88,13 +89,13 @@ pub struct CloneLabels {
     pub repo: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Protocol {
     Ssh,
     Https,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum CacheStatus {
     Hot,
     Warm,
@@ -137,13 +138,13 @@ pub struct CloneDownstreamBytesLabels {
     pub repo: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum ClonePhase {
     InfoRefs,
     UploadPack,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum CloneSource {
     Local,
     Upstream,
@@ -169,17 +170,97 @@ pub struct HydrationSkipLabels {
     pub reason: HydrationSkipReason,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum AuthState {
     Anonymous,
     Unresolved,
     Resolved,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum HydrationSkipReason {
     SameNodeDedup,
     SemaphoreSaturated,
+}
+
+impl EncodeLabelValue for Protocol {
+    fn encode(
+        &self,
+        encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+    ) -> Result<(), fmt::Error> {
+        match self {
+            Self::Ssh => encoder.write_str("ssh")?,
+            Self::Https => encoder.write_str("https")?,
+        }
+        Ok(())
+    }
+}
+
+impl EncodeLabelValue for CacheStatus {
+    fn encode(
+        &self,
+        encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+    ) -> Result<(), fmt::Error> {
+        match self {
+            Self::Hot => encoder.write_str("hot")?,
+            Self::Warm => encoder.write_str("warm")?,
+            Self::Cold => encoder.write_str("cold")?,
+        }
+        Ok(())
+    }
+}
+
+impl EncodeLabelValue for ClonePhase {
+    fn encode(
+        &self,
+        encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+    ) -> Result<(), fmt::Error> {
+        match self {
+            Self::InfoRefs => encoder.write_str("info_refs")?,
+            Self::UploadPack => encoder.write_str("upload_pack")?,
+        }
+        Ok(())
+    }
+}
+
+impl EncodeLabelValue for CloneSource {
+    fn encode(
+        &self,
+        encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+    ) -> Result<(), fmt::Error> {
+        match self {
+            Self::Local => encoder.write_str("local")?,
+            Self::Upstream => encoder.write_str("upstream")?,
+        }
+        Ok(())
+    }
+}
+
+impl EncodeLabelValue for AuthState {
+    fn encode(
+        &self,
+        encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+    ) -> Result<(), fmt::Error> {
+        match self {
+            Self::Anonymous => encoder.write_str("anonymous")?,
+            Self::Unresolved => encoder.write_str("unresolved")?,
+            Self::Resolved => encoder.write_str("resolved")?,
+        }
+        Ok(())
+    }
+}
+
+impl EncodeLabelValue for HydrationSkipReason {
+    fn encode(
+        &self,
+        encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+    ) -> Result<(), fmt::Error> {
+        match self {
+            Self::SameNodeDedup => encoder.write_str("same_node_dedup")?,
+            Self::SemaphoreSaturated => encoder.write_str("semaphore_saturated")?,
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -808,6 +889,33 @@ mod tests {
         assert!(encoded.lines().any(
             |line| line.starts_with("forgeproxy_hydration_skipped_total{") && line.ends_with(" 1")
         ));
+    }
+
+    #[test]
+    fn clone_metrics_encode_lowercase_label_values() {
+        let metrics = MetricsRegistry::new();
+
+        record_clone_completion(
+            &metrics,
+            Protocol::Ssh,
+            CacheStatus::Hot,
+            "octocat",
+            "acme/widgets",
+            Duration::from_secs(1),
+        );
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_clone_total{")
+                && line.contains("protocol=\"ssh\"")
+                && line.contains("cache_status=\"hot\"")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_clone_summary_total{")
+                && line.contains("protocol=\"ssh\"")
+                && line.contains("cache_status=\"hot\"")
+                && line.contains("auth_state=\"resolved\"")
+        }));
     }
 
     #[test]

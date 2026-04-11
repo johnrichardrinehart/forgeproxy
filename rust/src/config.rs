@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -63,6 +64,12 @@ impl BackendType {
             Self::Gitea => "gitea",
             Self::Forgejo => "forgejo",
         }
+    }
+}
+
+impl fmt::Display for BackendType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_label())
     }
 }
 
@@ -806,7 +813,7 @@ fn validate_config(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BundleConfig, parse_config_str};
+    use super::{BackendType, BundleConfig, parse_config_str};
 
     #[test]
     fn bundle_execution_policy_defaults_single_core() {
@@ -884,5 +891,15 @@ mod tests {
                 "max_concurrent_ghe_fetches",
             );
         assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn backend_type_display_uses_lowercase_labels() {
+        assert_eq!(
+            BackendType::GithubEnterprise.to_string(),
+            "github_enterprise"
+        );
+        assert_eq!(BackendType::Github.to_string(), "github");
+        assert_eq!(BackendType::Gitlab.to_string(), "gitlab");
     }
 }

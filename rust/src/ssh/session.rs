@@ -608,7 +608,7 @@ async fn serve_local_upload_pack_once(
                 {
                     warn!(
                         repo = %owner_repo,
-                        serve_from = ?serve_from,
+                        serve_from = %serve_from,
                         total_bytes,
                         "client disconnected during local git upload-pack response"
                     );
@@ -629,7 +629,7 @@ async fn serve_local_upload_pack_once(
             Ok(exit) if !exit.status.success() => {
                 warn!(
                     repo = %owner_repo,
-                    serve_from = ?serve_from,
+                    serve_from = %serve_from,
                     status = %exit.status,
                     stderr = %String::from_utf8_lossy(&exit.stderr),
                     "local git upload-pack exited with non-zero status"
@@ -639,7 +639,7 @@ async fn serve_local_upload_pack_once(
             Ok(exit) => {
                 info!(
                     repo = %owner_repo,
-                    serve_from = ?serve_from,
+                    serve_from = %serve_from,
                     total_bytes,
                     status = %exit.status,
                     "local SSH git upload-pack completed"
@@ -649,7 +649,7 @@ async fn serve_local_upload_pack_once(
             Err(error) => {
                 error!(
                     repo = %owner_repo,
-                    serve_from = ?serve_from,
+                    serve_from = %serve_from,
                     error = %error,
                     "failed to wait on local git upload-pack"
                 );
@@ -672,7 +672,7 @@ async fn serve_local_upload_pack_once(
         let exit_status = if completed_successfully { 0 } else { 1 };
         info!(
             repo = %owner_repo,
-            serve_from = ?serve_from,
+            serve_from = %serve_from,
             total_bytes,
             exit_status,
             "finalizing local SSH git upload-pack channel"
@@ -745,6 +745,15 @@ fn is_complete_v2_fetch_request(buf: &[u8]) -> bool {
 enum V2RequestKind {
     LsRefs,
     Fetch,
+}
+
+impl std::fmt::Display for V2RequestKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LsRefs => f.write_str("ls_refs"),
+            Self::Fetch => f.write_str("fetch"),
+        }
+    }
 }
 
 fn split_next_complete_v2_request(buf: &[u8]) -> Option<(V2RequestKind, usize)> {
@@ -1153,7 +1162,7 @@ impl Handler for SshSession {
                     {
                         info!(
                             repo = %owner_repo,
-                            request_kind = ?request_kind,
+                            request_kind = %request_kind,
                             want_have_bytes = want_have.len(),
                             authenticated,
                             "upstream proxy: request complete, POSTing to upstream"
@@ -1198,7 +1207,7 @@ impl Handler for SshSession {
             }
             info!(
                 repo = %owner_repo,
-                request_kind = ?request_kind,
+                request_kind = %request_kind,
                 want_have_bytes = want_have.len(),
                 authenticated,
                 "upstream proxy: request complete, POSTing to upstream"
@@ -1958,7 +1967,7 @@ async fn proxy_upstream_upload_pack(
             } => {
                 info!(
                     repo = %owner_repo,
-                    serve_from = ?serve_from,
+                    serve_from = %serve_from,
                     wants = *want_count,
                     want_sample,
                     restored_from_s3_for_request = *restored_from_s3_for_request,
@@ -2212,7 +2221,7 @@ async fn proxy_upstream_upload_pack(
                 .join(",");
             error!(
                 repo = %owner_repo,
-                request_kind = ?request_kind,
+                request_kind = %request_kind,
                 wants = wants.len(),
                 want_sample,
                 error = %format!("{e:#}"),
@@ -2304,6 +2313,12 @@ mod tests {
         assert!(parse_git_command("ls -la").is_none());
         assert!(parse_git_command("git-upload-pack ''").is_none());
         assert!(parse_git_command("git-upload-pack 'noslash'").is_none());
+    }
+
+    #[test]
+    fn v2_request_kind_display_uses_lowercase_labels() {
+        assert_eq!(V2RequestKind::LsRefs.to_string(), "ls_refs");
+        assert_eq!(V2RequestKind::Fetch.to_string(), "fetch");
     }
 
     #[test]

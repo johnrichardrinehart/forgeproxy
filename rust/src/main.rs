@@ -515,7 +515,7 @@ async fn probe_upstream(config: &Config) -> Result<()> {
 
 async fn run_startup_init(config: &Config) -> usize {
     tracing::info!(
-        backend = ?config.backend_type,
+        backend = %config.backend_type,
         bucket = %config.storage.s3.bucket,
         valkey_endpoint = %config.valkey.endpoint,
         upstream_api_url = %config.upstream.api_url,
@@ -1035,11 +1035,11 @@ async fn build_app_state(
     tracing::info!(%node_id, "node identity established");
 
     let forge: Arc<dyn forge::ForgeBackend> = Arc::from(forge::build_backend(&config));
-    tracing::info!(backend = ?config.backend_type, "forge backend initialised");
+    tracing::info!(backend = %config.backend_type, "forge backend initialised");
 
     if matches!(config.backend_type, crate::config::BackendType::Github) {
         tracing::warn!(
-            backend = ?config.backend_type,
+            backend = %config.backend_type,
             "SSH key resolution is not supported with cloud/SaaS forge backends — \
              SSH authentication will not work. Use HTTP token authentication instead."
         );

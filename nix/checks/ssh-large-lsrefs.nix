@@ -371,7 +371,7 @@ pkgs.testers.runNixOSTest {
         client.succeed("test -d /tmp/repo-large-lsrefs/.git")
         proxy.wait_until_succeeds(
             "journalctl -u forgeproxy.service --no-pager"
-            " | grep -F '\"request_kind\":\"Fetch\"'"
+            " | grep -F '\"request_kind\":\"fetch\"'"
             " | grep -F '\"repo\":\"octocat/repo-large-lsrefs\"'",
             timeout=20,
         )

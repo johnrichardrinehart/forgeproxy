@@ -38,6 +38,15 @@ pub enum LocalUploadPackMode {
     Interactive,
 }
 
+impl std::fmt::Display for LocalUploadPackMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StatelessRpc => f.write_str("stateless_rpc"),
+            Self::Interactive => f.write_str("interactive"),
+        }
+    }
+}
+
 pub struct LocalUploadPackProcess {
     pub child: Child,
     pub stdin: Option<ChildStdin>,
@@ -87,8 +96,8 @@ pub async fn spawn_local_upload_pack(
     info!(
         repo = %owner_repo,
         protocol = protocol_name,
-        serve_from = ?serve_from,
-        mode = ?mode,
+        serve_from = %serve_from,
+        mode = %mode,
         path = %repo_path.display(),
         "serving upload-pack directly from local disk"
     );
@@ -517,4 +526,18 @@ fn spawn_background_upstream_hydration(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalUploadPackMode;
+
+    #[test]
+    fn local_upload_pack_mode_display_uses_lowercase_labels() {
+        assert_eq!(
+            LocalUploadPackMode::StatelessRpc.to_string(),
+            "stateless_rpc"
+        );
+        assert_eq!(LocalUploadPackMode::Interactive.to_string(), "interactive");
+    }
 }

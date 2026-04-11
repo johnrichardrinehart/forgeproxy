@@ -668,7 +668,7 @@ async fn handle_upload_pack(
             } => {
                 info!(
                     repo = %repo_slug,
-                    serve_from = ?serve_from,
+                    serve_from = %serve_from,
                     wants = *want_count,
                     want_sample,
                     restored_from_s3_for_request = *restored_from_s3_for_request,
