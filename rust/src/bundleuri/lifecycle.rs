@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::AppState;
+use crate::config::{CredentialMode, OrgCredential};
 
 fn format_error_chain(error: &anyhow::Error) -> String {
     error
@@ -342,31 +343,11 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
 
     let fetch_result = if state.cache_manager.has_repo(owner_repo) {
         // Repo is locally cached -- do an incremental fetch.
-        let upstream_url = format!(
-            "https://{}/{}.git",
-            state.config.upstream.hostname, owner_repo,
-        );
-        let admin_token =
-            crate::credentials::keyring::resolve_secret(&state.config.upstream.admin_token_env)
-                .await
-                .unwrap_or_default();
-        let env_vars = vec![("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
-        let env_with_auth: Vec<(String, String)> = if admin_token.is_empty() {
-            env_vars
-        } else {
-            let mut v = env_vars;
-            v.push(("GIT_ASKPASS".to_string(), "/bin/true".to_string()));
-            v
-        };
-
-        let url_with_token = if admin_token.is_empty() {
-            upstream_url
-        } else {
-            format!(
-                "https://x-access-token:{admin_token}@{}/{}.git",
-                state.config.upstream.hostname, owner_repo,
-            )
-        };
+        let url_with_token = resolve_bundle_fetch_url(state, owner_repo).await?;
+        let env_with_auth = vec![
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+            ("GIT_ASKPASS".to_string(), "/bin/true".to_string()),
+        ];
 
         crate::git::commands::git_clone_bare_local(&repo_path, &staged_repo_path).await?;
         crate::git::commands::git_fetch(&staged_repo_path, &url_with_token, &env_with_auth).await
@@ -520,6 +501,63 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
     Ok(outcome)
 }
 
+async fn resolve_bundle_fetch_url(state: &AppState, owner_repo: &str) -> Result<String> {
+    let (owner, _) = crate::ssh::upstream::split_owner_repo(owner_repo)?;
+    let token_key_name =
+        bundle_fetch_pat_key_name(owner, state.config.upstream_credentials.orgs.get(owner))?;
+    let token = crate::credentials::keyring::resolve_secret(token_key_name)
+        .await
+        .unwrap_or_default();
+    if token.is_empty() {
+        anyhow::bail!(
+            "bundle refresh requires per-org PAT '{}' for org '{}', but it is empty or unavailable",
+            token_key_name,
+            owner
+        );
+    }
+
+    Ok(format!(
+        "{}/{}.git",
+        authenticated_git_base_url(state, &format!("x-access-token:{token}")),
+        owner_repo,
+    ))
+}
+
+fn authenticated_git_base_url(state: &AppState, userinfo: &str) -> String {
+    let base = state.config.upstream.git_url_base();
+    if let Ok(mut parsed) = url::Url::parse(&base) {
+        if let Some((username, password)) = userinfo.split_once(':') {
+            let _ = parsed.set_username(username);
+            let _ = parsed.set_password(Some(password));
+        } else {
+            let _ = parsed.set_username(userinfo);
+        }
+        parsed.to_string().trim_end_matches('/').to_string()
+    } else {
+        base
+    }
+}
+
+fn bundle_fetch_pat_key_name<'a>(
+    owner: &str,
+    org_credential: Option<&'a OrgCredential>,
+) -> Result<&'a str> {
+    let Some(org_credential) = org_credential else {
+        anyhow::bail!(
+            "bundle refresh requires an explicit per-org PAT credential for org '{}'",
+            owner
+        );
+    };
+
+    match org_credential.mode {
+        CredentialMode::Pat => Ok(org_credential.keyring_key_name.as_str()),
+        CredentialMode::Ssh => anyhow::bail!(
+            "bundle refresh for org '{}' requires PAT mode because background mirror updates use HTTPS fetch",
+            owner
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic schedule
 // ---------------------------------------------------------------------------
@@ -641,6 +679,7 @@ pub async fn update_fetch_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CredentialMode, OrgCredential};
 
     #[test]
     fn ema_seeds_from_zero() {
@@ -667,5 +706,37 @@ mod tests {
         // alpha=0.0: ignores new value entirely.
         let result = compute_ema(300.0, 100.0, 0.0);
         assert!((result - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn bundle_refresh_uses_explicit_org_pat_key() {
+        let credential = OrgCredential {
+            mode: CredentialMode::Pat,
+            keyring_key_name: "pat-acme".to_string(),
+        };
+
+        let key_name = bundle_fetch_pat_key_name("acme", Some(&credential)).unwrap();
+        assert_eq!(key_name, "pat-acme");
+    }
+
+    #[test]
+    fn bundle_refresh_rejects_missing_org_credential() {
+        let error = bundle_fetch_pat_key_name("acme", None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an explicit per-org PAT credential")
+        );
+    }
+
+    #[test]
+    fn bundle_refresh_rejects_ssh_mode() {
+        let credential = OrgCredential {
+            mode: CredentialMode::Ssh,
+            keyring_key_name: "ssh-acme".to_string(),
+        };
+
+        let error = bundle_fetch_pat_key_name("acme", Some(&credential)).unwrap_err();
+        assert!(error.to_string().contains("requires PAT mode"));
     }
 }
