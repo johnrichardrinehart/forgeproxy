@@ -167,6 +167,18 @@ pub struct RepoLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BundleUriAdvertisementLabels {
+    pub repo: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BundleListRequestLabels {
+    pub repo: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct CacheSubtreeLabels {
     pub subtree: String,
 }
@@ -294,6 +306,8 @@ pub struct Metrics {
     // -- bundles --
     pub bundle_generation_total: Counter,
     pub bundle_generation_duration_seconds: Histogram,
+    pub bundle_uri_advertisement_total: Family<BundleUriAdvertisementLabels, Counter>,
+    pub bundle_list_request_total: Family<BundleListRequestLabels, Counter>,
 
     // -- auth --
     pub auth_cache_hits: Counter,
@@ -396,6 +410,21 @@ impl Metrics {
             "forgeproxy_bundle_generation_duration_seconds",
             "Bundle generation latency in seconds",
             bundle_generation_duration_seconds.clone(),
+        );
+
+        let bundle_uri_advertisement_total =
+            Family::<BundleUriAdvertisementLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_bundle_uri_advertisement",
+            "Git protocol v2 info/refs responses by bundle-uri advertisement result",
+            bundle_uri_advertisement_total.clone(),
+        );
+
+        let bundle_list_request_total = Family::<BundleListRequestLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_bundle_list_request",
+            "Bundle-list endpoint requests by outcome",
+            bundle_list_request_total.clone(),
         );
 
         let auth_cache_hits = Counter::default();
@@ -547,6 +576,8 @@ impl Metrics {
             clone_downstream_bytes,
             bundle_generation_total,
             bundle_generation_duration_seconds,
+            bundle_uri_advertisement_total,
+            bundle_list_request_total,
             auth_cache_hits,
             auth_cache_misses,
             archive_cache_hits_local,
@@ -688,6 +719,28 @@ pub fn observe_upload_pack_duration(
             repo: repo.to_string(),
         })
         .observe(elapsed.as_secs_f64());
+}
+
+pub fn inc_bundle_uri_advertisement(metrics: &MetricsRegistry, repo: &str, result: &str) {
+    metrics
+        .metrics
+        .bundle_uri_advertisement_total
+        .get_or_create(&BundleUriAdvertisementLabels {
+            repo: repo.to_string(),
+            result: result.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_bundle_list_request(metrics: &MetricsRegistry, repo: &str, result: &str) {
+    metrics
+        .metrics
+        .bundle_list_request_total
+        .get_or_create(&BundleListRequestLabels {
+            repo: repo.to_string(),
+            result: result.to_string(),
+        })
+        .inc();
 }
 
 pub fn set_upstream_api_rate_limit_remaining(metrics: &MetricsRegistry, remaining: u64) {
@@ -952,6 +1005,8 @@ mod tests {
             "acme/widgets",
             Duration::from_millis(250),
         );
+        inc_bundle_uri_advertisement(&metrics, "acme/widgets", "injected");
+        inc_bundle_list_request(&metrics, "acme/widgets", "served");
         inc_hydration_skipped(&metrics, HydrationSkipReason::SemaphoreSaturated);
 
         let encoded = encode_metrics(&metrics.registry);
@@ -964,6 +1019,18 @@ mod tests {
         assert!(encoded.lines().any(
             |line| line.starts_with("forgeproxy_hydration_skipped_total{") && line.ends_with(" 1")
         ));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_bundle_uri_advertisement_total{")
+                && line.contains("repo=\"acme/widgets\"")
+                && line.contains("result=\"injected\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_bundle_list_request_total{")
+                && line.contains("repo=\"acme/widgets\"")
+                && line.contains("result=\"served\"")
+                && line.ends_with(" 1")
+        }));
     }
 
     #[test]

@@ -496,8 +496,23 @@ async fn handle_info_refs(
         repo,
     );
 
-    let modified_body =
-        crate::http::protocolv2::inject_bundle_uri(&upstream_bytes, &bundle_list_url);
+    let (modified_body, bundle_uri_result) =
+        crate::http::protocolv2::inject_bundle_uri_with_result(&upstream_bytes, &bundle_list_url);
+    let repo_slug = format!("{owner}/{repo}");
+    let bundle_uri_result_label = bundle_uri_result.as_metric_label();
+    crate::metrics::inc_bundle_uri_advertisement(
+        &state.metrics,
+        &repo_slug,
+        bundle_uri_result_label,
+    );
+    info!(
+        repo = %repo_slug,
+        result = bundle_uri_result_label,
+        bundle_list_url = %bundle_list_url,
+        upstream_bytes = upstream_bytes.len(),
+        downstream_bytes = modified_body.len(),
+        "processed bundle-uri advertisement"
+    );
 
     state
         .metrics
@@ -507,7 +522,7 @@ async fn handle_info_refs(
             protocol: Protocol::Https,
             phase: ClonePhase::InfoRefs,
             username: metric_username.clone(),
-            repo: format!("{owner}/{repo}"),
+            repo: repo_slug.clone(),
         })
         .inc_by(upstream_bytes.len() as u64);
     state
@@ -519,13 +534,13 @@ async fn handle_info_refs(
             phase: ClonePhase::InfoRefs,
             source: CloneSource::Upstream,
             username: metric_username,
-            repo: format!("{owner}/{repo}"),
+            repo: repo_slug.clone(),
         })
         .inc_by(modified_body.len() as u64);
 
     state
         .remember_recent_advertised_refs(
-            format!("{owner}/{repo}"),
+            repo_slug,
             &client_fingerprint,
             &git_session_id,
             crate::coordination::registry::RequestAdvertisedRefs {

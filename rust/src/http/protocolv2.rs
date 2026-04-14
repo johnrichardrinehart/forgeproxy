@@ -34,6 +34,25 @@ pub enum PktLine {
     ResponseEnd,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleUriInjectionResult {
+    Injected,
+    AlreadyPresent,
+    NotProtocolV2,
+    Empty,
+}
+
+impl BundleUriInjectionResult {
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::Injected => "injected",
+            Self::AlreadyPresent => "already_present",
+            Self::NotProtocolV2 => "not_protocol_v2",
+            Self::Empty => "empty",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Encoding
 // ---------------------------------------------------------------------------
@@ -162,12 +181,15 @@ pub fn decode_pkt_lines(data: &[u8]) -> Vec<PktLine> {
 ///
 /// If the response does not look like a protocol v2 capability advertisement
 /// (e.g. protocol v0/v1), the data is returned unmodified.
-pub fn inject_bundle_uri(response_body: &[u8], _bundle_list_url: &str) -> Vec<u8> {
+pub fn inject_bundle_uri_with_result(
+    response_body: &[u8],
+    _bundle_list_url: &str,
+) -> (Vec<u8>, BundleUriInjectionResult) {
     let packets = decode_pkt_lines(response_body);
 
     if packets.is_empty() {
         debug!("empty packet sequence; returning body unchanged");
-        return response_body.to_vec();
+        return (response_body.to_vec(), BundleUriInjectionResult::Empty);
     }
 
     // Quick sanity check: the first data packet should contain "version 2".
@@ -181,7 +203,10 @@ pub fn inject_bundle_uri(response_body: &[u8], _bundle_list_url: &str) -> Vec<u8
 
     if !is_v2 {
         debug!("response is not protocol v2; returning body unchanged");
-        return response_body.to_vec();
+        return (
+            response_body.to_vec(),
+            BundleUriInjectionResult::NotProtocolV2,
+        );
     }
 
     // Check whether bundle-uri is already advertised.
@@ -195,7 +220,10 @@ pub fn inject_bundle_uri(response_body: &[u8], _bundle_list_url: &str) -> Vec<u8
 
     if already_present {
         debug!("bundle-uri capability already present; returning body unchanged");
-        return response_body.to_vec();
+        return (
+            response_body.to_vec(),
+            BundleUriInjectionResult::AlreadyPresent,
+        );
     }
 
     // Rebuild the response, inserting the bundle-uri capability line just
@@ -216,7 +244,7 @@ pub fn inject_bundle_uri(response_body: &[u8], _bundle_list_url: &str) -> Vec<u8
         output.extend_from_slice(&encode_pkt(pkt));
     }
 
-    output
+    (output, BundleUriInjectionResult::Injected)
 }
 
 // ---------------------------------------------------------------------------
@@ -293,10 +321,11 @@ mod tests {
         wire.extend_from_slice(&encode_pkt_line(b"server-option\n"));
         wire.extend_from_slice(b"0000");
 
-        let result = inject_bundle_uri(
+        let (result, injection_result) = inject_bundle_uri_with_result(
             &wire,
             "https://dynamic-host.example/bundles/o/r/bundle-list",
         );
+        assert_eq!(injection_result, BundleUriInjectionResult::Injected);
         let packets = decode_pkt_lines(&result);
 
         // Should have the original 5 data packets + 1 injected + 1 flush = 7
@@ -321,10 +350,11 @@ mod tests {
         wire.extend_from_slice(b"0000");
 
         let original_len = wire.len();
-        let result = inject_bundle_uri(
+        let (result, injection_result) = inject_bundle_uri_with_result(
             &wire,
             "https://dynamic-host.example/bundles/o/r/bundle-list",
         );
+        assert_eq!(injection_result, BundleUriInjectionResult::AlreadyPresent);
         assert_eq!(
             result.len(),
             original_len,
@@ -340,10 +370,11 @@ mod tests {
         wire.extend_from_slice(b"0000");
 
         let original = wire.clone();
-        let result = inject_bundle_uri(
+        let (result, injection_result) = inject_bundle_uri_with_result(
             &wire,
             "https://dynamic-host.example/bundles/o/r/bundle-list",
         );
+        assert_eq!(injection_result, BundleUriInjectionResult::NotProtocolV2);
         assert_eq!(result, original, "should not modify non-v2 responses");
     }
 }

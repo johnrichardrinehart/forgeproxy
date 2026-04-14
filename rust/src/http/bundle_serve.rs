@@ -32,7 +32,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::AppState;
 use crate::http::handler::AppError;
@@ -53,24 +53,44 @@ pub async fn handle_bundle_list(
     auth_token: Option<&str>,
 ) -> Result<Response, AppError> {
     // 1. Validate that the caller has at least read access.
-    crate::auth::http_validator::validate_http_auth(state, auth_token, owner, repo)
-        .await
-        .map_err(|error| {
-            debug!(error = ?error, "bundle-list auth validation failed");
-            error
-        })?;
-
     let owner_repo = format!("{owner}/{repo}");
+    if let Err(error) =
+        crate::auth::http_validator::validate_http_auth(state, auth_token, owner, repo).await
+    {
+        crate::metrics::inc_bundle_list_request(&state.metrics, &owner_repo, "auth_failed");
+        debug!(error = ?error, "bundle-list auth validation failed");
+        info!(
+            repo = %owner_repo,
+            result = "auth_failed",
+            "bundle-list request completed"
+        );
+        return Err(error);
+    }
+
     let Some(metadata) =
         crate::coordination::registry::load_current_node_bundle_metadata(state, &owner_repo)
             .await
             .with_context(|| format!("failed to read bundle metadata for {owner_repo}"))
-            .map_err(AppError::Internal)?
+            .map_err(|error| {
+                crate::metrics::inc_bundle_list_request(
+                    &state.metrics,
+                    &owner_repo,
+                    "metadata_load_failed",
+                );
+                AppError::Internal(error)
+            })?
     else {
+        crate::metrics::inc_bundle_list_request(&state.metrics, &owner_repo, "missing_metadata");
         debug!(
             repo = %owner_repo,
             publisher_id = %state.bundle_publisher_id,
             "no bundle metadata published for this node"
+        );
+        info!(
+            repo = %owner_repo,
+            result = "missing_metadata",
+            publisher_id = %state.bundle_publisher_id,
+            "bundle-list request completed"
         );
         return Ok((
             StatusCode::NOT_FOUND,
@@ -88,7 +108,10 @@ pub async fn handle_bundle_list(
     )
     .await
     .with_context(|| format!("failed to generate presigned URL for {owner_repo}"))
-    .map_err(AppError::Internal)?;
+    .map_err(|error| {
+        crate::metrics::inc_bundle_list_request(&state.metrics, &owner_repo, "presign_failed");
+        AppError::Internal(error)
+    })?;
 
     let mut body = String::with_capacity(512);
     writeln!(body, "[bundle]").map_err(|err| AppError::Internal(err.into()))?;
@@ -102,11 +125,15 @@ pub async fn handle_bundle_list(
     writeln!(body, "\tcreationToken = {}", metadata.creation_token)
         .map_err(|err| AppError::Internal(err.into()))?;
 
-    debug!(
+    crate::metrics::inc_bundle_list_request(&state.metrics, &owner_repo, "served");
+    info!(
         repo = %owner_repo,
         publisher_id = %metadata.publisher_id,
         creation_token = metadata.creation_token,
-        "generated bundle-list for {owner}/{repo}"
+        bundle_s3_key = %metadata.bundle_s3_key,
+        has_filtered_bundle = metadata.filtered_bundle_s3_key.is_some(),
+        result = "served",
+        "bundle-list request completed"
     );
 
     Ok((
