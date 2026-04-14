@@ -441,6 +441,10 @@ pub struct CloneConfig {
     /// pack into a staging generation.
     #[serde(default)]
     pub hydration_mode: HydrationMode,
+    /// Whether staged published generations should be repacked with bitmap and
+    /// multi-pack-index support before they are exposed to clone readers.
+    #[serde(default)]
+    pub prepare_published_generation_indexes: bool,
     /// Maximum time a client request should wait for a local mirror catch-up
     /// publish before falling back to proxying upstream.
     #[serde(default = "default_request_wait_for_local_catch_up_secs")]
@@ -470,6 +474,7 @@ impl Default for CloneConfig {
             max_concurrent_upstream_clones_per_repo_per_instance:
                 default_max_concurrent_upstream_clones_per_repo_per_instance(),
             hydration_mode: HydrationMode::default(),
+            prepare_published_generation_indexes: false,
             request_wait_for_local_catch_up_secs: default_request_wait_for_local_catch_up_secs(),
             tee_cleanup_interval_secs: default_tee_cleanup_interval_secs(),
             tee_retention_secs: default_tee_retention_secs(),
@@ -844,6 +849,16 @@ mod tests {
     #[test]
     fn config_example_parses() {
         parse_config_str(include_str!("../../config.example.yaml")).unwrap();
+    }
+
+    #[test]
+    fn clone_config_accepts_published_generation_index_preparation() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  prepare_published_generation_indexes: false\n",
+            "  prepare_published_generation_indexes: true\n",
+        );
+        let config = parse_config_str(&config).unwrap();
+        assert!(config.clone.prepare_published_generation_indexes);
     }
 
     #[test]

@@ -35,6 +35,9 @@ valkey:
 auth:
   webhook_secret_env: "FORGE_WEBHOOK_SECRET"
 
+clone:
+  prepare_published_generation_indexes: ${prepare_published_generation_indexes}
+
 storage:
   local:
     path: "/var/cache/forgeproxy"

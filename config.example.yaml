@@ -32,6 +32,7 @@ clone:
   lock_wait_timeout: 120
   max_concurrent_upstream_clones: 5
   max_concurrent_upstream_fetches: 10
+  prepare_published_generation_indexes: false
   request_wait_for_local_catch_up_secs: 30
   tee_cleanup_interval_secs: 60
   tee_retention_secs: 900

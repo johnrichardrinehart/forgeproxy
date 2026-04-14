@@ -19,30 +19,31 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
   secret_id = aws_secretsmanager_secret.forgeproxy_config.id
 
   secret_string = templatefile("${path.module}/templates/service-config.yaml.tpl", {
-    upstream_hostname             = var.upstream_hostname
-    upstream_api_url              = var.upstream_api_url
-    upstream_git_url_base         = coalesce(var.upstream_git_url_base, "https://${var.upstream_hostname}")
-    backend_type                  = var.backend_type
-    valkey_private_ip             = aws_instance.valkey.private_ip
-    valkey_enable_tls             = local.valkey_tls_enable
-    backend_port                  = local.backend_port
-    bundle_bucket                 = aws_s3_bucket.bundle.id
-    s3_bundle_prefix              = var.s3_bundle_prefix
-    aws_region                    = var.aws_region
-    s3_use_fips                   = var.s3_use_fips
-    s3_presigned_url_ttl          = var.s3_presigned_url_ttl
-    local_cache_max_bytes         = var.local_cache_max_bytes
-    eviction_policy               = var.eviction_policy
-    metrics_enabled               = var.metrics_enabled
-    metrics_refresh_interval_secs = var.metrics_refresh_interval_secs
-    logs_enabled                  = var.logs_enabled
-    traces_enabled                = var.traces_enabled
-    traces_sample_ratio           = var.traces_sample_ratio
-    log_level                     = var.log_level
-    name_prefix                   = var.name_prefix
-    org_creds                     = var.org_creds
-    ghe_key_lookup_enabled        = local.ghe_key_lookup_enabled
-    ghe_key_lookup_url            = local.ghe_key_lookup_enabled ? "http://${aws_lb.ghe_key_lookup[0].dns_name}:${local.ghe_key_lookup_listen_port}" : ""
+    upstream_hostname                    = var.upstream_hostname
+    upstream_api_url                     = var.upstream_api_url
+    upstream_git_url_base                = coalesce(var.upstream_git_url_base, "https://${var.upstream_hostname}")
+    backend_type                         = var.backend_type
+    valkey_private_ip                    = aws_instance.valkey.private_ip
+    valkey_enable_tls                    = local.valkey_tls_enable
+    backend_port                         = local.backend_port
+    bundle_bucket                        = aws_s3_bucket.bundle.id
+    s3_bundle_prefix                     = var.s3_bundle_prefix
+    aws_region                           = var.aws_region
+    s3_use_fips                          = var.s3_use_fips
+    s3_presigned_url_ttl                 = var.s3_presigned_url_ttl
+    local_cache_max_bytes                = var.local_cache_max_bytes
+    eviction_policy                      = var.eviction_policy
+    prepare_published_generation_indexes = var.prepare_published_generation_indexes
+    metrics_enabled                      = var.metrics_enabled
+    metrics_refresh_interval_secs        = var.metrics_refresh_interval_secs
+    logs_enabled                         = var.logs_enabled
+    traces_enabled                       = var.traces_enabled
+    traces_sample_ratio                  = var.traces_sample_ratio
+    log_level                            = var.log_level
+    name_prefix                          = var.name_prefix
+    org_creds                            = var.org_creds
+    ghe_key_lookup_enabled               = local.ghe_key_lookup_enabled
+    ghe_key_lookup_url                   = local.ghe_key_lookup_enabled ? "http://${aws_lb.ghe_key_lookup[0].dns_name}:${local.ghe_key_lookup_listen_port}" : ""
   })
 }
 

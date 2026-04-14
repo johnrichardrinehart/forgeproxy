@@ -327,6 +327,12 @@ variable "metrics_refresh_interval_secs" {
   description = "Refresh interval in seconds for forgeproxy cache usage gauges."
 }
 
+variable "prepare_published_generation_indexes" {
+  type        = bool
+  default     = false
+  description = "Repack staged published generations with bitmap and multi-pack-index support before exposing them to clone readers."
+}
+
 variable "logs_enabled" {
   type        = bool
   default     = true

@@ -179,6 +179,54 @@ pub async fn git_clone_bare_shared_local(source: &Path, dest: &Path) -> Result<(
     Ok(())
 }
 
+/// Repack a bare generation so local `git upload-pack` can use reachability
+/// bitmaps through the multi-pack-index path.
+#[instrument(fields(repo = %repo_path.display(), pack_threads))]
+pub async fn git_prepare_published_generation_indexes(
+    repo_path: &Path,
+    pack_threads: usize,
+) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("-c")
+        .arg(format!("pack.threads={pack_threads}"))
+        .arg("repack")
+        .arg("-a")
+        .arg("-d")
+        .arg("--write-bitmap-index")
+        .arg("--write-midx");
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git repack for published generation indexes");
+
+    let started_at = std::time::Instant::now();
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git repack for published generation indexes")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git repack for published generation indexes failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    info!(
+        repo = %repo_path.display(),
+        pack_threads,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "prepared published generation bitmap/MIDX indexes"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Fetch
 // ---------------------------------------------------------------------------
@@ -1042,5 +1090,117 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
         .unwrap();
 
         assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_prepare_published_generation_indexes_writes_midx_bitmap() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let work_path = tempdir.path().join("work");
+        let bare_path = tempdir.path().join("repo.git");
+
+        assert!(
+            StdCommand::new("git")
+                .arg("init")
+                .arg(&work_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User")
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        for index in 0..3 {
+            std::fs::write(work_path.join(format!("file-{index}.txt")), "hello\n").unwrap();
+            assert!(
+                StdCommand::new("git")
+                    .arg("-C")
+                    .arg(&work_path)
+                    .arg("add")
+                    .arg(".")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                StdCommand::new("git")
+                    .arg("-C")
+                    .arg(&work_path)
+                    .arg("commit")
+                    .arg("-m")
+                    .arg(format!("commit {index}"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        assert!(
+            StdCommand::new("git")
+                .arg("clone")
+                .arg("--bare")
+                .arg(&work_path)
+                .arg(&bare_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        git_prepare_published_generation_indexes(&bare_path, 1)
+            .await
+            .unwrap();
+
+        let pack_dir = bare_path.join("objects").join("pack");
+        assert!(pack_dir.join("multi-pack-index").is_file());
+        assert!(
+            std::fs::read_dir(&pack_dir).unwrap().any(|entry| {
+                let file_name = entry.unwrap().file_name();
+                let file_name = file_name.to_string_lossy();
+                file_name.starts_with("multi-pack-index-") && file_name.ends_with(".bitmap")
+            }),
+            "expected a MIDX bitmap in {}",
+            pack_dir.display()
+        );
+
+        assert!(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&bare_path)
+                .arg("multi-pack-index")
+                .arg("verify")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&bare_path)
+                .arg("rev-list")
+                .arg("--test-bitmap")
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 }

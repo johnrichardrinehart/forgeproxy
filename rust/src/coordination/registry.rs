@@ -1455,6 +1455,76 @@ async fn publish_ready_repo(
     Ok(staged_repo_path.to_path_buf())
 }
 
+async fn prepare_published_generation_indexes_if_enabled(
+    state: &crate::AppState,
+    owner_repo: &str,
+    staged_repo_path: &Path,
+    source: &str,
+) -> bool {
+    if !state.config.clone.prepare_published_generation_indexes {
+        return false;
+    }
+
+    let started_at = Instant::now();
+    info!(
+        repo = %owner_repo,
+        source,
+        staged = %staged_repo_path.display(),
+        pack_threads = state.bundle_pack_threads,
+        "preparing staged generation bitmap/MIDX indexes"
+    );
+
+    let permit = match state
+        .bundle_generation_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                source,
+                staged = %staged_repo_path.display(),
+                error = %error,
+                "skipping staged generation bitmap/MIDX preparation because semaphore is closed"
+            );
+            return false;
+        }
+    };
+
+    let result = crate::git::commands::git_prepare_published_generation_indexes(
+        staged_repo_path,
+        state.bundle_pack_threads,
+    )
+    .await;
+    drop(permit);
+
+    match result {
+        Ok(()) => {
+            info!(
+                repo = %owner_repo,
+                source,
+                staged = %staged_repo_path.display(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "finished staged generation bitmap/MIDX preparation"
+            );
+        }
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                source,
+                staged = %staged_repo_path.display(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                error = %error,
+                "staged generation bitmap/MIDX preparation failed; publishing generation without prepared indexes"
+            );
+        }
+    }
+
+    true
+}
+
 async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
     if repo_path.exists() && !crate::cache::manager::is_usable_bare_repo(repo_path) {
         let metadata = tokio::fs::symlink_metadata(repo_path)
@@ -1562,6 +1632,31 @@ async fn publish_repo_mirror_generation(
             elapsed_ms = staged_validation_started_at.elapsed().as_millis(),
             "finished quick staged-generation verification before publish"
         );
+
+        let index_preparation_attempted = prepare_published_generation_indexes_if_enabled(
+            state,
+            owner_repo,
+            &staged_repo_path,
+            source,
+        )
+        .await;
+        if index_preparation_attempted {
+            let post_index_validation_started_at = Instant::now();
+            info!(
+                repo = %owner_repo,
+                source,
+                staged = %staged_repo_path.display(),
+                "performing quick staged-generation verification after bitmap/MIDX preparation"
+            );
+            quick_check_ready_repo(state, owner_repo, &staged_repo_path, source, None).await?;
+            info!(
+                repo = %owner_repo,
+                source,
+                staged = %staged_repo_path.display(),
+                elapsed_ms = post_index_validation_started_at.elapsed().as_millis(),
+                "finished quick staged-generation verification after bitmap/MIDX preparation"
+            );
+        }
 
         let publish_started_at = Instant::now();
         info!(

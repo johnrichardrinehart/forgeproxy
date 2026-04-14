@@ -405,6 +405,12 @@ variable "log_level" {
   }
 }
 
+variable "prepare_published_generation_indexes" {
+  type        = bool
+  default     = false
+  description = "Repack staged published generations with bitmap and multi-pack-index support before exposing them to clone readers."
+}
+
 variable "org_creds" {
   type = list(object({
     name = string
