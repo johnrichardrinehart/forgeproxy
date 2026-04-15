@@ -200,8 +200,8 @@ pub async fn git_prepare_published_generation_indexes(
 
     let started_at = std::time::Instant::now();
 
-    run_git_multi_pack_index_write(repo_path, false).await?;
-    run_git_multi_pack_index_write(repo_path, true).await?;
+    run_git_multi_pack_index_write(repo_path, false, pack_threads).await?;
+    run_git_multi_pack_index_write(repo_path, true, pack_threads).await?;
 
     info!(
         repo = %repo_path.display(),
@@ -234,10 +234,16 @@ fn repo_has_pack_files(repo_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-async fn run_git_multi_pack_index_write(repo_path: &Path, bitmap: bool) -> Result<()> {
+async fn run_git_multi_pack_index_write(
+    repo_path: &Path,
+    bitmap: bool,
+    pack_threads: usize,
+) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(repo_path)
+        .arg("-c")
+        .arg(format!("pack.threads={pack_threads}"))
         .arg("multi-pack-index")
         .arg("write");
     if bitmap {

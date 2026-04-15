@@ -827,6 +827,29 @@ fn leased_generation_paths(state: &crate::AppState, owner_repo: &str) -> HashSet
         .unwrap_or_default()
 }
 
+fn lease_published_generation_path(
+    state: &crate::AppState,
+    owner_repo: &str,
+    generation_path: &Path,
+) -> PublishedGenerationLease {
+    let mut leases = state.published_generation_leases.lock().unwrap();
+    let count = leases
+        .entry(owner_repo.to_string())
+        .or_default()
+        .entry(generation_path.to_path_buf())
+        .or_insert(0);
+    *count += 1;
+    drop(leases);
+
+    PublishedGenerationLease {
+        owner_repo: owner_repo.to_string(),
+        generation_path: generation_path.to_path_buf(),
+        cache_manager: state.cache_manager.clone(),
+        repo_publish_mutexes: std::sync::Arc::clone(&state.repo_publish_mutexes),
+        published_generation_leases: std::sync::Arc::clone(&state.published_generation_leases),
+    }
+}
+
 pub(crate) async fn prune_retired_generations(
     state: &crate::AppState,
     owner_repo: &str,
@@ -961,13 +984,11 @@ pub async fn acquire_published_generation_lease(
     )
     .await?;
 
-    Ok(PublishedGenerationLease {
-        owner_repo: owner_repo.to_string(),
-        generation_path,
-        cache_manager: state.cache_manager.clone(),
-        repo_publish_mutexes: std::sync::Arc::clone(&state.repo_publish_mutexes),
-        published_generation_leases: std::sync::Arc::clone(&state.published_generation_leases),
-    })
+    Ok(lease_published_generation_path(
+        state,
+        owner_repo,
+        &generation_path,
+    ))
 }
 
 pub async fn acquire_local_serve_repo_lease(
@@ -1616,74 +1637,82 @@ async fn publish_ready_repo(
     Ok(staged_repo_path.to_path_buf())
 }
 
-async fn prepare_published_generation_indexes_if_enabled(
-    state: &crate::AppState,
-    owner_repo: &str,
-    staged_repo_path: &Path,
-    source: &str,
-) -> bool {
+/// Spawn a background task to write MIDX and bitmap indexes on a
+/// just-published generation.  This keeps bitmap preparation off the
+/// publish-critical path so the generation is immediately available to
+/// `git upload-pack` readers.  The first few clones after publish may run
+/// without bitmaps (slower object enumeration); once the background task
+/// completes, subsequent clones benefit from the bitmap.
+fn spawn_published_generation_index_preparation(
+    state: crate::AppState,
+    owner_repo: String,
+    published_path: PathBuf,
+    published_lease: PublishedGenerationLease,
+    source: String,
+) {
     if !state.config.clone.prepare_published_generation_indexes {
-        return false;
+        return;
     }
 
-    let started_at = Instant::now();
-    info!(
-        repo = %owner_repo,
-        source,
-        staged = %staged_repo_path.display(),
-        pack_threads = state.bundle_pack_threads,
-        "preparing staged generation bitmap/MIDX indexes"
-    );
+    tokio::spawn(async move {
+        let _published_lease = published_lease;
+        let started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source,
+            path = %published_path.display(),
+            pack_threads = state.bundle_pack_threads,
+            "starting background bitmap/MIDX preparation for published generation"
+        );
 
-    let permit = match state
-        .bundle_generation_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-    {
-        Ok(permit) => permit,
-        Err(error) => {
-            warn!(
-                repo = %owner_repo,
-                source,
-                staged = %staged_repo_path.display(),
-                error = %error,
-                "skipping staged generation bitmap/MIDX preparation because semaphore is closed"
-            );
-            return false;
+        let permit = match state
+            .bundle_generation_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    error = %error,
+                    "skipping background bitmap/MIDX preparation because semaphore is closed"
+                );
+                return;
+            }
+        };
+
+        let result = crate::git::commands::git_prepare_published_generation_indexes(
+            &published_path,
+            state.bundle_pack_threads,
+        )
+        .await;
+        drop(permit);
+
+        match result {
+            Ok(()) => {
+                info!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "finished background bitmap/MIDX preparation for published generation"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    error = %error,
+                    "background bitmap/MIDX preparation failed for published generation"
+                );
+            }
         }
-    };
-
-    let result = crate::git::commands::git_prepare_published_generation_indexes(
-        staged_repo_path,
-        state.bundle_pack_threads,
-    )
-    .await;
-    drop(permit);
-
-    match result {
-        Ok(()) => {
-            info!(
-                repo = %owner_repo,
-                source,
-                staged = %staged_repo_path.display(),
-                elapsed_ms = started_at.elapsed().as_millis(),
-                "finished staged generation bitmap/MIDX preparation"
-            );
-        }
-        Err(error) => {
-            warn!(
-                repo = %owner_repo,
-                source,
-                staged = %staged_repo_path.display(),
-                elapsed_ms = started_at.elapsed().as_millis(),
-                error = %error,
-                "staged generation bitmap/MIDX preparation failed; publishing generation without prepared indexes"
-            );
-        }
-    }
-
-    true
+    });
 }
 
 async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
@@ -1794,31 +1823,6 @@ async fn publish_repo_mirror_generation(
             "finished quick staged-generation verification before publish"
         );
 
-        let index_preparation_attempted = prepare_published_generation_indexes_if_enabled(
-            state,
-            owner_repo,
-            &staged_repo_path,
-            source,
-        )
-        .await;
-        if index_preparation_attempted {
-            let post_index_validation_started_at = Instant::now();
-            info!(
-                repo = %owner_repo,
-                source,
-                staged = %staged_repo_path.display(),
-                "performing quick staged-generation verification after bitmap/MIDX preparation"
-            );
-            quick_check_ready_repo(state, owner_repo, &staged_repo_path, source, None).await?;
-            info!(
-                repo = %owner_repo,
-                source,
-                staged = %staged_repo_path.display(),
-                elapsed_ms = post_index_validation_started_at.elapsed().as_millis(),
-                "finished quick staged-generation verification after bitmap/MIDX preparation"
-            );
-        }
-
         let publish_started_at = Instant::now();
         info!(
             repo = %owner_repo,
@@ -1829,6 +1833,14 @@ async fn publish_repo_mirror_generation(
         );
         let published_path =
             publish_ready_repo(state, owner_repo, &staged_repo_path, source).await?;
+        let published_lease = lease_published_generation_path(state, owner_repo, &published_path);
+        spawn_published_generation_index_preparation(
+            state.clone(),
+            owner_repo.to_string(),
+            published_path.clone(),
+            published_lease,
+            source.to_string(),
+        );
         spawn_generation_deep_validation(
             state.clone(),
             owner_repo.to_string(),
