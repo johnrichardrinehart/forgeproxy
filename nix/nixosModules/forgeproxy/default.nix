@@ -179,6 +179,33 @@ in
       description = "Directory used for forgeproxy cache data.";
     };
 
+    cacheMount = {
+      device = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/dev/disk/by-label/forgeproxy-cache";
+        description = ''
+          Optional dedicated block device for the forgeproxy cache directory.
+          When set, the module mounts it with noatime/nodiratime so Git cache
+          reads do not generate access-time writes.
+        '';
+      };
+
+      fsType = lib.mkOption {
+        type = lib.types.str;
+        default = "xfs";
+        example = "ext4";
+        description = "Filesystem type for services.forgeproxy.cacheMount.device.";
+      };
+
+      options = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "discard" ];
+        description = "Additional mount options for the dedicated forgeproxy cache mount.";
+      };
+    };
+
     logLevel = lib.mkOption {
       type = lib.types.str;
       default = "info";
@@ -211,6 +238,18 @@ in
 
   config = lib.mkIf cfg.enable {
     users.groups.forgeproxy-cache = { };
+
+    fileSystems = lib.mkIf (cfg.cacheMount.device != null) {
+      "${cfg.cacheDir}" = {
+        device = cfg.cacheMount.device;
+        fsType = cfg.cacheMount.fsType;
+        options = [
+          "noatime"
+          "nodiratime"
+        ]
+        ++ cfg.cacheMount.options;
+      };
+    };
 
     # ── systemd service ────────────────────────────────────────────────
     systemd.services.forgeproxy = {

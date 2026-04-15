@@ -3,6 +3,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{info, warn};
 
 use crate::AppState;
@@ -53,6 +54,8 @@ pub struct LocalUploadPackProcess {
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
     pub upload_pack_guard: crate::metrics::UploadPackGuard,
+    pub _global_upload_pack_permit: OwnedSemaphorePermit,
+    pub _repo_upload_pack_permit: OwnedSemaphorePermit,
     pub _lease: LocalServeRepoLease,
 }
 
@@ -68,6 +71,34 @@ pub async fn spawn_local_upload_pack(
         state, owner_repo, serve_from,
     )
     .await?;
+    spawn_local_upload_pack_with_lease(
+        state,
+        owner_repo,
+        protocol,
+        serve_from,
+        repo_lease,
+        mode,
+        git_protocol,
+    )
+    .await
+}
+
+pub async fn spawn_local_upload_pack_with_lease(
+    state: &AppState,
+    owner_repo: &str,
+    protocol: Protocol,
+    serve_from: LocalServeRepoSource,
+    repo_lease: LocalServeRepoLease,
+    mode: LocalUploadPackMode,
+    git_protocol: Option<&str>,
+) -> Result<LocalUploadPackProcess> {
+    let repo_upload_pack_permit = acquire_local_repo_upload_pack_permit(state, owner_repo).await?;
+    let global_upload_pack_permit = state
+        .local_upload_pack_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("local upload-pack semaphore closed"))?;
     let repo_path = repo_lease.repo_path().to_path_buf();
 
     let mut cmd = Command::new("git");
@@ -108,13 +139,41 @@ pub async fn spawn_local_upload_pack(
         stderr: child.stderr.take(),
         child,
         upload_pack_guard,
+        _global_upload_pack_permit: global_upload_pack_permit,
+        _repo_upload_pack_permit: repo_upload_pack_permit,
         _lease: repo_lease,
     })
+}
+
+async fn acquire_local_repo_upload_pack_permit(
+    state: &AppState,
+    owner_repo: &str,
+) -> Result<OwnedSemaphorePermit> {
+    let semaphore = {
+        let mut semaphores = state.repo_upload_pack_semaphores.lock().await;
+        semaphores
+            .entry(owner_repo.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    state
+                        .config
+                        .clone
+                        .max_concurrent_local_upload_packs_per_repo,
+                ))
+            })
+            .clone()
+    };
+
+    semaphore
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("repo upload-pack semaphore closed"))
 }
 
 pub struct LocalUploadPackExit {
     pub status: std::process::ExitStatus,
     pub stderr: Vec<u8>,
+    pub cpu_seconds: f64,
 }
 
 pub async fn wait_for_local_upload_pack_exit(
@@ -125,11 +184,36 @@ pub async fn wait_for_local_upload_pack_exit(
 
     let mut stderr_buf = Vec::new();
     let _ = stderr.read_to_end(&mut stderr_buf).await;
+    let cpu_seconds = child
+        .id()
+        .and_then(read_linux_process_cpu_seconds)
+        .unwrap_or_default();
     let status = child.wait().await?;
     Ok(LocalUploadPackExit {
         status,
         stderr: stderr_buf,
+        cpu_seconds,
     })
+}
+
+fn read_linux_process_cpu_seconds(pid: u32) -> Option<f64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let fields = after_comm.split_whitespace().collect::<Vec<_>>();
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    Some((utime + stime) as f64 / linux_clock_ticks_per_second())
+}
+
+fn linux_clock_ticks_per_second() -> f64 {
+    std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|stdout| stdout.trim().parse::<f64>().ok())
+        .filter(|ticks| *ticks > 0.0)
+        .unwrap_or(100.0)
 }
 
 async fn seed_tee_capture(

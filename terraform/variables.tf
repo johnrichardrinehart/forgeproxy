@@ -365,6 +365,58 @@ variable "local_cache_max_bytes" {
   description = "Maximum size of local cache in bytes"
 }
 
+variable "max_concurrent_local_upload_packs" {
+  type        = number
+  default     = 4
+  description = "Maximum concurrent local git upload-pack subprocesses per forgeproxy instance."
+
+  validation {
+    condition     = var.max_concurrent_local_upload_packs > 0
+    error_message = "max_concurrent_local_upload_packs must be greater than 0."
+  }
+}
+
+variable "max_concurrent_local_upload_packs_per_repo" {
+  type        = number
+  default     = 1
+  description = "Maximum concurrent local git upload-pack subprocesses per repository per forgeproxy instance."
+
+  validation {
+    condition     = var.max_concurrent_local_upload_packs_per_repo > 0
+    error_message = "max_concurrent_local_upload_packs_per_repo must be greater than 0."
+  }
+}
+
+variable "pack_cache_enabled" {
+  type        = bool
+  default     = true
+  description = "Enable disk-backed local upload-pack response caching for safe fresh clone requests."
+}
+
+variable "pack_cache_max_bytes" {
+  type        = number
+  default     = 107374182400 # 100 GiB
+  description = "Maximum size of the local pack response cache in bytes."
+}
+
+variable "pack_cache_ttl_secs" {
+  type        = number
+  default     = 900
+  description = "TTL for local pack response cache artifacts in seconds."
+}
+
+variable "pack_cache_wait_for_inflight_secs" {
+  type        = number
+  default     = 120
+  description = "Seconds a same-key clone waits for an in-flight cached pack artifact."
+}
+
+variable "pack_cache_min_response_bytes" {
+  type        = number
+  default     = 67108864 # 64 MiB
+  description = "Minimum upload-pack response size to store in the pack response cache."
+}
+
 variable "eviction_policy" {
   type        = string
   default     = "lfu"

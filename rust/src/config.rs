@@ -94,6 +94,8 @@ pub struct Config {
     pub fetch_schedule: FetchScheduleConfig,
     #[serde(default)]
     pub bundles: BundleConfig,
+    #[serde(default)]
+    pub pack_cache: PackCacheConfig,
     pub storage: StorageConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -448,6 +450,15 @@ pub struct CloneConfig {
     /// forgeproxy instance.
     #[serde(default = "default_max_concurrent_upstream_clones_per_repo_per_instance")]
     pub max_concurrent_upstream_clones_per_repo_per_instance: usize,
+    /// Maximum concurrent local `git upload-pack` subprocesses on this
+    /// instance. This bounds pack-objects CPU even when many requests are
+    /// served from warm local disk.
+    #[serde(default = "default_max_concurrent_local_upload_packs")]
+    pub max_concurrent_local_upload_packs: usize,
+    /// Maximum concurrent local `git upload-pack` subprocesses for a single
+    /// repository on this instance.
+    #[serde(default = "default_max_concurrent_local_upload_packs_per_repo")]
+    pub max_concurrent_local_upload_packs_per_repo: usize,
     /// Strategy used after tee capture successfully materializes the cloned
     /// pack into a staging generation.
     #[serde(default)]
@@ -489,6 +500,9 @@ impl Default for CloneConfig {
                 default_max_concurrent_upstream_clones_per_repo_across_instances(),
             max_concurrent_upstream_clones_per_repo_per_instance:
                 default_max_concurrent_upstream_clones_per_repo_per_instance(),
+            max_concurrent_local_upload_packs: default_max_concurrent_local_upload_packs(),
+            max_concurrent_local_upload_packs_per_repo:
+                default_max_concurrent_local_upload_packs_per_repo(),
             hydration_mode: HydrationMode::default(),
             prepare_published_generation_indexes: false,
             request_wait_for_local_catch_up_secs: default_request_wait_for_local_catch_up_secs(),
@@ -557,6 +571,14 @@ fn default_max_concurrent_upstream_clones_per_repo_across_instances() -> usize {
 
 fn default_max_concurrent_upstream_clones_per_repo_per_instance() -> usize {
     3
+}
+
+fn default_max_concurrent_local_upload_packs() -> usize {
+    4
+}
+
+fn default_max_concurrent_local_upload_packs_per_repo() -> usize {
+    1
 }
 
 // ---------------------------------------------------------------------------
@@ -649,6 +671,62 @@ pub struct BundleConfig {
 pub struct BundleExecutionPolicy {
     pub max_concurrent_generations: usize,
     pub pack_threads: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Pack response cache
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackCacheConfig {
+    /// Enable replay caching of local upload-pack responses for safe fresh
+    /// clone requests.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum bytes retained by the disk-backed pack response cache.
+    #[serde(default = "default_pack_cache_max_bytes")]
+    pub max_bytes: u64,
+    /// Maximum age of a cache artifact before it is ignored and removed by a
+    /// future sweep.
+    #[serde(default = "default_pack_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Maximum time a same-key request waits for an in-flight pack artifact
+    /// before bypassing the cache and running its own local upload-pack.
+    #[serde(default = "default_pack_cache_wait_for_inflight_secs")]
+    pub wait_for_inflight_secs: u64,
+    /// Do not store responses smaller than this threshold. Small requests do
+    /// not justify cache bookkeeping.
+    #[serde(default = "default_pack_cache_min_response_bytes")]
+    pub min_response_bytes: u64,
+}
+
+impl Default for PackCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bytes: default_pack_cache_max_bytes(),
+            ttl_secs: default_pack_cache_ttl_secs(),
+            wait_for_inflight_secs: default_pack_cache_wait_for_inflight_secs(),
+            min_response_bytes: default_pack_cache_min_response_bytes(),
+        }
+    }
+}
+
+fn default_pack_cache_max_bytes() -> u64 {
+    100 * 1024 * 1024 * 1024
+}
+
+fn default_pack_cache_ttl_secs() -> u64 {
+    900
+}
+
+fn default_pack_cache_wait_for_inflight_secs() -> u64 {
+    120
+}
+
+fn default_pack_cache_min_response_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 
 impl Default for BundleConfig {
@@ -827,6 +905,22 @@ fn validate_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.bundles.pack_threads.is_none_or(|value| value > 0),
         "pack_threads must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.clone.max_concurrent_local_upload_packs > 0,
+        "max_concurrent_local_upload_packs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.clone.max_concurrent_local_upload_packs_per_repo > 0,
+        "max_concurrent_local_upload_packs_per_repo must be greater than 0"
+    );
+    anyhow::ensure!(
+        !config.pack_cache.enabled || config.pack_cache.max_bytes > 0,
+        "pack_cache.max_bytes must be greater than 0 when pack cache is enabled"
+    );
+    anyhow::ensure!(
+        !config.pack_cache.enabled || config.pack_cache.ttl_secs > 0,
+        "pack_cache.ttl_secs must be greater than 0 when pack cache is enabled"
     );
     anyhow::ensure!(
         (0.0..=1.0).contains(&config.observability.traces.sample_ratio),

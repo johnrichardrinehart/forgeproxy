@@ -33,6 +33,8 @@ clone:
   max_concurrent_upstream_clones: 5
   max_concurrent_upstream_fetches: 10
   reserved_request_time_upstream_fetches: 2
+  max_concurrent_local_upload_packs: 4
+  max_concurrent_local_upload_packs_per_repo: 1
   max_concurrent_tee_captures: 8
   max_concurrent_tee_captures_per_repo_per_instance: 2
   prepare_published_generation_indexes: false
@@ -52,6 +54,12 @@ bundles:
   # Set explicitly to bound CPU used by bundle and bitmap/MIDX generation.
   pack_threads: 4
   generate_filtered_bundles: true
+pack_cache:
+  enabled: true
+  max_bytes: 107374182400
+  ttl_secs: 900
+  wait_for_inflight_secs: 120
+  min_response_bytes: 67108864
 storage:
   local:
     path: "/var/cache/forgeproxy"

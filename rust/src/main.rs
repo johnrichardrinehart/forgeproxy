@@ -12,6 +12,7 @@ mod health;
 mod http;
 mod metrics;
 mod observability;
+pub(crate) mod pack_cache;
 mod runtime_resource;
 mod ssh;
 mod storage;
@@ -139,6 +140,14 @@ pub struct AppState {
     /// Per-repo local semaphore cache limiting tee capture/import work for the
     /// same repository within this instance.
     pub repo_tee_capture_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
+    /// Semaphore limiting concurrent local upload-pack subprocesses on this
+    /// instance.
+    pub local_upload_pack_semaphore: Arc<Semaphore>,
+    /// Per-repo local semaphore cache limiting concurrent local upload-pack
+    /// subprocesses for the same repository within this instance.
+    pub repo_upload_pack_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
+    /// Shared disk-backed upload-pack response cache.
+    pub pack_cache: Arc<pack_cache::PackCache>,
     /// Per-repo refcounts for published reader generations currently in use by
     /// local clone/fetch handlers on this node.
     pub published_generation_leases: Arc<
@@ -1101,6 +1110,12 @@ async fn build_app_state(
         .clone
         .max_concurrent_upstream_fetches
         .saturating_sub(config.clone.reserved_request_time_upstream_fetches);
+    let pack_cache = Arc::new(pack_cache::PackCache::new(
+        std::path::Path::new(&config.storage.local.path),
+        config.pack_cache.clone(),
+        metrics.clone(),
+    ));
+    pack_cache.ensure_ready().await?;
 
     let state = AppState {
         config: Arc::clone(&config),
@@ -1128,6 +1143,11 @@ async fn build_app_state(
         repo_publish_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_catch_up_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_tee_capture_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        local_upload_pack_semaphore: Arc::new(Semaphore::new(
+            config.clone.max_concurrent_local_upload_packs,
+        )),
+        repo_upload_pack_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        pack_cache,
         published_generation_leases: Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

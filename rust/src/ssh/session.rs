@@ -27,7 +27,7 @@ use crate::AppState;
 use crate::cache::CacheManager;
 use crate::clone_support::{
     CloneCompletion, LocalUploadPackMode, UpstreamHydrationRequest, UpstreamHydrationTracker,
-    spawn_local_upload_pack, wait_for_local_upload_pack_exit,
+    spawn_local_upload_pack, spawn_local_upload_pack_with_lease, wait_for_local_upload_pack_exit,
 };
 use crate::coordination::registry::{LocalServeDecision, LocalServeRepoSource};
 use crate::metrics::{
@@ -527,11 +527,142 @@ async fn serve_local_upload_pack_once(
         should_close_channel,
     } = response;
 
-    let mut process = match spawn_local_upload_pack(
+    let repo_lease = match crate::coordination::registry::acquire_local_serve_repo_lease(
+        state, owner_repo, serve_from,
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            error!(repo = %owner_repo, error = %error, "failed to acquire local repo lease for SSH upload-pack");
+            if should_close_channel {
+                let _ = handle.exit_status_request(channel_id, 1).await;
+                let _ = handle.eof(channel_id).await;
+                let _ = handle.close(channel_id).await;
+            }
+            return;
+        }
+    };
+    let generation_path = repo_lease.repo_path().to_path_buf();
+    let mut pack_cache_writer = None;
+
+    match state.pack_cache.key_for_fresh_clone(
+        owner_repo,
+        &generation_path,
+        request_body,
+        git_protocol,
+    ) {
+        Ok(key) => match state.pack_cache.lookup_or_reserve(Protocol::Ssh, key).await {
+            Ok(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
+                match tokio::fs::File::open(&hit.path).await {
+                    Ok(mut file) => {
+                        let mut total_bytes = 0u64;
+                        let mut stream_writer =
+                            stream_channel.as_ref().map(|channel| channel.make_writer());
+                        let downstream_counter = state
+                            .metrics
+                            .metrics
+                            .clone_downstream_bytes
+                            .get_or_create(&CloneDownstreamBytesLabels {
+                                protocol: Protocol::Ssh,
+                                phase: ClonePhase::UploadPack,
+                                source: CloneSource::Local,
+                                username: completion.metric_username.clone(),
+                                repo: completion.metric_repo.clone(),
+                            })
+                            .clone();
+                        let _active_clone_guard = state
+                            .begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
+                        let mut buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
+                        loop {
+                            match file.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(read) => {
+                                    if send_channel_response_data(
+                                        &handle,
+                                        channel_id,
+                                        stream_writer.as_mut(),
+                                        &channel_states,
+                                        &buf[..read],
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        warn!(
+                                            repo = %owner_repo,
+                                            total_bytes,
+                                            "client disconnected during SSH pack cache replay"
+                                        );
+                                        break;
+                                    }
+                                    total_bytes += read as u64;
+                                    downstream_counter.inc_by(read as u64);
+                                }
+                                Err(error) => {
+                                    error!(repo = %owner_repo, error = %error, "failed to read SSH pack cache artifact");
+                                    break;
+                                }
+                            }
+                        }
+                        completion.record_success(&state.metrics, Protocol::Ssh);
+                        if should_close_channel {
+                            finalize_upload_pack_channel(
+                                owner_repo,
+                                &handle,
+                                &channel_states,
+                                channel_id,
+                                0,
+                                total_bytes,
+                                Duration::from_secs(
+                                    state.config.clone.ssh_upload_pack_close_grace_secs,
+                                ),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(
+                            repo = %owner_repo,
+                            path = %hit.path.display(),
+                            error = %error,
+                            "failed to open SSH pack cache artifact; falling back to local upload-pack"
+                        );
+                        crate::metrics::inc_pack_cache_request(
+                            &state.metrics,
+                            Protocol::Ssh,
+                            "bypass",
+                            "artifact_open_failed",
+                        );
+                    }
+                }
+            }
+            Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
+                pack_cache_writer = Some(writer);
+            }
+            Ok(crate::pack_cache::PackCacheLookup::BypassAfterWait) => {}
+            Err(error) => {
+                warn!(repo = %owner_repo, error = %error, "SSH pack cache lookup failed; falling back to local upload-pack");
+            }
+        },
+        Err(reason) => {
+            if state.pack_cache.enabled() && reason != "disabled" {
+                crate::metrics::inc_pack_cache_request(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    "bypass",
+                    reason,
+                );
+            }
+        }
+    }
+
+    let mut process = match spawn_local_upload_pack_with_lease(
         state,
         owner_repo,
         Protocol::Ssh,
         serve_from,
+        repo_lease,
         LocalUploadPackMode::StatelessRpc,
         git_protocol,
     )
@@ -540,6 +671,9 @@ async fn serve_local_upload_pack_once(
         Ok(process) => process,
         Err(error) => {
             error!(repo = %owner_repo, error = %error, "failed to spawn local git upload-pack");
+            if let Some(writer) = pack_cache_writer.take() {
+                writer.abort().await;
+            }
             if should_close_channel {
                 let _ = handle.exit_status_request(channel_id, 1).await;
                 let _ = handle.eof(channel_id).await;
@@ -562,15 +696,23 @@ async fn serve_local_upload_pack_once(
 
     let Some(mut stdout) = process.stdout.take() else {
         error!(repo = %owner_repo, "missing stdout from local git upload-pack");
+        if let Some(writer) = pack_cache_writer.take() {
+            writer.abort().await;
+        }
         return;
     };
     let Some(mut stderr) = process.stderr.take() else {
         error!(repo = %owner_repo, "missing stderr from local git upload-pack");
+        if let Some(writer) = pack_cache_writer.take() {
+            writer.abort().await;
+        }
         return;
     };
     let crate::clone_support::LocalUploadPackProcess {
         child,
         upload_pack_guard: _upload_pack_guard,
+        _global_upload_pack_permit,
+        _repo_upload_pack_permit,
         _lease: _repo_lease,
         ..
     } = process;
@@ -593,11 +735,24 @@ async fn serve_local_upload_pack_once(
     let _active_clone_guard =
         state.begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
     let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
+    let mut disconnected = false;
     loop {
         match stdout.read(&mut stdout_buf).await {
             Ok(0) => break,
             Ok(read) => {
                 let chunk = &stdout_buf[..read];
+                if let Some(writer) = pack_cache_writer.as_mut()
+                    && let Err(error) = writer.write_chunk(chunk).await
+                {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %error,
+                        "SSH pack cache write failed; continuing client stream without caching artifact"
+                    );
+                    if let Some(writer) = pack_cache_writer.take() {
+                        writer.abort().await;
+                    }
+                }
                 if send_channel_response_data(
                     &handle,
                     channel_id,
@@ -614,6 +769,10 @@ async fn serve_local_upload_pack_once(
                         total_bytes,
                         "client disconnected during local git upload-pack response"
                     );
+                    if let Some(writer) = pack_cache_writer.take() {
+                        writer.abort().await;
+                    }
+                    disconnected = true;
                     break;
                 }
                 total_bytes += read as u64;
@@ -621,14 +780,26 @@ async fn serve_local_upload_pack_once(
             }
             Err(error) => {
                 error!(repo = %owner_repo, error = %error, "failed to read local git upload-pack stdout");
+                if let Some(writer) = pack_cache_writer.take() {
+                    writer.abort().await;
+                }
                 break;
             }
         }
     }
 
+    if disconnected {
+        let _ = child.kill().await;
+    }
     let completed_successfully =
         match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
             Ok(exit) if !exit.status.success() => {
+                crate::metrics::inc_upload_pack_cpu_seconds(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    "local",
+                    exit.cpu_seconds,
+                );
                 warn!(
                     repo = %owner_repo,
                     serve_from = %serve_from,
@@ -639,6 +810,12 @@ async fn serve_local_upload_pack_once(
                 false
             }
             Ok(exit) => {
+                crate::metrics::inc_upload_pack_cpu_seconds(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    "local",
+                    exit.cpu_seconds,
+                );
                 info!(
                     repo = %owner_repo,
                     serve_from = %serve_from,
@@ -660,6 +837,11 @@ async fn serve_local_upload_pack_once(
         };
 
     if completed_successfully {
+        if let Some(writer) = pack_cache_writer.take()
+            && let Err(error) = writer.finish().await
+        {
+            warn!(repo = %owner_repo, error = %error, "failed to finalize SSH pack cache artifact");
+        }
         crate::metrics::observe_upload_pack_duration(
             &state.metrics,
             Protocol::Ssh,
@@ -668,6 +850,8 @@ async fn serve_local_upload_pack_once(
             completion.started_at.elapsed(),
         );
         completion.record_success(&state.metrics, Protocol::Ssh);
+    } else if let Some(writer) = pack_cache_writer.take() {
+        writer.abort().await;
     }
 
     if should_close_channel {
@@ -1576,6 +1760,8 @@ impl Handler for SshSession {
                             let crate::clone_support::LocalUploadPackProcess {
                                 child,
                                 upload_pack_guard,
+                                _global_upload_pack_permit: global_upload_pack_permit,
+                                _repo_upload_pack_permit: repo_upload_pack_permit,
                                 _lease: repo_lease,
                                 ..
                             } = process;
@@ -1611,6 +1797,8 @@ impl Handler for SshSession {
                             // finalizes the channel in RFC 4254 order.
                             tokio::spawn(async move {
                                 let _upload_pack_guard = upload_pack_guard;
+                                let _global_upload_pack_permit = global_upload_pack_permit;
+                                let _repo_upload_pack_permit = repo_upload_pack_permit;
                                 let _repo_lease = repo_lease;
                                 let _active_clone_guard = state_for_stream
                                     .begin_active_clone(Protocol::Ssh, CacheStatus::Hot);
@@ -1674,11 +1862,20 @@ impl Handler for SshSession {
                                     }
                                 }
 
+                                if disconnected {
+                                    let _ = child.kill().await;
+                                }
                                 let exit_code =
                                     match wait_for_local_upload_pack_exit(&mut child, &mut stderr)
                                         .await
                                     {
                                         Ok(exit) => {
+                                            crate::metrics::inc_upload_pack_cpu_seconds(
+                                                &state_for_stream.metrics,
+                                                Protocol::Ssh,
+                                                "local",
+                                                exit.cpu_seconds,
+                                            );
                                             if exit.status.success() {
                                                 crate::metrics::observe_upload_pack_duration(
                                                     &state_for_stream.metrics,

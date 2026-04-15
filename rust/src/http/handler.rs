@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::clone_support::{
     CloneCompletion, LocalUploadPackMode, UpstreamHydrationRequest, UpstreamHydrationTracker,
-    spawn_local_upload_pack, wait_for_local_upload_pack_exit,
+    spawn_local_upload_pack_with_lease, wait_for_local_upload_pack_exit,
 };
 use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoLease, LocalServeRepoSource,
@@ -619,8 +619,9 @@ async fn handle_upload_pack(
         .map(|want| want.chars().take(12).collect::<String>())
         .collect::<Vec<String>>()
         .join(",");
-    let local_authz_confirmed =
-        local_http_clone_access_confirmed(&state, auth_header.as_deref(), &owner, &repo).await;
+    let local_http_access =
+        local_http_clone_access(&state, auth_header.as_deref(), &owner, &repo).await;
+    let local_authz_confirmed = local_http_access == LocalHttpAccess::Confirmed;
     let client_fingerprint = http_git_client_fingerprint(&headers, &metric_username, &owner, &repo);
     let recent_advertised_refs = state
         .recent_advertised_refs(&repo_slug, &client_fingerprint)
@@ -659,6 +660,54 @@ async fn handle_upload_pack(
         "git_client_agent",
         tracing::field::display(request_metadata.agent.as_deref().unwrap_or("")),
     );
+
+    if matches!(
+        &request_metadata.request_phase,
+        crate::tee_hydration::UploadPackRequestPhase::V2Command(command) if command == "bundle-uri"
+    ) {
+        match local_http_access {
+            LocalHttpAccess::Confirmed => {}
+            LocalHttpAccess::Denied => {
+                crate::metrics::inc_bundle_uri_command(&state.metrics, "auth_failed");
+                return Err(AppError::Unauthorized(
+                    "HTTP authorization is required before serving bundle URIs.\n".to_string(),
+                ));
+            }
+            LocalHttpAccess::Indeterminate => {
+                crate::metrics::inc_bundle_uri_command(&state.metrics, "auth_indeterminate");
+                return Ok((
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+                    Body::from("0000"),
+                )
+                    .into_response());
+            }
+        }
+        match crate::http::bundle_serve::bundle_uri_command_response(&state, &repo_slug).await {
+            Ok(Some(body)) => {
+                crate::metrics::inc_bundle_uri_command(&state.metrics, "served");
+                return Ok((
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+                    Body::from(body),
+                )
+                    .into_response());
+            }
+            Ok(None) => {
+                crate::metrics::inc_bundle_uri_command(&state.metrics, "missing_metadata");
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    "No bundles available for this repository.\n",
+                )
+                    .into_response());
+            }
+            Err(error) => {
+                crate::metrics::inc_bundle_uri_command(&state.metrics, "failed");
+                return Err(AppError::Internal(error));
+            }
+        }
+    }
+
     let local_decision = crate::coordination::registry::resolve_local_fetch_serveability(
         &state,
         &repo_slug,
@@ -1071,12 +1120,19 @@ async fn proxy_info_refs_to_upstream(
     Ok(stream_upstream_response(upstream_resp))
 }
 
-async fn local_http_clone_access_confirmed(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalHttpAccess {
+    Confirmed,
+    Denied,
+    Indeterminate,
+}
+
+async fn local_http_clone_access(
     state: &AppState,
     auth_header: Option<&str>,
     owner: &str,
     repo: &str,
-) -> bool {
+) -> LocalHttpAccess {
     let auth_header = auth_header.filter(|header| !header.trim().is_empty());
     let auth_kind = if auth_header.is_some() {
         "presented client Authorization header"
@@ -1085,7 +1141,7 @@ async fn local_http_clone_access_confirmed(
     };
 
     match crate::auth::http_validator::validate_http_auth(state, auth_header, owner, repo).await {
-        Ok(()) => true,
+        Ok(()) => LocalHttpAccess::Confirmed,
         Err(AppError::Unauthorized(message)) => {
             info!(
                 %owner,
@@ -1094,7 +1150,7 @@ async fn local_http_clone_access_confirmed(
                 auth_kind,
                 "local HTTP clone access probe denied; proxying upstream"
             );
-            false
+            LocalHttpAccess::Denied
         }
         Err(AppError::UpstreamRateLimited { status, .. }) => {
             warn!(
@@ -1104,7 +1160,7 @@ async fn local_http_clone_access_confirmed(
                 auth_kind,
                 "local HTTP clone access probe was rate limited; proxying upstream"
             );
-            false
+            LocalHttpAccess::Indeterminate
         }
         Err(AppError::Internal(error)) => {
             warn!(
@@ -1114,7 +1170,7 @@ async fn local_http_clone_access_confirmed(
                 auth_kind,
                 "local HTTP clone access probe failed; proxying upstream"
             );
-            false
+            LocalHttpAccess::Indeterminate
         }
         Err(AppError::BadRequest(message)) => {
             warn!(
@@ -1124,7 +1180,7 @@ async fn local_http_clone_access_confirmed(
                 auth_kind,
                 "local HTTP clone access probe rejected malformed input; proxying upstream"
             );
-            false
+            LocalHttpAccess::Indeterminate
         }
         Err(AppError::NotFound(message)) => {
             info!(
@@ -1134,7 +1190,7 @@ async fn local_http_clone_access_confirmed(
                 auth_kind,
                 "local HTTP clone access probe found no upstream repo metadata; proxying upstream"
             );
-            false
+            LocalHttpAccess::Indeterminate
         }
         Err(AppError::UpstreamFallback(message)) => {
             warn!(
@@ -1144,7 +1200,7 @@ async fn local_http_clone_access_confirmed(
                 auth_kind,
                 "local HTTP clone access probe was capacity-limited; proxying upstream"
             );
-            false
+            LocalHttpAccess::Indeterminate
         }
     }
 }
@@ -1161,11 +1217,104 @@ async fn serve_local_upload_pack(
     completion: CloneCompletion,
 ) -> Result<Response, AppError> {
     let owner_repo = format!("{owner}/{repo}");
-    let mut process = spawn_local_upload_pack(
+    let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease(
+        state,
+        &owner_repo,
+        serve_from,
+    )
+    .await?;
+    let generation_path = repo_lease.repo_path().to_path_buf();
+
+    let mut pack_cache_lookup = match state.pack_cache.key_for_fresh_clone(
+        &owner_repo,
+        &generation_path,
+        request_body,
+        git_protocol,
+    ) {
+        Ok(key) => Some(
+            state
+                .pack_cache
+                .lookup_or_reserve(Protocol::Https, key)
+                .await
+                .map_err(AppError::Internal)?,
+        ),
+        Err(reason) => {
+            if state.pack_cache.enabled() && reason != "disabled" {
+                crate::metrics::inc_pack_cache_request(
+                    &state.metrics,
+                    Protocol::Https,
+                    "bypass",
+                    reason,
+                );
+            }
+            None
+        }
+    };
+
+    match pack_cache_lookup.take() {
+        Some(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
+            match tokio::fs::File::open(&hit.path).await {
+                Ok(file) => {
+                    let downstream_counter = state
+                        .metrics
+                        .metrics
+                        .clone_downstream_bytes
+                        .get_or_create(&CloneDownstreamBytesLabels {
+                            protocol: Protocol::Https,
+                            phase: ClonePhase::UploadPack,
+                            source: CloneSource::Local,
+                            username: completion.metric_username.clone(),
+                            repo: completion.metric_repo.clone(),
+                        })
+                        .clone();
+                    let active_clone_guard =
+                        state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
+                    let stream = CloneCompletionStream::new(
+                        CountingBytesStream::new(ReaderStream::new(file), downstream_counter),
+                        state.metrics.clone(),
+                        Protocol::Https,
+                        completion,
+                        None,
+                        active_clone_guard,
+                    );
+                    let body = Body::from_stream(stream);
+                    return Ok((
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+                        body,
+                    )
+                        .into_response());
+                }
+                Err(error) => {
+                    warn!(
+                        path = %hit.path.display(),
+                        error = %error,
+                        "pack cache artifact disappeared before HTTP replay; falling back to local upload-pack"
+                    );
+                    crate::metrics::inc_pack_cache_request(
+                        &state.metrics,
+                        Protocol::Https,
+                        "bypass",
+                        "artifact_open_failed",
+                    );
+                }
+            }
+        }
+        other => pack_cache_lookup = other,
+    }
+
+    let pack_cache_writer = match pack_cache_lookup {
+        Some(crate::pack_cache::PackCacheLookup::Generate(writer)) => Some(writer),
+        Some(crate::pack_cache::PackCacheLookup::BypassAfterWait) | None => None,
+        Some(crate::pack_cache::PackCacheLookup::Hit(_)) => unreachable!(),
+    };
+
+    let mut process = spawn_local_upload_pack_with_lease(
         state,
         &owner_repo,
         Protocol::Https,
         serve_from,
+        repo_lease,
         LocalUploadPackMode::StatelessRpc,
         git_protocol,
     )
@@ -1181,16 +1330,17 @@ async fn serve_local_upload_pack(
     let stdout = process
         .stdout
         .context("failed to capture git upload-pack stdout")?;
-    let mut stderr = process
+    let stderr = process
         .stderr
         .context("failed to capture git upload-pack stderr")?;
     let crate::clone_support::LocalUploadPackProcess {
         child,
         upload_pack_guard,
+        _global_upload_pack_permit: global_upload_pack_permit,
+        _repo_upload_pack_permit: repo_upload_pack_permit,
         _lease: repo_lease,
         ..
     } = process;
-    let mut child = child;
 
     // Stream stdout as the response body.
     let downstream_counter = state
@@ -1207,11 +1357,152 @@ async fn serve_local_upload_pack(
         .clone();
     let active_clone_guard =
         state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
-    let stream = CloneCompletionStream::new(
-        LeasedReaderStream::new(
-            CountingBytesStream::new(ReaderStream::new(stdout), downstream_counter),
+    let upload_pack_cpu_metrics = state.metrics.clone();
+    let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = if let Some(
+        pack_cache_writer,
+    ) =
+        pack_cache_writer
+    {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+        tokio::spawn(
+            async move {
+                let _repo_lease = repo_lease;
+                let _upload_pack_guard = upload_pack_guard;
+                let _global_upload_pack_permit = global_upload_pack_permit;
+                let _repo_upload_pack_permit = repo_upload_pack_permit;
+                let mut child = child;
+                let mut stderr = stderr;
+                let mut stdout_stream = ReaderStream::new(stdout);
+                let mut writer = Some(pack_cache_writer);
+                let mut downstream_open = true;
+
+                while let Some(item) = stdout_stream.next().await {
+                    match item {
+                        Ok(bytes) => {
+                            if let Some(active_writer) = writer.as_mut()
+                                && let Err(error) = active_writer.write_chunk(&bytes).await
+                            {
+                                warn!(
+                                    error = %error,
+                                    "pack cache write failed; continuing client stream without caching artifact"
+                                );
+                                if let Some(active_writer) = writer.take() {
+                                    active_writer.abort().await;
+                                }
+                            }
+                            if downstream_open && tx.send(Ok(bytes)).await.is_err() {
+                                downstream_open = false;
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(active_writer) = writer.take() {
+                                active_writer.abort().await;
+                            }
+                            if downstream_open {
+                                let _ = tx.send(Err(error)).await;
+                            }
+                            let _ = child.kill().await;
+                            if let Ok(exit) =
+                                wait_for_local_upload_pack_exit(&mut child, &mut stderr).await
+                            {
+                                crate::metrics::inc_upload_pack_cpu_seconds(
+                                    &upload_pack_cpu_metrics,
+                                    Protocol::Https,
+                                    "pack_cache_generation",
+                                    exit.cpu_seconds,
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
+                    Ok(exit) if exit.status.success() => {
+                        crate::metrics::inc_upload_pack_cpu_seconds(
+                            &upload_pack_cpu_metrics,
+                            Protocol::Https,
+                            "pack_cache_generation",
+                            exit.cpu_seconds,
+                        );
+                        if let Some(active_writer) = writer.take()
+                            && let Err(error) = active_writer.finish().await
+                        {
+                            warn!(error = %error, "failed to finalize pack cache artifact");
+                        }
+                    }
+                    Ok(exit) => {
+                        crate::metrics::inc_upload_pack_cpu_seconds(
+                            &upload_pack_cpu_metrics,
+                            Protocol::Https,
+                            "pack_cache_generation",
+                            exit.cpu_seconds,
+                        );
+                        if let Some(active_writer) = writer.take() {
+                            active_writer.abort().await;
+                        }
+                        warn!(
+                            status = %exit.status,
+                            stderr = %String::from_utf8_lossy(&exit.stderr),
+                            "git upload-pack exited with non-zero status; discarding pack cache artifact"
+                        );
+                    }
+                    Err(error) => {
+                        if let Some(active_writer) = writer.take() {
+                            active_writer.abort().await;
+                        }
+                        error!(error = %error, "failed to wait on git upload-pack");
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+        Box::pin(ReceiverStream::new(rx))
+    } else {
+        let mut child = child;
+        let mut stderr = stderr;
+        let upload_pack_cpu_metrics = upload_pack_cpu_metrics.clone();
+        tokio::spawn(
+            async move {
+                let _upload_pack_guard = upload_pack_guard;
+                let _global_upload_pack_permit = global_upload_pack_permit;
+                let _repo_upload_pack_permit = repo_upload_pack_permit;
+                match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
+                    Ok(exit) if !exit.status.success() => {
+                        crate::metrics::inc_upload_pack_cpu_seconds(
+                            &upload_pack_cpu_metrics,
+                            Protocol::Https,
+                            "local",
+                            exit.cpu_seconds,
+                        );
+                        warn!(
+                            status = %exit.status,
+                            stderr = %String::from_utf8_lossy(&exit.stderr),
+                            "git upload-pack exited with non-zero status"
+                        );
+                    }
+                    Ok(exit) => {
+                        crate::metrics::inc_upload_pack_cpu_seconds(
+                            &upload_pack_cpu_metrics,
+                            Protocol::Https,
+                            "local",
+                            exit.cpu_seconds,
+                        );
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to wait on git upload-pack");
+                    }
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
+        Box::pin(LeasedReaderStream::new(
+            ReaderStream::new(stdout),
             repo_lease,
-        ),
+        ))
+    };
+    let stream = CloneCompletionStream::new(
+        CountingBytesStream::new(stream, downstream_counter),
         state.metrics.clone(),
         Protocol::Https,
         completion,
@@ -1219,27 +1510,6 @@ async fn serve_local_upload_pack(
         active_clone_guard,
     );
     let body = Body::from_stream(stream);
-
-    // Reap the child in the background so we don't leak processes.
-    tokio::spawn(
-        async move {
-            let _upload_pack_guard = upload_pack_guard;
-            match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
-                Ok(exit) if !exit.status.success() => {
-                    warn!(
-                        status = %exit.status,
-                        stderr = %String::from_utf8_lossy(&exit.stderr),
-                        "git upload-pack exited with non-zero status"
-                    );
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to wait on git upload-pack");
-                }
-                _ => {}
-            }
-        }
-        .instrument(tracing::Span::current()),
-    );
 
     Ok((
         StatusCode::OK,

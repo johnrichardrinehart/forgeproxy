@@ -543,6 +543,11 @@
           "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"state_tee\", service\\.instance\\.id=~\"$instance\"})",
           "legendFormat": "/var/cache/forgeproxy/.state/tee",
           "refId": "E"
+        },
+        {
+          "expr": "sum(forgeproxy_pack_cache_size_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "/var/cache/forgeproxy/.state/pack-cache",
+          "refId": "F"
         }
       ],
       "fieldConfig": {
@@ -599,7 +604,7 @@
     {
       "id": 33,
       "type": "timeseries",
-      "title": "Archive Cache Operations / min",
+      "title": "Cache Operations / min",
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
@@ -617,6 +622,21 @@
           "expr": "sum(rate(forgeproxy_archive_cache_misses_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
           "legendFormat": "Miss (upstream)",
           "refId": "C"
+        },
+        {
+          "expr": "sum by (result) (rate(forgeproxy_pack_cache_requests_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Pack cache {{result}}",
+          "refId": "D"
+        },
+        {
+          "expr": "sum by (result) (rate(forgeproxy_pack_cache_inflight_waits_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Pack cache wait {{result}}",
+          "refId": "E"
+        },
+        {
+          "expr": "sum by (result) (rate(forgeproxy_generation_coalescing_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Generation coalescing {{result}}",
+          "refId": "F"
         }
       ],
       "fieldConfig": {
@@ -663,6 +683,21 @@
           "expr": "sum(rate(forgeproxy_bundle_generation_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
           "legendFormat": "Generations",
           "refId": "A"
+        },
+        {
+          "expr": "sum by (result) (rate(forgeproxy_bundle_uri_command_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "bundle-uri {{result}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (result) (rate(forgeproxy_bundle_presign_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "presign {{result}}",
+          "refId": "C"
+        },
+        {
+          "expr": "sum by (bundle_kind) (forgeproxy_bundle_manifest_entries{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "manifest {{bundle_kind}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {
@@ -705,6 +740,16 @@
           "expr": "histogram_quantile(0.99, sum by (le) (rate(forgeproxy_bundle_generation_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(forgeproxy_pack_cache_artifact_generation_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "pack-cache p95",
+          "refId": "D"
+        },
+        {
+          "expr": "sum by (protocol, source) (rate(forgeproxy_upload_pack_cpu_seconds_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "upload-pack CPU {{protocol}}/{{source}}",
+          "refId": "E"
         }
       ],
       "fieldConfig": {

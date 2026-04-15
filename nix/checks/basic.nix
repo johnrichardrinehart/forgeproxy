@@ -146,6 +146,15 @@ let
       ssh_upload_pack_close_grace_secs: 5
       max_concurrent_upstream_clones: 5
       max_concurrent_upstream_fetches: 10
+      max_concurrent_local_upload_packs: 2
+      max_concurrent_local_upload_packs_per_repo: 1
+
+    pack_cache:
+      enabled: true
+      max_bytes: 1073741824
+      ttl_secs: 900
+      wait_for_inflight_secs: 120
+      min_response_bytes: 1
 
     fetch_schedule:
       default_interval: 1800
@@ -227,7 +236,7 @@ pkgs.testers.runNixOSTest {
   # This scenario now exercises full OTLP wiring plus late-stage generation
   # lease assertions. Give it enough headroom to reach the final subtests on
   # slower builders without weakening the behavior being checked.
-  globalTimeout = 420;
+  globalTimeout = 60 * 10;
 
   # ---------------------------------------------------------------------------
   # Node definitions
@@ -457,9 +466,64 @@ pkgs.testers.runNixOSTest {
   testScript = ''
     import base64
     import hashlib
+    import re
+    import time
 
     def pkt_line(payload: str) -> str:
         return f"{len(payload) + 4:04x}{payload}"
+
+    def wait_for_metric_fragment(machine, fragment: str, timeout: int = 15):
+        deadline = time.time() + timeout
+        last_metrics = ""
+        while time.time() < deadline:
+            last_metrics = machine.succeed("curl -sf http://localhost:8080/metrics")
+            if fragment in last_metrics:
+                return last_metrics
+            time.sleep(1)
+        recent_logs = machine.succeed(
+            "journalctl -u forgeproxy --since '2m ago' --no-pager -o cat || true"
+        )
+        raise Exception(
+            f"timed out waiting for metric fragment {fragment!r}\n"
+            f"recent forgeproxy logs:\n{recent_logs}\n"
+            f"metrics tail:\n{last_metrics[-4000:]}"
+        )
+
+    def wait_for_metric_line(machine, fragments, timeout: int = 15):
+        deadline = time.time() + timeout
+        last_metrics = ""
+        while time.time() < deadline:
+            last_metrics = machine.succeed("curl -sf http://localhost:8080/metrics")
+            for line in last_metrics.splitlines():
+                if all(fragment in line for fragment in fragments):
+                    return last_metrics
+            time.sleep(1)
+        recent_logs = machine.succeed(
+            "journalctl -u forgeproxy --since '2m ago' --no-pager -o cat || true"
+        )
+        raise Exception(
+            f"timed out waiting for metric line containing {fragments!r}\n"
+            f"recent forgeproxy logs:\n{recent_logs}\n"
+            f"metrics tail:\n{last_metrics[-4000:]}"
+        )
+
+    def wait_for_metric_regex(machine, pattern: str, timeout: int = 15):
+        compiled = re.compile(pattern, re.MULTILINE)
+        deadline = time.time() + timeout
+        last_metrics = ""
+        while time.time() < deadline:
+            last_metrics = machine.succeed("curl -sf http://localhost:8080/metrics")
+            if compiled.search(last_metrics):
+                return last_metrics
+            time.sleep(1)
+        recent_logs = machine.succeed(
+            "journalctl -u forgeproxy --since '2m ago' --no-pager -o cat || true"
+        )
+        raise Exception(
+            f"timed out waiting for metric pattern {pattern!r}\n"
+            f"recent forgeproxy logs:\n{recent_logs}\n"
+            f"metrics tail:\n{last_metrics[-4000:]}"
+        )
 
     ghe.start()
     valkey.start()
@@ -514,6 +578,13 @@ pkgs.testers.runNixOSTest {
             " -X POST http://localhost:3000/api/v1/user/repos"
             " -H 'Content-Type: application/json'"
             " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
+            ' -d \'{"name": "pack-cache", "auto_init": false}\'''
+        )
+        ghe.succeed(
+            "curl -sf"
+            " -X POST http://localhost:3000/api/v1/user/repos"
+            " -H 'Content-Type: application/json'"
+            " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
             ' -d \'{"name": "fallback-only", "auto_init": false}\'''
         )
 
@@ -544,6 +615,19 @@ pkgs.testers.runNixOSTest {
             "git add README.md && "
             "git commit -m 'Initial commit' && "
             "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/shallow-only.git && "
+            "git push -u origin main"
+        )
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo 'Pack cache repo' > README.md && "
+            "git add README.md && "
+            "git commit -m 'Initial commit' && "
+            "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/pack-cache.git && "
             "git push -u origin main"
         )
         ghe.succeed(
@@ -690,6 +774,45 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             "find ${cacheLayout.generationDir "octocat/hello-world"} -mindepth 1 -maxdepth 1 -type d | grep -q ."
         )
+
+    with subtest("Repeated warm HTTPS clone uses the pack response cache"):
+        client.succeed(
+            "rm -rf /tmp/pack-cache-warm /tmp/pack-cache-miss /tmp/pack-cache-hit && "
+            "git clone https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-warm"
+        )
+        proxy.wait_until_succeeds(
+            "test -L ${cacheLayout.repoPath "octocat/pack-cache"}"
+        )
+        proxy.wait_until_succeeds(
+            "find ${cacheLayout.generationDir "octocat/pack-cache"} -mindepth 1 -maxdepth 1 -type d | grep -q ."
+        )
+        client.succeed(
+            "git clone https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-miss"
+        )
+        wait_for_metric_regex(proxy, r"^forgeproxy_pack_cache_size_bytes [1-9][0-9]*$")
+        client.succeed(
+            "git clone https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-hit"
+        )
+        client.succeed("grep -Fx 'Pack cache repo' /tmp/pack-cache-hit/README.md")
+        metrics = wait_for_metric_line(
+            proxy,
+            [
+                "forgeproxy_pack_cache_requests_total{",
+                'protocol="https"',
+                'reason="reserved"',
+                'result="miss"',
+            ],
+        )
+        metrics = wait_for_metric_line(
+            proxy,
+            [
+                "forgeproxy_pack_cache_requests_total{",
+                'protocol="https"',
+                'result="hit"',
+            ],
+        )
+        assert "forgeproxy_pack_cache_artifact_generation_duration_seconds" in metrics, metrics
+        assert re.search(r"^forgeproxy_pack_cache_size_bytes [1-9][0-9]*$", metrics, re.MULTILINE), metrics
 
     with subtest("Web root through proxy reaches upstream UI"):
         client.succeed(

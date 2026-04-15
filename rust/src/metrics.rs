@@ -194,6 +194,45 @@ pub struct UpstreamFallbackLabels {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheRequestLabels {
+    pub protocol: Protocol,
+    pub result: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheInflightWaitLabels {
+    pub protocol: Protocol,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UploadPackCpuLabels {
+    pub protocol: Protocol,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BundleUriCommandLabels {
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BundlePresignLabels {
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BundleManifestEntriesLabels {
+    pub bundle_kind: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct GenerationCoalescingLabels {
+    pub result: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum AuthState {
     Anonymous,
@@ -353,6 +392,19 @@ pub struct Metrics {
 
     // -- upstream fallback --
     pub upstream_fallback: Family<UpstreamFallbackLabels, Counter>,
+
+    // -- pack cache --
+    pub pack_cache_requests_total: Family<PackCacheRequestLabels, Counter>,
+    pub pack_cache_size_bytes: Gauge,
+    pub pack_cache_inflight_waits_total: Family<PackCacheInflightWaitLabels, Counter>,
+    pub pack_cache_artifact_generation_duration_seconds: Histogram,
+    pub upload_pack_cpu_seconds_total: Family<UploadPackCpuLabels, Counter>,
+
+    // -- bundle URI / manifests --
+    pub bundle_uri_command_total: Family<BundleUriCommandLabels, Counter>,
+    pub bundle_presign_total: Family<BundlePresignLabels, Counter>,
+    pub bundle_manifest_entries: Family<BundleManifestEntriesLabels, Gauge>,
+    pub generation_coalescing_total: Family<GenerationCoalescingLabels, Counter>,
 }
 
 impl Metrics {
@@ -583,6 +635,71 @@ impl Metrics {
             upstream_fallback.clone(),
         );
 
+        let pack_cache_requests_total = Family::<PackCacheRequestLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_requests",
+            "Pack response cache requests by result and reason",
+            pack_cache_requests_total.clone(),
+        );
+
+        let pack_cache_size_bytes = Gauge::default();
+        registry.register(
+            "forgeproxy_pack_cache_size_bytes",
+            "Current pack response cache size in bytes",
+            pack_cache_size_bytes.clone(),
+        );
+
+        let pack_cache_inflight_waits_total =
+            Family::<PackCacheInflightWaitLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_inflight_waits",
+            "Pack response cache same-key in-flight waits by result",
+            pack_cache_inflight_waits_total.clone(),
+        );
+
+        let pack_cache_artifact_generation_duration_seconds =
+            Histogram::new(exponential_buckets(0.1, 2.0, 16));
+        registry.register(
+            "forgeproxy_pack_cache_artifact_generation_duration_seconds",
+            "Pack response cache artifact generation latency in seconds",
+            pack_cache_artifact_generation_duration_seconds.clone(),
+        );
+
+        let upload_pack_cpu_seconds_total = Family::<UploadPackCpuLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_upload_pack_cpu_seconds",
+            "Approximate local upload-pack CPU-seconds by protocol and source",
+            upload_pack_cpu_seconds_total.clone(),
+        );
+
+        let bundle_uri_command_total = Family::<BundleUriCommandLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_bundle_uri_command",
+            "Protocol v2 bundle-uri command requests by result",
+            bundle_uri_command_total.clone(),
+        );
+
+        let bundle_presign_total = Family::<BundlePresignLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_bundle_presign",
+            "Bundle presigned URL generation by result",
+            bundle_presign_total.clone(),
+        );
+
+        let bundle_manifest_entries = Family::<BundleManifestEntriesLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_bundle_manifest_entries",
+            "Current repo-global bundle manifest entries by bundle kind",
+            bundle_manifest_entries.clone(),
+        );
+
+        let generation_coalescing_total = Family::<GenerationCoalescingLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_generation_coalescing",
+            "Published generation coalescing decisions by result",
+            generation_coalescing_total.clone(),
+        );
+
         Self {
             clone_total,
             clone_summary_total,
@@ -615,6 +732,15 @@ impl Metrics {
             cache_subtree_size_bytes,
             hydration_skipped,
             upstream_fallback,
+            pack_cache_requests_total,
+            pack_cache_size_bytes,
+            pack_cache_inflight_waits_total,
+            pack_cache_artifact_generation_duration_seconds,
+            upload_pack_cpu_seconds_total,
+            bundle_uri_command_total,
+            bundle_presign_total,
+            bundle_manifest_entries,
+            generation_coalescing_total,
         }
     }
 }
@@ -865,6 +991,105 @@ pub fn inc_upstream_fallback(metrics: &MetricsRegistry, protocol: Protocol, reas
         .get_or_create(&UpstreamFallbackLabels {
             protocol,
             reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_pack_cache_request(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    result: &str,
+    reason: &str,
+) {
+    metrics
+        .metrics
+        .pack_cache_requests_total
+        .get_or_create(&PackCacheRequestLabels {
+            protocol,
+            result: result.to_string(),
+            reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn set_pack_cache_size_bytes(metrics: &MetricsRegistry, size_bytes: u64) {
+    metrics
+        .metrics
+        .pack_cache_size_bytes
+        .set(size_bytes.min(i64::MAX as u64) as i64);
+}
+
+pub fn inc_pack_cache_inflight_wait(metrics: &MetricsRegistry, protocol: Protocol, result: &str) {
+    metrics
+        .metrics
+        .pack_cache_inflight_waits_total
+        .get_or_create(&PackCacheInflightWaitLabels {
+            protocol,
+            result: result.to_string(),
+        })
+        .inc();
+}
+
+pub fn observe_pack_cache_artifact_generation(metrics: &MetricsRegistry, elapsed: Duration) {
+    metrics
+        .metrics
+        .pack_cache_artifact_generation_duration_seconds
+        .observe(elapsed.as_secs_f64());
+}
+
+pub fn inc_upload_pack_cpu_seconds(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    source: &str,
+    cpu_seconds: f64,
+) {
+    metrics
+        .metrics
+        .upload_pack_cpu_seconds_total
+        .get_or_create(&UploadPackCpuLabels {
+            protocol,
+            source: source.to_string(),
+        })
+        .inc_by(cpu_seconds.max(0.0) as u64);
+}
+
+pub fn inc_bundle_uri_command(metrics: &MetricsRegistry, result: &str) {
+    metrics
+        .metrics
+        .bundle_uri_command_total
+        .get_or_create(&BundleUriCommandLabels {
+            result: result.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_bundle_presign(metrics: &MetricsRegistry, result: &str) {
+    metrics
+        .metrics
+        .bundle_presign_total
+        .get_or_create(&BundlePresignLabels {
+            result: result.to_string(),
+        })
+        .inc();
+}
+
+pub fn set_bundle_manifest_entries(metrics: &MetricsRegistry, bundle_kind: &str, count: usize) {
+    metrics
+        .metrics
+        .bundle_manifest_entries
+        .get_or_create(&BundleManifestEntriesLabels {
+            bundle_kind: bundle_kind.to_string(),
+        })
+        .set(count.min(i64::MAX as usize) as i64);
+}
+
+#[allow(dead_code)]
+pub fn inc_generation_coalescing(metrics: &MetricsRegistry, result: &str) {
+    metrics
+        .metrics
+        .generation_coalescing_total
+        .get_or_create(&GenerationCoalescingLabels {
+            result: result.to_string(),
         })
         .inc();
 }

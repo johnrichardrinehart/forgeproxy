@@ -2135,6 +2135,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn load_current_node_bundle_metadata(
     state: &crate::AppState,
     owner_repo: &str,
@@ -2200,7 +2201,7 @@ async fn list_published_bundle_metadata(
     Ok(metadata)
 }
 
-async fn latest_published_bundle_metadata(
+pub(crate) async fn latest_published_bundle_metadata(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<Option<crate::bundleuri::PublishedBundleMetadata>> {
