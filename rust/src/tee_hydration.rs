@@ -167,6 +167,7 @@ impl TeeCapture {
 struct SidebandPackExtractor {
     buffer: Vec<u8>,
     wrote_pack: bool,
+    disabled: bool,
 }
 
 impl SidebandPackExtractor {
@@ -175,6 +176,9 @@ impl SidebandPackExtractor {
         bytes: &[u8],
         pack_file: &mut BufWriter<File>,
     ) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
         self.buffer.extend_from_slice(bytes);
 
         loop {
@@ -186,7 +190,9 @@ impl SidebandPackExtractor {
                 .ok()
                 .and_then(|text| usize::from_str_radix(text, 16).ok())
             else {
-                anyhow::bail!("invalid pkt-line header in tee response stream");
+                self.disabled = true;
+                self.buffer.clear();
+                return Ok(());
             };
 
             if len == 0 || len == 1 || len == 2 {
@@ -194,7 +200,9 @@ impl SidebandPackExtractor {
                 continue;
             }
             if len < 4 {
-                anyhow::bail!("invalid pkt-line length {len} in tee response stream");
+                self.disabled = true;
+                self.buffer.clear();
+                return Ok(());
             }
             if self.buffer.len() < len {
                 return Ok(());
@@ -404,7 +412,7 @@ pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<Path
             .ok()
             .and_then(|text| usize::from_str_radix(text, 16).ok())
         else {
-            anyhow::bail!("invalid pkt-line header in {}", response_path.display());
+            return Ok(None);
         };
 
         if len == 0 || len == 1 || len == 2 {
@@ -412,10 +420,7 @@ pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<Path
         }
 
         if len < 4 {
-            anyhow::bail!(
-                "invalid pkt-line length {len} in {}",
-                response_path.display()
-            );
+            return Ok(None);
         }
 
         let payload_len = len - 4;
@@ -851,6 +856,8 @@ mod tests {
             .await
             .unwrap();
         capture.write_request(b"want-have").await.unwrap();
+        // The tee writer is a generic capture path. Direct pack extraction is
+        // opportunistic and must not make arbitrary response bytes fatal.
         capture.write_response_chunk(b"pack-bytes").await.unwrap();
         capture.finish(true).await.unwrap();
 
@@ -866,6 +873,12 @@ mod tests {
         assert!(capture_dir.join("request.bin").is_file());
         assert!(capture_dir.join("response.bin").is_file());
         assert!(capture_dir.join("status.json").is_file());
+        assert_eq!(
+            tokio::fs::read(capture_dir.join("response.bin"))
+                .await
+                .unwrap(),
+            b"pack-bytes"
+        );
     }
 
     #[tokio::test]
@@ -885,6 +898,64 @@ mod tests {
             .unwrap();
         let pack = tokio::fs::read(pack_path).await.unwrap();
         assert_eq!(pack, b"PACKabcd");
+    }
+
+    #[tokio::test]
+    async fn direct_pack_capture_handles_split_pkt_lines_and_ignores_non_pack_sidebands() {
+        let tmp = tempdir().unwrap();
+        let mut capture = TeeCapture::start(tmp.path(), "acme/widgets", "ssh")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        response.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(b"\x02counting\n"));
+        response.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(b"\x01PACK"));
+        response.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(b"\x03fatal\n"));
+        response.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(b"\x01abcd"));
+        response.extend_from_slice(b"0000");
+
+        for chunk in response.chunks(3) {
+            capture.write_response_chunk(chunk).await.unwrap();
+        }
+
+        let capture_dir = capture.dir().to_path_buf();
+        capture.finish(true).await.unwrap();
+
+        let pack_path = extract_pack_from_capture(&capture_dir)
+            .await
+            .unwrap()
+            .unwrap();
+        let pack = tokio::fs::read(pack_path).await.unwrap();
+        assert_eq!(pack, b"PACKabcd");
+        assert_eq!(
+            tokio::fs::read(capture_dir.join("response.bin"))
+                .await
+                .unwrap(),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_direct_pack_capture_preserves_response_and_returns_no_pack() {
+        let tmp = tempdir().unwrap();
+        let mut capture = TeeCapture::start(tmp.path(), "acme/widgets", "ssh")
+            .await
+            .unwrap();
+        capture.write_response_chunk(b"not-pkt-data").await.unwrap();
+        let capture_dir = capture.dir().to_path_buf();
+        capture.finish(true).await.unwrap();
+
+        assert!(
+            extract_pack_from_capture(&capture_dir)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            tokio::fs::read(capture_dir.join("response.bin"))
+                .await
+                .unwrap(),
+            b"not-pkt-data"
+        );
     }
 
     #[tokio::test]
