@@ -1113,6 +1113,7 @@ async fn build_app_state(
     let pack_cache = Arc::new(pack_cache::PackCache::new(
         std::path::Path::new(&config.storage.local.path),
         config.pack_cache.clone(),
+        config.storage.local.max_bytes,
         metrics.clone(),
     ));
     pack_cache.ensure_ready().await?;

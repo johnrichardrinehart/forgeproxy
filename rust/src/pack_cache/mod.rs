@@ -19,6 +19,7 @@ const PACK_CACHE_DIR: &str = "pack-cache";
 pub struct PackCache {
     root: PathBuf,
     config: PackCacheConfig,
+    max_bytes: u64,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     metrics: MetricsRegistry,
 }
@@ -50,6 +51,7 @@ pub struct PackCacheWriter {
     final_path: PathBuf,
     tmp_path: PathBuf,
     root: PathBuf,
+    max_bytes: u64,
     writer: BufWriter<File>,
     bytes_written: u64,
     min_response_bytes: u64,
@@ -61,12 +63,19 @@ pub struct PackCacheWriter {
 }
 
 impl PackCache {
-    pub fn new(base_path: &Path, config: PackCacheConfig, metrics: MetricsRegistry) -> Self {
+    pub fn new(
+        base_path: &Path,
+        config: PackCacheConfig,
+        local_cache_max_bytes: u64,
+        metrics: MetricsRegistry,
+    ) -> Self {
+        let max_bytes = config.effective_max_bytes(local_cache_max_bytes);
         Self {
             root: base_path
                 .join(crate::cache::layout::STATE_ROOT_DIR)
                 .join(PACK_CACHE_DIR),
             config,
+            max_bytes,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             metrics,
         }
@@ -270,6 +279,7 @@ impl PackCache {
             final_path,
             tmp_path,
             root: self.root.clone(),
+            max_bytes: self.max_bytes,
             writer: BufWriter::with_capacity(1024 * 1024, file),
             bytes_written: 0,
             min_response_bytes: self.config.min_response_bytes,
@@ -330,6 +340,14 @@ impl PackCacheWriter {
                 &self.metrics,
                 self.started_at.elapsed(),
             );
+            if let Err(error) = prune_to_limit(&self.root, self.max_bytes) {
+                warn!(
+                    root = %self.root.display(),
+                    max_bytes = self.max_bytes,
+                    error = %error,
+                    "failed to prune pack cache after artifact promotion"
+                );
+            }
             crate::metrics::set_pack_cache_size_bytes(
                 &self.metrics,
                 directory_size(&self.root).unwrap_or(0),
@@ -515,6 +533,53 @@ fn directory_size(root: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+fn prune_to_limit(root: &Path, max_bytes: u64) -> std::io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let mut artifacts = Vec::new();
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".pack-response"))
+        {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        total = total.saturating_add(metadata.len());
+        artifacts.push((modified, metadata.len(), path));
+    }
+
+    if total <= max_bytes {
+        return Ok(());
+    }
+
+    artifacts.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in artifacts {
+        if total <= max_bytes {
+            break;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => total = total.saturating_sub(size),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                total = total.saturating_sub(size);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

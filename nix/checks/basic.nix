@@ -151,7 +151,7 @@ let
 
     pack_cache:
       enabled: true
-      max_bytes: 1073741824
+      max_percent: 0.25
       ttl_secs: 900
       wait_for_inflight_secs: 120
       min_response_bytes: 1

@@ -696,14 +696,25 @@ async fn handle_upload_pack(
             Ok(None) => {
                 crate::metrics::inc_bundle_uri_command(&state.metrics, "missing_metadata");
                 return Ok((
-                    StatusCode::NOT_FOUND,
-                    "No bundles available for this repository.\n",
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+                    Body::from("0000"),
                 )
                     .into_response());
             }
             Err(error) => {
                 crate::metrics::inc_bundle_uri_command(&state.metrics, "failed");
-                return Err(AppError::Internal(error));
+                warn!(
+                    repo = %repo_slug,
+                    error = %error,
+                    "bundle-uri command failed; returning empty response so fetch can continue"
+                );
+                return Ok((
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+                    Body::from("0000"),
+                )
+                    .into_response());
             }
         }
     }

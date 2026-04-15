@@ -184,6 +184,92 @@ pub async fn generate_filtered_bundle(
     })
 }
 
+/// Generate an incremental bundle containing objects reachable from current
+/// refs but not reachable from the supplied base ref tips.
+#[instrument(skip(state, base_refs), fields(%owner_repo, base_refs = base_refs.len()))]
+pub async fn generate_incremental_bundle(
+    state: &crate::AppState,
+    repo_path: &Path,
+    owner_repo: &str,
+    base_refs: &HashMap<String, String>,
+) -> Result<Option<BundleResult>> {
+    let started_at = Instant::now();
+    let current_refs = get_refs(repo_path).await?;
+    if current_refs.is_empty() || current_refs == *base_refs {
+        return Ok(None);
+    }
+
+    let mut refs = current_refs.keys().cloned().collect::<Vec<_>>();
+    refs.sort();
+    let mut not_refs = base_refs.values().cloned().collect::<Vec<_>>();
+    not_refs.sort();
+    not_refs.dedup();
+
+    if refs.is_empty() || not_refs.is_empty() {
+        return Ok(None);
+    }
+
+    let tmp_dir =
+        tempfile::tempdir().context("failed to create temp dir for incremental bundle")?;
+    let bundle_path = tmp_dir.path().join(format!(
+        "{}.incremental.bundle",
+        owner_repo.replace('/', "_")
+    ));
+
+    info!(
+        owner_repo,
+        refs = refs.len(),
+        not_refs = not_refs.len(),
+        "creating incremental bundle"
+    );
+
+    let _bundle_generation_permit = state
+        .bundle_generation_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .context("bundle generation semaphore closed")?;
+    commands::git_bundle_create(
+        repo_path,
+        &bundle_path,
+        Some(&refs),
+        Some(&not_refs),
+        state.bundle_pack_threads,
+    )
+    .await
+    .with_context(|| format!("git bundle create (incremental) failed for {owner_repo}"))?;
+    verify_bundle_or_log(
+        repo_path,
+        &bundle_path,
+        owner_repo,
+        "incremental",
+        Some(&refs),
+        not_refs.len(),
+    )
+    .await?;
+
+    let metadata = tokio::fs::metadata(&bundle_path)
+        .await
+        .context("failed to stat incremental bundle file")?;
+
+    let creation_token =
+        crate::bundleuri::creation_token::next_creation_token(state, owner_repo).await?;
+
+    state.metrics.metrics.bundle_generation_total.inc();
+    state
+        .metrics
+        .metrics
+        .bundle_generation_duration_seconds
+        .observe(started_at.elapsed().as_secs_f64());
+
+    Ok(Some(BundleResult {
+        _temp_dir: tmp_dir,
+        bundle_path,
+        creation_token,
+        size_bytes: metadata.len(),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

@@ -467,6 +467,10 @@ pub struct CloneConfig {
     /// multi-pack-index support before they are exposed to clone readers.
     #[serde(default)]
     pub prepare_published_generation_indexes: bool,
+    /// Optional window during which lower-priority refreshes may keep serving
+    /// the current published generation instead of publishing another one.
+    #[serde(default)]
+    pub generation_coalescing_window_secs: u64,
     /// Maximum time a client request should wait for a local mirror catch-up
     /// publish before falling back to proxying upstream.
     #[serde(default = "default_request_wait_for_local_catch_up_secs")]
@@ -505,6 +509,7 @@ impl Default for CloneConfig {
                 default_max_concurrent_local_upload_packs_per_repo(),
             hydration_mode: HydrationMode::default(),
             prepare_published_generation_indexes: false,
+            generation_coalescing_window_secs: 0,
             request_wait_for_local_catch_up_secs: default_request_wait_for_local_catch_up_secs(),
             tee_cleanup_interval_secs: default_tee_cleanup_interval_secs(),
             tee_retention_secs: default_tee_retention_secs(),
@@ -665,6 +670,11 @@ pub struct BundleConfig {
     /// Whether to produce filtered (blobless / treeless) bundle variants.
     #[serde(default)]
     pub generate_filtered_bundles: bool,
+    /// Maximum incremental bundle entries retained in the repo-global bundle
+    /// manifest. Incrementals are generated against the current base, so older
+    /// incrementals are redundant for latest clones.
+    #[serde(default = "default_max_incremental_bundles")]
+    pub max_incremental_bundles: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,9 +694,10 @@ pub struct PackCacheConfig {
     /// clone requests.
     #[serde(default)]
     pub enabled: bool,
-    /// Maximum bytes retained by the disk-backed pack response cache.
-    #[serde(default = "default_pack_cache_max_bytes")]
-    pub max_bytes: u64,
+    /// Fraction of `storage.local.max_bytes` retained by the disk-backed pack
+    /// response cache.
+    #[serde(default = "default_pack_cache_max_percent")]
+    pub max_percent: f64,
     /// Maximum age of a cache artifact before it is ignored and removed by a
     /// future sweep.
     #[serde(default = "default_pack_cache_ttl_secs")]
@@ -705,7 +716,7 @@ impl Default for PackCacheConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            max_bytes: default_pack_cache_max_bytes(),
+            max_percent: default_pack_cache_max_percent(),
             ttl_secs: default_pack_cache_ttl_secs(),
             wait_for_inflight_secs: default_pack_cache_wait_for_inflight_secs(),
             min_response_bytes: default_pack_cache_min_response_bytes(),
@@ -713,8 +724,8 @@ impl Default for PackCacheConfig {
     }
 }
 
-fn default_pack_cache_max_bytes() -> u64 {
-    100 * 1024 * 1024 * 1024
+fn default_pack_cache_max_percent() -> f64 {
+    0.20
 }
 
 fn default_pack_cache_ttl_secs() -> u64 {
@@ -729,6 +740,12 @@ fn default_pack_cache_min_response_bytes() -> u64 {
     64 * 1024 * 1024
 }
 
+impl PackCacheConfig {
+    pub fn effective_max_bytes(&self, local_cache_max_bytes: u64) -> u64 {
+        ((local_cache_max_bytes as f64 * self.max_percent) as u64).max(1)
+    }
+}
+
 impl Default for BundleConfig {
     fn default() -> Self {
         Self {
@@ -737,6 +754,7 @@ impl Default for BundleConfig {
             max_concurrent_generations: default_max_concurrent_generations(),
             pack_threads: None,
             generate_filtered_bundles: false,
+            max_incremental_bundles: default_max_incremental_bundles(),
         }
     }
 }
@@ -775,6 +793,10 @@ fn default_bundle_lock_ttl() -> u64 {
 
 fn default_max_concurrent_generations() -> usize {
     2
+}
+
+fn default_max_incremental_bundles() -> usize {
+    1
 }
 
 fn default_pack_threads(available_parallelism: usize, max_concurrent_generations: usize) -> usize {
@@ -915,8 +937,8 @@ fn validate_config(config: &Config) -> Result<()> {
         "max_concurrent_local_upload_packs_per_repo must be greater than 0"
     );
     anyhow::ensure!(
-        !config.pack_cache.enabled || config.pack_cache.max_bytes > 0,
-        "pack_cache.max_bytes must be greater than 0 when pack cache is enabled"
+        config.pack_cache.max_percent > 0.0 && config.pack_cache.max_percent <= 1.0,
+        "pack_cache.max_percent must be in range (0.0, 1.0]"
     );
     anyhow::ensure!(
         !config.pack_cache.enabled || config.pack_cache.ttl_secs > 0,

@@ -37,12 +37,13 @@ auth:
 
 clone:
   prepare_published_generation_indexes: ${prepare_published_generation_indexes}
+  generation_coalescing_window_secs: ${generation_coalescing_window_secs}
   max_concurrent_local_upload_packs: ${max_concurrent_local_upload_packs}
   max_concurrent_local_upload_packs_per_repo: ${max_concurrent_local_upload_packs_per_repo}
 
 pack_cache:
   enabled: ${pack_cache_enabled}
-  max_bytes: ${pack_cache_max_bytes}
+  max_percent: ${pack_cache_max_percent}
   ttl_secs: ${pack_cache_ttl_secs}
   wait_for_inflight_secs: ${pack_cache_wait_for_inflight_secs}
   min_response_bytes: ${pack_cache_min_response_bytes}
@@ -61,6 +62,7 @@ storage:
 
 bundles:
   pack_threads: ${bundle_pack_threads}
+  max_incremental_bundles: ${bundle_max_incremental_bundles}
 
 observability:
   metrics:

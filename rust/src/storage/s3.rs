@@ -60,6 +60,20 @@ pub async fn upload_text(client: &Client, bucket: &str, key: &str, contents: &st
     Ok(())
 }
 
+/// Delete an S3 object if present.
+#[instrument(skip(client), fields(%bucket, %key))]
+pub async fn delete_object_if_exists(client: &Client, bucket: &str, key: &str) -> Result<()> {
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .context("S3 DeleteObject")?;
+    debug!("S3 object deleted");
+    Ok(())
+}
+
 /// Download an S3 object to a local file path, creating parent directories if
 /// needed.
 #[instrument(skip(client, metrics), fields(%bucket, %key, path = %file_path.display()))]

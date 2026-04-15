@@ -277,6 +277,12 @@ variable "max_concurrent_local_upload_packs" {
   description = "Maximum concurrent local git upload-pack subprocesses per forgeproxy instance."
 }
 
+variable "generation_coalescing_window_secs" {
+  type        = number
+  default     = 60
+  description = "Seconds lower-priority refreshes may keep serving the current published generation before publishing a newer one."
+}
+
 variable "max_concurrent_local_upload_packs_per_repo" {
   type        = number
   default     = 1
@@ -289,10 +295,10 @@ variable "pack_cache_enabled" {
   description = "Enable disk-backed local upload-pack response caching for safe fresh clone requests."
 }
 
-variable "pack_cache_max_bytes" {
+variable "pack_cache_max_percent" {
   type        = number
-  default     = 107374182400
-  description = "Maximum size of the local pack response cache in bytes."
+  default     = 0.20
+  description = "Fraction of local_cache_max_bytes usable by the local pack response cache."
 }
 
 variable "pack_cache_ttl_secs" {
@@ -384,6 +390,12 @@ variable "bundle_pack_threads" {
     condition     = var.bundle_pack_threads > 0
     error_message = "bundle_pack_threads must be greater than 0."
   }
+}
+
+variable "bundle_max_incremental_bundles" {
+  type        = number
+  default     = 1
+  description = "Maximum incremental bundle entries retained per repo-global bundle manifest."
 }
 
 variable "logs_enabled" {

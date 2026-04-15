@@ -37,6 +37,8 @@ pub struct TeeCapture {
     dir: PathBuf,
     request_file: BufWriter<File>,
     response_file: BufWriter<File>,
+    pack_file: BufWriter<File>,
+    pack_extractor: SidebandPackExtractor,
 }
 
 impl TeeCapture {
@@ -57,19 +59,26 @@ impl TeeCapture {
 
         let request_path = dir.join("request.bin");
         let response_path = dir.join("response.bin");
+        let pack_path = dir.join("pack.bin");
         let request_file = File::create(&request_path)
             .await
             .with_context(|| format!("create request capture {}", request_path.display()))?;
         let response_file = File::create(&response_path)
             .await
             .with_context(|| format!("create response capture {}", response_path.display()))?;
+        let pack_file = File::create(&pack_path)
+            .await
+            .with_context(|| format!("create direct pack capture {}", pack_path.display()))?;
         ensure_shared_file(&request_path, "tee request capture").await?;
         ensure_shared_file(&response_path, "tee response capture").await?;
+        ensure_shared_file(&pack_path, "tee direct pack capture").await?;
 
         Ok(Self {
             dir,
             request_file: BufWriter::with_capacity(CAPTURE_WRITE_BUFFER_BYTES, request_file),
             response_file: BufWriter::with_capacity(CAPTURE_WRITE_BUFFER_BYTES, response_file),
+            pack_file: BufWriter::with_capacity(CAPTURE_WRITE_BUFFER_BYTES, pack_file),
+            pack_extractor: SidebandPackExtractor::default(),
         })
     }
 
@@ -94,6 +103,10 @@ impl TeeCapture {
             .write_all(bytes)
             .await
             .context("write tee response bytes")?;
+        self.pack_extractor
+            .write_sideband_pack_payloads(bytes, &mut self.pack_file)
+            .await
+            .context("write direct tee pack bytes")?;
         Ok(())
     }
 
@@ -133,6 +146,10 @@ impl TeeCapture {
             .flush()
             .await
             .context("flush tee request")?;
+        self.pack_file
+            .flush()
+            .await
+            .context("flush tee direct pack")?;
         let status_path = self.dir.join("status.json");
         let status = serde_json::json!({
             "success": success,
@@ -143,6 +160,58 @@ impl TeeCapture {
             .with_context(|| format!("write tee status {}", status_path.display()))?;
         ensure_shared_file(&status_path, "tee status").await?;
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SidebandPackExtractor {
+    buffer: Vec<u8>,
+    wrote_pack: bool,
+}
+
+impl SidebandPackExtractor {
+    async fn write_sideband_pack_payloads(
+        &mut self,
+        bytes: &[u8],
+        pack_file: &mut BufWriter<File>,
+    ) -> Result<()> {
+        self.buffer.extend_from_slice(bytes);
+
+        loop {
+            if self.buffer.len() < 4 {
+                return Ok(());
+            }
+
+            let Some(len) = std::str::from_utf8(&self.buffer[..4])
+                .ok()
+                .and_then(|text| usize::from_str_radix(text, 16).ok())
+            else {
+                anyhow::bail!("invalid pkt-line header in tee response stream");
+            };
+
+            if len == 0 || len == 1 || len == 2 {
+                self.buffer.drain(..4);
+                continue;
+            }
+            if len < 4 {
+                anyhow::bail!("invalid pkt-line length {len} in tee response stream");
+            }
+            if self.buffer.len() < len {
+                return Ok(());
+            }
+
+            let packet = self.buffer[4..len].to_vec();
+            self.buffer.drain(..len);
+            if let Some((band, rest)) = packet.split_first()
+                && *band == 1
+            {
+                pack_file
+                    .write_all(rest)
+                    .await
+                    .context("write direct tee sideband-1 pack payload")?;
+                self.wrote_pack = true;
+            }
+        }
     }
 }
 
@@ -294,6 +363,16 @@ async fn write_capture_artifact(path: &Path, bytes: &[u8], label: &str) -> Resul
 }
 
 pub async fn extract_pack_from_capture(capture_dir: &Path) -> Result<Option<PathBuf>> {
+    let direct_pack_path = capture_dir.join("pack.bin");
+    if direct_pack_path.is_file()
+        && tokio::fs::metadata(&direct_pack_path)
+            .await
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
+    {
+        return Ok(Some(direct_pack_path));
+    }
+
     let response_path = capture_dir.join("response.bin");
     if !response_path.is_file() {
         return Ok(None);

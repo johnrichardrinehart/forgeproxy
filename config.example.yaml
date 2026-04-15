@@ -38,6 +38,7 @@ clone:
   max_concurrent_tee_captures: 8
   max_concurrent_tee_captures_per_repo_per_instance: 2
   prepare_published_generation_indexes: false
+  generation_coalescing_window_secs: 60
   request_wait_for_local_catch_up_secs: 30
   tee_cleanup_interval_secs: 60
   tee_retention_secs: 900
@@ -54,9 +55,10 @@ bundles:
   # Set explicitly to bound CPU used by bundle and bitmap/MIDX generation.
   pack_threads: 4
   generate_filtered_bundles: true
+  max_incremental_bundles: 1
 pack_cache:
   enabled: true
-  max_bytes: 107374182400
+  max_percent: 0.20
   ttl_secs: 900
   wait_for_inflight_secs: 120
   min_response_bytes: 67108864

@@ -1758,11 +1758,35 @@ async fn publish_repo_mirror_generation(
     owner_repo: &str,
     source: &str,
 ) -> Result<PathBuf> {
+    publish_repo_mirror_generation_inner(state, owner_repo, source, false).await
+}
+
+async fn publish_repo_mirror_generation_inner(
+    state: &crate::AppState,
+    owner_repo: &str,
+    source: &str,
+    allow_coalescing: bool,
+) -> Result<PathBuf> {
     let mirror_path = state.cache_manager.ensure_repo_mirror_dir(owner_repo)?;
     if !state.cache_manager.has_repo_at(&mirror_path) {
         bail!("repo mirror is not available for publication");
     }
 
+    if allow_coalescing
+        && let Some(current_target) = coalescable_generation_target(state, owner_repo)?
+    {
+        crate::metrics::inc_generation_coalescing(&state.metrics, "reused_current");
+        info!(
+            repo = %owner_repo,
+            source,
+            generation = %current_target.display(),
+            window_secs = state.config.clone.generation_coalescing_window_secs,
+            "reusing current published generation inside coalescing window"
+        );
+        return Ok(current_target);
+    }
+
+    crate::metrics::inc_generation_coalescing(&state.metrics, "published_new");
     let staged_repo_path = state.cache_manager.create_staging_repo_path(owner_repo)?;
     let result = async {
         let stage_clone_started_at = Instant::now();
@@ -1889,6 +1913,37 @@ struct DeltaMirrorFetchResult {
     published_repo_path: PathBuf,
 }
 
+fn coalescable_generation_target(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<Option<PathBuf>> {
+    let window_secs = state.config.clone.generation_coalescing_window_secs;
+    if window_secs == 0 {
+        return Ok(None);
+    }
+
+    let Some(current_target) = state.cache_manager.current_repo_target(owner_repo)? else {
+        return Ok(None);
+    };
+    let metadata = match std::fs::metadata(&current_target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat {}", current_target.display()));
+        }
+    };
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+        .unwrap_or_default();
+    if age <= std::time::Duration::from_secs(window_secs) {
+        Ok(Some(current_target))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn fetch_delta_into_repo_mirror(
     state: &crate::AppState,
     owner_repo: &str,
@@ -1994,9 +2049,13 @@ async fn fetch_delta_into_repo_mirror(
                 elapsed_ms = mirror_validation_started_at.elapsed().as_millis(),
                 "finished quick mirror verification before publishing a generation"
             );
-            let _published_generation_path =
-                publish_repo_mirror_generation(state, owner_repo, "delta workspace integration")
-                    .await?;
+            let _published_generation_path = publish_repo_mirror_generation_inner(
+                state,
+                owner_repo,
+                "delta workspace integration",
+                priority != FetchPriority::RequestTime,
+            )
+            .await?;
             let published_repo_path = state.cache_manager.repo_path(owner_repo);
             Ok::<PathBuf, anyhow::Error>(published_repo_path)
         }
@@ -2135,32 +2194,6 @@ where
     }
 }
 
-#[allow(dead_code)]
-pub(crate) async fn load_current_node_bundle_metadata(
-    state: &crate::AppState,
-    owner_repo: &str,
-) -> Result<Option<crate::bundleuri::PublishedBundleMetadata>> {
-    let metadata_key = crate::bundleuri::bundle_metadata_s3_key(
-        &state.config.storage.s3.prefix,
-        owner_repo,
-        &state.bundle_publisher_id,
-    );
-    let Some(metadata_json) = crate::storage::s3::download_text_if_exists(
-        &state.s3_client,
-        &state.metrics,
-        &state.config.storage.s3.bucket,
-        &metadata_key,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    let metadata = serde_json::from_str(&metadata_json)
-        .with_context(|| format!("parse published bundle metadata JSON for {owner_repo}"))?;
-    Ok(Some(metadata))
-}
-
 async fn list_published_bundle_metadata(
     state: &crate::AppState,
     owner_repo: &str,
@@ -2210,32 +2243,240 @@ pub(crate) async fn latest_published_bundle_metadata(
     Ok(metadata.pop())
 }
 
-pub(crate) async fn publish_bundle_artifacts(
+pub(crate) async fn load_repo_bundle_manifest(
     state: &crate::AppState,
     owner_repo: &str,
-    bundle: &crate::bundleuri::generator::BundleResult,
-    filtered_bundle: Option<&crate::bundleuri::generator::BundleResult>,
-) -> Result<crate::bundleuri::PublishedBundleMetadata> {
-    let bundle_s3_key = crate::bundleuri::bundle_object_s3_key(
-        &state.config.storage.s3.prefix,
-        owner_repo,
-        &state.bundle_publisher_id,
-    );
-    crate::storage::s3::upload_bundle(
+) -> Result<Option<crate::bundleuri::BundleManifest>> {
+    let manifest_key =
+        crate::bundleuri::repo_bundle_manifest_s3_key(&state.config.storage.s3.prefix, owner_repo);
+    let Some(manifest_json) = crate::storage::s3::download_text_if_exists(
         &state.s3_client,
         &state.metrics,
         &state.config.storage.s3.bucket,
-        &bundle_s3_key,
-        &bundle.bundle_path,
+        &manifest_key,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let manifest = serde_json::from_str(&manifest_json)
+        .with_context(|| format!("parse repo bundle manifest JSON for {owner_repo}"))?;
+    Ok(Some(manifest))
+}
+
+async fn publish_repo_bundle_manifest(
+    state: &crate::AppState,
+    owner_repo: &str,
+    new_entries: Vec<crate::bundleuri::BundleManifestEntry>,
+) -> Result<(
+    crate::bundleuri::BundleManifest,
+    Vec<crate::bundleuri::BundleManifestEntry>,
+)> {
+    let lock_key = format!("forgeproxy:lock:bundle-manifest:{owner_repo}");
+    let node_id = crate::coordination::node::node_id();
+    let started_at = Instant::now();
+    let lock_lease = loop {
+        if let Some(lease) = crate::coordination::locks::acquire_lock_lease(
+            &state.valkey,
+            &lock_key,
+            &node_id,
+            state.config.bundles.bundle_lock_ttl,
+            Some(&state.metrics),
+        )
+        .await?
+        {
+            break lease;
+        }
+        if started_at.elapsed() > Duration::from_secs(state.config.clone.lock_wait_timeout) {
+            anyhow::bail!("timed out waiting for repo bundle manifest lock for {owner_repo}");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+
+    let result = publish_repo_bundle_manifest_locked(state, owner_repo, new_entries).await;
+    let release_result = crate::coordination::locks::release_lock_lease(
+        &state.valkey,
+        &lock_lease,
+        true,
+        Some(&state.metrics),
+    )
+    .await;
+    if let Err(error) = release_result {
+        warn!(
+            repo = %owner_repo,
+            error = %error,
+            "failed to release repo bundle manifest lock"
+        );
+    }
+
+    result
+}
+
+async fn publish_repo_bundle_manifest_locked(
+    state: &crate::AppState,
+    owner_repo: &str,
+    new_entries: Vec<crate::bundleuri::BundleManifestEntry>,
+) -> Result<(
+    crate::bundleuri::BundleManifest,
+    Vec<crate::bundleuri::BundleManifestEntry>,
+)> {
+    let mut manifest = load_repo_bundle_manifest(state, owner_repo)
+        .await?
+        .unwrap_or_else(|| crate::bundleuri::BundleManifest {
+            version: 1,
+            owner_repo: owner_repo.to_string(),
+            updated_at_unix_secs: 0,
+            entries: Vec::new(),
+        });
+
+    for entry in new_entries {
+        manifest.entries.retain(|existing| {
+            if entry.bundle_kind == crate::bundleuri::BundleKind::Base
+                && existing.bundle_kind == crate::bundleuri::BundleKind::Base
+            {
+                return false;
+            }
+            if entry.bundle_kind == crate::bundleuri::BundleKind::Filtered
+                && existing.bundle_kind == crate::bundleuri::BundleKind::Filtered
+                && existing.filter == entry.filter
+            {
+                return false;
+            }
+            existing.id != entry.id && existing.bundle_s3_key != entry.bundle_s3_key
+        });
+        manifest.entries.push(entry);
+    }
+    let pruned_entries = prune_incremental_manifest_entries(
+        &mut manifest.entries,
+        state.config.bundles.max_incremental_bundles,
+    );
+    manifest.entries.sort_by_key(|entry| entry.creation_token);
+    manifest.updated_at_unix_secs = chrono::Utc::now().timestamp();
+
+    let manifest_key =
+        crate::bundleuri::repo_bundle_manifest_s3_key(&state.config.storage.s3.prefix, owner_repo);
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).context("serialize repo bundle manifest")?;
+    crate::storage::s3::upload_text(
+        &state.s3_client,
+        &state.config.storage.s3.bucket,
+        &manifest_key,
+        &manifest_json,
     )
     .await
-    .with_context(|| format!("failed to upload published bundle for {owner_repo}"))?;
+    .with_context(|| format!("failed to upload repo bundle manifest for {owner_repo}"))?;
 
-    let filtered_bundle_s3_key = if let Some(filtered_bundle) = filtered_bundle {
-        let filtered_s3_key = crate::bundleuri::filtered_bundle_object_s3_key(
+    Ok((manifest, pruned_entries))
+}
+
+fn prune_incremental_manifest_entries(
+    entries: &mut Vec<crate::bundleuri::BundleManifestEntry>,
+    max_incrementals: usize,
+) -> Vec<crate::bundleuri::BundleManifestEntry> {
+    let mut incremental_indexes = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.bundle_kind == crate::bundleuri::BundleKind::Incremental)
+        .map(|(index, entry)| (index, entry.creation_token))
+        .collect::<Vec<_>>();
+    if incremental_indexes.len() <= max_incrementals {
+        return Vec::new();
+    }
+
+    incremental_indexes.sort_by_key(|(_, creation_token)| *creation_token);
+    let remove_count = incremental_indexes.len() - max_incrementals;
+    let mut remove_indexes = incremental_indexes
+        .into_iter()
+        .take(remove_count)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    remove_indexes.sort_unstable_by(|a, b| b.cmp(a));
+    let mut removed_entries = Vec::with_capacity(remove_indexes.len());
+    for index in remove_indexes {
+        removed_entries.push(entries.remove(index));
+    }
+    removed_entries
+}
+
+pub(crate) async fn publish_bundle_artifacts(
+    state: &crate::AppState,
+    owner_repo: &str,
+    repo_path: &Path,
+    bundle: &crate::bundleuri::generator::BundleResult,
+    filtered_bundle: Option<&crate::bundleuri::generator::BundleResult>,
+) -> Result<crate::bundleuri::PublishedBundleMetadata> {
+    let now = chrono::Utc::now().timestamp();
+    let current_refs = crate::bundleuri::generator::get_refs(repo_path).await?;
+    let existing_manifest = load_repo_bundle_manifest(state, owner_repo).await?;
+    let existing_base = existing_manifest.as_ref().and_then(|manifest| {
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.bundle_kind == crate::bundleuri::BundleKind::Base)
+            .max_by_key(|entry| entry.creation_token)
+    });
+    let mut manifest_entries = Vec::new();
+    let current_base_s3_key = if let Some(base_entry) = existing_base {
+        let incremental_s3_key = crate::bundleuri::repo_bundle_object_s3_key(
             &state.config.storage.s3.prefix,
             owner_repo,
-            &state.bundle_publisher_id,
+            bundle.creation_token,
+            crate::bundleuri::BundleKind::Incremental,
+        );
+        crate::storage::s3::upload_bundle(
+            &state.s3_client,
+            &state.metrics,
+            &state.config.storage.s3.bucket,
+            &incremental_s3_key,
+            &bundle.bundle_path,
+        )
+        .await
+        .with_context(|| format!("failed to upload incremental bundle for {owner_repo}"))?;
+        manifest_entries.push(crate::bundleuri::BundleManifestEntry {
+            id: format!("incremental-{:020}", bundle.creation_token),
+            bundle_kind: crate::bundleuri::BundleKind::Incremental,
+            creation_token: bundle.creation_token,
+            bundle_s3_key: incremental_s3_key,
+            filter: None,
+            refs: current_refs.clone(),
+            updated_at_unix_secs: now,
+        });
+        base_entry.bundle_s3_key.clone()
+    } else {
+        let base_s3_key = crate::bundleuri::repo_bundle_object_s3_key(
+            &state.config.storage.s3.prefix,
+            owner_repo,
+            bundle.creation_token,
+            crate::bundleuri::BundleKind::Base,
+        );
+        crate::storage::s3::upload_bundle(
+            &state.s3_client,
+            &state.metrics,
+            &state.config.storage.s3.bucket,
+            &base_s3_key,
+            &bundle.bundle_path,
+        )
+        .await
+        .with_context(|| format!("failed to upload base bundle for {owner_repo}"))?;
+        manifest_entries.push(crate::bundleuri::BundleManifestEntry {
+            id: format!("base-{:020}", bundle.creation_token),
+            bundle_kind: crate::bundleuri::BundleKind::Base,
+            creation_token: bundle.creation_token,
+            bundle_s3_key: base_s3_key.clone(),
+            filter: None,
+            refs: current_refs.clone(),
+            updated_at_unix_secs: now,
+        });
+        base_s3_key
+    };
+
+    let filtered_bundle_s3_key = if let Some(filtered_bundle) = filtered_bundle {
+        let filtered_s3_key = crate::bundleuri::repo_bundle_object_s3_key(
+            &state.config.storage.s3.prefix,
+            owner_repo,
+            filtered_bundle.creation_token,
+            crate::bundleuri::BundleKind::Filtered,
         );
         crate::storage::s3::upload_bundle(
             &state.s3_client,
@@ -2246,17 +2487,57 @@ pub(crate) async fn publish_bundle_artifacts(
         )
         .await
         .with_context(|| format!("failed to upload filtered bundle for {owner_repo}"))?;
+        manifest_entries.push(crate::bundleuri::BundleManifestEntry {
+            id: format!("filtered-blob-none-{:020}", filtered_bundle.creation_token),
+            bundle_kind: crate::bundleuri::BundleKind::Filtered,
+            creation_token: filtered_bundle.creation_token,
+            bundle_s3_key: filtered_s3_key.clone(),
+            filter: Some("blob:none".to_string()),
+            refs: current_refs.clone(),
+            updated_at_unix_secs: now,
+        });
         Some(filtered_s3_key)
     } else {
         None
     };
 
+    let (manifest, pruned_entries) =
+        publish_repo_bundle_manifest(state, owner_repo, manifest_entries).await?;
+    for pruned_entry in pruned_entries {
+        if let Err(error) = crate::storage::s3::delete_object_if_exists(
+            &state.s3_client,
+            &state.config.storage.s3.bucket,
+            &pruned_entry.bundle_s3_key,
+        )
+        .await
+        {
+            warn!(
+                repo = %owner_repo,
+                key = %pruned_entry.bundle_s3_key,
+                error = %error,
+                "failed to delete pruned bundle object"
+            );
+        }
+    }
+    let full_entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.filter.is_none())
+        .count();
+    let filtered_entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.filter.is_some())
+        .count();
+    crate::metrics::set_bundle_manifest_entries(&state.metrics, "full", full_entries);
+    crate::metrics::set_bundle_manifest_entries(&state.metrics, "filtered", filtered_entries);
+
     let metadata = crate::bundleuri::PublishedBundleMetadata {
         publisher_id: state.bundle_publisher_id.clone(),
         creation_token: bundle.creation_token,
-        bundle_s3_key: bundle_s3_key.clone(),
+        bundle_s3_key: current_base_s3_key,
         filtered_bundle_s3_key,
-        updated_at_unix_secs: chrono::Utc::now().timestamp(),
+        updated_at_unix_secs: now,
         service_instance_id: state
             .runtime_resource_attributes
             .service_instance_id
@@ -2285,7 +2566,7 @@ pub(crate) async fn publish_bundle_artifacts(
         &repo_key,
         [
             ("bundle_list_key", metadata_key.as_str()),
-            ("latest_bundle_s3_key", bundle_s3_key.as_str()),
+            ("latest_bundle_s3_key", metadata.bundle_s3_key.as_str()),
             ("latest_bundle_token", &bundle.creation_token.to_string()),
         ],
     )
@@ -2801,7 +3082,7 @@ async fn publish_bootstrap_bundle(
         .await
     {
         Ok(bundle) => {
-            publish_bundle_artifacts(state, owner_repo, &bundle, None).await?;
+            publish_bundle_artifacts(state, owner_repo, published_repo_path, &bundle, None).await?;
         }
         Err(error) => {
             warn!(

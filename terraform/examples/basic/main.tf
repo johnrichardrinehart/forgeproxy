@@ -59,10 +59,11 @@ module "forgeproxy" {
 
   local_cache_max_bytes                      = var.local_cache_max_bytes
   eviction_policy                            = var.eviction_policy
+  generation_coalescing_window_secs          = var.generation_coalescing_window_secs
   max_concurrent_local_upload_packs          = var.max_concurrent_local_upload_packs
   max_concurrent_local_upload_packs_per_repo = var.max_concurrent_local_upload_packs_per_repo
   pack_cache_enabled                         = var.pack_cache_enabled
-  pack_cache_max_bytes                       = var.pack_cache_max_bytes
+  pack_cache_max_percent                     = var.pack_cache_max_percent
   pack_cache_ttl_secs                        = var.pack_cache_ttl_secs
   pack_cache_wait_for_inflight_secs          = var.pack_cache_wait_for_inflight_secs
   pack_cache_min_response_bytes              = var.pack_cache_min_response_bytes
@@ -75,6 +76,7 @@ module "forgeproxy" {
   metrics_refresh_interval_secs        = var.metrics_refresh_interval_secs
   prepare_published_generation_indexes = var.prepare_published_generation_indexes
   bundle_pack_threads                  = var.bundle_pack_threads
+  bundle_max_incremental_bundles       = var.bundle_max_incremental_bundles
   logs_enabled                         = var.logs_enabled
   traces_enabled                       = var.traces_enabled
   traces_sample_ratio                  = var.traces_sample_ratio

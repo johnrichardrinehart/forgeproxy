@@ -504,13 +504,39 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
             let _new_interval =
                 update_fetch_schedule(state, owner_repo, result.bytes_received).await?;
 
-            // 8. Generate a full bundle for this node's published generation.
-            let bundle_result = crate::bundleuri::generator::generate_full_bundle(
-                state,
-                &staged_repo_path,
-                owner_repo,
-            )
-            .await;
+            // 8. Generate a base bundle once, then incremental bundles against
+            // the repo-global base manifest entry.
+            let existing_manifest =
+                crate::coordination::registry::load_repo_bundle_manifest(state, owner_repo).await?;
+            let existing_base = existing_manifest.as_ref().and_then(|manifest| {
+                manifest
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.bundle_kind == crate::bundleuri::BundleKind::Base)
+                    .max_by_key(|entry| entry.creation_token)
+            });
+            let bundle_result = if let Some(base_entry) = existing_base
+                && !base_entry.refs.is_empty()
+            {
+                crate::bundleuri::generator::generate_incremental_bundle(
+                    state,
+                    &staged_repo_path,
+                    owner_repo,
+                    &base_entry.refs,
+                )
+                .await
+                .map(|maybe_bundle| {
+                    maybe_bundle.ok_or_else(|| anyhow::anyhow!("no incremental bundle changes"))
+                })
+                .and_then(|result| result)
+            } else {
+                crate::bundleuri::generator::generate_full_bundle(
+                    state,
+                    &staged_repo_path,
+                    owner_repo,
+                )
+                .await
+            };
 
             match bundle_result {
                 Ok(bundle) => {
@@ -551,6 +577,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
                     if let Err(e) = crate::coordination::registry::publish_bundle_artifacts(
                         state,
                         owner_repo,
+                        &staged_repo_path,
                         &bundle,
                         filtered_bundle.as_ref(),
                     )

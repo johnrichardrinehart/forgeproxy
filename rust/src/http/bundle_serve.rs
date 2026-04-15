@@ -2,9 +2,9 @@
 //!
 //! When a Git client sees the `bundle-uri` capability in the protocol v2
 //! info/refs response it will fetch the advertised bundle-list URL.  This
-//! module generates that document on-the-fly from the current node's published
-//! bundle metadata in S3, replacing the raw S3 keys with short-lived
-//! pre-signed download URLs.
+//! module generates that document on-the-fly from repo-global bundle manifest
+//! metadata in S3, replacing the raw S3 keys with short-lived pre-signed
+//! download URLs.
 //!
 //! # Bundle-list format
 //!
@@ -117,40 +117,46 @@ pub async fn bundle_list_body(
     state: &AppState,
     owner_repo: &str,
 ) -> anyhow::Result<Option<String>> {
-    let Some(metadata) =
-        crate::coordination::registry::latest_published_bundle_metadata(state, owner_repo).await?
+    let Some(manifest) =
+        crate::coordination::registry::load_repo_bundle_manifest(state, owner_repo).await?
     else {
         return Ok(None);
     };
+    if manifest.entries.is_empty() {
+        return Ok(None);
+    }
 
     let presigned_ttl_secs = 60u64; // short-lived; clients fetch immediately
-    let presigned_url = crate::storage::s3::generate_presigned_url(
-        &state.s3_client,
-        &state.config.storage.s3.bucket,
-        &metadata.bundle_s3_key,
-        presigned_ttl_secs,
-    )
-    .await
-    .with_context(|| format!("failed to generate presigned URL for {owner_repo}"))?;
-    crate::metrics::inc_bundle_presign(&state.metrics, "success");
-
     let mut body = String::with_capacity(512);
     writeln!(body, "[bundle]")?;
     writeln!(body, "\tversion = 1")?;
     writeln!(body, "\tmode = all")?;
     writeln!(body, "\theuristic = creationToken")?;
     writeln!(body)?;
-    writeln!(body, "[bundle \"{}\"]", metadata.publisher_id)?;
-    writeln!(body, "\turi = {presigned_url}")?;
-    writeln!(body, "\tcreationToken = {}", metadata.creation_token)?;
+    for entry in &manifest.entries {
+        let presigned_url = crate::storage::s3::generate_presigned_url(
+            &state.s3_client,
+            &state.config.storage.s3.bucket,
+            &entry.bundle_s3_key,
+            presigned_ttl_secs,
+        )
+        .await
+        .with_context(|| format!("failed to generate presigned URL for {owner_repo}"))?;
+        crate::metrics::inc_bundle_presign(&state.metrics, "success");
 
-    crate::metrics::set_bundle_manifest_entries(&state.metrics, "full", 1);
+        writeln!(body)?;
+        writeln!(body, "[bundle \"{}\"]", entry.id)?;
+        writeln!(body, "\turi = {presigned_url}")?;
+        writeln!(body, "\tcreationToken = {}", entry.creation_token)?;
+        if let Some(filter) = entry.filter.as_deref() {
+            writeln!(body, "\tfilter = {filter}")?;
+        }
+    }
+
+    record_manifest_metrics(state, &manifest);
     info!(
         repo = %owner_repo,
-        publisher_id = %metadata.publisher_id,
-        creation_token = metadata.creation_token,
-        bundle_s3_key = %metadata.bundle_s3_key,
-        has_filtered_bundle = metadata.filtered_bundle_s3_key.is_some(),
+        entries = manifest.entries.len(),
         "built bundle-list body"
     );
 
@@ -161,36 +167,59 @@ pub async fn bundle_uri_command_response(
     state: &AppState,
     owner_repo: &str,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let Some(metadata) =
-        crate::coordination::registry::latest_published_bundle_metadata(state, owner_repo).await?
+    let Some(manifest) =
+        crate::coordination::registry::load_repo_bundle_manifest(state, owner_repo).await?
     else {
         return Ok(None);
     };
-
-    let presigned_url = crate::storage::s3::generate_presigned_url(
-        &state.s3_client,
-        &state.config.storage.s3.bucket,
-        &metadata.bundle_s3_key,
-        60,
-    )
-    .await
-    .with_context(|| format!("failed to generate presigned URL for {owner_repo}"))?;
-    crate::metrics::inc_bundle_presign(&state.metrics, "success");
+    if manifest.entries.is_empty() {
+        return Ok(None);
+    }
 
     let mut body = Vec::new();
-    for line in [
+    let mut lines = vec![
         "bundle.version=1\n".to_string(),
         "bundle.mode=all\n".to_string(),
         "bundle.heuristic=creationToken\n".to_string(),
-        format!("bundle.{}.uri={presigned_url}\n", metadata.publisher_id),
-        format!(
+    ];
+    for entry in &manifest.entries {
+        let presigned_url = crate::storage::s3::generate_presigned_url(
+            &state.s3_client,
+            &state.config.storage.s3.bucket,
+            &entry.bundle_s3_key,
+            60,
+        )
+        .await
+        .with_context(|| format!("failed to generate presigned URL for {owner_repo}"))?;
+        crate::metrics::inc_bundle_presign(&state.metrics, "success");
+        lines.push(format!("bundle.{}.uri={presigned_url}\n", entry.id));
+        lines.push(format!(
             "bundle.{}.creationToken={}\n",
-            metadata.publisher_id, metadata.creation_token
-        ),
-    ] {
+            entry.id, entry.creation_token
+        ));
+        if let Some(filter) = entry.filter.as_deref() {
+            lines.push(format!("bundle.{}.filter={filter}\n", entry.id));
+        }
+    }
+    for line in lines {
         body.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(line.as_bytes()));
     }
     body.extend_from_slice(b"0000");
-    crate::metrics::set_bundle_manifest_entries(&state.metrics, "full", 1);
+    record_manifest_metrics(state, &manifest);
     Ok(Some(body))
+}
+
+fn record_manifest_metrics(state: &AppState, manifest: &crate::bundleuri::BundleManifest) {
+    let full_entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.filter.is_none())
+        .count();
+    let filtered_entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.filter.is_some())
+        .count();
+    crate::metrics::set_bundle_manifest_entries(&state.metrics, "full", full_entries);
+    crate::metrics::set_bundle_manifest_entries(&state.metrics, "filtered", filtered_entries);
 }
