@@ -48,6 +48,9 @@ fetch_schedule:
 bundles:
   min_clone_count_for_bundles: 2
   bundle_lock_ttl: 300
+  # Optional. Defaults to available parallelism divided by max_concurrent_generations.
+  # Set explicitly to bound CPU used by bundle and bitmap/MIDX generation.
+  pack_threads: 4
   generate_filtered_bundles: true
 storage:
   local:

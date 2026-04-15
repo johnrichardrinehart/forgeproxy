@@ -94,6 +94,7 @@ org_creds = [
 metrics_enabled = true
 metrics_refresh_interval_secs = 60
 prepare_published_generation_indexes = false
+bundle_pack_threads = 4
 logs_enabled = true
 traces_enabled = false
 traces_sample_ratio = 1.0

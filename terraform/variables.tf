@@ -408,7 +408,18 @@ variable "log_level" {
 variable "prepare_published_generation_indexes" {
   type        = bool
   default     = false
-  description = "Repack staged published generations with bitmap and multi-pack-index support before exposing them to clone readers."
+  description = "Prepare published generation bitmap and multi-pack-index support in the background after exposing them to clone readers."
+}
+
+variable "bundle_pack_threads" {
+  type        = number
+  default     = 4
+  description = "Git pack.threads value used for bundle generation and published-generation bitmap/MIDX preparation."
+
+  validation {
+    condition     = var.bundle_pack_threads > 0
+    error_message = "bundle_pack_threads must be greater than 0."
+  }
 }
 
 variable "org_creds" {

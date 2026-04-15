@@ -50,6 +50,9 @@ storage:
     use_fips: ${s3_use_fips}
     presigned_url_ttl: ${s3_presigned_url_ttl}
 
+bundles:
+  pack_threads: ${bundle_pack_threads}
+
 observability:
   metrics:
     prometheus:

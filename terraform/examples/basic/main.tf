@@ -67,6 +67,7 @@ module "forgeproxy" {
   metrics_enabled                      = var.metrics_enabled
   metrics_refresh_interval_secs        = var.metrics_refresh_interval_secs
   prepare_published_generation_indexes = var.prepare_published_generation_indexes
+  bundle_pack_threads                  = var.bundle_pack_threads
   logs_enabled                         = var.logs_enabled
   traces_enabled                       = var.traces_enabled
   traces_sample_ratio                  = var.traces_sample_ratio

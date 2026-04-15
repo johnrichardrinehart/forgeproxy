@@ -34,6 +34,7 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     local_cache_max_bytes                = var.local_cache_max_bytes
     eviction_policy                      = var.eviction_policy
     prepare_published_generation_indexes = var.prepare_published_generation_indexes
+    bundle_pack_threads                  = var.bundle_pack_threads
     metrics_enabled                      = var.metrics_enabled
     metrics_refresh_interval_secs        = var.metrics_refresh_interval_secs
     logs_enabled                         = var.logs_enabled
