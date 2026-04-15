@@ -30,6 +30,8 @@ pub struct FetchResult {
     pub bytes_received: u64,
 }
 
+const FETCH_REFSPECS_STDIN_THRESHOLD: usize = 100;
+
 // ---------------------------------------------------------------------------
 // Clone
 // ---------------------------------------------------------------------------
@@ -315,14 +317,21 @@ pub async fn git_fetch_refspecs(
         bail!("git fetch requires at least one refspec");
     }
 
+    let use_stdin = should_feed_fetch_refspecs_on_stdin(refspecs);
+
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo_path).arg("fetch").arg("--force");
     if prune {
         cmd.arg("--prune");
     }
+    if use_stdin {
+        cmd.arg("--stdin");
+    }
     cmd.arg(remote_url);
-    for refspec in refspecs {
-        cmd.arg(refspec);
+    if !use_stdin {
+        for refspec in refspecs {
+            cmd.arg(refspec);
+        }
     }
 
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -330,7 +339,11 @@ pub async fn git_fetch_refspecs(
         cmd.env(k, v);
     }
 
-    cmd.stdin(Stdio::null());
+    cmd.stdin(if use_stdin {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
@@ -339,6 +352,26 @@ pub async fn git_fetch_refspecs(
     let mut child = cmd.spawn().context("failed to spawn git fetch")?;
     let pid = child.id().unwrap_or_default();
     let started_at = std::time::Instant::now();
+    let stdin_writer = if use_stdin {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to capture git fetch stdin")?;
+        let input = encode_fetch_refspecs_stdin(refspecs);
+        Some(tokio::spawn(async move {
+            stdin
+                .write_all(&input)
+                .await
+                .context("failed to write refspecs to git fetch stdin")?;
+            stdin
+                .shutdown()
+                .await
+                .context("failed to close git fetch stdin")?;
+            Ok::<(), anyhow::Error>(())
+        }))
+    } else {
+        None
+    };
     let stderr = child
         .stderr
         .take()
@@ -394,12 +427,25 @@ pub async fn git_fetch_refspecs(
         }
     };
 
+    let stdin_writer_result = if let Some(stdin_writer) = stdin_writer {
+        Some(
+            stdin_writer
+                .await
+                .context("git fetch stdin writer task join failed"),
+        )
+    } else {
+        None
+    };
+
     if !status.success() {
         bail!(
             "git fetch failed (status {}): {}",
             status,
             stderr_buf.trim()
         );
+    }
+    if let Some(result) = stdin_writer_result {
+        result??;
     }
 
     let refs_updated = count_updated_refs(&stderr_buf);
@@ -417,6 +463,19 @@ pub async fn git_fetch_refspecs(
         refs_updated,
         bytes_received,
     })
+}
+
+fn should_feed_fetch_refspecs_on_stdin(refspecs: &[String]) -> bool {
+    refspecs.len() > FETCH_REFSPECS_STDIN_THRESHOLD
+}
+
+fn encode_fetch_refspecs_stdin(refspecs: &[String]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(refspecs.iter().map(|refspec| refspec.len() + 1).sum());
+    for refspec in refspecs {
+        input.extend_from_slice(refspec.as_bytes());
+        input.push(b'\n');
+    }
+    input
 }
 
 pub fn redact_url_secret(url: &str, unmask_chars: usize) -> String {
@@ -1025,6 +1084,28 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
     }
 
     #[test]
+    fn large_fetch_refspec_lists_are_sent_on_stdin() {
+        let small = vec!["+refs/heads/main:refs/heads/main".to_string(); 100];
+        let large = vec!["+refs/heads/main:refs/heads/main".to_string(); 101];
+
+        assert!(!should_feed_fetch_refspecs_on_stdin(&small));
+        assert!(should_feed_fetch_refspecs_on_stdin(&large));
+    }
+
+    #[test]
+    fn fetch_refspec_stdin_encoding_is_line_delimited() {
+        let input = encode_fetch_refspecs_stdin(&[
+            "+refs/heads/main:refs/heads/main".to_string(),
+            "+refs/heads/dev:refs/heads/dev".to_string(),
+        ]);
+
+        assert_eq!(
+            input,
+            b"+refs/heads/main:refs/heads/main\n+refs/heads/dev:refs/heads/dev\n"
+        );
+    }
+
+    #[test]
     fn redact_url_secret_masks_password_with_visible_edges() {
         let redacted = redact_url_secret(
             "https://x-access-token:ghp_abcdefghijklmnopqrstuvwxyz@ghe.example.com/org/repo.git",
@@ -1137,6 +1218,102 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
         .unwrap();
 
         assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_fetch_refspecs_handles_large_selected_fetch_via_stdin() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let remote_path = tempdir.path().join("remote");
+        let cache_path = tempdir.path().join("cache.git");
+
+        assert_git_success(StdCommand::new("git").arg("init").arg(&remote_path));
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&remote_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&remote_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User"),
+        );
+
+        std::fs::write(remote_path.join("file.txt"), "hello\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&remote_path)
+                .arg("add")
+                .arg("file.txt"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&remote_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("initial"),
+        );
+
+        let head = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&remote_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        for index in 0..=FETCH_REFSPECS_STDIN_THRESHOLD {
+            assert_git_success(
+                StdCommand::new("git")
+                    .arg("-C")
+                    .arg(&remote_path)
+                    .arg("update-ref")
+                    .arg(format!("refs/heads/branch-{index:03}"))
+                    .arg(&head),
+            );
+        }
+
+        git_init_bare(&cache_path).await.unwrap();
+
+        let refspecs = (0..=FETCH_REFSPECS_STDIN_THRESHOLD)
+            .map(|index| format!("+refs/heads/branch-{index:03}:refs/heads/branch-{index:03}"))
+            .collect::<Vec<_>>();
+
+        timeout(
+            Duration::from_secs(10),
+            git_fetch_refspecs(
+                &cache_path,
+                remote_path.to_str().unwrap(),
+                &[],
+                &refspecs,
+                false,
+            ),
+        )
+        .await
+        .expect("git_fetch_refspecs timed out")
+        .unwrap();
+
+        let refs = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&cache_path)
+                .arg("for-each-ref")
+                .arg("--format=%(refname)")
+                .arg("refs/heads"),
+        );
+
+        assert_eq!(refs.lines().count(), refspecs.len());
+        assert!(refs.contains("refs/heads/branch-000"));
+        assert!(refs.contains("refs/heads/branch-100"));
     }
 
     #[tokio::test]
@@ -1259,5 +1436,28 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
                 .unwrap()
                 .success()
         );
+    }
+
+    fn assert_git_success(command: &mut StdCommand) {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout(command: &mut StdCommand) -> String {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 }
