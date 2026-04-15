@@ -179,44 +179,29 @@ pub async fn git_clone_bare_shared_local(source: &Path, dest: &Path) -> Result<(
     Ok(())
 }
 
-/// Repack a bare generation so local `git upload-pack` can use reachability
-/// bitmaps through the multi-pack-index path.
+/// Prepare a bare generation so local `git upload-pack` can use object lookup
+/// and reachability bitmaps through the multi-pack-index path.
+///
+/// Avoid a full `git repack -a -d`, which rewrites all pack data on every
+/// published generation. MIDX writes keep existing packs in place and only
+/// rebuild the index/bitmap metadata that upload-pack needs for fast serving.
 #[instrument(fields(repo = %repo_path.display(), pack_threads))]
 pub async fn git_prepare_published_generation_indexes(
     repo_path: &Path,
     pack_threads: usize,
 ) -> Result<()> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_path)
-        .arg("-c")
-        .arg(format!("pack.threads={pack_threads}"))
-        .arg("repack")
-        .arg("-a")
-        .arg("-d")
-        .arg("--write-bitmap-index")
-        .arg("--write-midx");
-
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    debug!("spawning git repack for published generation indexes");
+    if !repo_has_pack_files(repo_path)? {
+        info!(
+            repo = %repo_path.display(),
+            "skipping published generation bitmap/MIDX indexes because the repo has no pack files"
+        );
+        return Ok(());
+    }
 
     let started_at = std::time::Instant::now();
-    let output = cmd
-        .output()
-        .await
-        .context("failed to spawn git repack for published generation indexes")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "git repack for published generation indexes failed (status {}): {}",
-            output.status,
-            stderr.trim(),
-        );
-    }
+    run_git_multi_pack_index_write(repo_path, false).await?;
+    run_git_multi_pack_index_write(repo_path, true).await?;
 
     info!(
         repo = %repo_path.display(),
@@ -224,6 +209,62 @@ pub async fn git_prepare_published_generation_indexes(
         elapsed_ms = started_at.elapsed().as_millis(),
         "prepared published generation bitmap/MIDX indexes"
     );
+    Ok(())
+}
+
+fn repo_has_pack_files(repo_path: &Path) -> Result<bool> {
+    let pack_dir = repo_path.join("objects").join("pack");
+    if !pack_dir.is_dir() {
+        return Ok(false);
+    }
+
+    for entry in std::fs::read_dir(&pack_dir)
+        .with_context(|| format!("failed to read pack directory {}", pack_dir.display()))?
+    {
+        let entry = entry?;
+        if entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "pack")
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+async fn run_git_multi_pack_index_write(repo_path: &Path, bitmap: bool) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("multi-pack-index")
+        .arg("write");
+    if bitmap {
+        cmd.arg("--bitmap");
+    }
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!(bitmap, "spawning git multi-pack-index write");
+
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn git multi-pack-index write bitmap={bitmap}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git multi-pack-index write bitmap={} failed (status {}): {}",
+            bitmap,
+            output.status,
+            stderr.trim(),
+        );
+    }
+
     Ok(())
 }
 
@@ -1160,6 +1201,16 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
                 .arg("--bare")
                 .arg(&work_path)
                 .arg(&bare_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&bare_path)
+                .arg("repack")
+                .arg("-d")
                 .status()
                 .unwrap()
                 .success()
