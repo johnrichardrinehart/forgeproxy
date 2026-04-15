@@ -429,6 +429,17 @@ pub struct CloneConfig {
     /// Semaphore limit for concurrent fetches against upstream.
     #[serde(default = "default_max_concurrent_upstream_fetches")]
     pub max_concurrent_upstream_fetches: usize,
+    /// Number of upstream fetch slots reserved for request-time local
+    /// catch-up. Lower-priority refreshes and tee convergence can only use the
+    /// remaining fetch capacity.
+    #[serde(default = "default_reserved_request_time_upstream_fetches")]
+    pub reserved_request_time_upstream_fetches: usize,
+    /// Host-wide limit for simultaneous tee capture/import work.
+    #[serde(default = "default_max_concurrent_tee_captures")]
+    pub max_concurrent_tee_captures: usize,
+    /// Per-repo per-host limit for simultaneous tee capture/import work.
+    #[serde(default = "default_max_concurrent_tee_captures_per_repo_per_instance")]
+    pub max_concurrent_tee_captures_per_repo_per_instance: usize,
     /// Maximum concurrent upstream hydrations for a single repo across all
     /// forgeproxy instances.
     #[serde(default = "default_max_concurrent_upstream_clones_per_repo_across_instances")]
@@ -469,6 +480,11 @@ impl Default for CloneConfig {
             lock_wait_timeout: default_lock_wait_timeout(),
             max_concurrent_upstream_clones: default_max_concurrent_upstream_clones(),
             max_concurrent_upstream_fetches: default_max_concurrent_upstream_fetches(),
+            reserved_request_time_upstream_fetches: default_reserved_request_time_upstream_fetches(
+            ),
+            max_concurrent_tee_captures: default_max_concurrent_tee_captures(),
+            max_concurrent_tee_captures_per_repo_per_instance:
+                default_max_concurrent_tee_captures_per_repo_per_instance(),
             max_concurrent_upstream_clones_per_repo_across_instances:
                 default_max_concurrent_upstream_clones_per_repo_across_instances(),
             max_concurrent_upstream_clones_per_repo_per_instance:
@@ -521,6 +537,18 @@ fn default_max_concurrent_upstream_clones() -> usize {
 
 fn default_max_concurrent_upstream_fetches() -> usize {
     8
+}
+
+fn default_reserved_request_time_upstream_fetches() -> usize {
+    2
+}
+
+fn default_max_concurrent_tee_captures() -> usize {
+    8
+}
+
+fn default_max_concurrent_tee_captures_per_repo_per_instance() -> usize {
+    2
 }
 
 fn default_max_concurrent_upstream_clones_per_repo_across_instances() -> usize {

@@ -113,6 +113,12 @@ pub struct AppState {
     pub clone_semaphore: Arc<Semaphore>,
     /// Semaphore limiting concurrent fetches against upstream.
     pub fetch_semaphore: Arc<Semaphore>,
+    /// Semaphore limiting lower-priority upstream fetches so request-time
+    /// catch-up keeps reserved capacity.
+    pub low_priority_fetch_semaphore: Arc<Semaphore>,
+    pub low_priority_fetch_limit: usize,
+    /// Semaphore limiting simultaneous tee capture/import work on this host.
+    pub tee_capture_semaphore: Arc<Semaphore>,
     /// Semaphore limiting concurrent CPU-heavy bundle-generation subprocesses.
     pub bundle_generation_semaphore: Arc<Semaphore>,
     /// Resolved maximum number of repos to process concurrently during the
@@ -127,6 +133,12 @@ pub struct AppState {
     /// generation mutation work while allowing clone/fetch hydration to run
     /// concurrently up to the configured per-repo limits.
     pub repo_publish_mutexes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
+    /// Per-repo local mutex cache coalescing request-time catch-up fetches.
+    /// Waiters still re-check their own wants before serving from local disk.
+    pub repo_catch_up_mutexes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
+    /// Per-repo local semaphore cache limiting tee capture/import work for the
+    /// same repository within this instance.
+    pub repo_tee_capture_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
     /// Per-repo refcounts for published reader generations currently in use by
     /// local clone/fetch handlers on this node.
     pub published_generation_leases: Arc<
@@ -1085,6 +1097,11 @@ async fn build_app_state(
         .or_else(|| runtime_resource_attributes.service_machine_id.clone())
         .unwrap_or_else(|| node_id.clone());
 
+    let low_priority_fetch_limit = config
+        .clone
+        .max_concurrent_upstream_fetches
+        .saturating_sub(config.clone.reserved_request_time_upstream_fetches);
+
     let state = AppState {
         config: Arc::clone(&config),
         valkey,
@@ -1099,6 +1116,9 @@ async fn build_app_state(
         rate_limit,
         clone_semaphore: Arc::new(Semaphore::new(clone_concurrency_limit)),
         fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
+        low_priority_fetch_semaphore: Arc::new(Semaphore::new(low_priority_fetch_limit)),
+        low_priority_fetch_limit,
+        tee_capture_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_tee_captures)),
         bundle_generation_semaphore: Arc::new(Semaphore::new(
             bundle_execution_policy.max_concurrent_generations,
         )),
@@ -1106,6 +1126,8 @@ async fn build_app_state(
         bundle_pack_threads: bundle_execution_policy.pack_threads,
         repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_publish_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        repo_catch_up_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        repo_tee_capture_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         published_generation_leases: Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

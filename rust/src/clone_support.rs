@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::AppState;
 use crate::coordination::registry::{
-    CloneHydrationPermits, LocalServeRepoLease, LocalServeRepoSource, RequestAdvertisedRefs,
+    LocalServeRepoLease, LocalServeRepoSource, RequestAdvertisedRefs, TeeCapturePermits,
 };
 use crate::metrics::{CacheStatus, MetricsRegistry, Protocol};
 
@@ -163,7 +163,7 @@ pub struct UpstreamHydrationTracker {
     auth_header: Option<String>,
     protocol_name: &'static str,
     capture: Option<crate::tee_hydration::BufferedTeeCapture>,
-    hydration_permits: Option<CloneHydrationPermits>,
+    tee_capture_permits: Option<TeeCapturePermits>,
     enable_hydration: bool,
 }
 
@@ -183,12 +183,9 @@ impl UpstreamHydrationTracker {
         request: UpstreamHydrationRequest<'_>,
     ) -> Self {
         let owner_repo = format!("{owner}/{repo}");
-        let mut hydration_permits = if request.enable_hydration {
-            match crate::coordination::registry::try_acquire_clone_hydration_permits(
-                state,
-                &owner_repo,
-            )
-            .await
+        let tee_capture_permits = if request.enable_hydration {
+            match crate::coordination::registry::try_acquire_tee_capture_permits(state, &owner_repo)
+                .await
             {
                 Ok(Some(permits)) => Some(permits),
                 Ok(None) => {
@@ -199,10 +196,9 @@ impl UpstreamHydrationTracker {
                     info!(
                         repo = %owner_repo,
                         protocol = protocol_name,
-                        per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
-                        cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
-                        lease_ttl_secs = state.config.clone.lock_ttl,
-                        "skipping tee hydration because the repo clone semaphore is saturated"
+                        host_limit = state.config.clone.max_concurrent_tee_captures,
+                        per_repo_host_limit = state.config.clone.max_concurrent_tee_captures_per_repo_per_instance,
+                        "skipping tee hydration because the tee capture semaphore is saturated"
                     );
                     None
                 }
@@ -211,7 +207,7 @@ impl UpstreamHydrationTracker {
                         repo = %owner_repo,
                         protocol = protocol_name,
                         error = %error,
-                        "failed to acquire clone hydration permits for upstream miss"
+                        "failed to acquire tee capture permits for upstream miss"
                     );
                     None
                 }
@@ -220,7 +216,7 @@ impl UpstreamHydrationTracker {
             None
         };
 
-        let capture = if request.enable_hydration && hydration_permits.is_some() {
+        let capture = if request.enable_hydration && tee_capture_permits.is_some() {
             match crate::tee_hydration::TeeCapture::start(
                 &state.cache_manager.base_path,
                 &owner_repo,
@@ -279,19 +275,6 @@ impl UpstreamHydrationTracker {
             None
         };
 
-        if capture.is_none()
-            && let Some(permits) = hydration_permits.take()
-            && let Err(error) =
-                crate::coordination::registry::release_clone_hydration_permits(state, permits).await
-        {
-            warn!(
-                repo = %owner_repo,
-                protocol = protocol_name,
-                error = %error,
-                "failed to release clone hydration permits after tee capture setup failure"
-            );
-        }
-
         Self {
             state: state.clone(),
             owner: owner.to_string(),
@@ -300,7 +283,7 @@ impl UpstreamHydrationTracker {
             auth_header: auth_header.map(ToOwned::to_owned),
             protocol_name,
             capture: capture.map(crate::tee_hydration::BufferedTeeCapture::new),
-            hydration_permits,
+            tee_capture_permits,
             enable_hydration: request.enable_hydration,
         }
     }
@@ -340,18 +323,7 @@ impl UpstreamHydrationTracker {
                 "failed to clean up aborted tee capture after proxy error"
             );
         }
-        if let Some(permits) = self.hydration_permits.take()
-            && let Err(error) =
-                crate::coordination::registry::release_clone_hydration_permits(&self.state, permits)
-                    .await
-        {
-            warn!(
-                repo = %self.owner_repo,
-                protocol = self.protocol_name,
-                error = %error,
-                "failed to release clone hydration permits after proxy error"
-            );
-        }
+        self.tee_capture_permits.take();
     }
 
     pub async fn finish(mut self) {
@@ -369,65 +341,30 @@ impl UpstreamHydrationTracker {
         if let Some(active_capture) = self.capture.take() {
             match active_capture.finish_success().await {
                 Ok(Some(capture_dir)) => {
-                    if let Some(permits) = self.hydration_permits.take() {
-                        tokio::spawn(async move {
-                            if let Err(error) =
-                                crate::coordination::registry::try_ensure_repo_cloned_from_tee_with_permits(
-                                    &state,
-                                    &owner_bg,
-                                    &repo_bg,
-                                    auth_bg.as_deref(),
-                                    capture_dir,
-                                    permits,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    repo = %owner_repo_bg,
-                                    protocol = protocol_name,
-                                    error = %error,
-                                    "tee hydration after upstream miss failed"
-                                );
-                            }
-                        });
-                    } else {
-                        tokio::spawn(async move {
-                            if let Err(error) =
-                                crate::coordination::registry::try_ensure_repo_cloned_from_tee(
-                                    &state,
-                                    &owner_bg,
-                                    &repo_bg,
-                                    auth_bg.as_deref(),
-                                    capture_dir,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    repo = %owner_repo_bg,
-                                    protocol = protocol_name,
-                                    error = %error,
-                                    "tee hydration after upstream miss failed"
-                                );
-                            }
-                        });
-                    }
-                }
-                Ok(None) => {
-                    if let Some(permits) = self.hydration_permits.take()
-                        && let Err(error) =
-                            crate::coordination::registry::release_clone_hydration_permits(
-                                &self.state,
-                                permits,
+                    let tee_capture_permits = self.tee_capture_permits.take();
+                    tokio::spawn(async move {
+                        let _tee_capture_permits = tee_capture_permits;
+                        if let Err(error) =
+                            crate::coordination::registry::try_ensure_repo_cloned_from_tee(
+                                &state,
+                                &owner_bg,
+                                &repo_bg,
+                                auth_bg.as_deref(),
+                                capture_dir,
                             )
                             .await
-                    {
-                        warn!(
-                            repo = %self.owner_repo,
-                            protocol = self.protocol_name,
-                            error = %error,
-                            "failed to release clone hydration permits after dropping tee capture"
-                        );
-                    }
+                        {
+                            warn!(
+                                repo = %owner_repo_bg,
+                                protocol = protocol_name,
+                                error = %error,
+                                "tee hydration after upstream miss failed"
+                            );
+                        }
+                    });
+                }
+                Ok(None) => {
+                    self.tee_capture_permits.take();
                     spawn_background_upstream_hydration(
                         state,
                         owner_bg,
@@ -445,21 +382,7 @@ impl UpstreamHydrationTracker {
                         error = %error,
                         "failed to finalize buffered tee capture"
                     );
-                    if let Some(permits) = self.hydration_permits.take()
-                        && let Err(release_error) =
-                            crate::coordination::registry::release_clone_hydration_permits(
-                                &self.state,
-                                permits,
-                            )
-                            .await
-                    {
-                        warn!(
-                            repo = %self.owner_repo,
-                            protocol = self.protocol_name,
-                            error = %release_error,
-                            "failed to release clone hydration permits after tee finalization failure"
-                        );
-                    }
+                    self.tee_capture_permits.take();
                     spawn_background_upstream_hydration(
                         state,
                         owner_bg,
@@ -481,20 +404,7 @@ impl UpstreamHydrationTracker {
                 protocol_name,
                 "background upstream hydration after miss completed without capture failed",
             );
-            if let Some(permits) = self.hydration_permits.take()
-                && let Err(error) = crate::coordination::registry::release_clone_hydration_permits(
-                    &self.state,
-                    permits,
-                )
-                .await
-            {
-                warn!(
-                    repo = %owner_repo_bg,
-                    protocol = self.protocol_name,
-                    error = %error,
-                    "failed to release clone hydration permits after miss completed without capture"
-                );
-            }
+            self.tee_capture_permits.take();
         }
     }
 }

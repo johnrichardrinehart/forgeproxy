@@ -2044,6 +2044,53 @@ async fn proxy_upstream_upload_pack(
 
     let stream_channel = stream_channel;
     let mut stream_writer = stream_channel.as_ref().map(|channel| channel.make_writer());
+    let mut upstream_clone_permits =
+        match crate::coordination::registry::try_acquire_clone_hydration_permits(
+            &state,
+            &owner_repo,
+        )
+        .await
+        {
+            Ok(Ok(permits)) => Some(permits),
+            Ok(Err(reason)) => {
+                warn!(
+                    repo = %owner_repo,
+                    reason = reason.as_metric_reason(),
+                    "upstream SSH upload-pack proxy is saturated; falling back to direct upstream stream without local hydration"
+                );
+                crate::metrics::inc_upstream_fallback(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    reason.as_metric_reason(),
+                );
+                None
+            }
+            Err(error) => {
+                error!(
+                    repo = %owner_repo,
+                    error = %error,
+                    "failed to acquire upstream SSH upload-pack proxy permits"
+                );
+                let msg = format!(
+                    "Repository '{}' upstream proxy failed: {}\n",
+                    owner_repo, error,
+                );
+                let _ = handle.extended_data(channel_id, 1, msg.into_bytes()).await;
+                if behavior.should_close_channel {
+                    finalize_upload_pack_channel(
+                        &owner_repo,
+                        &handle,
+                        &channel_states,
+                        channel_id,
+                        1,
+                        0,
+                        Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
+                    )
+                    .await;
+                }
+                return;
+            }
+        };
     match super::upstream::post_upload_pack_stream(
         &state,
         &owner_repo,
@@ -2092,6 +2139,8 @@ async fn proxy_upstream_upload_pack(
             let advertised_refs = capture_metadata.lock().await.get(&channel_id).cloned();
             let (owner, repo) =
                 super::upstream::split_owner_repo(&owner_repo).unwrap_or((&owner_repo, ""));
+            let enable_hydration =
+                behavior.capture_for_hydration && upstream_clone_permits.is_some();
             let mut hydration = UpstreamHydrationTracker::start(
                 &state,
                 owner,
@@ -2101,7 +2150,7 @@ async fn proxy_upstream_upload_pack(
                 UpstreamHydrationRequest {
                     advertised_refs: advertised_refs.as_ref(),
                     request_body: &want_have,
-                    enable_hydration: behavior.capture_for_hydration,
+                    enable_hydration,
                 },
             )
             .await;
@@ -2215,6 +2264,17 @@ async fn proxy_upstream_upload_pack(
                     .await;
                 }
             }
+            if let Some(permits) = upstream_clone_permits.take()
+                && let Err(error) =
+                    crate::coordination::registry::release_clone_hydration_permits(&state, permits)
+                        .await
+            {
+                warn!(
+                    repo = %owner_repo,
+                    error = %error,
+                    "failed to release upstream SSH upload-pack proxy permits"
+                );
+            }
         }
         Err(e) => {
             let wants = if request_kind == V2RequestKind::Fetch {
@@ -2255,6 +2315,17 @@ async fn proxy_upstream_upload_pack(
                     Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
                 )
                 .await;
+            }
+            if let Some(permits) = upstream_clone_permits.take()
+                && let Err(error) =
+                    crate::coordination::registry::release_clone_hydration_permits(&state, permits)
+                        .await
+            {
+                warn!(
+                    repo = %owner_repo,
+                    error = %error,
+                    "failed to release upstream SSH upload-pack proxy permits after upstream failure"
+                );
             }
         }
     }

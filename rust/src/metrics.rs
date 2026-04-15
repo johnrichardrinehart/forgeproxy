@@ -188,6 +188,12 @@ pub struct HydrationSkipLabels {
     pub reason: HydrationSkipReason,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UpstreamFallbackLabels {
+    pub protocol: Protocol,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum AuthState {
     Anonymous,
@@ -344,6 +350,9 @@ pub struct Metrics {
 
     // -- hydration --
     pub hydration_skipped: Family<HydrationSkipLabels, Counter>,
+
+    // -- upstream fallback --
+    pub upstream_fallback: Family<UpstreamFallbackLabels, Counter>,
 }
 
 impl Metrics {
@@ -567,6 +576,13 @@ impl Metrics {
             hydration_skipped.clone(),
         );
 
+        let upstream_fallback = Family::<UpstreamFallbackLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_upstream_fallback",
+            "Requests handed off to the direct upstream path by reason",
+            upstream_fallback.clone(),
+        );
+
         Self {
             clone_total,
             clone_summary_total,
@@ -598,6 +614,7 @@ impl Metrics {
             mirror_size_bytes,
             cache_subtree_size_bytes,
             hydration_skipped,
+            upstream_fallback,
         }
     }
 }
@@ -838,6 +855,17 @@ pub fn inc_hydration_skipped(metrics: &MetricsRegistry, reason: HydrationSkipRea
         .metrics
         .hydration_skipped
         .get_or_create(&HydrationSkipLabels { reason })
+        .inc();
+}
+
+pub fn inc_upstream_fallback(metrics: &MetricsRegistry, protocol: Protocol, reason: &str) {
+    metrics
+        .metrics
+        .upstream_fallback
+        .get_or_create(&UpstreamFallbackLabels {
+            protocol,
+            reason: reason.to_string(),
+        })
         .inc();
 }
 

@@ -79,6 +79,8 @@ const VALKEY_RETRY_ATTEMPTS: usize = 5;
 const VALKEY_RETRY_BASE_DELAY_MS: u64 = 250;
 type RepoPublishMutex = std::sync::Arc<tokio::sync::Mutex<()>>;
 type RepoPublishMutexes = std::sync::Arc<tokio::sync::Mutex<HashMap<String, RepoPublishMutex>>>;
+type RepoCatchUpMutex = std::sync::Arc<tokio::sync::Mutex<()>>;
+type RepoCatchUpMutexes = std::sync::Arc<tokio::sync::Mutex<HashMap<String, RepoCatchUpMutex>>>;
 type PublishedGenerationLeases =
     std::sync::Arc<std::sync::Mutex<HashMap<String, HashMap<PathBuf, usize>>>>;
 
@@ -302,6 +304,7 @@ pub async fn try_ensure_repo_cloned_from_tee(
         Some(capture_dir),
         None,
         None,
+        FetchPriority::TeeConvergence,
     )
     .await
 }
@@ -312,7 +315,17 @@ pub async fn ensure_repo_cloned_from_upstream(
     repo: &str,
     auth_header: Option<&str>,
 ) -> Result<()> {
-    try_ensure_repo_cloned_inner(state, owner, repo, auth_header, None, None, None).await
+    try_ensure_repo_cloned_inner(
+        state,
+        owner,
+        repo,
+        auth_header,
+        None,
+        None,
+        None,
+        FetchPriority::Background,
+    )
+    .await
 }
 
 async fn ensure_repo_cloned_from_upstream_with_refspecs(
@@ -330,6 +343,7 @@ async fn ensure_repo_cloned_from_upstream_with_refspecs(
         None,
         None,
         request_refspecs,
+        FetchPriority::RequestTime,
     )
     .await
 }
@@ -340,6 +354,42 @@ pub struct CloneHydrationPermits {
     distributed_repo_permit: crate::coordination::locks::SemaphoreLease,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneHydrationPermitFailure {
+    Disabled,
+    GlobalSaturated,
+    LocalRepoSaturated,
+    DistributedRepoSaturated,
+}
+
+impl CloneHydrationPermitFailure {
+    pub fn as_metric_reason(self) -> &'static str {
+        match self {
+            Self::Disabled => "clone_permits_disabled",
+            Self::GlobalSaturated => "clone_global_saturated",
+            Self::LocalRepoSaturated => "clone_local_repo_saturated",
+            Self::DistributedRepoSaturated => "clone_distributed_repo_saturated",
+        }
+    }
+}
+
+pub struct TeeCapturePermits {
+    _global_tee_capture_permit: OwnedSemaphorePermit,
+    _local_repo_tee_capture_permit: OwnedSemaphorePermit,
+}
+
+struct FetchPermits {
+    _global_fetch_permit: OwnedSemaphorePermit,
+    _low_priority_fetch_permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchPriority {
+    RequestTime,
+    Background,
+    TeeConvergence,
+}
+
 fn normalize_owner_repo(owner_repo: &str) -> &str {
     owner_repo.strip_suffix(".git").unwrap_or(owner_repo)
 }
@@ -347,18 +397,38 @@ fn normalize_owner_repo(owner_repo: &str) -> &str {
 pub async fn try_acquire_clone_hydration_permits(
     state: &crate::AppState,
     owner_repo: &str,
-) -> Result<Option<CloneHydrationPermits>> {
+) -> Result<std::result::Result<CloneHydrationPermits, CloneHydrationPermitFailure>> {
     let owner_repo = normalize_owner_repo(owner_repo);
+    if state.config.clone.max_concurrent_upstream_clones == 0
+        || state
+            .config
+            .clone
+            .max_concurrent_upstream_clones_per_repo_per_instance
+            == 0
+        || state
+            .config
+            .clone
+            .max_concurrent_upstream_clones_per_repo_across_instances
+            == 0
+    {
+        return Ok(Err(CloneHydrationPermitFailure::Disabled));
+    }
+
     let global_clone_permit = match state.clone_semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
-        Err(TryAcquireError::NoPermits) => return Ok(None),
+        Err(TryAcquireError::NoPermits) => {
+            return Ok(Err(CloneHydrationPermitFailure::GlobalSaturated));
+        }
         Err(TryAcquireError::Closed) => {
             return Err(anyhow::anyhow!("clone semaphore closed"));
         }
     };
-    let Some(local_repo_permit) = acquire_local_repo_clone_permit(state, owner_repo).await? else {
-        return Ok(None);
+
+    let Some(local_repo_permit) = try_acquire_local_repo_clone_permit(state, owner_repo).await?
+    else {
+        return Ok(Err(CloneHydrationPermitFailure::LocalRepoSaturated));
     };
+
     let distributed_permit_key = format!("forgeproxy:semaphore:clone:{owner_repo}");
     let Some(distributed_repo_permit) = crate::coordination::locks::acquire_semaphore_lease(
         &state.valkey,
@@ -373,10 +443,10 @@ pub async fn try_acquire_clone_hydration_permits(
     )
     .await?
     else {
-        return Ok(None);
+        return Ok(Err(CloneHydrationPermitFailure::DistributedRepoSaturated));
     };
 
-    Ok(Some(CloneHydrationPermits {
+    Ok(Ok(CloneHydrationPermits {
         _global_clone_permit: global_clone_permit,
         _local_repo_permit: local_repo_permit,
         distributed_repo_permit,
@@ -446,24 +516,96 @@ pub async fn release_clone_hydration_permits(
     .await
 }
 
-pub async fn try_ensure_repo_cloned_from_tee_with_permits(
+async fn acquire_fetch_permits(
     state: &crate::AppState,
-    owner: &str,
-    repo: &str,
-    auth_header: Option<&str>,
-    capture_dir: PathBuf,
-    permits: CloneHydrationPermits,
-) -> Result<()> {
-    try_ensure_repo_cloned_inner(
-        state,
-        owner,
-        repo,
-        auth_header,
-        Some(capture_dir),
-        Some(permits),
-        None,
-    )
-    .await
+    owner_repo: &str,
+    priority: FetchPriority,
+) -> Result<Option<FetchPermits>> {
+    let low_priority_fetch_permit = match priority {
+        FetchPriority::RequestTime => None,
+        FetchPriority::Background | FetchPriority::TeeConvergence => {
+            if state.low_priority_fetch_limit == 0 {
+                info!(
+                    repo = %owner_repo,
+                    ?priority,
+                    reserved_request_time_fetches = state.config.clone.reserved_request_time_upstream_fetches,
+                    max_concurrent_fetches = state.config.clone.max_concurrent_upstream_fetches,
+                    "skipping lower-priority upstream fetch because all fetch slots are reserved for request-time catch-up"
+                );
+                return Ok(None);
+            }
+            Some(
+                state
+                    .low_priority_fetch_semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("low-priority fetch semaphore closed"))?,
+            )
+        }
+    };
+
+    let global_fetch_permit = state
+        .fetch_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("fetch semaphore closed"))?;
+
+    Ok(Some(FetchPermits {
+        _global_fetch_permit: global_fetch_permit,
+        _low_priority_fetch_permit: low_priority_fetch_permit,
+    }))
+}
+
+async fn acquire_local_repo_tee_capture_permit(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    let semaphore = {
+        let mut semaphores = state.repo_tee_capture_semaphores.lock().await;
+        semaphores
+            .entry(owner_repo.to_string())
+            .or_insert_with(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    state
+                        .config
+                        .clone
+                        .max_concurrent_tee_captures_per_repo_per_instance,
+                ))
+            })
+            .clone()
+    };
+
+    match semaphore.try_acquire_owned() {
+        Ok(permit) => Ok(Some(permit)),
+        Err(TryAcquireError::NoPermits) => Ok(None),
+        Err(TryAcquireError::Closed) => Err(anyhow::anyhow!("repo tee capture semaphore closed")),
+    }
+}
+
+pub async fn try_acquire_tee_capture_permits(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<Option<TeeCapturePermits>> {
+    let owner_repo = normalize_owner_repo(owner_repo);
+    let global_tee_capture_permit = match state.tee_capture_semaphore.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(TryAcquireError::NoPermits) => return Ok(None),
+        Err(TryAcquireError::Closed) => {
+            return Err(anyhow::anyhow!("tee capture semaphore closed"));
+        }
+    };
+    let Some(local_repo_tee_capture_permit) =
+        acquire_local_repo_tee_capture_permit(state, owner_repo).await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(TeeCapturePermits {
+        _global_tee_capture_permit: global_tee_capture_permit,
+        _local_repo_tee_capture_permit: local_repo_tee_capture_permit,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,7 +664,7 @@ async fn promote_initial_repo_clone(temp_repo_path: &Path, mirror_path: &Path) -
     Ok(())
 }
 
-async fn acquire_local_repo_clone_permit(
+async fn try_acquire_local_repo_clone_permit(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<Option<OwnedSemaphorePermit>> {
@@ -587,6 +729,13 @@ async fn try_acquire_local_repo_publish_guard(
     try_acquire_repo_publish_guard(&state.repo_publish_mutexes, owner_repo).await
 }
 
+async fn try_acquire_local_repo_catch_up_guard(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Option<OwnedMutexGuard<()>> {
+    try_acquire_repo_catch_up_guard(&state.repo_catch_up_mutexes, owner_repo).await
+}
+
 async fn repo_publish_mutex(
     repo_publish_mutexes: &RepoPublishMutexes,
     owner_repo: &str,
@@ -613,6 +762,27 @@ async fn try_acquire_repo_publish_guard(
     owner_repo: &str,
 ) -> Option<OwnedMutexGuard<()>> {
     repo_publish_mutex(repo_publish_mutexes, owner_repo)
+        .await
+        .try_lock_owned()
+        .ok()
+}
+
+async fn repo_catch_up_mutex(
+    repo_catch_up_mutexes: &RepoCatchUpMutexes,
+    owner_repo: &str,
+) -> RepoCatchUpMutex {
+    let mut mutexes = repo_catch_up_mutexes.lock().await;
+    mutexes
+        .entry(owner_repo.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+async fn try_acquire_repo_catch_up_guard(
+    repo_catch_up_mutexes: &RepoCatchUpMutexes,
+    owner_repo: &str,
+) -> Option<OwnedMutexGuard<()>> {
+    repo_catch_up_mutex(repo_catch_up_mutexes, owner_repo)
         .await
         .try_lock_owned()
         .ok()
@@ -812,6 +982,7 @@ pub async fn acquire_local_serve_repo_lease(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_ensure_repo_cloned_inner(
     state: &crate::AppState,
     owner: &str,
@@ -820,6 +991,7 @@ async fn try_ensure_repo_cloned_inner(
     tee_capture_dir: Option<PathBuf>,
     preacquired_permits: Option<CloneHydrationPermits>,
     request_refspecs: Option<&[String]>,
+    delta_fetch_priority: FetchPriority,
 ) -> Result<()> {
     // Strip trailing ".git" from repo if present to avoid double-suffixing
     // (the URL path extractor preserves it, and we append ".git" below).
@@ -864,26 +1036,8 @@ async fn try_ensure_repo_cloned_inner(
                 published = %published_repo_path.display(),
                 "updating existing repo through a delta workspace backed by the local mirror"
             );
-            if clone_hydration_permits.is_none() {
-                clone_hydration_permits =
-                    acquire_clone_hydration_permits(state, &owner_repo).await?;
-            }
-            if clone_hydration_permits.is_none() {
-                if let Some(capture_dir) = tee_capture_dir.as_ref() {
-                    cleanup_tee_capture_dir(capture_dir).await?;
-                }
-                crate::metrics::inc_hydration_skipped(
-                    &state.metrics,
-                    crate::metrics::HydrationSkipReason::SemaphoreSaturated,
-                );
-                info!(
-                    repo = %owner_repo,
-                    per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
-                    cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
-                    lease_ttl_secs = state.config.clone.lock_ttl,
-                    "skipping delta fetch because the repo clone semaphore is saturated"
-                );
-                return Ok(());
+            if let Some(permits) = clone_hydration_permits.take() {
+                release_clone_hydration_permits(state, permits).await?;
             }
             let hydrate_started_at = chrono::Utc::now().timestamp();
             let mut info = get_repo_info(&state.valkey, &owner_repo)
@@ -896,8 +1050,14 @@ async fn try_ensure_repo_cloned_inner(
             set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
             let fetch_result =
-                fetch_delta_into_repo_mirror(state, &owner_repo, &clone_url, request_refspecs)
-                    .await?;
+                fetch_delta_into_repo_mirror(
+                    state,
+                    &owner_repo,
+                    &clone_url,
+                    request_refspecs,
+                    delta_fetch_priority,
+                )
+                .await?;
             let published_repo_path = state.cache_manager.repo_path(&owner_repo);
             let mut info = get_repo_info(&state.valkey, &owner_repo)
                 .await?
@@ -926,27 +1086,6 @@ async fn try_ensure_repo_cloned_inner(
             mirror = %mirror_path.display(),
             "starting initial repo mirror hydration"
         );
-        if clone_hydration_permits.is_none() {
-            clone_hydration_permits =
-                acquire_clone_hydration_permits(state, &owner_repo).await?;
-        }
-        if clone_hydration_permits.is_none() {
-            if let Some(capture_dir) = tee_capture_dir.as_ref() {
-                cleanup_tee_capture_dir(capture_dir).await?;
-            }
-            crate::metrics::inc_hydration_skipped(
-                &state.metrics,
-                crate::metrics::HydrationSkipReason::SemaphoreSaturated,
-            );
-            info!(
-                repo = %owner_repo,
-                per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
-                cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
-                lease_ttl_secs = state.config.clone.lock_ttl,
-                "skipping initial hydration because the repo clone semaphore is saturated"
-            );
-            return Ok(());
-        }
         let hydrate_started_at = chrono::Utc::now().timestamp();
         let mut info = get_repo_info(&state.valkey, &owner_repo)
             .await?
@@ -1091,6 +1230,24 @@ async fn try_ensure_repo_cloned_inner(
             let mut initial_clone_path = None;
 
             if tee_outcome == TeeHydrationOutcome::NotHydrated {
+                if clone_hydration_permits.is_none() {
+                    clone_hydration_permits =
+                        acquire_clone_hydration_permits(state, &owner_repo).await?;
+                }
+                if clone_hydration_permits.is_none() {
+                    crate::metrics::inc_hydration_skipped(
+                        &state.metrics,
+                        crate::metrics::HydrationSkipReason::SemaphoreSaturated,
+                    );
+                    info!(
+                        repo = %owner_repo,
+                        per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
+                        cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
+                        lease_ttl_secs = state.config.clone.lock_ttl,
+                        "skipping initial upstream clone because the repo clone semaphore is saturated"
+                    );
+                    return Ok((tee_outcome, initial_clone_path));
+                }
                 let temp_clone_path = create_temporary_initial_repo_clone_path(&mirror_path)?;
                 info!(
                     repo = %owner_repo,
@@ -1141,6 +1298,10 @@ async fn try_ensure_repo_cloned_inner(
         };
         let (tee_outcome, initial_clone_path) = hydrate_result?;
         release_result?;
+        if tee_outcome == TeeHydrationOutcome::NotHydrated && initial_clone_path.is_none() {
+            clear_hydration_state(state, &owner_repo, "skipped").await?;
+            return Ok::<(), anyhow::Error>(());
+        }
 
         let _repo_generation_guard = acquire_local_repo_publish_guard(state, &owner_repo).await;
         if let Some(initial_clone_path) = initial_clone_path.as_ref() {
@@ -1714,7 +1875,12 @@ async fn fetch_delta_into_repo_mirror(
     owner_repo: &str,
     clone_url: &str,
     request_refspecs: Option<&[String]>,
+    priority: FetchPriority,
 ) -> Result<crate::git::commands::FetchResult> {
+    if state.config.clone.max_concurrent_upstream_fetches == 0 {
+        bail!("upstream fetch semaphore is disabled");
+    }
+
     let mirror_path = require_existing_repo_mirror(state, owner_repo).await?;
     if !state.cache_manager.has_repo_at(&mirror_path) {
         bail!("repo mirror is not available for delta fetch");
@@ -1732,6 +1898,9 @@ async fn fetch_delta_into_repo_mirror(
                 )
             })?;
 
+        let Some(fetch_permits) = acquire_fetch_permits(state, owner_repo, priority).await? else {
+            bail!("no upstream fetch slots are available for {priority:?} delta fetch");
+        };
         let fetch_result =
             if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
                 info!(
@@ -1750,6 +1919,7 @@ async fn fetch_delta_into_repo_mirror(
             } else {
                 crate::git::commands::git_fetch(&delta_repo_path, clone_url, &[]).await?
             };
+        drop(fetch_permits);
         {
             // Keep the writer-owned mirror stable from the moment we merge the
             // delta workspace until a new published generation is ready.
@@ -2166,7 +2336,14 @@ async fn converge_published_repo_generation(
         clone_url = %redacted_clone_url,
         "starting capture convergence follow-on delta fetch"
     );
-    let fetch_result = fetch_delta_into_repo_mirror(state, owner_repo, clone_url, None).await?;
+    let fetch_result = fetch_delta_into_repo_mirror(
+        state,
+        owner_repo,
+        clone_url,
+        None,
+        FetchPriority::TeeConvergence,
+    )
+    .await?;
     info!(
         repo = %owner_repo,
         published = %state.cache_manager.repo_path(owner_repo).display(),
@@ -3038,6 +3215,61 @@ fn should_start_request_time_refresh(
     matches!(hydration_lease_count, Some(0))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn try_start_request_time_catch_up(
+    state: &crate::AppState,
+    owner_repo: &str,
+    owner: &str,
+    repo: &str,
+    auth_header: Option<&str>,
+    wants: &[String],
+    request_refspecs: Option<Vec<String>>,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    let Some(catch_up_guard) = try_acquire_local_repo_catch_up_guard(state, owner_repo).await
+    else {
+        debug!(
+            repo = %owner_repo,
+            "request-time local catch-up is already running; waiting for publish before rechecking wants"
+        );
+        return None;
+    };
+
+    info!(
+        repo = %owner_repo,
+        request_refspec_count = request_refspecs.as_ref().map_or(0, Vec::len),
+        "starting request-time local catch-up task"
+    );
+    let state = state.clone();
+    let owner_repo = owner_repo.to_string();
+    let owner = owner.to_string();
+    let repo = repo.to_string();
+    let auth_header = auth_header.map(ToOwned::to_owned);
+    let wants = wants.to_vec();
+    Some(tokio::spawn(async move {
+        let _catch_up_guard = catch_up_guard;
+        let current_decision =
+            classify_local_wants_satisfaction_without_request_restore(&state, &owner_repo, &wants)
+                .await?;
+        if matches!(current_decision, LocalServeDecision::SatisfiesWants { .. }) {
+            info!(
+                repo = %owner_repo,
+                wants = wants.len(),
+                "request-time local catch-up skipped because another publish already satisfied this request"
+            );
+            return Ok(());
+        }
+
+        ensure_repo_cloned_from_upstream_with_refspecs(
+            &state,
+            &owner,
+            &repo,
+            auth_header.as_deref(),
+            request_refspecs.as_deref(),
+        )
+        .await
+    }))
+}
+
 pub async fn wait_for_local_catch_up(
     state: &crate::AppState,
     owner: &str,
@@ -3095,26 +3327,16 @@ pub async fn wait_for_local_catch_up(
         hydration_lease_count,
     );
     let mut refresh_handle = if should_start_refresh {
-        info!(
-            repo = %owner_repo,
-            request_refspec_count = request_refspecs.as_ref().map_or(0, Vec::len),
-            "starting request-time local catch-up task"
-        );
-        let state = state.clone();
-        let owner = owner.to_string();
-        let repo = repo_clean.to_string();
-        let auth_header = auth_header.map(ToOwned::to_owned);
-        let request_refspecs = request_refspecs.clone();
-        Some(tokio::spawn(async move {
-            ensure_repo_cloned_from_upstream_with_refspecs(
-                &state,
-                &owner,
-                &repo,
-                auth_header.as_deref(),
-                request_refspecs.as_deref(),
-            )
-            .await
-        }))
+        try_start_request_time_catch_up(
+            state,
+            &owner_repo,
+            owner,
+            repo_clean,
+            auth_header,
+            wants,
+            request_refspecs.clone(),
+        )
+        .await
     } else {
         None
     };
@@ -3154,6 +3376,7 @@ pub async fn wait_for_local_catch_up(
                     return Ok(last_decision);
                 }
             }
+            refresh_handle = None;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
         let decision =
@@ -3168,6 +3391,18 @@ pub async fn wait_for_local_catch_up(
             return Ok(decision);
         }
         last_decision = decision;
+        if should_start_refresh && refresh_handle.is_none() {
+            refresh_handle = try_start_request_time_catch_up(
+                state,
+                &owner_repo,
+                owner,
+                repo_clean,
+                auth_header,
+                wants,
+                request_refspecs.clone(),
+            )
+            .await;
+        }
     }
 
     info!(

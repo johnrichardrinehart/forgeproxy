@@ -455,6 +455,9 @@ pkgs.testers.runNixOSTest {
   # Test script
   # ---------------------------------------------------------------------------
   testScript = ''
+    import base64
+    import hashlib
+
     def pkt_line(payload: str) -> str:
         return f"{len(payload) + 4:04x}{payload}"
 
@@ -506,6 +509,13 @@ pkgs.testers.runNixOSTest {
             " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
             ' -d \'{"name": "shallow-only", "auto_init": false}\'''
         )
+        ghe.succeed(
+            "curl -sf"
+            " -X POST http://localhost:3000/api/v1/user/repos"
+            " -H 'Content-Type: application/json'"
+            " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
+            ' -d \'{"name": "fallback-only", "auto_init": false}\'''
+        )
 
         # Push initial content
         ghe.succeed(
@@ -534,6 +544,19 @@ pkgs.testers.runNixOSTest {
             "git add README.md && "
             "git commit -m 'Initial commit' && "
             "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/shallow-only.git && "
+            "git push -u origin main"
+        )
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo 'Fallback repo' > README.md && "
+            "git add README.md && "
+            "git commit -m 'Initial commit' && "
+            "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/fallback-only.git && "
             "git push -u origin main"
         )
 
@@ -600,6 +623,38 @@ pkgs.testers.runNixOSTest {
     with subtest("Proxy nginx starts"):
         proxy.wait_for_unit("nginx.service")
         proxy.wait_for_open_port(443)
+
+    with subtest("HTTPS upload-pack overload falls back to upstream through nginx"):
+        auth_header = "Basic " + base64.b64encode(
+            b"${common.giteaAdminUser}:${common.giteaAdminPassword}"
+        ).decode()
+        token_hash = hashlib.sha256(auth_header.encode()).hexdigest()
+        valkey.succeed(
+            f"redis-cli SET 'forgeproxy:http:auth:{token_hash}:octocat/fallback-only' none EX 300"
+        )
+        valkey.succeed(
+            "redis-cli SET 'forgeproxy:http:auth:anonymous:octocat/fallback-only' none EX 300"
+        )
+        semaphore_key = "forgeproxy:semaphore:clone:octocat/fallback-only"
+        zadd_args = " ".join(f"9999999999999 saturated-{i}" for i in range(10))
+        valkey.succeed(
+            f"redis-cli DEL '{semaphore_key}' >/dev/null && "
+            f"redis-cli ZADD '{semaphore_key}' {zadd_args} >/dev/null && "
+            f"redis-cli EXPIRE '{semaphore_key}' 300 >/dev/null"
+        )
+        client.succeed(
+            "git clone https://octocat:secret123@proxy/octocat/fallback-only.git /tmp/fallback-only"
+        )
+        output = client.succeed("cat /tmp/fallback-only/README.md")
+        assert "Fallback repo" in output, f"fallback README.md content mismatch: {output}"
+        proxy.wait_until_succeeds(
+            "curl -sf http://localhost:8080/metrics"
+            " | grep -F 'forgeproxy_upstream_fallback_total{protocol=\"https\",reason=\"clone_distributed_repo_saturated\"}'"
+        )
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --no-pager -o cat"
+            " | grep -F 'upstream upload-pack proxy is saturated'"
+        )
 
     # ── Health and metrics endpoints ──────────────────────────────────────
     with subtest("Health endpoint responds"):

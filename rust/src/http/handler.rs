@@ -1136,6 +1136,16 @@ async fn local_http_clone_access_confirmed(
             );
             false
         }
+        Err(AppError::UpstreamFallback(message)) => {
+            warn!(
+                %owner,
+                %repo,
+                %message,
+                auth_kind,
+                "local HTTP clone access probe was capacity-limited; proxying upstream"
+            );
+            false
+        }
     }
 }
 
@@ -1254,25 +1264,56 @@ async fn proxy_upload_pack_to_upstream(
     git_session_id: String,
     client_fingerprint: String,
 ) -> Result<Response, AppError> {
+    let owner_repo = format!("{owner}/{repo}");
     let upstream_url = format!(
         "{}/{}/{}/git-upload-pack",
         state.config.upstream.git_url_base(),
         owner,
         repo,
     );
+    let upstream_clone_permits =
+        match crate::coordination::registry::try_acquire_clone_hydration_permits(state, &owner_repo)
+            .await
+            .map_err(AppError::Internal)?
+        {
+            Ok(permits) => permits,
+            Err(reason) => {
+                warn!(
+                    repo = %owner_repo,
+                    reason = reason.as_metric_reason(),
+                    "upstream upload-pack proxy is saturated; asking nginx to fall back to upstream"
+                );
+                crate::metrics::inc_upstream_fallback(
+                    &state.metrics,
+                    Protocol::Https,
+                    reason.as_metric_reason(),
+                );
+                return Err(AppError::UpstreamFallback(
+                    "Upstream clone capacity is saturated. Please retry later.\n".to_string(),
+                ));
+            }
+        };
 
     let req =
         apply_forwarded_request_headers(state.http_client.post(&upstream_url), request_headers);
     let capture_body = decoded_body.clone();
-    let upstream_resp = req
-        .body(body)
-        .send()
-        .await
-        .context("failed to reach upstream forge for upload-pack")?;
+    let upstream_resp = match req.body(body).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            crate::coordination::registry::release_clone_hydration_permits(
+                state,
+                upstream_clone_permits,
+            )
+            .await
+            .map_err(AppError::Internal)?;
+            return Err(AppError::Internal(
+                anyhow::Error::new(error).context("failed to reach upstream forge for upload-pack"),
+            ));
+        }
+    };
 
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status();
-        let owner_repo = format!("{owner}/{repo}");
         let wants = request_metadata.want_oids.clone();
         let want_sample = wants
             .iter()
@@ -1287,13 +1328,18 @@ async fn proxy_upload_pack_to_upstream(
             want_sample,
             "cannot satisfy HTTP upload-pack request from local disk and upstream upload-pack failed"
         );
+        crate::coordination::registry::release_clone_hydration_permits(
+            state,
+            upstream_clone_permits,
+        )
+        .await
+        .map_err(AppError::Internal)?;
         return forward_upstream_response(upstream_resp).await;
     }
 
     let status = upstream_resp.status();
     let forwarded_headers = collect_forwarded_response_headers(upstream_resp.headers());
 
-    let owner_repo = format!("{owner}/{repo}");
     let (tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(8);
     let completion_metrics = state.metrics.clone();
     let active_clone_guard =
@@ -1344,6 +1390,7 @@ async fn proxy_upload_pack_to_upstream(
         .map(|recent| recent.advertised_refs.clone());
     tokio::spawn(
         async move {
+            let mut upstream_clone_permits = Some(upstream_clone_permits);
             let mut stream = upstream_resp.bytes_stream();
             let mut ls_refs_response =
                 if request_phase == crate::tee_hydration::UploadPackRequestPhase::V2LsRefs {
@@ -1374,6 +1421,20 @@ async fn proxy_upload_pack_to_upstream(
 
                         if tx.send(Ok(chunk)).await.is_err() {
                             hydration.handle_stream_error().await;
+                            if let Some(permits) = upstream_clone_permits.take()
+                                && let Err(error) =
+                                    crate::coordination::registry::release_clone_hydration_permits(
+                                        &state_for_stream,
+                                        permits,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    repo = %owner_repo_for_cache,
+                                    error = %error,
+                                    "failed to release upstream upload-pack proxy permits after client disconnect"
+                                );
+                            }
                             return;
                         }
                         downstream_counter.inc_by(chunk_len);
@@ -1386,6 +1447,20 @@ async fn proxy_upload_pack_to_upstream(
                     Err(e) => {
                         hydration.handle_stream_error().await;
                         let _ = tx.send(Err(e)).await;
+                        if let Some(permits) = upstream_clone_permits.take()
+                            && let Err(error) =
+                                crate::coordination::registry::release_clone_hydration_permits(
+                                    &state_for_stream,
+                                    permits,
+                                )
+                                .await
+                        {
+                            warn!(
+                                repo = %owner_repo_for_cache,
+                                error = %error,
+                                "failed to release upstream upload-pack proxy permits after upstream stream error"
+                            );
+                        }
                         return;
                     }
                 }
@@ -1393,7 +1468,7 @@ async fn proxy_upload_pack_to_upstream(
             if let Some(ls_refs_response) = ls_refs_response {
                 state_for_stream
                     .merge_recent_advertised_refs(
-                        owner_repo_for_cache,
+                        owner_repo_for_cache.clone(),
                         client_fingerprint,
                         git_session_id,
                         crate::coordination::registry::RequestAdvertisedRefs {
@@ -1405,6 +1480,19 @@ async fn proxy_upload_pack_to_upstream(
                     .await;
             }
             hydration.finish().await;
+            if let Some(permits) = upstream_clone_permits.take()
+                && let Err(error) = crate::coordination::registry::release_clone_hydration_permits(
+                    &state_for_stream,
+                    permits,
+                )
+                .await
+            {
+                warn!(
+                    repo = %owner_repo_for_cache,
+                    error = %error,
+                    "failed to release upstream upload-pack proxy permits"
+                );
+            }
         }
         .instrument(tracing::Span::current()),
     );
@@ -1469,6 +1557,9 @@ pub enum AppError {
         headers: Vec<(String, String)>,
         body: String,
     },
+    /// Ask the fronting proxy to retry this Git request directly against the
+    /// upstream forge.
+    UpstreamFallback(String),
     /// An unexpected internal error.
     Internal(anyhow::Error),
 }
@@ -1504,6 +1595,15 @@ impl IntoResponse for AppError {
                     };
                     response.headers_mut().insert(name, value);
                 }
+                response
+            }
+            AppError::UpstreamFallback(msg) => {
+                let status = StatusCode::from_u16(530).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                let mut response = (status, msg).into_response();
+                response.headers_mut().insert(
+                    HeaderName::from_static("x-forgeproxy-upstream-fallback"),
+                    HeaderValue::from_static("1"),
+                );
                 response
             }
             AppError::Internal(err) => {

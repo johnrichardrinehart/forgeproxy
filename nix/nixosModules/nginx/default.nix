@@ -153,13 +153,37 @@ in
           "~ ^/(.+)/git-upload-pack$" = {
             proxyPass = "http://127.0.0.1:${toString cfg.backendPort}";
             extraConfig = ''
+              proxy_intercept_errors on;
+              error_page 530 = @forge_upstream_git_upload_pack;
               proxy_set_header Authorization $http_authorization;
               proxy_set_header Host $host;
               proxy_set_header X-Real-IP $remote_addr;
               proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
               proxy_set_header X-Forwarded-Proto $scheme;
               proxy_buffering off;
-              proxy_request_buffering off;
+              proxy_request_buffering on;
+              client_max_body_size 0;
+              client_body_timeout 15m;
+              proxy_connect_timeout 30s;
+              proxy_read_timeout 15m;
+              proxy_send_timeout 15m;
+              send_timeout 15m;
+            '';
+          };
+
+          "@forge_upstream_git_upload_pack" = {
+            extraConfig = ''
+              internal;
+              proxy_pass https://forge-upstream;
+              proxy_set_header Authorization $http_authorization;
+              proxy_set_header Host $forge_upstream_host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_ssl_server_name on;
+              proxy_ssl_name $forge_upstream_host;
+              proxy_buffering off;
+              proxy_request_buffering on;
               client_max_body_size 0;
               client_body_timeout 15m;
               proxy_connect_timeout 30s;
