@@ -1070,7 +1070,7 @@ async fn try_ensure_repo_cloned_inner(
             info.bootstrap_bundle_pending = false;
             set_repo_info(&state.valkey, &owner_repo, &info).await?;
 
-            let fetch_result =
+            let delta_fetch =
                 fetch_delta_into_repo_mirror(
                     state,
                     &owner_repo,
@@ -1079,7 +1079,7 @@ async fn try_ensure_repo_cloned_inner(
                     delta_fetch_priority,
                 )
                 .await?;
-            let published_repo_path = state.cache_manager.repo_path(&owner_repo);
+            let published_repo_path = delta_fetch.published_repo_path;
             let mut info = get_repo_info(&state.valkey, &owner_repo)
                 .await?
                 .unwrap_or_default();
@@ -1095,10 +1095,11 @@ async fn try_ensure_repo_cloned_inner(
                 repo = %owner_repo,
                 mirror = %mirror_path.display(),
                 published = %published_repo_path.display(),
-                refs_updated = fetch_result.refs_updated,
-                bytes_received = fetch_result.bytes_received,
+                refs_updated = delta_fetch.fetch_result.refs_updated,
+                bytes_received = delta_fetch.fetch_result.bytes_received,
                 "delta workspace fetch integrated into the local mirror and published"
             );
+            publish_bootstrap_bundle_best_effort(state, &owner_repo, &published_repo_path).await;
             return Ok::<(), anyhow::Error>(());
         }
 
@@ -1183,7 +1184,6 @@ async fn try_ensure_repo_cloned_inner(
                 let published_generation_path =
                     publish_repo_mirror_generation(state, &owner_repo, "S3 restore").await?;
                 let published_repo_path = state.cache_manager.repo_path(&owner_repo);
-                publish_bootstrap_bundle(state, &owner_repo, &published_repo_path).await?;
 
                 let mut info = get_repo_info(&state.valkey, &owner_repo)
                     .await?
@@ -1196,6 +1196,8 @@ async fn try_ensure_repo_cloned_inner(
                 set_repo_info(&state.valkey, &owner_repo, &info).await?;
                 crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
                     .await?;
+                publish_bootstrap_bundle_best_effort(state, &owner_repo, &published_repo_path)
+                    .await;
                 info!(
                     %owner_repo,
                     mirror = %mirror_path.display(),
@@ -1399,7 +1401,7 @@ async fn try_ensure_repo_cloned_inner(
                 auth_header.map(ToOwned::to_owned),
             );
         } else {
-            publish_bootstrap_bundle(state, &owner_repo, &published_repo_path).await?;
+            publish_bootstrap_bundle_best_effort(state, &owner_repo, &published_repo_path).await;
         }
 
         debug!(
@@ -1882,13 +1884,18 @@ async fn publish_repo_mirror_generation(
     }
 }
 
+struct DeltaMirrorFetchResult {
+    fetch_result: crate::git::commands::FetchResult,
+    published_repo_path: PathBuf,
+}
+
 async fn fetch_delta_into_repo_mirror(
     state: &crate::AppState,
     owner_repo: &str,
     clone_url: &str,
     request_refspecs: Option<&[String]>,
     priority: FetchPriority,
-) -> Result<crate::git::commands::FetchResult> {
+) -> Result<DeltaMirrorFetchResult> {
     if state.config.clone.max_concurrent_upstream_fetches == 0 {
         bail!("upstream fetch semaphore is disabled");
     }
@@ -1991,9 +1998,12 @@ async fn fetch_delta_into_repo_mirror(
                 publish_repo_mirror_generation(state, owner_repo, "delta workspace integration")
                     .await?;
             let published_repo_path = state.cache_manager.repo_path(owner_repo);
-            publish_bootstrap_bundle(state, owner_repo, &published_repo_path).await?;
+            Ok::<PathBuf, anyhow::Error>(published_repo_path)
         }
-        Ok::<crate::git::commands::FetchResult, anyhow::Error>(fetch_result)
+        .map(|published_repo_path| DeltaMirrorFetchResult {
+            fetch_result,
+            published_repo_path,
+        })
     }
     .await;
 
@@ -2348,7 +2358,7 @@ async fn converge_published_repo_generation(
         clone_url = %redacted_clone_url,
         "starting capture convergence follow-on delta fetch"
     );
-    let fetch_result = fetch_delta_into_repo_mirror(
+    let delta_fetch = fetch_delta_into_repo_mirror(
         state,
         owner_repo,
         clone_url,
@@ -2358,12 +2368,13 @@ async fn converge_published_repo_generation(
     .await?;
     info!(
         repo = %owner_repo,
-        published = %state.cache_manager.repo_path(owner_repo).display(),
+        published = %delta_fetch.published_repo_path.display(),
         clone_url = %redacted_clone_url,
-        refs_updated = fetch_result.refs_updated,
-        bytes_received = fetch_result.bytes_received,
+        refs_updated = delta_fetch.fetch_result.refs_updated,
+        bytes_received = delta_fetch.fetch_result.bytes_received,
         "capture convergence follow-on delta fetch finished"
     );
+    publish_bootstrap_bundle_best_effort(state, owner_repo, &delta_fetch.published_repo_path).await;
     Ok(())
 }
 
@@ -2802,6 +2813,22 @@ async fn publish_bootstrap_bundle(
     }
 
     Ok(())
+}
+
+async fn publish_bootstrap_bundle_best_effort(
+    state: &crate::AppState,
+    owner_repo: &str,
+    published_repo_path: &Path,
+) {
+    if let Err(error) = publish_bootstrap_bundle(state, owner_repo, published_repo_path).await {
+        warn!(
+            %owner_repo,
+            published = %published_repo_path.display(),
+            error = %error,
+            error_chain = %format!("{error:#}"),
+            "bootstrap bundle publication failed; keeping locally cached repo"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

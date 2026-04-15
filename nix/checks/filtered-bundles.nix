@@ -204,7 +204,9 @@ pkgs.testers.runNixOSTest {
 
         environment.systemPackages = with pkgs; [
           curl
+          iptables
           jq
+          redis
         ];
 
         # Trust the test CA so forgeproxy (reqwest) validates the mock GHE cert
@@ -328,5 +330,66 @@ pkgs.testers.runNixOSTest {
         proxy.succeed(
             "systemctl is-active forgeproxy.service"
         )
+
+    with subtest("Delta publish clears hydration guard before blocked bundle upload"):
+        ghe.succeed(
+            "set -euo pipefail; "
+            "tmp=$(mktemp -d); "
+            "git clone http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/hello-world.git $tmp/repo; "
+            "cd $tmp/repo; "
+            "git config user.email test@test.local; "
+            "git config user.name Test; "
+            "echo 'Delta content' > delta.txt; "
+            "git add delta.txt; "
+            "git commit -m 'Delta commit'; "
+            "git push origin main"
+        )
+
+        proxy.wait_until_succeeds(
+            "test \"$(redis-cli -h valkey HGET 'forgeproxy:repo:octocat/hello-world' status)\" = ready "
+            "&& test -z \"$(redis-cli -h valkey HGET 'forgeproxy:repo:octocat/hello-world' hydrating_node_id)\""
+        )
+        proxy.succeed("sleep 2")
+        since = proxy.succeed("date --iso-8601=seconds --utc").strip()
+        proxy.succeed(
+            "for ip in $(getent ahostsv4 s3 | awk '{ print $1 }' | sort -u); do "
+            "iptables -I OUTPUT -p tcp -d \"$ip\" --dport 9000 -j DROP; "
+            "done; "
+            "for ip in $(getent ahostsv6 s3 | awk '{ print $1 }' | sort -u); do "
+            "ip6tables -I OUTPUT -p tcp -d \"$ip\" --dport 9000 -j DROP; "
+            "done"
+        )
+
+        client.succeed(
+            "rm -rf /tmp/repo-delta /tmp/repo-delta.log; "
+            "git clone http://octocat:secret123@proxy:8080/octocat/hello-world.git /tmp/repo-delta >/tmp/repo-delta.log 2>&1 & "
+            "echo $! >/tmp/repo-delta.pid"
+        )
+
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy.service --since '"
+            + since
+            + "' --no-pager | grep -F 'creating full bundle' "
+            "&& test \"$(redis-cli -h valkey HGET 'forgeproxy:repo:octocat/hello-world' status)\" = ready "
+            "&& test -z \"$(redis-cli -h valkey HGET 'forgeproxy:repo:octocat/hello-world' hydrating_node_id)\""
+        )
+        proxy.fail(
+            "journalctl -u forgeproxy.service --since '"
+            + since
+            + "' --no-pager | grep -F 'bundle uploaded'"
+        )
+        client.wait_until_succeeds("test -f /tmp/repo-delta/delta.txt")
+
+        proxy.succeed(
+            "for ip in $(getent ahostsv4 s3 | awk '{ print $1 }' | sort -u); do "
+            "iptables -D OUTPUT -p tcp -d \"$ip\" --dport 9000 -j DROP || true; "
+            "done; "
+            "for ip in $(getent ahostsv6 s3 | awk '{ print $1 }' | sort -u); do "
+            "ip6tables -D OUTPUT -p tcp -d \"$ip\" --dport 9000 -j DROP || true; "
+            "done"
+        )
+
+        client.succeed("grep -F 'Delta content' /tmp/repo-delta/delta.txt")
+        proxy.succeed("systemctl is-active forgeproxy.service")
   '';
 }
