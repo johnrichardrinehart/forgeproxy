@@ -24,7 +24,10 @@ const PACK_CACHE_DIR: &str = "pack-cache";
 const PACK_RESPONSE_EXT: &str = "pack-response";
 const COMPOSITE_MANIFEST_EXT: &str = "pack-composite.json";
 const DELTA_PACK_EXT: &str = "delta.pack";
+const METADATA_EXT: &str = "pack-cache-meta.json";
 const COMPOSITE_MANIFEST_VERSION: u32 = 1;
+const PACK_CACHE_METADATA_VERSION: u32 = 1;
+const MAX_RECENT_ENTRIES_PER_REPO: usize = 16;
 
 #[derive(Clone)]
 pub struct PackCache {
@@ -32,7 +35,7 @@ pub struct PackCache {
     config: PackCacheConfig,
     max_bytes: u64,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
-    recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, PackCacheRecentEntry>>>,
+    recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
     metrics: MetricsRegistry,
 }
 
@@ -40,7 +43,7 @@ pub struct PackCache {
 pub struct PackCacheKey {
     digest: String,
     pub(crate) owner_repo: String,
-    warming: Option<PackCacheWarmingMetadata>,
+    base: Option<PackCacheBaseMetadata>,
 }
 
 impl PartialEq for PackCacheKey {
@@ -62,17 +65,15 @@ impl PackCacheKey {
         &self.digest
     }
 
-    pub(crate) fn warming_tip_oids(&self) -> Option<&[String]> {
-        self.warming
-            .as_ref()
-            .map(|warming| warming.tip_oids.as_slice())
+    pub(crate) fn base_request_wants(&self) -> Option<&[String]> {
+        self.base.as_ref().map(|base| base.request_wants.as_slice())
     }
 
     fn from_digest(digest: String) -> Self {
         Self {
             digest,
             owner_repo: String::new(),
-            warming: None,
+            base: None,
         }
     }
 }
@@ -80,14 +81,16 @@ impl PackCacheKey {
 #[derive(Debug, Clone)]
 pub struct PackCacheRecentEntry {
     pub key: PackCacheKey,
-    pub tip_oids: Vec<String>,
+    pub request_wants: Vec<String>,
     pub request_template: Vec<String>,
+    pub full_tip: bool,
 }
 
 #[derive(Debug, Clone)]
-struct PackCacheWarmingMetadata {
-    tip_oids: Vec<String>,
+struct PackCacheBaseMetadata {
+    request_wants: Vec<String>,
     request_template: Vec<String>,
+    full_tip: bool,
 }
 
 pub struct PackCacheHit {
@@ -109,6 +112,16 @@ struct CompositeManifest {
     delta_size_bytes: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PackCacheMetadata {
+    version: u32,
+    key: String,
+    owner_repo: String,
+    request_wants: Vec<String>,
+    request_template: Vec<String>,
+    full_tip: bool,
+}
+
 pub enum PackCacheLookup {
     Hit(PackCacheHit),
     Generate(Box<PackCacheWriter>),
@@ -126,7 +139,7 @@ pub struct PackCacheWriter {
     min_response_bytes: u64,
     started_at: Instant,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
-    recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, PackCacheRecentEntry>>>,
+    recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
     notify: Arc<Notify>,
     metrics: MetricsRegistry,
     completed: bool,
@@ -157,6 +170,8 @@ impl PackCache {
             tokio::fs::create_dir_all(&self.root)
                 .await
                 .with_context(|| format!("create pack cache root {}", self.root.display()))?;
+            self.reload_recent_metadata()
+                .with_context(|| format!("reload pack cache metadata {}", self.root.display()))?;
             self.refresh_size_metric().await;
         }
         Ok(())
@@ -184,8 +199,9 @@ impl PackCache {
         let ref_tips = collect_repo_ref_tips(repo_path)?;
         let tip_oids = unique_tip_oids(&ref_tips);
         let ref_tips_digest = repo_ref_tips_digest(&ref_tips);
-        let warming = (request.wants == tip_oids).then(|| PackCacheWarmingMetadata {
-            tip_oids,
+        let base = Some(PackCacheBaseMetadata {
+            full_tip: request.wants == tip_oids,
+            request_wants: request.wants.clone(),
             request_template: request.non_want_lines.clone(),
         });
 
@@ -193,7 +209,7 @@ impl PackCache {
             owner_repo,
             &ref_tips_digest,
             &request.normalized,
-            warming,
+            base,
         ))
     }
 
@@ -216,19 +232,38 @@ impl PackCache {
             owner_repo,
             &ref_tips_digest,
             &normalized_request,
-            Some(PackCacheWarmingMetadata {
-                tip_oids,
+            Some(PackCacheBaseMetadata {
+                request_wants: tip_oids,
                 request_template: request_template.to_vec(),
+                full_tip: true,
             }),
         ))
     }
 
-    pub fn lookup_recent_key(&self, owner_repo: &str) -> Option<PackCacheRecentEntry> {
+    pub fn lookup_recent_compatible_key(&self, key: &PackCacheKey) -> Option<PackCacheRecentEntry> {
+        let base = key.base.as_ref()?;
         self.recent_pack_cache_keys
             .lock()
             .ok()?
-            .get(owner_repo)
+            .get(&key.owner_repo)?
+            .iter()
+            .find(|entry| {
+                entry.request_template == base.request_template
+                    && entry.request_wants.len() == base.request_wants.len()
+                    && entry.key != *key
+            })
             .cloned()
+    }
+
+    pub fn lookup_recent_full_tip_keys(&self, owner_repo: &str) -> Vec<PackCacheRecentEntry> {
+        self.recent_pack_cache_keys
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(owner_repo).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.full_tip)
+            .collect()
     }
 
     pub async fn lookup_or_reserve(
@@ -523,6 +558,70 @@ impl PackCache {
             .join(format!("{}.{}", key.as_str(), COMPOSITE_MANIFEST_EXT))
     }
 
+    fn reload_recent_metadata(&self) -> Result<()> {
+        let mut recent = HashMap::new();
+        if !self.root.exists() {
+            return Ok(());
+        }
+
+        for entry in std::fs::read_dir(&self.root)
+            .with_context(|| format!("read pack cache root {}", self.root.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(METADATA_EXT))
+            {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    warn!(path = %path.display(), error = %error, "failed to read pack cache metadata");
+                    continue;
+                }
+            };
+            let metadata: PackCacheMetadata = match serde_json::from_slice(&bytes) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warn!(path = %path.display(), error = %error, "failed to parse pack cache metadata");
+                    continue;
+                }
+            };
+            if metadata.version != PACK_CACHE_METADATA_VERSION {
+                warn!(path = %path.display(), version = metadata.version, "ignoring unsupported pack cache metadata version");
+                continue;
+            }
+            let key = PackCacheKey::from_digest(metadata.key.clone());
+            if self.lookup_sync(&key)?.is_none() {
+                continue;
+            }
+            insert_recent_entry(
+                &mut recent,
+                metadata.owner_repo.clone(),
+                PackCacheRecentEntry {
+                    key: PackCacheKey {
+                        digest: metadata.key,
+                        owner_repo: metadata.owner_repo.clone(),
+                        base: Some(PackCacheBaseMetadata {
+                            request_wants: metadata.request_wants.clone(),
+                            request_template: metadata.request_template.clone(),
+                            full_tip: metadata.full_tip,
+                        }),
+                    },
+                    request_wants: metadata.request_wants,
+                    request_template: metadata.request_template,
+                    full_tip: metadata.full_tip,
+                },
+            );
+        }
+
+        *self.recent_pack_cache_keys.lock().unwrap() = recent;
+        Ok(())
+    }
+
     async fn refresh_size_metric(&self) {
         let size = tokio::task::spawn_blocking({
             let root = self.root.clone();
@@ -703,15 +802,25 @@ impl PackCacheWriter {
             &self.metrics,
             self.started_at.elapsed(),
         );
-        if let Some(warming) = &self.key.warming {
-            self.recent_pack_cache_keys.lock().unwrap().insert(
+        if let Some(base) = &self.key.base {
+            let entry = PackCacheRecentEntry {
+                key: self.key.clone(),
+                request_wants: base.request_wants.clone(),
+                request_template: base.request_template.clone(),
+                full_tip: base.full_tip,
+            };
+            insert_recent_entry(
+                &mut self.recent_pack_cache_keys.lock().unwrap(),
                 self.key.owner_repo.clone(),
-                PackCacheRecentEntry {
-                    key: self.key.clone(),
-                    tip_oids: warming.tip_oids.clone(),
-                    request_template: warming.request_template.clone(),
-                },
+                entry.clone(),
             );
+            if let Err(error) = self.write_metadata(&entry) {
+                warn!(
+                    key = %self.key.as_str(),
+                    error = %error,
+                    "failed to persist pack cache metadata"
+                );
+            }
         }
         if let Err(error) = prune_to_limit(&self.root, self.max_bytes) {
             warn!(
@@ -731,6 +840,37 @@ impl PackCacheWriter {
             path = %self.final_path.display(),
             "stored pack cache artifact"
         );
+    }
+
+    fn write_metadata(&self, entry: &PackCacheRecentEntry) -> Result<()> {
+        let metadata = PackCacheMetadata {
+            version: PACK_CACHE_METADATA_VERSION,
+            key: self.key.as_str().to_string(),
+            owner_repo: self.key.owner_repo.clone(),
+            request_wants: entry.request_wants.clone(),
+            request_template: entry.request_template.clone(),
+            full_tip: entry.full_tip,
+        };
+        let path = self
+            .root
+            .join(format!("{}.{}", self.key.as_str(), METADATA_EXT));
+        let tmp_path = self.root.join(format!(
+            "{}.tmp.{}.{}",
+            self.key.as_str(),
+            std::process::id(),
+            METADATA_EXT
+        ));
+        let bytes = serde_json::to_vec(&metadata).context("serialize pack cache metadata")?;
+        std::fs::write(&tmp_path, bytes)
+            .with_context(|| format!("write pack cache metadata {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "promote pack cache metadata {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -760,7 +900,7 @@ fn pack_cache_key(
     owner_repo: &str,
     ref_tips_digest: &str,
     normalized_request: &str,
-    warming: Option<PackCacheWarmingMetadata>,
+    base: Option<PackCacheBaseMetadata>,
 ) -> PackCacheKey {
     let mut hasher = Sha256::new();
     hasher.update(b"forgeproxy-pack-cache-v1\0");
@@ -773,8 +913,24 @@ fn pack_cache_key(
     PackCacheKey {
         digest: hex_digest(hasher.finalize().as_slice()),
         owner_repo: owner_repo.to_string(),
-        warming,
+        base,
     }
+}
+
+fn insert_recent_entry(
+    recent: &mut HashMap<String, Vec<PackCacheRecentEntry>>,
+    owner_repo: String,
+    entry: PackCacheRecentEntry,
+) {
+    let entries = recent.entry(owner_repo).or_default();
+    entries.retain(|existing| {
+        existing.key != entry.key
+            && !(existing.request_template == entry.request_template
+                && existing.request_wants.len() == entry.request_wants.len()
+                && existing.request_wants == entry.request_wants)
+    });
+    entries.insert(0, entry);
+    entries.truncate(MAX_RECENT_ENTRIES_PER_REPO);
 }
 
 fn collect_repo_ref_tips(
@@ -1067,7 +1223,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PackCache, PackCacheArtifact, PackCacheKey, collect_repo_ref_tips,
+        PackCache, PackCacheArtifact, PackCacheBaseMetadata, PackCacheKey, collect_repo_ref_tips,
         normalize_fresh_clone_request, normalize_fresh_clone_request_parts, unique_tip_oids,
     };
     use crate::config::PackCacheConfig;
@@ -1213,12 +1369,20 @@ mod tests {
         let base_key = PackCacheKey {
             digest: "base".to_string(),
             owner_repo: "owner/repo".to_string(),
-            warming: None,
+            base: None,
         };
         let composite_key = PackCacheKey {
             digest: "composite".to_string(),
             owner_repo: "owner/repo".to_string(),
-            warming: None,
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
         };
         let base_pack = raw_pack(1, b"base-body");
         let delta_pack = raw_pack(2, b"delta-body");
@@ -1250,6 +1414,120 @@ mod tests {
         assert_eq!(&raw[..4], b"PACK");
         assert_eq!(u32::from_be_bytes(raw[8..12].try_into().unwrap()), 3);
         assert_eq!(&raw[12..raw.len() - 20], b"base-bodydelta-body");
+    }
+
+    #[test]
+    fn partial_fresh_clone_key_keeps_actual_request_wants_as_base_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let refs_heads = temp.path().join("refs").join("heads");
+        std::fs::create_dir_all(&refs_heads).unwrap();
+        std::fs::write(
+            refs_heads.join("main"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        std::fs::write(
+            refs_heads.join("other"),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                ttl_secs: 900,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+            },
+            1024 * 1024,
+            MetricsRegistry::new(),
+        );
+        let mut request = Vec::new();
+        request.extend_from_slice(&pkt(b"command=fetch\n"));
+        request.extend_from_slice(&pkt(b"want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"));
+        request.extend_from_slice(&pkt(b"done\n"));
+        request.extend_from_slice(b"0000");
+
+        let key = cache
+            .key_for_fresh_clone("owner/repo", temp.path(), &request, Some("version=2"))
+            .unwrap();
+        let base = key
+            .base
+            .as_ref()
+            .expect("fresh clone key should carry base metadata");
+
+        assert_eq!(
+            base.request_wants,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
+        assert!(!base.full_tip);
+    }
+
+    #[tokio::test]
+    async fn persisted_metadata_reloads_recent_compatible_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = PackCacheConfig {
+            enabled: true,
+            max_percent: 1.0,
+            ttl_secs: 900,
+            wait_for_inflight_secs: 1,
+            min_response_bytes: 0,
+        };
+        let cache = PackCache::new(
+            temp.path(),
+            config.clone(),
+            1024 * 1024,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+        let base_key = PackCacheKey {
+            digest: "persisted-base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+        let lookup = cache
+            .lookup_or_reserve(Protocol::Https, base_key.clone())
+            .await
+            .unwrap();
+        let super::PackCacheLookup::Generate(mut writer) = lookup else {
+            panic!("expected cache reservation");
+        };
+        writer.write_chunk(b"not a real response").await.unwrap();
+        writer.finish().await.unwrap();
+
+        let reloaded = PackCache::new(temp.path(), config, 1024 * 1024, MetricsRegistry::new());
+        reloaded.ensure_ready().await.unwrap();
+        let future_key = PackCacheKey {
+            digest: "future".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+
+        let recent = reloaded.lookup_recent_compatible_key(&future_key).unwrap();
+
+        assert_eq!(recent.key.as_str(), "persisted-base");
+        assert_eq!(
+            recent.request_wants,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
+        assert!(!recent.full_tip);
     }
 
     #[test]

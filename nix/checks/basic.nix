@@ -635,7 +635,12 @@ pkgs.testers.runNixOSTest {
             "git add README.md && "
             "git commit -m 'Initial commit' && "
             "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/pack-cache.git && "
-            "git push -u origin main"
+            "git checkout -b side && "
+            "echo 'Pack cache side branch' > side.txt && "
+            "git add side.txt && "
+            "git commit -m 'Side branch commit' && "
+            "git checkout main && "
+            "git push -u origin main side"
         )
         ghe.succeed(
             "set -e && "
@@ -649,7 +654,12 @@ pkgs.testers.runNixOSTest {
             "git add README.md BIG.bin && "
             "git commit -m 'Initial large commit' && "
             "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/pack-cache-stress.git && "
-            "git push -u origin main"
+            "git checkout -b side && "
+            "echo 'Pack cache stress side branch' > side.txt && "
+            "git add side.txt && "
+            "git commit -m 'Stress side branch commit' && "
+            "git checkout main && "
+            "git push -u origin main side"
         )
         ghe.succeed(
             "set -e && "
@@ -836,6 +846,11 @@ pkgs.testers.runNixOSTest {
         assert re.search(r"^forgeproxy_pack_cache_size_bytes [1-9][0-9]*$", metrics, re.MULTILINE), metrics
 
     with subtest("Pack response cache serves slight misses through on-demand delta composites"):
+        client.succeed(
+            "rm -rf /tmp/pack-cache-main-base /tmp/pack-cache-main-hit && "
+            "git clone --single-branch --branch main https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-main-base && "
+            "git clone --single-branch --branch main https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-main-hit"
+        )
         composite_count_before = int(
             proxy.succeed(
                 "find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-composite.json' | wc -l"
@@ -860,7 +875,7 @@ pkgs.testers.runNixOSTest {
         )
         client.succeed(
             "rm -rf /tmp/pack-cache-delta && "
-            "git clone https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-delta"
+            "git clone --single-branch --branch main https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-delta"
         )
         client.succeed("grep -Fx 'Delta composite update' /tmp/pack-cache-delta/README.md")
         proxy.wait_until_succeeds(
@@ -886,10 +901,10 @@ pkgs.testers.runNixOSTest {
             "test -L ${cacheLayout.repoPath "octocat/pack-cache-stress"}"
         )
         client.succeed(
-            "git clone https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-base"
+            "git clone --single-branch --branch main https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-base"
         )
         client.succeed(
-            "git clone https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-hit"
+            "git clone --single-branch --branch main https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-hit"
         )
         full_count_before = int(
             proxy.succeed(
@@ -921,7 +936,7 @@ pkgs.testers.runNixOSTest {
             )
             client.succeed(
                 f"rm -rf /tmp/pack-cache-stress-delta-{i} && "
-                f"git clone https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-delta-{i}"
+                f"git clone --single-branch --branch main https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-delta-{i}"
             )
             client.succeed(
                 f"grep -Fx 'stress churn {i}' /tmp/pack-cache-stress-delta-{i}/churn-{i}.txt"

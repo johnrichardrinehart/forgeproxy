@@ -730,7 +730,7 @@ async fn serve_local_upload_pack_once(
                     }
                     Err(miss) => {
                         if miss.reason != "no_base"
-                            && miss.reason != "not_full_tip_request"
+                            && miss.reason != "missing_request_wants"
                             && miss.reason != "same_tips"
                         {
                             crate::metrics::inc_pack_cache_request(

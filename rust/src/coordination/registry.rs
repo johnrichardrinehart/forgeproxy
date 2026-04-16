@@ -1741,14 +1741,14 @@ fn spawn_pack_cache_warming(
     if !state.pack_cache.enabled() {
         return;
     }
-    let Some(prev_entry) = state.pack_cache.lookup_recent_key(&owner_repo) else {
+    let prev_entries = state.pack_cache.lookup_recent_full_tip_keys(&owner_repo);
+    if prev_entries.is_empty() {
         return;
-    };
+    }
 
     tokio::spawn(async move {
         let _published_lease = published_lease;
         let started_at = Instant::now();
-        crate::metrics::inc_pack_cache_stitch_attempt(&state.metrics, &owner_repo);
         info!(
             repo = %owner_repo,
             source,
@@ -1756,39 +1756,43 @@ fn spawn_pack_cache_warming(
             "starting pack cache stitching for published generation"
         );
 
-        let result =
-            warm_pack_cache_for_generation(&state, &owner_repo, &published_path, prev_entry).await;
-        crate::metrics::observe_pack_cache_stitch_duration(
-            &state.metrics,
-            &owner_repo,
-            started_at.elapsed(),
-        );
+        for prev_entry in prev_entries {
+            crate::metrics::inc_pack_cache_stitch_attempt(&state.metrics, &owner_repo);
+            let result =
+                warm_pack_cache_for_generation(&state, &owner_repo, &published_path, prev_entry)
+                    .await;
+            crate::metrics::observe_pack_cache_stitch_duration(
+                &state.metrics,
+                &owner_repo,
+                started_at.elapsed(),
+            );
 
-        match result {
-            Ok(()) => {
-                info!(
-                    repo = %owner_repo,
-                    source,
-                    path = %published_path.display(),
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    "finished pack cache stitching for published generation"
-                );
-            }
-            Err(failure) => {
-                crate::metrics::inc_pack_cache_stitch_failure(
-                    &state.metrics,
-                    &owner_repo,
-                    failure.reason,
-                );
-                warn!(
-                    repo = %owner_repo,
-                    source,
-                    path = %published_path.display(),
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    reason = failure.reason,
-                    error = %failure.error,
-                    "pack cache stitching failed for published generation"
-                );
+            match result {
+                Ok(()) => {
+                    info!(
+                        repo = %owner_repo,
+                        source,
+                        path = %published_path.display(),
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        "finished pack cache stitching for published generation"
+                    );
+                }
+                Err(failure) => {
+                    crate::metrics::inc_pack_cache_stitch_failure(
+                        &state.metrics,
+                        &owner_repo,
+                        failure.reason,
+                    );
+                    warn!(
+                        repo = %owner_repo,
+                        source,
+                        path = %published_path.display(),
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        reason = failure.reason,
+                        error = %failure.error,
+                        "pack cache stitching failed for published generation"
+                    );
+                }
             }
         }
     });
@@ -1804,12 +1808,12 @@ async fn warm_pack_cache_for_generation(
         .pack_cache
         .key_for_warming(owner_repo, published_path, &prev_entry.request_template)
         .map_err(|reason| PackCacheStitchFailure::new(reason, anyhow::anyhow!(reason)))?;
-    let new_tip_oids = new_key
-        .warming_tip_oids()
+    let new_request_wants = new_key
+        .base_request_wants()
         .ok_or_else(|| {
             PackCacheStitchFailure::new(
-                "missing_new_tip_oids",
-                anyhow::anyhow!("warming key did not carry tip OIDs"),
+                "missing_new_request_wants",
+                anyhow::anyhow!("warming key did not carry request wants"),
             )
         })?
         .to_vec();
@@ -1817,7 +1821,7 @@ async fn warm_pack_cache_for_generation(
     if new_key == prev_entry.key {
         return Ok(());
     }
-    if new_tip_oids == prev_entry.tip_oids {
+    if new_request_wants == prev_entry.request_wants {
         return Ok(());
     }
 
@@ -1837,16 +1841,20 @@ async fn warm_pack_cache_for_generation(
         Err(error) => return Err(PackCacheStitchFailure::new("reserve", error)),
     };
 
-    let delta_pack =
-        match build_pack_cache_delta(state, published_path, &prev_entry.tip_oids, &new_tip_oids)
-            .await
-        {
-            Ok(delta_pack) => delta_pack,
-            Err(failure) => {
-                writer.abort().await;
-                return Err(failure);
-            }
-        };
+    let delta_pack = match build_pack_cache_delta(
+        state,
+        published_path,
+        &prev_entry.request_wants,
+        &new_request_wants,
+    )
+    .await
+    {
+        Ok(delta_pack) => delta_pack,
+        Err(failure) => {
+            writer.abort().await;
+            return Err(failure);
+        }
+    };
 
     writer
         .finish_composite(&prev_entry.key, &delta_pack)
@@ -1890,41 +1898,47 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
     repo_path: &Path,
     writer: Box<crate::pack_cache::PackCacheWriter>,
 ) -> std::result::Result<crate::pack_cache::PackCacheHit, PackCacheCompositeMiss> {
-    let Some(prev_entry) = state.pack_cache.lookup_recent_key(owner_repo) else {
+    let Some(prev_entry) = state.pack_cache.lookup_recent_compatible_key(writer.key()) else {
         return Err(PackCacheCompositeMiss {
             writer: Some(writer),
             reason: "no_base",
         });
     };
-    let Some(new_tip_oids) = writer.key().warming_tip_oids().map(<[String]>::to_vec) else {
+    let Some(new_request_wants) = writer.key().base_request_wants().map(<[String]>::to_vec) else {
         return Err(PackCacheCompositeMiss {
             writer: Some(writer),
-            reason: "not_full_tip_request",
+            reason: "missing_request_wants",
         });
     };
-    if new_tip_oids == prev_entry.tip_oids {
+    if new_request_wants == prev_entry.request_wants {
         return Err(PackCacheCompositeMiss {
             writer: Some(writer),
             reason: "same_tips",
         });
     }
 
-    let delta_pack =
-        match build_pack_cache_delta(state, repo_path, &prev_entry.tip_oids, &new_tip_oids).await {
-            Ok(delta_pack) => delta_pack,
-            Err(failure) => {
-                warn!(
-                    repo = %owner_repo,
-                    reason = failure.reason,
-                    error = %failure.error,
-                    "failed to build on-demand pack cache delta"
-                );
-                return Err(PackCacheCompositeMiss {
-                    writer: Some(writer),
-                    reason: failure.reason,
-                });
-            }
-        };
+    let delta_pack = match build_pack_cache_delta(
+        state,
+        repo_path,
+        &prev_entry.request_wants,
+        &new_request_wants,
+    )
+    .await
+    {
+        Ok(delta_pack) => delta_pack,
+        Err(failure) => {
+            warn!(
+                repo = %owner_repo,
+                reason = failure.reason,
+                error = %failure.error,
+                "failed to build on-demand pack cache delta"
+            );
+            return Err(PackCacheCompositeMiss {
+                writer: Some(writer),
+                reason: failure.reason,
+            });
+        }
+    };
 
     let hit = writer
         .finish_composite(&prev_entry.key, &delta_pack)
@@ -2098,17 +2112,15 @@ async fn publish_repo_mirror_generation_inner(
             published_lease,
             source.to_string(),
         );
-        if source != "delta workspace integration" || allow_coalescing {
-            let pack_cache_warming_lease =
-                lease_published_generation_path(state, owner_repo, &published_path);
-            spawn_pack_cache_warming(
-                state.clone(),
-                owner_repo.to_string(),
-                published_path.clone(),
-                pack_cache_warming_lease,
-                source.to_string(),
-            );
-        }
+        let pack_cache_warming_lease =
+            lease_published_generation_path(state, owner_repo, &published_path);
+        spawn_pack_cache_warming(
+            state.clone(),
+            owner_repo.to_string(),
+            published_path.clone(),
+            pack_cache_warming_lease,
+            source.to_string(),
+        );
         spawn_generation_deep_validation(
             state.clone(),
             owner_repo.to_string(),
