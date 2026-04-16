@@ -1926,7 +1926,7 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
             }
         };
 
-    writer
+    let hit = writer
         .finish_composite(&prev_entry.key, &delta_pack)
         .await
         .map_err(|error| {
@@ -1939,7 +1939,13 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
                 writer: None,
                 reason: "finish_composite",
             }
-        })
+        })?;
+    info!(
+        repo = %owner_repo,
+        delta_bytes = delta_pack.len(),
+        "finished on-demand pack cache composite"
+    );
+    Ok(hit)
 }
 
 async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
@@ -2092,15 +2098,17 @@ async fn publish_repo_mirror_generation_inner(
             published_lease,
             source.to_string(),
         );
-        let pack_cache_warming_lease =
-            lease_published_generation_path(state, owner_repo, &published_path);
-        spawn_pack_cache_warming(
-            state.clone(),
-            owner_repo.to_string(),
-            published_path.clone(),
-            pack_cache_warming_lease,
-            source.to_string(),
-        );
+        if source != "delta workspace integration" || allow_coalescing {
+            let pack_cache_warming_lease =
+                lease_published_generation_path(state, owner_repo, &published_path);
+            spawn_pack_cache_warming(
+                state.clone(),
+                owner_repo.to_string(),
+                published_path.clone(),
+                pack_cache_warming_lease,
+                source.to_string(),
+            );
+        }
         spawn_generation_deep_validation(
             state.clone(),
             owner_repo.to_string(),

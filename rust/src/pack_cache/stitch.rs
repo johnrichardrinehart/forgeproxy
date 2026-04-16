@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-const MAX_PKT_LINE_LEN: usize = 0xffff;
+const MAX_PKT_LINE_LEN: usize = 65520;
 const PKT_HEADER_LEN: usize = 4;
 const SIDEBAND_PREFIX_LEN: usize = 1;
 const MAX_SIDEBAND_PACK_CHUNK: usize = MAX_PKT_LINE_LEN - PKT_HEADER_LEN - SIDEBAND_PREFIX_LEN;

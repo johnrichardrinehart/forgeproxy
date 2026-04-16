@@ -814,6 +814,48 @@ pkgs.testers.runNixOSTest {
         assert "forgeproxy_pack_cache_artifact_generation_duration_seconds" in metrics, metrics
         assert re.search(r"^forgeproxy_pack_cache_size_bytes [1-9][0-9]*$", metrics, re.MULTILINE), metrics
 
+    with subtest("Pack response cache serves slight misses through on-demand delta composites"):
+        composite_count_before = int(
+            proxy.succeed(
+                "find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-composite.json' | wc -l"
+            ).strip()
+        )
+        delta_count_before = int(
+            proxy.succeed(
+                "find /var/cache/forgeproxy/.state/pack-cache -name '*.delta.pack' | wc -l"
+            ).strip()
+        )
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "git clone http://octocat:secret123@localhost:3000/octocat/pack-cache.git $tmp && "
+            "cd $tmp && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "printf '\\nDelta composite update\\n' >> README.md && "
+            "git add README.md && "
+            "git commit -m 'Delta composite update' && "
+            "git push origin main"
+        )
+        client.succeed(
+            "rm -rf /tmp/pack-cache-delta && "
+            "git clone https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-delta"
+        )
+        client.succeed("grep -Fx 'Delta composite update' /tmp/pack-cache-delta/README.md")
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --no-pager -o cat"
+            " | grep -F 'finished on-demand pack cache composite'"
+            " | grep -F 'octocat/pack-cache.git'"
+        )
+        proxy.wait_until_succeeds(
+            "test $(find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-composite.json' | wc -l) "
+            f"-gt {composite_count_before}"
+        )
+        proxy.wait_until_succeeds(
+            "test $(find /var/cache/forgeproxy/.state/pack-cache -name '*.delta.pack' | wc -l) "
+            f"-gt {delta_count_before}"
+        )
+
     with subtest("Web root through proxy reaches upstream UI"):
         client.succeed(
             "curl -sf https://proxy/ > /tmp/proxy-root.html && "
