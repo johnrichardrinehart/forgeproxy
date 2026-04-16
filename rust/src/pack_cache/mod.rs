@@ -2,16 +2,19 @@ pub(crate) mod stitch;
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Notify};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
 use crate::config::PackCacheConfig;
@@ -328,25 +331,29 @@ impl PackCache {
         self.lookup(key).await
     }
 
-    pub async fn read_composite_response(&self, hit: &PackCacheHit) -> Result<Vec<u8>> {
+    pub fn stream_composite_response(
+        &self,
+        hit: &PackCacheHit,
+    ) -> Result<ReceiverStream<io::Result<Bytes>>> {
         let PackCacheArtifact::Composite { key } = &hit.artifact else {
-            return tokio::fs::read(&hit.path)
-                .await
-                .with_context(|| format!("read pack cache artifact {}", hit.path.display()));
+            anyhow::bail!("pack cache hit is not a composite artifact");
         };
-
         let (base_path, delta_paths) = self.composite_chain(key)?;
-        let base_response = tokio::fs::read(&base_path)
-            .await
-            .with_context(|| format!("read base pack cache artifact {}", base_path.display()))?;
-        let mut delta_packs = Vec::with_capacity(delta_paths.len());
-        for delta_path in delta_paths {
-            let delta_pack = tokio::fs::read(&delta_path)
-                .await
-                .with_context(|| format!("read pack cache delta {}", delta_path.display()))?;
-            delta_packs.push(delta_pack);
-        }
-        stitch::stitch_response_with_delta_chain(&base_response, &delta_packs)
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+
+        tokio::task::spawn_blocking(move || {
+            let result =
+                stitch::stream_stitched_response_from_paths(&base_path, &delta_paths, |chunk| {
+                    sender
+                        .blocking_send(Ok(Bytes::from(chunk)))
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
+                });
+            if let Err(error) = result {
+                let _ = sender.blocking_send(Err(io::Error::other(error.to_string())));
+            }
+        });
+
+        Ok(ReceiverStream::new(receiver))
     }
 
     async fn lookup(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
@@ -1065,6 +1072,7 @@ mod tests {
     };
     use crate::config::PackCacheConfig;
     use crate::metrics::{MetricsRegistry, Protocol};
+    use futures::StreamExt;
     use sha1::{Digest, Sha1};
 
     fn pkt(payload: &[u8]) -> Vec<u8> {
@@ -1232,7 +1240,11 @@ mod tests {
 
         let hit = cache.lookup_by_key(&composite_key).await.unwrap().unwrap();
         assert!(matches!(hit.artifact, PackCacheArtifact::Composite { .. }));
-        let replayed = cache.read_composite_response(&hit).await.unwrap();
+        let mut stream = cache.stream_composite_response(&hit).unwrap();
+        let mut replayed = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            replayed.extend_from_slice(&chunk.unwrap());
+        }
         let raw = super::stitch::extract_raw_pack(&replayed).unwrap();
 
         assert_eq!(&raw[..4], b"PACK");

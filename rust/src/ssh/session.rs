@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use base64::Engine as _;
+use futures::StreamExt;
 use russh::keys::{PublicKey, PublicKeyBase64};
 use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf};
@@ -573,14 +574,15 @@ async fn replay_ssh_pack_cache_hit(
             }
         }
         crate::pack_cache::PackCacheArtifact::Composite { .. } => {
-            let bytes = state.pack_cache.read_composite_response(&hit).await?;
-            for chunk in bytes.chunks(SSH_DATA_CHUNK_SIZE) {
+            let mut stream = state.pack_cache.stream_composite_response(&hit)?;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
                 if send_channel_response_data(
                     replay.handle,
                     replay.channel_id,
                     stream_writer.as_mut(),
                     replay.channel_states,
-                    chunk,
+                    &chunk,
                 )
                 .await
                 .is_err()

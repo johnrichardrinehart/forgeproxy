@@ -1233,10 +1233,7 @@ async fn serve_http_pack_cache_hit_response(
                 Box::pin(ReaderStream::new(file))
             }
             crate::pack_cache::PackCacheArtifact::Composite { .. } => {
-                let bytes = state.pack_cache.read_composite_response(&hit).await?;
-                Box::pin(futures::stream::once(async move {
-                    Ok::<Bytes, std::io::Error>(Bytes::from(bytes))
-                }))
+                Box::pin(state.pack_cache.stream_composite_response(&hit)?)
             }
         };
 
