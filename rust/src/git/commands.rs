@@ -899,6 +899,7 @@ pub async fn git_bundle_create(
         .arg("bundle")
         .arg("create")
         .arg(output);
+    set_tmpdir_to_output_parent(&mut cmd, output);
 
     match refs {
         Some(ref_list) if !ref_list.is_empty() => {
@@ -963,6 +964,7 @@ pub async fn git_bundle_create_filtered(
         .arg(format!("--filter={filter}"))
         .arg(output)
         .arg("--all");
+    set_tmpdir_to_output_parent(&mut cmd, output);
 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -986,6 +988,15 @@ pub async fn git_bundle_create_filtered(
 
     debug!("git bundle create --filter succeeded");
     Ok(())
+}
+
+fn set_tmpdir_to_output_parent(cmd: &mut Command, output: &Path) {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        cmd.env("TMPDIR", parent);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,6 +1114,36 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
             input,
             b"+refs/heads/main:refs/heads/main\n+refs/heads/dev:refs/heads/dev\n"
         );
+    }
+
+    #[test]
+    fn bundle_create_tmpdir_env_uses_output_parent() {
+        let tmpdir_key = std::ffi::OsStr::new("TMPDIR");
+        let output = Path::new("/cache/.state/bundle-tmp/work/repo.bundle");
+        let mut cmd = Command::new("git");
+
+        set_tmpdir_to_output_parent(&mut cmd, output);
+
+        let tmpdir = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == tmpdir_key).then_some(value))
+            .flatten();
+
+        assert_eq!(
+            tmpdir,
+            Some(Path::new("/cache/.state/bundle-tmp/work").as_os_str())
+        );
+    }
+
+    #[test]
+    fn bundle_create_tmpdir_env_ignores_parentless_output() {
+        let tmpdir_key = std::ffi::OsStr::new("TMPDIR");
+        let mut cmd = Command::new("git");
+
+        set_tmpdir_to_output_parent(&mut cmd, Path::new("repo.bundle"));
+
+        assert!(!cmd.as_std().get_envs().any(|(key, _)| key == tmpdir_key));
     }
 
     #[test]

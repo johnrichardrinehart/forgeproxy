@@ -44,6 +44,7 @@ rec {
   stateGenerationsRoot = "${stateRoot}/generations";
   stateDeltaRoot = "${stateRoot}/delta";
   stateTeeRoot = "${stateRoot}/tee";
+  stateBundleTmpRoot = "${stateRoot}/bundle-tmp";
 
   repoPath = ownerRepo: repoPathUnder generationsRoot ownerRepo true;
   generationDir = ownerRepo: repoPathUnder stateGenerationsRoot ownerRepo true;

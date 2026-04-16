@@ -28,6 +28,7 @@ let
       generations_root=${lib.escapeShellArg cacheLayout.generationsRoot}
       mirrors_root=${lib.escapeShellArg cacheLayout.mirrorsRoot}
       state_generations_root=${lib.escapeShellArg cacheLayout.stateGenerationsRoot}
+      bundle_tmp_root=${lib.escapeShellArg cacheLayout.stateBundleTmpRoot}
       tee_root=${lib.escapeShellArg cacheLayout.stateTeeRoot}
       delta_root=${lib.escapeShellArg cacheLayout.stateDeltaRoot}
       tee_max_age_minutes=15
@@ -141,6 +142,20 @@ let
         while IFS= read -r capture_dir; do
           scrub_stale_tee_capture "$capture_dir"
         done < <(find "$tee_root" -mindepth 3 -maxdepth 3 -type d -print)
+      fi
+
+      if [[ -d "$bundle_tmp_root" ]]; then
+        while IFS= read -r temp_dir; do
+          if repo_is_active "$temp_dir"; then
+            echo "forgeproxy-cache-scrub: skipping active bundle temp dir $temp_dir" >&2
+            continue
+          fi
+
+          echo "forgeproxy-cache-scrub: removing stale bundle temp dir $temp_dir" >&2
+          if ! rm -rf "$temp_dir"; then
+            echo "forgeproxy-cache-scrub: warning: failed to remove stale bundle temp dir $temp_dir" >&2
+          fi
+        done < <(find "$bundle_tmp_root" -mindepth 1 -maxdepth 1 -type d -mmin +"$tee_max_age_minutes" -print 2>/dev/null)
       fi
     '';
   };
@@ -368,6 +383,7 @@ in
       "d ${cacheLayout.snapshotsRoot} 2775 root forgeproxy-cache - -"
       "d ${cacheLayout.stateRoot} 2775 root forgeproxy-cache - -"
       "d ${cacheLayout.stateTeeRoot} 2775 root forgeproxy-cache - -"
+      "d ${cacheLayout.stateBundleTmpRoot} 2775 root forgeproxy-cache - -"
     ];
 
     # ── System packages required at runtime ────────────────────────────

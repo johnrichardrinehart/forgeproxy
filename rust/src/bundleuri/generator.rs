@@ -45,7 +45,7 @@ pub async fn generate_full_bundle(
     let started_at = Instant::now();
     let current_refs = get_refs(repo_path).await?;
 
-    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for bundle")?;
+    let tmp_dir = create_bundle_tempdir(state, "bundle")?;
     let bundle_path = tmp_dir
         .path()
         .join(format!("{}.full.bundle", owner_repo.replace('/', "_")));
@@ -124,7 +124,7 @@ pub async fn generate_filtered_bundle(
 ) -> Result<BundleResult> {
     let started_at = Instant::now();
     let current_refs = get_refs(repo_path).await?;
-    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for filtered bundle")?;
+    let tmp_dir = create_bundle_tempdir(state, "filtered bundle")?;
     let bundle_path = tmp_dir
         .path()
         .join(format!("{}.filtered.bundle", owner_repo.replace('/', "_")));
@@ -209,8 +209,7 @@ pub async fn generate_incremental_bundle(
         return Ok(None);
     }
 
-    let tmp_dir =
-        tempfile::tempdir().context("failed to create temp dir for incremental bundle")?;
+    let tmp_dir = create_bundle_tempdir(state, "incremental bundle")?;
     let bundle_path = tmp_dir.path().join(format!(
         "{}.incremental.bundle",
         owner_repo.replace('/', "_")
@@ -281,6 +280,34 @@ pub async fn generate_incremental_bundle(
 #[instrument]
 pub async fn get_refs(repo_path: &Path) -> Result<HashMap<String, String>> {
     commands::git_for_each_ref(repo_path).await
+}
+
+fn create_bundle_tempdir(state: &crate::AppState, context: &str) -> Result<tempfile::TempDir> {
+    let cache_root = Path::new(&state.config.storage.local.path);
+    let tmp_root = crate::cache::layout::state_bundle_tmp_root(cache_root);
+
+    std::fs::create_dir_all(&tmp_root)
+        .with_context(|| format!("failed to create bundle temp root {}", tmp_root.display()))?;
+
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("forgeproxy-bundle-")
+        .tempdir_in(&tmp_root)
+        .with_context(|| format!("failed to create temp dir for {context}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(tmp_dir.path(), std::fs::Permissions::from_mode(0o770))
+            .with_context(|| {
+                format!(
+                    "failed to set permissions on bundle temp dir {}",
+                    tmp_dir.path().display()
+                )
+            })?;
+    }
+
+    Ok(tmp_dir)
 }
 
 async fn verify_bundle_or_log(
