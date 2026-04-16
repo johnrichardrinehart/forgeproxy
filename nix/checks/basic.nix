@@ -585,6 +585,13 @@ pkgs.testers.runNixOSTest {
             " -X POST http://localhost:3000/api/v1/user/repos"
             " -H 'Content-Type: application/json'"
             " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
+            ' -d \'{"name": "pack-cache-stress", "auto_init": false}\'''
+        )
+        ghe.succeed(
+            "curl -sf"
+            " -X POST http://localhost:3000/api/v1/user/repos"
+            " -H 'Content-Type: application/json'"
+            " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
             ' -d \'{"name": "fallback-only", "auto_init": false}\'''
         )
 
@@ -628,6 +635,20 @@ pkgs.testers.runNixOSTest {
             "git add README.md && "
             "git commit -m 'Initial commit' && "
             "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/pack-cache.git && "
+            "git push -u origin main"
+        )
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo 'Pack cache stress repo' > README.md && "
+            "head -c 16777216 /dev/urandom > BIG.bin && "
+            "git add README.md BIG.bin && "
+            "git commit -m 'Initial large commit' && "
+            "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/pack-cache-stress.git && "
             "git push -u origin main"
         )
         ghe.succeed(
@@ -854,6 +875,78 @@ pkgs.testers.runNixOSTest {
         proxy.wait_until_succeeds(
             "test $(find /var/cache/forgeproxy/.state/pack-cache -name '*.delta.pack' | wc -l) "
             f"-gt {delta_count_before}"
+        )
+
+    with subtest("Pack response cache handles high-churn large repo delta stress"):
+        client.succeed(
+            "rm -rf /tmp/pack-cache-stress-warm /tmp/pack-cache-stress-base /tmp/pack-cache-stress-hit && "
+            "git clone https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-warm"
+        )
+        proxy.wait_until_succeeds(
+            "test -L ${cacheLayout.repoPath "octocat/pack-cache-stress"}"
+        )
+        client.succeed(
+            "git clone https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-base"
+        )
+        client.succeed(
+            "git clone https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-hit"
+        )
+        full_count_before = int(
+            proxy.succeed(
+                "find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-response' | wc -l"
+            ).strip()
+        )
+        composite_count_before = int(
+            proxy.succeed(
+                "find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-composite.json' | wc -l"
+            ).strip()
+        )
+        delta_count_before = int(
+            proxy.succeed(
+                "find /var/cache/forgeproxy/.state/pack-cache -name '*.delta.pack' | wc -l"
+            ).strip()
+        )
+        for i in range(1, 5):
+            ghe.succeed(
+                "set -e && "
+                "tmp=$(mktemp -d) && "
+                "git clone http://octocat:secret123@localhost:3000/octocat/pack-cache-stress.git $tmp && "
+                "cd $tmp && "
+                "git config user.email test@test.local && "
+                "git config user.name Test && "
+                f"printf 'stress churn {i}\\n' > churn-{i}.txt && "
+                f"git add churn-{i}.txt && "
+                f"git commit -m 'stress churn {i}' && "
+                "git push origin main"
+            )
+            client.succeed(
+                f"rm -rf /tmp/pack-cache-stress-delta-{i} && "
+                f"git clone https://octocat:secret123@proxy/octocat/pack-cache-stress.git /tmp/pack-cache-stress-delta-{i}"
+            )
+            client.succeed(
+                f"grep -Fx 'stress churn {i}' /tmp/pack-cache-stress-delta-{i}/churn-{i}.txt"
+            )
+
+        proxy.wait_until_succeeds(
+            "test $(journalctl -u forgeproxy --no-pager -o cat"
+            " | grep -F 'finished on-demand pack cache composite'"
+            " | grep -F 'octocat/pack-cache-stress.git'"
+            " | wc -l) -ge 4"
+        )
+        proxy.wait_until_succeeds(
+            "test $(find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-composite.json' | wc -l) "
+            f"-ge {composite_count_before + 4}"
+        )
+        proxy.wait_until_succeeds(
+            "test $(find /var/cache/forgeproxy/.state/pack-cache -name '*.delta.pack' | wc -l) "
+            f"-ge {delta_count_before + 4}"
+        )
+        proxy.wait_until_succeeds(
+            "test $(find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-response' | wc -l) "
+            f"-eq {full_count_before}"
+        )
+        proxy.succeed(
+            "test -z \"$(find /var/cache/forgeproxy/.state/pack-cache -name '*.delta.pack' -size +2M -print -quit)\""
         )
 
     with subtest("Web root through proxy reaches upstream UI"):
