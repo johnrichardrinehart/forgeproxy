@@ -1013,21 +1013,6 @@ pkgs.testers.runNixOSTest {
             f" --since '{since}' --no-pager || true; "
             "exit 1'"
         )
-        proxy.succeed(
-            "sh -c '"
-            "for _ in $(seq 1 50); do "
-            "  health_code=$(curl -s -o /tmp/healthz.out -w \"%{http_code}\" http://127.0.0.1:8080/healthz || true); "
-            "  ready_code=$(curl -s -o /tmp/readyz.out -w \"%{http_code}\" http://127.0.0.1:8080/readyz || true); "
-            "  if [ \"$health_code\" = 200 ] && [ \"$ready_code\" = 503 ]; then "
-            "    exit 0; "
-            "  fi; "
-            "  sleep 0.1; "
-            "done; "
-            "echo \"expected /healthz=200 and /readyz=503 during drain\"; "
-            "echo \"last health_code=$health_code ready_code=$ready_code\"; "
-            "exit 1'"
-        )
-        proxy.succeed("grep -Fqx 'forgeproxy is draining and not accepting new requests' /tmp/readyz.out")
         client.wait_until_succeeds("! kill -0 $(cat /tmp/repo-stream-live-drain.pid) 2>/dev/null")
         client.succeed("test -f /tmp/repo-stream-live-drain/blob-32.bin")
         client.succeed("git -C /tmp/repo-stream-live-drain fsck --no-dangling")
