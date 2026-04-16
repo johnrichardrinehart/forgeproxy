@@ -930,6 +930,7 @@ fn is_complete_v2_fetch_request(buf: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum V2RequestKind {
     LsRefs,
+    BundleUri,
     Fetch,
 }
 
@@ -937,6 +938,7 @@ impl std::fmt::Display for V2RequestKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LsRefs => f.write_str("ls_refs"),
+            Self::BundleUri => f.write_str("bundle_uri"),
             Self::Fetch => f.write_str("fetch"),
         }
     }
@@ -969,6 +971,8 @@ fn split_next_complete_v2_request(buf: &[u8]) -> Option<(V2RequestKind, usize)> 
             request_kind = Some(V2RequestKind::Fetch);
         } else if payload == b"command=ls-refs" {
             request_kind = Some(V2RequestKind::LsRefs);
+        } else if payload == b"command=bundle-uri" {
+            request_kind = Some(V2RequestKind::BundleUri);
         }
 
         offset += len;
@@ -1351,7 +1355,7 @@ impl Handler for SshSession {
                             request_kind = %request_kind,
                             want_have_bytes = want_have.len(),
                             authenticated,
-                            "upstream proxy: request complete, POSTing to upstream"
+                            "upstream proxy: request complete"
                         );
                         proxy_upstream_upload_pack(
                             UpstreamUploadPackContext {
@@ -2129,6 +2133,47 @@ async fn proxy_upstream_upload_pack(
     let _output_guard = output_lock.lock().await;
     let mut fetch_started_at = None;
     let mut fetch_cache_status = None;
+    if request_kind == V2RequestKind::BundleUri {
+        let response = if authenticated {
+            match crate::http::bundle_serve::bundle_uri_command_response(&state, &owner_repo).await
+            {
+                Ok(Some(body)) => {
+                    crate::metrics::inc_bundle_uri_command(&state.metrics, "ssh_served");
+                    body
+                }
+                Ok(None) => {
+                    crate::metrics::inc_bundle_uri_command(&state.metrics, "ssh_missing_metadata");
+                    b"0000".to_vec()
+                }
+                Err(error) => {
+                    crate::metrics::inc_bundle_uri_command(&state.metrics, "ssh_failed");
+                    warn!(
+                        repo = %owner_repo,
+                        error = %error,
+                        "SSH bundle-uri command failed; returning empty response so fetch can continue"
+                    );
+                    b"0000".to_vec()
+                }
+            }
+        } else {
+            crate::metrics::inc_bundle_uri_command(&state.metrics, "ssh_auth_failed");
+            b"0000".to_vec()
+        };
+        let mut stream_writer = stream_channel.as_ref().map(|channel| channel.make_writer());
+        if send_channel_response_data(
+            &handle,
+            channel_id,
+            stream_writer.as_mut(),
+            &channel_states,
+            &response,
+        )
+        .await
+        .is_err()
+        {
+            warn!(repo = %owner_repo, "failed to send SSH bundle-uri response");
+        }
+        return;
+    }
     if request_kind == V2RequestKind::Fetch {
         fetch_started_at = Some(Instant::now());
         let wants = crate::tee_hydration::parse_fetch_request_metadata(&want_have)
@@ -2597,6 +2642,7 @@ mod tests {
     #[test]
     fn v2_request_kind_display_uses_lowercase_labels() {
         assert_eq!(V2RequestKind::LsRefs.to_string(), "ls_refs");
+        assert_eq!(V2RequestKind::BundleUri.to_string(), "bundle_uri");
         assert_eq!(V2RequestKind::Fetch.to_string(), "fetch");
     }
 
@@ -2730,6 +2776,16 @@ mod tests {
         assert_eq!(
             complete_v2_request_kind(req.as_bytes()),
             Some(V2RequestKind::LsRefs),
+            "{req:?}"
+        );
+    }
+
+    #[test]
+    fn complete_v2_request_kind_detects_bundle_uri() {
+        let req = format!("{}0000", pkt_line("command=bundle-uri\n"));
+        assert_eq!(
+            complete_v2_request_kind(req.as_bytes()),
+            Some(V2RequestKind::BundleUri),
             "{req:?}"
         );
     }

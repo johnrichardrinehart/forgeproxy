@@ -89,6 +89,13 @@ pub async fn fetch_ref_advertisement(
                 .context("failed to read ref advertisement body")?;
 
             let stripped = strip_http_service_line(&body).to_vec();
+            let (stripped, bundle_uri_result) =
+                crate::http::protocolv2::inject_bundle_uri_with_result(&stripped, "");
+            crate::metrics::inc_bundle_uri_advertisement(
+                &state.metrics,
+                owner_repo,
+                bundle_uri_result.as_metric_label(),
+            );
 
             state
                 .metrics
