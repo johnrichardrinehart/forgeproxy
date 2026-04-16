@@ -49,6 +49,7 @@ use crate::clone_support::{
 };
 use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoLease, LocalServeRepoSource,
+    try_finish_pack_cache_delta_composite,
 };
 use crate::metrics::{
     ActiveCloneGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource,
@@ -1218,6 +1219,58 @@ async fn local_http_clone_access(
 
 /// Run a local `git upload-pack` process and stream its output as the HTTP
 /// response body.
+async fn serve_http_pack_cache_hit_response(
+    state: &AppState,
+    hit: crate::pack_cache::PackCacheHit,
+    completion: CloneCompletion,
+) -> Result<Response, anyhow::Error> {
+    let source_stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        match hit.artifact {
+            crate::pack_cache::PackCacheArtifact::Full => {
+                let file = tokio::fs::File::open(&hit.path)
+                    .await
+                    .with_context(|| format!("open pack cache artifact {}", hit.path.display()))?;
+                Box::pin(ReaderStream::new(file))
+            }
+            crate::pack_cache::PackCacheArtifact::Composite { .. } => {
+                let bytes = state.pack_cache.read_composite_response(&hit).await?;
+                Box::pin(futures::stream::once(async move {
+                    Ok::<Bytes, std::io::Error>(Bytes::from(bytes))
+                }))
+            }
+        };
+
+    let downstream_counter = state
+        .metrics
+        .metrics
+        .clone_downstream_bytes
+        .get_or_create(&CloneDownstreamBytesLabels {
+            protocol: Protocol::Https,
+            phase: ClonePhase::UploadPack,
+            source: CloneSource::Local,
+            username: completion.metric_username.clone(),
+            repo: completion.metric_repo.clone(),
+        })
+        .clone();
+    let active_clone_guard =
+        state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
+    let stream = CloneCompletionStream::new(
+        CountingBytesStream::new(source_stream, downstream_counter),
+        state.metrics.clone(),
+        Protocol::Https,
+        completion,
+        None,
+        active_clone_guard,
+    );
+    let body = Body::from_stream(stream);
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+        body,
+    )
+        .into_response())
+}
+
 async fn serve_local_upload_pack(
     state: &AppState,
     owner: &str,
@@ -1262,41 +1315,10 @@ async fn serve_local_upload_pack(
 
     match pack_cache_lookup.take() {
         Some(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
-            match tokio::fs::File::open(&hit.path).await {
-                Ok(file) => {
-                    let downstream_counter = state
-                        .metrics
-                        .metrics
-                        .clone_downstream_bytes
-                        .get_or_create(&CloneDownstreamBytesLabels {
-                            protocol: Protocol::Https,
-                            phase: ClonePhase::UploadPack,
-                            source: CloneSource::Local,
-                            username: completion.metric_username.clone(),
-                            repo: completion.metric_repo.clone(),
-                        })
-                        .clone();
-                    let active_clone_guard =
-                        state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
-                    let stream = CloneCompletionStream::new(
-                        CountingBytesStream::new(ReaderStream::new(file), downstream_counter),
-                        state.metrics.clone(),
-                        Protocol::Https,
-                        completion,
-                        None,
-                        active_clone_guard,
-                    );
-                    let body = Body::from_stream(stream);
-                    return Ok((
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
-                        body,
-                    )
-                        .into_response());
-                }
+            match serve_http_pack_cache_hit_response(state, hit, completion.clone()).await {
+                Ok(response) => return Ok(response),
                 Err(error) => {
                     warn!(
-                        path = %hit.path.display(),
                         error = %error,
                         "pack cache artifact disappeared before HTTP replay; falling back to local upload-pack"
                     );
@@ -1313,7 +1335,43 @@ async fn serve_local_upload_pack(
     }
 
     let pack_cache_writer = match pack_cache_lookup {
-        Some(crate::pack_cache::PackCacheLookup::Generate(writer)) => Some(writer),
+        Some(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
+            match try_finish_pack_cache_delta_composite(
+                state,
+                &owner_repo,
+                repo_lease.repo_path(),
+                writer,
+            )
+            .await
+            {
+                Ok(hit) => {
+                    match serve_http_pack_cache_hit_response(state, hit, completion.clone()).await {
+                        Ok(response) => return Ok(response),
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                "on-demand pack cache composite could not be replayed; falling back without cache writer"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(miss) => {
+                    if miss.reason != "no_base"
+                        && miss.reason != "not_full_tip_request"
+                        && miss.reason != "same_tips"
+                    {
+                        crate::metrics::inc_pack_cache_request(
+                            &state.metrics,
+                            Protocol::Https,
+                            "bypass",
+                            miss.reason,
+                        );
+                    }
+                    miss.writer
+                }
+            }
+        }
         Some(crate::pack_cache::PackCacheLookup::BypassAfterWait) | None => None,
         Some(crate::pack_cache::PackCacheLookup::Hit(_)) => unreachable!(),
     };

@@ -29,7 +29,9 @@ use crate::clone_support::{
     CloneCompletion, LocalUploadPackMode, UpstreamHydrationRequest, UpstreamHydrationTracker,
     spawn_local_upload_pack, spawn_local_upload_pack_with_lease, wait_for_local_upload_pack_exit,
 };
-use crate::coordination::registry::{LocalServeDecision, LocalServeRepoSource};
+use crate::coordination::registry::{
+    LocalServeDecision, LocalServeRepoSource, try_finish_pack_cache_delta_composite,
+};
 use crate::metrics::{
     ActiveConnectionGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource,
     CloneUpstreamBytesLabels, Protocol,
@@ -508,6 +510,111 @@ struct LocalUploadPackResponseContext {
     should_close_channel: bool,
 }
 
+struct LocalUploadPackReplayContext<'a> {
+    handle: &'a russh::server::Handle,
+    channel_states: &'a Arc<Mutex<HashMap<ChannelId, UpstreamProxyChannelState>>>,
+    channel_id: ChannelId,
+    stream_channel: Option<&'a Arc<ChannelWriteHalf<Msg>>>,
+    should_close_channel: bool,
+}
+
+async fn replay_ssh_pack_cache_hit(
+    state: &AppState,
+    owner_repo: &str,
+    hit: crate::pack_cache::PackCacheHit,
+    completion: &CloneCompletion,
+    replay: LocalUploadPackReplayContext<'_>,
+) -> Result<u64> {
+    let mut total_bytes = 0u64;
+    let mut stream_writer = replay.stream_channel.map(|channel| channel.make_writer());
+    let downstream_counter = state
+        .metrics
+        .metrics
+        .clone_downstream_bytes
+        .get_or_create(&CloneDownstreamBytesLabels {
+            protocol: Protocol::Ssh,
+            phase: ClonePhase::UploadPack,
+            source: CloneSource::Local,
+            username: completion.metric_username.clone(),
+            repo: completion.metric_repo.clone(),
+        })
+        .clone();
+    let _active_clone_guard =
+        state.begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
+
+    match hit.artifact {
+        crate::pack_cache::PackCacheArtifact::Full => {
+            let mut file = tokio::fs::File::open(&hit.path).await?;
+            let mut buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
+            loop {
+                let read = file.read(&mut buf).await?;
+                if read == 0 {
+                    break;
+                }
+                if send_channel_response_data(
+                    replay.handle,
+                    replay.channel_id,
+                    stream_writer.as_mut(),
+                    replay.channel_states,
+                    &buf[..read],
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        repo = %owner_repo,
+                        total_bytes,
+                        "client disconnected during SSH pack cache replay"
+                    );
+                    break;
+                }
+                total_bytes += read as u64;
+                downstream_counter.inc_by(read as u64);
+            }
+        }
+        crate::pack_cache::PackCacheArtifact::Composite { .. } => {
+            let bytes = state.pack_cache.read_composite_response(&hit).await?;
+            for chunk in bytes.chunks(SSH_DATA_CHUNK_SIZE) {
+                if send_channel_response_data(
+                    replay.handle,
+                    replay.channel_id,
+                    stream_writer.as_mut(),
+                    replay.channel_states,
+                    chunk,
+                )
+                .await
+                .is_err()
+                {
+                    warn!(
+                        repo = %owner_repo,
+                        total_bytes,
+                        "client disconnected during SSH composite pack cache replay"
+                    );
+                    break;
+                }
+                total_bytes += chunk.len() as u64;
+                downstream_counter.inc_by(chunk.len() as u64);
+            }
+        }
+    }
+
+    completion.record_success(&state.metrics, Protocol::Ssh);
+    if replay.should_close_channel {
+        finalize_upload_pack_channel(
+            owner_repo,
+            replay.handle,
+            replay.channel_states,
+            replay.channel_id,
+            0,
+            total_bytes,
+            Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
+        )
+        .await;
+    }
+
+    Ok(total_bytes)
+}
+
 async fn serve_local_upload_pack_once(
     state: &AppState,
     owner_repo: &str,
@@ -553,79 +660,27 @@ async fn serve_local_upload_pack_once(
     ) {
         Ok(key) => match state.pack_cache.lookup_or_reserve(Protocol::Ssh, key).await {
             Ok(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
-                match tokio::fs::File::open(&hit.path).await {
-                    Ok(mut file) => {
-                        let mut total_bytes = 0u64;
-                        let mut stream_writer =
-                            stream_channel.as_ref().map(|channel| channel.make_writer());
-                        let downstream_counter = state
-                            .metrics
-                            .metrics
-                            .clone_downstream_bytes
-                            .get_or_create(&CloneDownstreamBytesLabels {
-                                protocol: Protocol::Ssh,
-                                phase: ClonePhase::UploadPack,
-                                source: CloneSource::Local,
-                                username: completion.metric_username.clone(),
-                                repo: completion.metric_repo.clone(),
-                            })
-                            .clone();
-                        let _active_clone_guard = state
-                            .begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
-                        let mut buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
-                        loop {
-                            match file.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(read) => {
-                                    if send_channel_response_data(
-                                        &handle,
-                                        channel_id,
-                                        stream_writer.as_mut(),
-                                        &channel_states,
-                                        &buf[..read],
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        warn!(
-                                            repo = %owner_repo,
-                                            total_bytes,
-                                            "client disconnected during SSH pack cache replay"
-                                        );
-                                        break;
-                                    }
-                                    total_bytes += read as u64;
-                                    downstream_counter.inc_by(read as u64);
-                                }
-                                Err(error) => {
-                                    error!(repo = %owner_repo, error = %error, "failed to read SSH pack cache artifact");
-                                    break;
-                                }
-                            }
-                        }
-                        completion.record_success(&state.metrics, Protocol::Ssh);
-                        if should_close_channel {
-                            finalize_upload_pack_channel(
-                                owner_repo,
-                                &handle,
-                                &channel_states,
-                                channel_id,
-                                0,
-                                total_bytes,
-                                Duration::from_secs(
-                                    state.config.clone.ssh_upload_pack_close_grace_secs,
-                                ),
-                            )
-                            .await;
-                        }
-                        return;
-                    }
+                match replay_ssh_pack_cache_hit(
+                    state,
+                    owner_repo,
+                    hit,
+                    &completion,
+                    LocalUploadPackReplayContext {
+                        handle: &handle,
+                        channel_states: &channel_states,
+                        channel_id,
+                        stream_channel: stream_channel.as_ref(),
+                        should_close_channel,
+                    },
+                )
+                .await
+                {
+                    Ok(_) => return,
                     Err(error) => {
                         warn!(
                             repo = %owner_repo,
-                            path = %hit.path.display(),
                             error = %error,
-                            "failed to open SSH pack cache artifact; falling back to local upload-pack"
+                            "failed to replay SSH pack cache artifact; falling back to local upload-pack"
                         );
                         crate::metrics::inc_pack_cache_request(
                             &state.metrics,
@@ -637,7 +692,55 @@ async fn serve_local_upload_pack_once(
                 }
             }
             Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
-                pack_cache_writer = Some(writer);
+                match try_finish_pack_cache_delta_composite(
+                    state,
+                    owner_repo,
+                    repo_lease.repo_path(),
+                    writer,
+                )
+                .await
+                {
+                    Ok(hit) => {
+                        match replay_ssh_pack_cache_hit(
+                            state,
+                            owner_repo,
+                            hit,
+                            &completion,
+                            LocalUploadPackReplayContext {
+                                handle: &handle,
+                                channel_states: &channel_states,
+                                channel_id,
+                                stream_channel: stream_channel.as_ref(),
+                                should_close_channel,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(_) => return,
+                            Err(error) => {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %error,
+                                    "on-demand SSH pack cache composite could not be replayed; falling back without cache writer"
+                                );
+                            }
+                        }
+                    }
+                    Err(miss) => {
+                        if miss.reason != "no_base"
+                            && miss.reason != "not_full_tip_request"
+                            && miss.reason != "same_tips"
+                        {
+                            crate::metrics::inc_pack_cache_request(
+                                &state.metrics,
+                                Protocol::Ssh,
+                                "bypass",
+                                miss.reason,
+                            );
+                        }
+                        pack_cache_writer = miss.writer;
+                    }
+                }
             }
             Ok(crate::pack_cache::PackCacheLookup::BypassAfterWait) => {}
             Err(error) => {

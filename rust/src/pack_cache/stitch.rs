@@ -105,6 +105,17 @@ pub fn stitch_raw_packs(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn stitch_response_with_delta_chain(
+    base_response: &[u8],
+    delta_packs: &[Vec<u8>],
+) -> Result<Vec<u8>> {
+    let mut stitched_pack = extract_raw_pack(base_response)?;
+    for delta_pack in delta_packs {
+        stitched_pack = stitch_raw_packs(&stitched_pack, delta_pack)?;
+    }
+    replace_sideband1_in_response(base_response, &stitched_pack)
+}
+
 fn read_packet_len(bytes: &[u8], offset: usize) -> Result<(usize, usize)> {
     ensure!(
         offset + PKT_HEADER_LEN <= bytes.len(),

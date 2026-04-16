@@ -1821,7 +1821,7 @@ async fn warm_pack_cache_for_generation(
         return Ok(());
     }
 
-    let mut writer = match state
+    let writer = match state
         .pack_cache
         .lookup_or_reserve(crate::metrics::Protocol::Https, new_key)
         .await
@@ -1837,56 +1837,30 @@ async fn warm_pack_cache_for_generation(
         Err(error) => return Err(PackCacheStitchFailure::new("reserve", error)),
     };
 
-    let stitched_response = match build_stitched_pack_cache_response(
-        state,
-        owner_repo,
-        published_path,
-        &prev_entry,
-        &new_tip_oids,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(failure) => {
-            writer.abort().await;
-            return Err(failure);
-        }
-    };
+    let delta_pack =
+        match build_pack_cache_delta(state, published_path, &prev_entry.tip_oids, &new_tip_oids)
+            .await
+        {
+            Ok(delta_pack) => delta_pack,
+            Err(failure) => {
+                writer.abort().await;
+                return Err(failure);
+            }
+        };
 
-    if let Err(error) = writer.write_chunk(&stitched_response).await {
-        writer.abort().await;
-        return Err(PackCacheStitchFailure::new("write", error));
-    }
     writer
-        .finish()
+        .finish_composite(&prev_entry.key, &delta_pack)
         .await
-        .map_err(|error| PackCacheStitchFailure::new("finish", error))
+        .map(|_| ())
+        .map_err(|error| PackCacheStitchFailure::new("finish_composite", error))
 }
 
-async fn build_stitched_pack_cache_response(
+async fn build_pack_cache_delta(
     state: &crate::AppState,
-    owner_repo: &str,
     published_path: &Path,
-    prev_entry: &crate::pack_cache::PackCacheRecentEntry,
+    prev_tip_oids: &[String],
     new_tip_oids: &[String],
 ) -> std::result::Result<Vec<u8>, PackCacheStitchFailure> {
-    let base_hit = state
-        .pack_cache
-        .lookup_by_key(&prev_entry.key)
-        .await
-        .map_err(|error| PackCacheStitchFailure::new("lookup_base", error))?
-        .ok_or_else(|| {
-            PackCacheStitchFailure::new(
-                "base_missing",
-                anyhow::anyhow!("previous pack cache artifact is no longer available"),
-            )
-        })?;
-    let base_response = tokio::fs::read(&base_hit.path)
-        .await
-        .map_err(|error| PackCacheStitchFailure::new("read_base", error))?;
-    let base_pack = crate::pack_cache::stitch::extract_raw_pack(&base_response)
-        .map_err(|error| PackCacheStitchFailure::new("extract_base_pack", error))?;
-
     let permit = state
         .bundle_generation_semaphore
         .clone()
@@ -1895,24 +1869,76 @@ async fn build_stitched_pack_cache_response(
         .map_err(|error| PackCacheStitchFailure::new("semaphore", error))?;
     let delta_pack = crate::git::commands::git_pack_objects_delta(
         published_path,
-        &prev_entry.tip_oids,
+        prev_tip_oids,
         new_tip_oids,
         state.bundle_pack_threads,
     )
     .await
     .map_err(|error| PackCacheStitchFailure::new("delta_pack", error))?;
     drop(permit);
+    Ok(delta_pack)
+}
 
-    let stitched_pack = crate::pack_cache::stitch::stitch_raw_packs(&base_pack, &delta_pack)
-        .map_err(|error| PackCacheStitchFailure::new("stitch_pack", error))?;
-    crate::pack_cache::stitch::replace_sideband1_in_response(&base_response, &stitched_pack)
+pub(crate) struct PackCacheCompositeMiss {
+    pub writer: Option<Box<crate::pack_cache::PackCacheWriter>>,
+    pub reason: &'static str,
+}
+
+pub(crate) async fn try_finish_pack_cache_delta_composite(
+    state: &crate::AppState,
+    owner_repo: &str,
+    repo_path: &Path,
+    writer: Box<crate::pack_cache::PackCacheWriter>,
+) -> std::result::Result<crate::pack_cache::PackCacheHit, PackCacheCompositeMiss> {
+    let Some(prev_entry) = state.pack_cache.lookup_recent_key(owner_repo) else {
+        return Err(PackCacheCompositeMiss {
+            writer: Some(writer),
+            reason: "no_base",
+        });
+    };
+    let Some(new_tip_oids) = writer.key().warming_tip_oids().map(<[String]>::to_vec) else {
+        return Err(PackCacheCompositeMiss {
+            writer: Some(writer),
+            reason: "not_full_tip_request",
+        });
+    };
+    if new_tip_oids == prev_entry.tip_oids {
+        return Err(PackCacheCompositeMiss {
+            writer: Some(writer),
+            reason: "same_tips",
+        });
+    }
+
+    let delta_pack =
+        match build_pack_cache_delta(state, repo_path, &prev_entry.tip_oids, &new_tip_oids).await {
+            Ok(delta_pack) => delta_pack,
+            Err(failure) => {
+                warn!(
+                    repo = %owner_repo,
+                    reason = failure.reason,
+                    error = %failure.error,
+                    "failed to build on-demand pack cache delta"
+                );
+                return Err(PackCacheCompositeMiss {
+                    writer: Some(writer),
+                    reason: failure.reason,
+                });
+            }
+        };
+
+    writer
+        .finish_composite(&prev_entry.key, &delta_pack)
+        .await
         .map_err(|error| {
-            PackCacheStitchFailure::new(
-                "replace_response_pack",
-                error.context(format!(
-                    "failed to stitch pack cache response for {owner_repo}"
-                )),
-            )
+            warn!(
+                repo = %owner_repo,
+                error = %error,
+                "failed to finish on-demand pack cache composite"
+            );
+            PackCacheCompositeMiss {
+                writer: None,
+                reason: "finish_composite",
+            }
         })
 }
 

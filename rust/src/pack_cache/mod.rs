@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -17,6 +18,10 @@ use crate::config::PackCacheConfig;
 use crate::metrics::{MetricsRegistry, Protocol};
 
 const PACK_CACHE_DIR: &str = "pack-cache";
+const PACK_RESPONSE_EXT: &str = "pack-response";
+const COMPOSITE_MANIFEST_EXT: &str = "pack-composite.json";
+const DELTA_PACK_EXT: &str = "delta.pack";
+const COMPOSITE_MANIFEST_VERSION: u32 = 1;
 
 #[derive(Clone)]
 pub struct PackCache {
@@ -59,6 +64,14 @@ impl PackCacheKey {
             .as_ref()
             .map(|warming| warming.tip_oids.as_slice())
     }
+
+    fn from_digest(digest: String) -> Self {
+        Self {
+            digest,
+            owner_repo: String::new(),
+            warming: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +90,20 @@ struct PackCacheWarmingMetadata {
 pub struct PackCacheHit {
     pub path: PathBuf,
     pub size_bytes: u64,
+    pub artifact: PackCacheArtifact,
+}
+
+pub enum PackCacheArtifact {
+    Full,
+    Composite { key: PackCacheKey },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompositeManifest {
+    version: u32,
+    base_key: String,
+    delta_pack_file: String,
+    delta_size_bytes: u64,
 }
 
 pub enum PackCacheLookup {
@@ -301,17 +328,70 @@ impl PackCache {
         self.lookup(key).await
     }
 
+    pub async fn read_composite_response(&self, hit: &PackCacheHit) -> Result<Vec<u8>> {
+        let PackCacheArtifact::Composite { key } = &hit.artifact else {
+            return tokio::fs::read(&hit.path)
+                .await
+                .with_context(|| format!("read pack cache artifact {}", hit.path.display()));
+        };
+
+        let (base_path, delta_paths) = self.composite_chain(key)?;
+        let base_response = tokio::fs::read(&base_path)
+            .await
+            .with_context(|| format!("read base pack cache artifact {}", base_path.display()))?;
+        let mut delta_packs = Vec::with_capacity(delta_paths.len());
+        for delta_path in delta_paths {
+            let delta_pack = tokio::fs::read(&delta_path)
+                .await
+                .with_context(|| format!("read pack cache delta {}", delta_path.display()))?;
+            delta_packs.push(delta_pack);
+        }
+        stitch::stitch_response_with_delta_chain(&base_response, &delta_packs)
+    }
+
     async fn lookup(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
-        let path = self.final_path(key);
-        self.lookup_path(&path)
+        if let Some(hit) = self.lookup_full_path(key)? {
+            return Ok(Some(hit));
+        }
+        self.lookup_composite_path(key)
     }
 
     fn lookup_sync(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
-        let path = self.final_path(key);
-        self.lookup_path(&path)
+        if let Some(hit) = self.lookup_full_path(key)? {
+            return Ok(Some(hit));
+        }
+        self.lookup_composite_path(key)
     }
 
-    fn lookup_path(&self, path: &Path) -> Result<Option<PackCacheHit>> {
+    fn lookup_full_path(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
+        let path = self.final_path(key);
+        self.lookup_existing_file(&path).map(|metadata| {
+            metadata.map(|metadata| PackCacheHit {
+                path,
+                size_bytes: metadata.len(),
+                artifact: PackCacheArtifact::Full,
+            })
+        })
+    }
+
+    fn lookup_composite_path(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
+        let manifest_path = self.composite_manifest_path(key);
+        let Some(metadata) = self.lookup_existing_file(&manifest_path)? else {
+            return Ok(None);
+        };
+        if self.composite_chain(key).is_err() {
+            self.remove_composite_files(key);
+            return Ok(None);
+        }
+
+        Ok(Some(PackCacheHit {
+            path: manifest_path,
+            size_bytes: metadata.len(),
+            artifact: PackCacheArtifact::Composite { key: key.clone() },
+        }))
+    }
+
+    fn lookup_existing_file(&self, path: &Path) -> Result<Option<std::fs::Metadata>> {
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -330,10 +410,63 @@ impl PackCache {
             return Ok(None);
         }
 
-        Ok(Some(PackCacheHit {
-            path: path.to_path_buf(),
-            size_bytes: metadata.len(),
-        }))
+        Ok(Some(metadata))
+    }
+
+    fn composite_chain(&self, key: &PackCacheKey) -> Result<(PathBuf, Vec<PathBuf>)> {
+        let mut current_key = key.clone();
+        let mut delta_paths = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        loop {
+            if !seen.insert(current_key.as_str().to_string()) {
+                anyhow::bail!("cycle in pack cache composite chain");
+            }
+
+            let full_path = self.final_path(&current_key);
+            if self.lookup_existing_file(&full_path)?.is_some() {
+                delta_paths.reverse();
+                return Ok((full_path, delta_paths));
+            }
+
+            let manifest = self.read_composite_manifest(&current_key)?;
+            let delta_path = self.root.join(&manifest.delta_pack_file);
+            self.lookup_existing_file(&delta_path)?
+                .with_context(|| format!("missing pack cache delta {}", delta_path.display()))?;
+            delta_paths.push(delta_path);
+            current_key = PackCacheKey::from_digest(manifest.base_key);
+        }
+    }
+
+    fn read_composite_manifest(&self, key: &PackCacheKey) -> Result<CompositeManifest> {
+        let path = self.composite_manifest_path(key);
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read pack cache composite manifest {}", path.display()))?;
+        let manifest: CompositeManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse pack cache composite manifest {}", path.display()))?;
+        anyhow::ensure!(
+            manifest.version == COMPOSITE_MANIFEST_VERSION,
+            "unsupported pack cache composite manifest version {}",
+            manifest.version
+        );
+        Ok(manifest)
+    }
+
+    fn remove_composite_files(&self, key: &PackCacheKey) {
+        if let Ok(manifest) = self.read_composite_manifest(key) {
+            let delta_path = self.root.join(manifest.delta_pack_file);
+            if let Err(error) = std::fs::remove_file(&delta_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(path = %delta_path.display(), error = %error, "failed to remove invalid pack cache delta");
+            }
+        }
+        let manifest_path = self.composite_manifest_path(key);
+        if let Err(error) = std::fs::remove_file(&manifest_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %manifest_path.display(), error = %error, "failed to remove invalid pack cache composite manifest");
+        }
     }
 
     async fn open_writer(&self, key: PackCacheKey) -> Result<PackCacheWriter> {
@@ -374,7 +507,13 @@ impl PackCache {
     }
 
     fn final_path(&self, key: &PackCacheKey) -> PathBuf {
-        self.root.join(format!("{}.pack-response", key.as_str()))
+        self.root
+            .join(format!("{}.{}", key.as_str(), PACK_RESPONSE_EXT))
+    }
+
+    fn composite_manifest_path(&self, key: &PackCacheKey) -> PathBuf {
+        self.root
+            .join(format!("{}.{}", key.as_str(), COMPOSITE_MANIFEST_EXT))
     }
 
     async fn refresh_size_metric(&self) {
@@ -389,6 +528,10 @@ impl PackCache {
 }
 
 impl PackCacheWriter {
+    pub(crate) fn key(&self) -> &PackCacheKey {
+        &self.key
+    }
+
     pub async fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer
             .write_all(bytes)
@@ -418,38 +561,7 @@ impl PackCacheWriter {
                         self.final_path.display()
                     )
                 })?;
-            crate::metrics::observe_pack_cache_artifact_generation(
-                &self.metrics,
-                self.started_at.elapsed(),
-            );
-            if let Some(warming) = &self.key.warming {
-                self.recent_pack_cache_keys.lock().unwrap().insert(
-                    self.key.owner_repo.clone(),
-                    PackCacheRecentEntry {
-                        key: self.key.clone(),
-                        tip_oids: warming.tip_oids.clone(),
-                        request_template: warming.request_template.clone(),
-                    },
-                );
-            }
-            if let Err(error) = prune_to_limit(&self.root, self.max_bytes) {
-                warn!(
-                    root = %self.root.display(),
-                    max_bytes = self.max_bytes,
-                    error = %error,
-                    "failed to prune pack cache after artifact promotion"
-                );
-            }
-            crate::metrics::set_pack_cache_size_bytes(
-                &self.metrics,
-                directory_size(&self.root).unwrap_or(0),
-            );
-            debug!(
-                key = %self.key.as_str(),
-                bytes = self.bytes_written,
-                path = %self.final_path.display(),
-                "stored pack cache artifact"
-            );
+            self.record_promotion();
         } else if let Err(error) = tokio::fs::remove_file(&self.tmp_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -463,6 +575,101 @@ impl PackCacheWriter {
         );
         self.release_inflight().await;
         Ok(())
+    }
+
+    pub async fn finish_composite(
+        mut self,
+        base_key: &PackCacheKey,
+        delta_pack: &[u8],
+    ) -> Result<PackCacheHit> {
+        self.writer
+            .shutdown()
+            .await
+            .context("shutdown unused full pack cache temp artifact writer")?;
+        if let Err(error) = tokio::fs::remove_file(&self.tmp_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %self.tmp_path.display(), error = %error, "failed to remove unused full pack cache temp artifact");
+        }
+
+        let final_delta_path = self
+            .root
+            .join(format!("{}.{}", self.key.as_str(), DELTA_PACK_EXT));
+        let final_manifest_path =
+            self.root
+                .join(format!("{}.{}", self.key.as_str(), COMPOSITE_MANIFEST_EXT));
+        let tmp_delta_path = self.root.join(format!(
+            "{}.tmp.{}.{}",
+            self.key.as_str(),
+            std::process::id(),
+            DELTA_PACK_EXT
+        ));
+        let tmp_manifest_path = self.root.join(format!(
+            "{}.tmp.{}.{}",
+            self.key.as_str(),
+            std::process::id(),
+            COMPOSITE_MANIFEST_EXT
+        ));
+        let delta_file_name = final_delta_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("pack cache delta path is not valid UTF-8")?
+            .to_string();
+
+        tokio::fs::write(&tmp_delta_path, delta_pack)
+            .await
+            .with_context(|| format!("write pack cache delta {}", tmp_delta_path.display()))?;
+        let manifest = CompositeManifest {
+            version: COMPOSITE_MANIFEST_VERSION,
+            base_key: base_key.as_str().to_string(),
+            delta_pack_file: delta_file_name,
+            delta_size_bytes: delta_pack.len() as u64,
+        };
+        let manifest_bytes =
+            serde_json::to_vec(&manifest).context("serialize pack cache composite manifest")?;
+        tokio::fs::write(&tmp_manifest_path, manifest_bytes)
+            .await
+            .with_context(|| {
+                format!(
+                    "write pack cache composite manifest {}",
+                    tmp_manifest_path.display()
+                )
+            })?;
+        tokio::fs::rename(&tmp_delta_path, &final_delta_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "promote pack cache delta {} to {}",
+                    tmp_delta_path.display(),
+                    final_delta_path.display()
+                )
+            })?;
+        tokio::fs::rename(&tmp_manifest_path, &final_manifest_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "promote pack cache composite manifest {} to {}",
+                    tmp_manifest_path.display(),
+                    final_manifest_path.display()
+                )
+            })?;
+
+        self.bytes_written = delta_pack.len() as u64;
+        self.record_promotion();
+        self.completed = true;
+        crate::metrics::set_pack_cache_size_bytes(
+            &self.metrics,
+            directory_size(&self.root).unwrap_or(0),
+        );
+        self.release_inflight().await;
+
+        Ok(PackCacheHit {
+            path: final_manifest_path,
+            size_bytes: delta_pack.len() as u64,
+            artifact: PackCacheArtifact::Composite {
+                key: self.key.clone(),
+            },
+        })
     }
 
     pub async fn abort(mut self) {
@@ -482,6 +689,41 @@ impl PackCacheWriter {
     async fn release_inflight(&self) {
         self.inflight.lock().await.remove(self.key.as_str());
         self.notify.notify_waiters();
+    }
+
+    fn record_promotion(&self) {
+        crate::metrics::observe_pack_cache_artifact_generation(
+            &self.metrics,
+            self.started_at.elapsed(),
+        );
+        if let Some(warming) = &self.key.warming {
+            self.recent_pack_cache_keys.lock().unwrap().insert(
+                self.key.owner_repo.clone(),
+                PackCacheRecentEntry {
+                    key: self.key.clone(),
+                    tip_oids: warming.tip_oids.clone(),
+                    request_template: warming.request_template.clone(),
+                },
+            );
+        }
+        if let Err(error) = prune_to_limit(&self.root, self.max_bytes) {
+            warn!(
+                root = %self.root.display(),
+                max_bytes = self.max_bytes,
+                error = %error,
+                "failed to prune pack cache after artifact promotion"
+            );
+        }
+        crate::metrics::set_pack_cache_size_bytes(
+            &self.metrics,
+            directory_size(&self.root).unwrap_or(0),
+        );
+        debug!(
+            key = %self.key.as_str(),
+            bytes = self.bytes_written,
+            path = %self.final_path.display(),
+            "stored pack cache artifact"
+        );
     }
 }
 
@@ -752,6 +994,16 @@ fn directory_size(root: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+fn is_pack_cache_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.ends_with(PACK_RESPONSE_EXT)
+                || name.ends_with(COMPOSITE_MANIFEST_EXT)
+                || name.ends_with(DELTA_PACK_EXT)
+        })
+}
+
 fn prune_to_limit(root: &Path, max_bytes: u64) -> std::io::Result<()> {
     if !root.exists() {
         return Ok(());
@@ -762,11 +1014,7 @@ fn prune_to_limit(root: &Path, max_bytes: u64) -> std::io::Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".pack-response"))
-        {
+        if !is_pack_cache_artifact(&path) {
             continue;
         }
         let metadata = entry.metadata()?;
@@ -812,14 +1060,44 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_repo_ref_tips, normalize_fresh_clone_request, normalize_fresh_clone_request_parts,
-        unique_tip_oids,
+        PackCache, PackCacheArtifact, PackCacheKey, collect_repo_ref_tips,
+        normalize_fresh_clone_request, normalize_fresh_clone_request_parts, unique_tip_oids,
     };
+    use crate::config::PackCacheConfig;
+    use crate::metrics::{MetricsRegistry, Protocol};
+    use sha1::{Digest, Sha1};
 
     fn pkt(payload: &[u8]) -> Vec<u8> {
         let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
         out.extend_from_slice(payload);
         out
+    }
+
+    fn sideband_packet(band: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len() + 1);
+        out.push(band);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn raw_pack(count: u32, body: &[u8]) -> Vec<u8> {
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&count.to_be_bytes());
+        pack.extend_from_slice(body);
+        let mut sha1 = Sha1::new();
+        sha1.update(&pack);
+        pack.extend_from_slice(&sha1.finalize());
+        pack
+    }
+
+    fn pack_response(pack: &[u8]) -> Vec<u8> {
+        let mut response = Vec::new();
+        response.extend_from_slice(&pkt(b"packfile\n"));
+        response.extend_from_slice(&pkt(&sideband_packet(1, pack)));
+        response.extend_from_slice(b"0000");
+        response
     }
 
     #[test]
@@ -905,6 +1183,61 @@ mod tests {
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn composite_artifact_replays_base_plus_delta_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                ttl_secs: 900,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+            },
+            1024 * 1024,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+
+        let base_key = PackCacheKey {
+            digest: "base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            warming: None,
+        };
+        let composite_key = PackCacheKey {
+            digest: "composite".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            warming: None,
+        };
+        let base_pack = raw_pack(1, b"base-body");
+        let delta_pack = raw_pack(2, b"delta-body");
+        tokio::fs::write(cache.final_path(&base_key), pack_response(&base_pack))
+            .await
+            .unwrap();
+
+        let lookup = cache
+            .lookup_or_reserve(Protocol::Https, composite_key.clone())
+            .await
+            .unwrap();
+        let super::PackCacheLookup::Generate(writer) = lookup else {
+            panic!("expected cache reservation");
+        };
+        writer
+            .finish_composite(&base_key, &delta_pack)
+            .await
+            .unwrap();
+
+        let hit = cache.lookup_by_key(&composite_key).await.unwrap().unwrap();
+        assert!(matches!(hit.artifact, PackCacheArtifact::Composite { .. }));
+        let replayed = cache.read_composite_response(&hit).await.unwrap();
+        let raw = super::stitch::extract_raw_pack(&replayed).unwrap();
+
+        assert_eq!(&raw[..4], b"PACK");
+        assert_eq!(u32::from_be_bytes(raw[8..12].try_into().unwrap()), 3);
+        assert_eq!(&raw[12..raw.len() - 20], b"base-bodydelta-body");
     }
 
     #[test]
