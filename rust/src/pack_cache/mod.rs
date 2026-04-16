@@ -1,4 +1,7 @@
+pub(crate) mod stitch;
+
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -21,18 +24,54 @@ pub struct PackCache {
     config: PackCacheConfig,
     max_bytes: u64,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, PackCacheRecentEntry>>>,
     metrics: MetricsRegistry,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct PackCacheKey {
     digest: String,
+    pub(crate) owner_repo: String,
+    warming: Option<PackCacheWarmingMetadata>,
+}
+
+impl PartialEq for PackCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest
+    }
+}
+
+impl Eq for PackCacheKey {}
+
+impl Hash for PackCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.digest.hash(state);
+    }
 }
 
 impl PackCacheKey {
     pub fn as_str(&self) -> &str {
         &self.digest
     }
+
+    pub(crate) fn warming_tip_oids(&self) -> Option<&[String]> {
+        self.warming
+            .as_ref()
+            .map(|warming| warming.tip_oids.as_slice())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PackCacheRecentEntry {
+    pub key: PackCacheKey,
+    pub tip_oids: Vec<String>,
+    pub request_template: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PackCacheWarmingMetadata {
+    tip_oids: Vec<String>,
+    request_template: Vec<String>,
 }
 
 pub struct PackCacheHit {
@@ -57,6 +96,7 @@ pub struct PackCacheWriter {
     min_response_bytes: u64,
     started_at: Instant,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, PackCacheRecentEntry>>>,
     notify: Arc<Notify>,
     metrics: MetricsRegistry,
     completed: bool,
@@ -77,6 +117,7 @@ impl PackCache {
             config,
             max_bytes,
             inflight: Arc::new(Mutex::new(HashMap::new())),
+            recent_pack_cache_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics,
         }
     }
@@ -109,19 +150,55 @@ impl PackCache {
             return Err("non_v2");
         }
 
-        let normalized_request = normalize_fresh_clone_request(request_body)?;
-        let ref_tips = repo_ref_tips_digest(repo_path)?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"forgeproxy-pack-cache-v1\0");
-        hasher.update(owner_repo.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(ref_tips.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(normalized_request.as_bytes());
+        let request = normalize_fresh_clone_request_parts(request_body)?;
+        let ref_tips = collect_repo_ref_tips(repo_path)?;
+        let tip_oids = unique_tip_oids(&ref_tips);
+        let ref_tips_digest = repo_ref_tips_digest(&ref_tips);
+        let warming = (request.wants == tip_oids).then(|| PackCacheWarmingMetadata {
+            tip_oids,
+            request_template: request.non_want_lines.clone(),
+        });
 
-        Ok(PackCacheKey {
-            digest: hex_digest(hasher.finalize().as_slice()),
-        })
+        Ok(pack_cache_key(
+            owner_repo,
+            &ref_tips_digest,
+            &request.normalized,
+            warming,
+        ))
+    }
+
+    pub fn key_for_warming(
+        &self,
+        owner_repo: &str,
+        repo_path: &Path,
+        request_template: &[String],
+    ) -> std::result::Result<PackCacheKey, &'static str> {
+        if !self.config.enabled {
+            return Err("disabled");
+        }
+
+        let ref_tips = collect_repo_ref_tips(repo_path)?;
+        let tip_oids = unique_tip_oids(&ref_tips);
+        let ref_tips_digest = repo_ref_tips_digest(&ref_tips);
+        let normalized_request = normalized_request_from_parts(request_template, &tip_oids);
+
+        Ok(pack_cache_key(
+            owner_repo,
+            &ref_tips_digest,
+            &normalized_request,
+            Some(PackCacheWarmingMetadata {
+                tip_oids,
+                request_template: request_template.to_vec(),
+            }),
+        ))
+    }
+
+    pub fn lookup_recent_key(&self, owner_repo: &str) -> Option<PackCacheRecentEntry> {
+        self.recent_pack_cache_keys
+            .lock()
+            .ok()?
+            .get(owner_repo)
+            .cloned()
     }
 
     pub async fn lookup_or_reserve(
@@ -220,6 +297,10 @@ impl PackCache {
         }
     }
 
+    pub async fn lookup_by_key(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
+        self.lookup(key).await
+    }
+
     async fn lookup(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
         let path = self.final_path(key);
         self.lookup_path(&path)
@@ -285,6 +366,7 @@ impl PackCache {
             min_response_bytes: self.config.min_response_bytes,
             started_at: Instant::now(),
             inflight: Arc::clone(&self.inflight),
+            recent_pack_cache_keys: Arc::clone(&self.recent_pack_cache_keys),
             notify,
             metrics: self.metrics.clone(),
             completed: false,
@@ -340,6 +422,16 @@ impl PackCacheWriter {
                 &self.metrics,
                 self.started_at.elapsed(),
             );
+            if let Some(warming) = &self.key.warming {
+                self.recent_pack_cache_keys.lock().unwrap().insert(
+                    self.key.owner_repo.clone(),
+                    PackCacheRecentEntry {
+                        key: self.key.clone(),
+                        tip_oids: warming.tip_oids.clone(),
+                        request_template: warming.request_template.clone(),
+                    },
+                );
+            }
             if let Err(error) = prune_to_limit(&self.root, self.max_bytes) {
                 warn!(
                     root = %self.root.display(),
@@ -415,13 +507,30 @@ impl Drop for PackCacheWriter {
     }
 }
 
-/// Compute a stable digest of a bare repo's ref→OID mapping.
-///
-/// Reads `packed-refs` and loose refs under `refs/`, collects every
-/// `(refname, oid)` pair into a sorted map (so rename-free reorderings are
-/// neutral), then hashes them.  The result changes if and only if the actual
-/// tip-OIDs change, regardless of which generation path on disk is live.
-fn repo_ref_tips_digest(repo_path: &Path) -> std::result::Result<String, &'static str> {
+fn pack_cache_key(
+    owner_repo: &str,
+    ref_tips_digest: &str,
+    normalized_request: &str,
+    warming: Option<PackCacheWarmingMetadata>,
+) -> PackCacheKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"forgeproxy-pack-cache-v1\0");
+    hasher.update(owner_repo.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(ref_tips_digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(normalized_request.as_bytes());
+
+    PackCacheKey {
+        digest: hex_digest(hasher.finalize().as_slice()),
+        owner_repo: owner_repo.to_string(),
+        warming,
+    }
+}
+
+fn collect_repo_ref_tips(
+    repo_path: &Path,
+) -> std::result::Result<BTreeMap<String, String>, &'static str> {
     let mut tips: BTreeMap<String, String> = BTreeMap::new();
 
     // Read packed-refs first (lower priority than loose refs).
@@ -447,14 +556,22 @@ fn repo_ref_tips_digest(repo_path: &Path) -> std::result::Result<String, &'stati
         return Err("no_refs");
     }
 
+    Ok(tips)
+}
+
+/// Compute a stable digest of a bare repo's ref->OID mapping.
+///
+/// The result changes if and only if the actual tip-OIDs change, regardless of
+/// which generation path on disk is live.
+fn repo_ref_tips_digest(tips: &BTreeMap<String, String>) -> String {
     let mut hasher = Sha256::new();
-    for (refname, oid) in &tips {
+    for (refname, oid) in tips {
         hasher.update(refname.as_bytes());
         hasher.update(b" ");
         hasher.update(oid.as_bytes());
         hasher.update(b"\n");
     }
-    Ok(hex_digest(hasher.finalize().as_slice()))
+    hex_digest(hasher.finalize().as_slice())
 }
 
 fn collect_loose_refs(dir: &Path, prefix: &str, tips: &mut BTreeMap<String, String>) {
@@ -480,7 +597,27 @@ fn collect_loose_refs(dir: &Path, prefix: &str, tips: &mut BTreeMap<String, Stri
     }
 }
 
+fn unique_tip_oids(tips: &BTreeMap<String, String>) -> Vec<String> {
+    let mut oids = tips.values().cloned().collect::<Vec<_>>();
+    oids.sort();
+    oids.dedup();
+    oids
+}
+
+#[cfg(test)]
 fn normalize_fresh_clone_request(bytes: &[u8]) -> std::result::Result<String, &'static str> {
+    Ok(normalize_fresh_clone_request_parts(bytes)?.normalized)
+}
+
+struct NormalizedFreshCloneRequest {
+    normalized: String,
+    non_want_lines: Vec<String>,
+    wants: Vec<String>,
+}
+
+fn normalize_fresh_clone_request_parts(
+    bytes: &[u8],
+) -> std::result::Result<NormalizedFreshCloneRequest, &'static str> {
     let mut offset = 0usize;
     let mut command_fetch = false;
     let mut has_done = false;
@@ -560,11 +697,26 @@ fn normalize_fresh_clone_request(bytes: &[u8]) -> std::result::Result<String, &'
     }
 
     wants.sort();
+    wants.dedup();
+    let non_want_lines = normalized;
+    let normalized = normalized_request_from_parts(&non_want_lines, &wants);
+
+    Ok(NormalizedFreshCloneRequest {
+        normalized,
+        non_want_lines,
+        wants,
+    })
+}
+
+fn normalized_request_from_parts(non_want_lines: &[String], wants: &[String]) -> String {
+    let mut normalized = non_want_lines.to_vec();
+    let mut wants = wants.to_vec();
+    wants.sort();
+    wants.dedup();
     for want in wants {
         normalized.push(format!("want {want}"));
     }
-
-    Ok(normalized.join("\n"))
+    normalized.join("\n")
 }
 
 fn parse_pkt_len(header: &[u8]) -> Option<usize> {
@@ -659,7 +811,10 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_fresh_clone_request;
+    use super::{
+        collect_repo_ref_tips, normalize_fresh_clone_request, normalize_fresh_clone_request_parts,
+        unique_tip_oids,
+    };
 
     fn pkt(payload: &[u8]) -> Vec<u8> {
         let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
@@ -690,6 +845,65 @@ mod tests {
         assert_eq!(
             normalize_fresh_clone_request(&first).unwrap(),
             normalize_fresh_clone_request(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn fresh_clone_request_parts_keep_template_and_dedupe_wants() {
+        let mut request = Vec::new();
+        request.extend_from_slice(&pkt(b"command=fetch\n"));
+        request.extend_from_slice(&pkt(b"thin-pack\n"));
+        request.extend_from_slice(b"0001");
+        request.extend_from_slice(&pkt(b"want bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"));
+        request.extend_from_slice(&pkt(b"want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"));
+        request.extend_from_slice(&pkt(b"want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"));
+        request.extend_from_slice(&pkt(b"done\n"));
+        request.extend_from_slice(b"0000");
+
+        let parsed = normalize_fresh_clone_request_parts(&request).unwrap();
+
+        assert_eq!(
+            parsed.non_want_lines,
+            vec!["command=fetch", "thin-pack", "delimiter", "done", "flush"]
+        );
+        assert_eq!(
+            parsed.wants,
+            vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+        );
+    }
+
+    #[test]
+    fn repo_ref_tip_collection_dedupes_tip_oids() {
+        let temp = tempfile::tempdir().unwrap();
+        let refs_heads = temp.path().join("refs").join("heads");
+        std::fs::create_dir_all(&refs_heads).unwrap();
+        std::fs::write(
+            refs_heads.join("main"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        std::fs::write(
+            refs_heads.join("alias"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("packed-refs"),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/tags/v1\n",
+        )
+        .unwrap();
+
+        let tips = collect_repo_ref_tips(temp.path()).unwrap();
+
+        assert_eq!(
+            unique_tip_oids(&tips),
+            vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
         );
     }
 

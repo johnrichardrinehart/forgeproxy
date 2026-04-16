@@ -990,6 +990,92 @@ pub async fn git_bundle_create_filtered(
     Ok(())
 }
 
+/// Generate a raw pack containing objects reachable from `new_tips` but not
+/// reachable from `prev_tips`.
+#[instrument(fields(repo = %repo_path.display(), prev_tips = prev_tips.len(), new_tips = new_tips.len()))]
+pub async fn git_pack_objects_delta(
+    repo_path: &Path,
+    prev_tips: &[String],
+    new_tips: &[String],
+    pack_threads: usize,
+) -> Result<Vec<u8>> {
+    if new_tips.is_empty() {
+        bail!("cannot create delta pack without new tips");
+    }
+
+    let mut input = Vec::new();
+    for oid in prev_tips {
+        input.push(b'^');
+        input.extend_from_slice(oid.as_bytes());
+        input.push(b'\n');
+    }
+    for oid in new_tips {
+        input.extend_from_slice(oid.as_bytes());
+        input.push(b'\n');
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("-c")
+        .arg(format!("pack.threads={pack_threads}"))
+        .arg("pack-objects")
+        .arg("--revs")
+        .arg("--stdout")
+        .arg("--no-delta-base-offset");
+
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git pack-objects delta");
+
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn git pack-objects delta")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to capture git pack-objects stdin")?;
+    let stdin_writer = tokio::spawn(async move {
+        stdin
+            .write_all(&input)
+            .await
+            .context("failed to write revs to git pack-objects")?;
+        stdin
+            .shutdown()
+            .await
+            .context("failed to close git pack-objects stdin")?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to wait on git pack-objects delta")?;
+    stdin_writer
+        .await
+        .context("git pack-objects stdin writer task join failed")??;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git pack-objects delta failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+    if output.stdout.is_empty() {
+        bail!("git pack-objects delta produced an empty pack");
+    }
+
+    debug!(
+        bytes = output.stdout.len(),
+        "git pack-objects delta succeeded"
+    );
+    Ok(output.stdout)
+}
+
 fn set_tmpdir_to_output_parent(cmd: &mut Command, output: &Path) {
     if let Some(parent) = output
         .parent()

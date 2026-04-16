@@ -1717,6 +1717,205 @@ fn spawn_published_generation_index_preparation(
     });
 }
 
+struct PackCacheStitchFailure {
+    reason: &'static str,
+    error: anyhow::Error,
+}
+
+impl PackCacheStitchFailure {
+    fn new(reason: &'static str, error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            reason,
+            error: error.into(),
+        }
+    }
+}
+
+fn spawn_pack_cache_warming(
+    state: crate::AppState,
+    owner_repo: String,
+    published_path: PathBuf,
+    published_lease: PublishedGenerationLease,
+    source: String,
+) {
+    if !state.pack_cache.enabled() {
+        return;
+    }
+    let Some(prev_entry) = state.pack_cache.lookup_recent_key(&owner_repo) else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        let _published_lease = published_lease;
+        let started_at = Instant::now();
+        crate::metrics::inc_pack_cache_stitch_attempt(&state.metrics, &owner_repo);
+        info!(
+            repo = %owner_repo,
+            source,
+            path = %published_path.display(),
+            "starting pack cache stitching for published generation"
+        );
+
+        let result =
+            warm_pack_cache_for_generation(&state, &owner_repo, &published_path, prev_entry).await;
+        crate::metrics::observe_pack_cache_stitch_duration(
+            &state.metrics,
+            &owner_repo,
+            started_at.elapsed(),
+        );
+
+        match result {
+            Ok(()) => {
+                info!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "finished pack cache stitching for published generation"
+                );
+            }
+            Err(failure) => {
+                crate::metrics::inc_pack_cache_stitch_failure(
+                    &state.metrics,
+                    &owner_repo,
+                    failure.reason,
+                );
+                warn!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    reason = failure.reason,
+                    error = %failure.error,
+                    "pack cache stitching failed for published generation"
+                );
+            }
+        }
+    });
+}
+
+async fn warm_pack_cache_for_generation(
+    state: &crate::AppState,
+    owner_repo: &str,
+    published_path: &Path,
+    prev_entry: crate::pack_cache::PackCacheRecentEntry,
+) -> std::result::Result<(), PackCacheStitchFailure> {
+    let new_key = state
+        .pack_cache
+        .key_for_warming(owner_repo, published_path, &prev_entry.request_template)
+        .map_err(|reason| PackCacheStitchFailure::new(reason, anyhow::anyhow!(reason)))?;
+    let new_tip_oids = new_key
+        .warming_tip_oids()
+        .ok_or_else(|| {
+            PackCacheStitchFailure::new(
+                "missing_new_tip_oids",
+                anyhow::anyhow!("warming key did not carry tip OIDs"),
+            )
+        })?
+        .to_vec();
+
+    if new_key == prev_entry.key {
+        return Ok(());
+    }
+    if new_tip_oids == prev_entry.tip_oids {
+        return Ok(());
+    }
+
+    let mut writer = match state
+        .pack_cache
+        .lookup_or_reserve(crate::metrics::Protocol::Https, new_key)
+        .await
+    {
+        Ok(crate::pack_cache::PackCacheLookup::Hit(_)) => return Ok(()),
+        Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => writer,
+        Ok(crate::pack_cache::PackCacheLookup::BypassAfterWait) => {
+            return Err(PackCacheStitchFailure::new(
+                "reservation_bypassed",
+                anyhow::anyhow!("pack cache reservation bypassed after in-flight wait"),
+            ));
+        }
+        Err(error) => return Err(PackCacheStitchFailure::new("reserve", error)),
+    };
+
+    let stitched_response = match build_stitched_pack_cache_response(
+        state,
+        owner_repo,
+        published_path,
+        &prev_entry,
+        &new_tip_oids,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(failure) => {
+            writer.abort().await;
+            return Err(failure);
+        }
+    };
+
+    if let Err(error) = writer.write_chunk(&stitched_response).await {
+        writer.abort().await;
+        return Err(PackCacheStitchFailure::new("write", error));
+    }
+    writer
+        .finish()
+        .await
+        .map_err(|error| PackCacheStitchFailure::new("finish", error))
+}
+
+async fn build_stitched_pack_cache_response(
+    state: &crate::AppState,
+    owner_repo: &str,
+    published_path: &Path,
+    prev_entry: &crate::pack_cache::PackCacheRecentEntry,
+    new_tip_oids: &[String],
+) -> std::result::Result<Vec<u8>, PackCacheStitchFailure> {
+    let base_hit = state
+        .pack_cache
+        .lookup_by_key(&prev_entry.key)
+        .await
+        .map_err(|error| PackCacheStitchFailure::new("lookup_base", error))?
+        .ok_or_else(|| {
+            PackCacheStitchFailure::new(
+                "base_missing",
+                anyhow::anyhow!("previous pack cache artifact is no longer available"),
+            )
+        })?;
+    let base_response = tokio::fs::read(&base_hit.path)
+        .await
+        .map_err(|error| PackCacheStitchFailure::new("read_base", error))?;
+    let base_pack = crate::pack_cache::stitch::extract_raw_pack(&base_response)
+        .map_err(|error| PackCacheStitchFailure::new("extract_base_pack", error))?;
+
+    let permit = state
+        .bundle_generation_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| PackCacheStitchFailure::new("semaphore", error))?;
+    let delta_pack = crate::git::commands::git_pack_objects_delta(
+        published_path,
+        &prev_entry.tip_oids,
+        new_tip_oids,
+        state.bundle_pack_threads,
+    )
+    .await
+    .map_err(|error| PackCacheStitchFailure::new("delta_pack", error))?;
+    drop(permit);
+
+    let stitched_pack = crate::pack_cache::stitch::stitch_raw_packs(&base_pack, &delta_pack)
+        .map_err(|error| PackCacheStitchFailure::new("stitch_pack", error))?;
+    crate::pack_cache::stitch::replace_sideband1_in_response(&base_response, &stitched_pack)
+        .map_err(|error| {
+            PackCacheStitchFailure::new(
+                "replace_response_pack",
+                error.context(format!(
+                    "failed to stitch pack cache response for {owner_repo}"
+                )),
+            )
+        })
+}
+
 async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
     if repo_path.exists() && !crate::cache::manager::is_usable_bare_repo(repo_path) {
         let metadata = tokio::fs::symlink_metadata(repo_path)
@@ -1865,6 +2064,15 @@ async fn publish_repo_mirror_generation_inner(
             owner_repo.to_string(),
             published_path.clone(),
             published_lease,
+            source.to_string(),
+        );
+        let pack_cache_warming_lease =
+            lease_published_generation_path(state, owner_repo, &published_path);
+        spawn_pack_cache_warming(
+            state.clone(),
+            owner_repo.to_string(),
+            published_path.clone(),
+            pack_cache_warming_lease,
             source.to_string(),
         );
         spawn_generation_deep_validation(

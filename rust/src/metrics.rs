@@ -208,6 +208,17 @@ pub struct PackCacheInflightWaitLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheStitchLabels {
+    pub owner_repo: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheStitchFailureLabels {
+    pub owner_repo: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct UploadPackCpuLabels {
     pub protocol: Protocol,
     pub source: String,
@@ -398,6 +409,9 @@ pub struct Metrics {
     pub pack_cache_size_bytes: Gauge,
     pub pack_cache_inflight_waits_total: Family<PackCacheInflightWaitLabels, Counter>,
     pub pack_cache_artifact_generation_duration_seconds: Histogram,
+    pub pack_cache_stitch_attempts_total: Family<PackCacheStitchLabels, Counter>,
+    pub pack_cache_stitch_duration_seconds: Family<PackCacheStitchLabels, Histogram>,
+    pub pack_cache_stitch_failures_total: Family<PackCacheStitchFailureLabels, Counter>,
     pub upload_pack_cpu_seconds_total: Family<UploadPackCpuLabels, Counter>,
 
     // -- bundle URI / manifests --
@@ -665,6 +679,31 @@ impl Metrics {
             pack_cache_artifact_generation_duration_seconds.clone(),
         );
 
+        let pack_cache_stitch_attempts_total = Family::<PackCacheStitchLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_stitch_attempts",
+            "Pack response cache proactive stitching attempts by repo",
+            pack_cache_stitch_attempts_total.clone(),
+        );
+
+        let pack_cache_stitch_duration_seconds =
+            Family::<PackCacheStitchLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.01, 2.0, 16))
+            });
+        registry.register(
+            "forgeproxy_pack_cache_stitch_duration_seconds",
+            "Pack response cache proactive stitching latency in seconds",
+            pack_cache_stitch_duration_seconds.clone(),
+        );
+
+        let pack_cache_stitch_failures_total =
+            Family::<PackCacheStitchFailureLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_stitch_failures",
+            "Pack response cache proactive stitching failures by repo and reason",
+            pack_cache_stitch_failures_total.clone(),
+        );
+
         let upload_pack_cpu_seconds_total = Family::<UploadPackCpuLabels, Counter>::default();
         registry.register(
             "forgeproxy_upload_pack_cpu_seconds",
@@ -736,6 +775,9 @@ impl Metrics {
             pack_cache_size_bytes,
             pack_cache_inflight_waits_total,
             pack_cache_artifact_generation_duration_seconds,
+            pack_cache_stitch_attempts_total,
+            pack_cache_stitch_duration_seconds,
+            pack_cache_stitch_failures_total,
             upload_pack_cpu_seconds_total,
             bundle_uri_command_total,
             bundle_presign_total,
@@ -1035,6 +1077,41 @@ pub fn observe_pack_cache_artifact_generation(metrics: &MetricsRegistry, elapsed
         .metrics
         .pack_cache_artifact_generation_duration_seconds
         .observe(elapsed.as_secs_f64());
+}
+
+pub fn inc_pack_cache_stitch_attempt(metrics: &MetricsRegistry, owner_repo: &str) {
+    metrics
+        .metrics
+        .pack_cache_stitch_attempts_total
+        .get_or_create(&PackCacheStitchLabels {
+            owner_repo: owner_repo.to_string(),
+        })
+        .inc();
+}
+
+pub fn observe_pack_cache_stitch_duration(
+    metrics: &MetricsRegistry,
+    owner_repo: &str,
+    elapsed: Duration,
+) {
+    metrics
+        .metrics
+        .pack_cache_stitch_duration_seconds
+        .get_or_create(&PackCacheStitchLabels {
+            owner_repo: owner_repo.to_string(),
+        })
+        .observe(elapsed.as_secs_f64());
+}
+
+pub fn inc_pack_cache_stitch_failure(metrics: &MetricsRegistry, owner_repo: &str, reason: &str) {
+    metrics
+        .metrics
+        .pack_cache_stitch_failures_total
+        .get_or_create(&PackCacheStitchFailureLabels {
+            owner_repo: owner_repo.to_string(),
+            reason: reason.to_string(),
+        })
+        .inc();
 }
 
 pub fn inc_upload_pack_cpu_seconds(
