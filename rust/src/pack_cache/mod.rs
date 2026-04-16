@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -98,7 +98,7 @@ impl PackCache {
     pub fn key_for_fresh_clone(
         &self,
         owner_repo: &str,
-        generation_path: &Path,
+        repo_path: &Path,
         request_body: &[u8],
         git_protocol: Option<&str>,
     ) -> std::result::Result<PackCacheKey, &'static str> {
@@ -110,12 +110,12 @@ impl PackCache {
         }
 
         let normalized_request = normalize_fresh_clone_request(request_body)?;
-        let generation_identity = generation_path.to_string_lossy();
+        let ref_tips = repo_ref_tips_digest(repo_path)?;
         let mut hasher = Sha256::new();
         hasher.update(b"forgeproxy-pack-cache-v1\0");
         hasher.update(owner_repo.as_bytes());
         hasher.update(b"\0");
-        hasher.update(generation_identity.as_bytes());
+        hasher.update(ref_tips.as_bytes());
         hasher.update(b"\0");
         hasher.update(normalized_request.as_bytes());
 
@@ -412,6 +412,71 @@ impl Drop for PackCacheWriter {
             inflight.lock().await.remove(&key);
             notify.notify_waiters();
         });
+    }
+}
+
+/// Compute a stable digest of a bare repo's ref→OID mapping.
+///
+/// Reads `packed-refs` and loose refs under `refs/`, collects every
+/// `(refname, oid)` pair into a sorted map (so rename-free reorderings are
+/// neutral), then hashes them.  The result changes if and only if the actual
+/// tip-OIDs change, regardless of which generation path on disk is live.
+fn repo_ref_tips_digest(repo_path: &Path) -> std::result::Result<String, &'static str> {
+    let mut tips: BTreeMap<String, String> = BTreeMap::new();
+
+    // Read packed-refs first (lower priority than loose refs).
+    let packed_refs_path = repo_path.join("packed-refs");
+    if let Ok(content) = std::fs::read_to_string(&packed_refs_path) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let mut parts = line.splitn(2, ' ');
+            if let (Some(oid), Some(refname)) = (parts.next(), parts.next()) {
+                tips.insert(refname.to_string(), oid.to_string());
+            }
+        }
+    }
+
+    // Walk loose refs, overwriting any packed-refs entries.
+    let refs_dir = repo_path.join("refs");
+    collect_loose_refs(&refs_dir, "refs", &mut tips);
+
+    if tips.is_empty() {
+        return Err("no_refs");
+    }
+
+    let mut hasher = Sha256::new();
+    for (refname, oid) in &tips {
+        hasher.update(refname.as_bytes());
+        hasher.update(b" ");
+        hasher.update(oid.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn collect_loose_refs(dir: &Path, prefix: &str, tips: &mut BTreeMap<String, String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        let full_ref = format!("{prefix}/{name}");
+        if path.is_dir() {
+            collect_loose_refs(&path, &full_ref, tips);
+        } else if let Ok(content) = std::fs::read_to_string(&path) {
+            let oid = content.trim().to_string();
+            if oid.len() >= 40 {
+                tips.insert(full_ref, oid);
+            }
+        }
     }
 }
 

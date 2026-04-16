@@ -543,12 +543,11 @@ async fn serve_local_upload_pack_once(
             return;
         }
     };
-    let generation_path = repo_lease.repo_path().to_path_buf();
     let mut pack_cache_writer = None;
 
     match state.pack_cache.key_for_fresh_clone(
         owner_repo,
-        &generation_path,
+        repo_lease.repo_path(),
         request_body,
         git_protocol,
     ) {
