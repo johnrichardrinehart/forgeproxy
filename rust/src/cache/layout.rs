@@ -94,5 +94,5 @@ fn split_owner_repo(owner_repo: &str) -> Option<(&str, &str)> {
 }
 
 fn normalize_repo_name(name: &str) -> &str {
-    name.strip_suffix(".git").unwrap_or(name)
+    crate::repo_identity::canonical_repo_leaf(name)
 }

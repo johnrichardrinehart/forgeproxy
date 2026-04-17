@@ -499,7 +499,7 @@ async fn handle_info_refs(
 
     let (modified_body, bundle_uri_result) =
         crate::http::protocolv2::inject_bundle_uri_with_result(&upstream_bytes, &bundle_list_url);
-    let repo_slug = format!("{owner}/{repo}");
+    let repo_slug = crate::repo_identity::canonical_owner_repo(&owner, &repo);
     let bundle_uri_result_label = bundle_uri_result.as_metric_label();
     crate::metrics::inc_bundle_uri_advertisement(
         &state.metrics,
@@ -602,7 +602,8 @@ async fn handle_upload_pack(
     )
     .await;
 
-    let repo_slug = format!("{}/{}", owner, repo);
+    let repo_identity = crate::repo_identity::RepoIdentity::new(&owner, &repo);
+    let repo_slug = repo_identity.canonical().to_string();
     let git_protocol = headers
         .get("Git-Protocol")
         .and_then(|value| value.to_str().ok())
@@ -1277,7 +1278,7 @@ async fn serve_local_upload_pack(
     git_protocol: Option<&str>,
     completion: CloneCompletion,
 ) -> Result<Response, AppError> {
-    let owner_repo = format!("{owner}/{repo}");
+    let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
     let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease(
         state,
         &owner_repo,
@@ -1598,7 +1599,7 @@ async fn proxy_upload_pack_to_upstream(
     git_session_id: String,
     client_fingerprint: String,
 ) -> Result<Response, AppError> {
-    let owner_repo = format!("{owner}/{repo}");
+    let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
     let upstream_url = format!(
         "{}/{}/{}/git-upload-pack",
         state.config.upstream.git_url_base(),

@@ -819,8 +819,10 @@ fn list_repo_dirs_under(root: &Path, root_description: &str) -> Result<Vec<(Stri
                 continue;
             }
 
-            let repo_clean = repo_str.strip_suffix(".git").unwrap_or(&repo_str);
-            repos.push((format!("{}/{}", owner_str, repo_clean), repo_path));
+            repos.push((
+                crate::repo_identity::canonical_owner_repo(&owner_str, &repo_str),
+                repo_path,
+            ));
         }
     }
 

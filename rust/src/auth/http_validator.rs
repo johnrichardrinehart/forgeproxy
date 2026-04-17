@@ -25,7 +25,7 @@ pub async fn validate_http_auth(
     repo: &str,
 ) -> Result<(), AppError> {
     // Normalise: callers may pass "repo.git" from the URL path.
-    let repo = repo.trim_end_matches(".git");
+    let repo = crate::repo_identity::canonical_repo_leaf(repo);
     let auth_header = auth_header.filter(|header| !header.trim().is_empty());
 
     // 1. Hash the token for the cache key (never store raw credentials).

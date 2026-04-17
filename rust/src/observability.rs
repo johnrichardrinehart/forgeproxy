@@ -31,7 +31,7 @@ impl GitRequestObservation {
         Self {
             owner: owner.to_string(),
             repo: repo.to_string(),
-            owner_repo: format!("{owner}/{repo}"),
+            owner_repo: crate::repo_identity::canonical_owner_repo(owner, repo),
             username: username.to_string(),
             git_protocol: git_protocol.unwrap_or("").to_string(),
             client_fingerprint: client_fingerprint.to_string(),

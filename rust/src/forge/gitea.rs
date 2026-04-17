@@ -89,6 +89,13 @@ fn extract_default_branch(body: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn repo_full_name_matches(owner: &str, repo: &str, body: &serde_json::Value) -> bool {
+    let Some(full_name) = body.get("full_name").and_then(|name| name.as_str()) else {
+        return true;
+    };
+    crate::repo_identity::RepoIdentity::new(owner, repo).matches_upstream_full_name(full_name)
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementation
 // ---------------------------------------------------------------------------
@@ -175,6 +182,16 @@ impl ForgeBackend for GiteaBackend {
             .await
             .context("failed to parse Gitea API response")
             .map_err(AuthError::from)?;
+
+        if !repo_full_name_matches(owner, repo, &body) {
+            warn!(
+                %owner,
+                %repo,
+                upstream_full_name = body.get("full_name").and_then(|name| name.as_str()).unwrap_or(""),
+                "Gitea repository canonical path did not match requested path"
+            );
+            return Ok(Permission::None);
+        }
 
         Ok(permission_from_repo_response(&body))
     }
@@ -283,6 +300,29 @@ impl ForgeBackend for GiteaBackend {
                 "admin token env var is empty — collaborator permission check will fail"
             );
         }
+        let repo_url = format!("{}/repos/{owner}/{repo}", self.api_url);
+        let repo_resp = http_client
+            .get(&repo_url)
+            .header("Authorization", format!("Bearer {admin_token}"))
+            .header("Accept", self.accept)
+            .send()
+            .await?;
+        rate_limit.record_response("GET /repos/{owner}/{repo}", repo_resp.headers());
+        if !repo_resp.status().is_success() {
+            warn!(%owner, %repo, status = %repo_resp.status(), "Gitea repo identity check failed before collaborator check");
+            return Ok(Permission::None);
+        }
+        let repo_body: serde_json::Value = repo_resp.json().await?;
+        if !repo_full_name_matches(owner, repo, &repo_body) {
+            warn!(
+                %owner,
+                %repo,
+                upstream_full_name = repo_body.get("full_name").and_then(|name| name.as_str()).unwrap_or(""),
+                "Gitea repository canonical path did not match requested path"
+            );
+            return Ok(Permission::None);
+        }
+
         let url = format!(
             "{}/repos/{owner}/{repo}/collaborators/{username}/permission",
             self.api_url

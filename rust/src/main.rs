@@ -13,6 +13,7 @@ mod http;
 mod metrics;
 mod observability;
 pub(crate) mod pack_cache;
+mod repo_identity;
 mod runtime_resource;
 mod ssh;
 mod storage;

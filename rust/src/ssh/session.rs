@@ -1215,8 +1215,7 @@ fn parse_git_command(cmd: &str) -> Option<(GitCommand, String)> {
     let rest = rest.trim_start_matches('/');
     let rest = rest.trim_end_matches('/');
 
-    // Strip the `.git` suffix if present.
-    let repo = rest.strip_suffix(".git").unwrap_or(rest);
+    let repo = crate::repo_identity::canonicalize_owner_repo(rest);
 
     if repo.is_empty() {
         return None;

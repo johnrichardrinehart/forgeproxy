@@ -1080,12 +1080,11 @@ pub fn observe_pack_cache_artifact_generation(metrics: &MetricsRegistry, elapsed
 }
 
 pub fn inc_pack_cache_stitch_attempt(metrics: &MetricsRegistry, owner_repo: &str) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     metrics
         .metrics
         .pack_cache_stitch_attempts_total
-        .get_or_create(&PackCacheStitchLabels {
-            owner_repo: owner_repo.to_string(),
-        })
+        .get_or_create(&PackCacheStitchLabels { owner_repo })
         .inc();
 }
 
@@ -1094,21 +1093,21 @@ pub fn observe_pack_cache_stitch_duration(
     owner_repo: &str,
     elapsed: Duration,
 ) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     metrics
         .metrics
         .pack_cache_stitch_duration_seconds
-        .get_or_create(&PackCacheStitchLabels {
-            owner_repo: owner_repo.to_string(),
-        })
+        .get_or_create(&PackCacheStitchLabels { owner_repo })
         .observe(elapsed.as_secs_f64());
 }
 
 pub fn inc_pack_cache_stitch_failure(metrics: &MetricsRegistry, owner_repo: &str, reason: &str) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     metrics
         .metrics
         .pack_cache_stitch_failures_total
         .get_or_create(&PackCacheStitchFailureLabels {
-            owner_repo: owner_repo.to_string(),
+            owner_repo,
             reason: reason.to_string(),
         })
         .inc();

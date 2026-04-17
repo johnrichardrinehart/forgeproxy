@@ -53,7 +53,7 @@ pub async fn handle_bundle_list(
     auth_token: Option<&str>,
 ) -> Result<Response, AppError> {
     // 1. Validate that the caller has at least read access.
-    let owner_repo = format!("{owner}/{repo}");
+    let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
     if let Err(error) =
         crate::auth::http_validator::validate_http_auth(state, auth_token, owner, repo).await
     {

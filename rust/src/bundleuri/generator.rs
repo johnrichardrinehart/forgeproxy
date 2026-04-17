@@ -46,9 +46,11 @@ pub async fn generate_full_bundle(
     let current_refs = get_refs(repo_path).await?;
 
     let tmp_dir = create_bundle_tempdir(state, "bundle")?;
-    let bundle_path = tmp_dir
-        .path()
-        .join(format!("{}.full.bundle", owner_repo.replace('/', "_")));
+    let canonical_owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let bundle_path = tmp_dir.path().join(format!(
+        "{}.full.bundle",
+        canonical_owner_repo.replace('/', "_")
+    ));
 
     info!(
         owner_repo,
@@ -125,9 +127,11 @@ pub async fn generate_filtered_bundle(
     let started_at = Instant::now();
     let current_refs = get_refs(repo_path).await?;
     let tmp_dir = create_bundle_tempdir(state, "filtered bundle")?;
-    let bundle_path = tmp_dir
-        .path()
-        .join(format!("{}.filtered.bundle", owner_repo.replace('/', "_")));
+    let canonical_owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let bundle_path = tmp_dir.path().join(format!(
+        "{}.filtered.bundle",
+        canonical_owner_repo.replace('/', "_")
+    ));
 
     info!(owner_repo, "creating filtered (blob:none) bundle");
 
@@ -210,9 +214,10 @@ pub async fn generate_incremental_bundle(
     }
 
     let tmp_dir = create_bundle_tempdir(state, "incremental bundle")?;
+    let canonical_owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     let bundle_path = tmp_dir.path().join(format!(
         "{}.incremental.bundle",
-        owner_repo.replace('/', "_")
+        canonical_owner_repo.replace('/', "_")
     ));
 
     info!(

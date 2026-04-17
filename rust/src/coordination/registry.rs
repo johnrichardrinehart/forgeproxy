@@ -53,19 +53,17 @@ pub struct FetchSchedule {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn repo_key(owner_repo: &str) -> String {
-    // Normalize: strip trailing ".git" so that "owner/repo" and
-    // "owner/repo.git" map to the same Valkey key.
-    let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+    let normalized = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     format!("forgeproxy:repo:{normalized}")
 }
 
 fn fetch_schedule_key(owner_repo: &str) -> String {
-    let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+    let normalized = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     format!("forgeproxy:repo:{normalized}:fetch_schedule")
 }
 
 fn clone_hydration_semaphore_key(owner_repo: &str) -> String {
-    let normalized = owner_repo.strip_suffix(".git").unwrap_or(owner_repo);
+    let normalized = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     format!("forgeproxy:semaphore:clone:{normalized}")
 }
 
@@ -390,8 +388,8 @@ enum FetchPriority {
     TeeConvergence,
 }
 
-fn normalize_owner_repo(owner_repo: &str) -> &str {
-    owner_repo.strip_suffix(".git").unwrap_or(owner_repo)
+fn normalize_owner_repo(owner_repo: &str) -> String {
+    crate::repo_identity::canonicalize_owner_repo(owner_repo)
 }
 
 pub async fn try_acquire_clone_hydration_permits(
@@ -424,7 +422,7 @@ pub async fn try_acquire_clone_hydration_permits(
         }
     };
 
-    let Some(local_repo_permit) = try_acquire_local_repo_clone_permit(state, owner_repo).await?
+    let Some(local_repo_permit) = try_acquire_local_repo_clone_permit(state, &owner_repo).await?
     else {
         return Ok(Err(CloneHydrationPermitFailure::LocalRepoSaturated));
     };
@@ -479,7 +477,7 @@ pub async fn acquire_clone_hydration_permits(
         .acquire_owned()
         .await
         .map_err(|_| anyhow::anyhow!("clone semaphore closed"))?;
-    let local_repo_permit = acquire_local_repo_clone_permit_waiting(state, owner_repo).await?;
+    let local_repo_permit = acquire_local_repo_clone_permit_waiting(state, &owner_repo).await?;
     let distributed_permit_key = format!("forgeproxy:semaphore:clone:{owner_repo}");
     let Some(distributed_repo_permit) = crate::coordination::locks::acquire_semaphore_lease(
         &state.valkey,
@@ -597,7 +595,7 @@ pub async fn try_acquire_tee_capture_permits(
         }
     };
     let Some(local_repo_tee_capture_permit) =
-        acquire_local_repo_tee_capture_permit(state, owner_repo).await?
+        acquire_local_repo_tee_capture_permit(state, &owner_repo).await?
     else {
         return Ok(None);
     };
@@ -827,6 +825,31 @@ fn leased_generation_paths(state: &crate::AppState, owner_repo: &str) -> HashSet
         .unwrap_or_default()
 }
 
+fn retained_generation_paths(
+    cache_manager: &crate::cache::CacheManager,
+    published_generation_leases: &PublishedGenerationLeases,
+    owner_repo: &str,
+) -> Vec<PathBuf> {
+    let mut retain = published_generation_leases
+        .lock()
+        .unwrap()
+        .get(owner_repo)
+        .map(|paths| {
+            paths
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<PathBuf>>()
+        })
+        .unwrap_or_default();
+    if let Ok(Some(current_target)) = cache_manager.current_repo_target(owner_repo)
+        && !retain.iter().any(|path| path == &current_target)
+    {
+        retain.push(current_target);
+    }
+    retain
+}
+
 fn lease_published_generation_path(
     state: &crate::AppState,
     owner_repo: &str,
@@ -943,23 +966,11 @@ impl Drop for PublishedGenerationLease {
         tokio::spawn(async move {
             let _guard = acquire_repo_publish_guard(&repo_publish_mutexes, &owner_repo).await;
 
-            let mut retain = published_generation_leases
-                .lock()
-                .unwrap()
-                .get(&owner_repo)
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter(|(_, count)| **count > 0)
-                        .map(|(path, _)| path.clone())
-                        .collect::<Vec<PathBuf>>()
-                })
-                .unwrap_or_default();
-            if let Ok(Some(current_target)) = cache_manager.current_repo_target(&owner_repo)
-                && !retain.iter().any(|path| path == &current_target)
-            {
-                retain.push(current_target);
-            }
+            let retain = retained_generation_paths(
+                &cache_manager,
+                &published_generation_leases,
+                &owner_repo,
+            );
 
             if let Err(error) = cache_manager.prune_generations_except(&owner_repo, &retain) {
                 warn!(
@@ -1014,10 +1025,8 @@ async fn try_ensure_repo_cloned_inner(
     request_refspecs: Option<&[String]>,
     delta_fetch_priority: FetchPriority,
 ) -> Result<()> {
-    // Strip trailing ".git" from repo if present to avoid double-suffixing
-    // (the URL path extractor preserves it, and we append ".git" below).
-    let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
-    let owner_repo = format!("{owner}/{repo_clean}");
+    let repo_clean = crate::repo_identity::canonical_repo_leaf(repo);
+    let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
     repair_published_without_mirror_invariant(state, &owner_repo).await?;
     let node_id = state.node_id.clone();
     let had_local_repo_at_start = state.cache_manager.has_repo(&owner_repo);
@@ -3854,8 +3863,8 @@ pub async fn wait_for_local_catch_up(
     request_refspecs: Option<Vec<String>>,
 ) -> Result<LocalServeDecision> {
     let timeout = Duration::from_secs(state.config.clone.request_wait_for_local_catch_up_secs);
-    let repo_clean = repo.strip_suffix(".git").unwrap_or(repo);
-    let owner_repo = format!("{owner}/{repo_clean}");
+    let repo_clean = crate::repo_identity::canonical_repo_leaf(repo);
+    let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
 
     let initial_decision =
         classify_local_wants_satisfaction_without_request_restore(state, &owner_repo, wants)

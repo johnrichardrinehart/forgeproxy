@@ -35,6 +35,16 @@ fn extract_default_branch(body: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn project_path_matches(owner: &str, repo: &str, body: &serde_json::Value) -> bool {
+    let Some(path) = body
+        .get("path_with_namespace")
+        .and_then(|path| path.as_str())
+    else {
+        return true;
+    };
+    crate::repo_identity::RepoIdentity::new(owner, repo).matches_upstream_full_name(path)
+}
+
 fn apply_gitlab_api_auth(
     req: reqwest::RequestBuilder,
     auth_header: Option<&str>,
@@ -156,6 +166,16 @@ impl ForgeBackend for GitLabBackend {
             .await
             .context("failed to parse GitLab API response")
             .map_err(AuthError::from)?;
+
+        if !project_path_matches(owner, repo, &body) {
+            warn!(
+                %owner,
+                %repo,
+                upstream_path = body.get("path_with_namespace").and_then(|path| path.as_str()).unwrap_or(""),
+                "GitLab project canonical path did not match requested path"
+            );
+            return Ok(Permission::None);
+        }
 
         Ok(permission_from_project_response(&body))
     }
@@ -285,6 +305,15 @@ impl ForgeBackend for GitLabBackend {
         }
 
         let body: serde_json::Value = resp.json().await?;
+        if !project_path_matches(owner, repo, &body) {
+            warn!(
+                %owner,
+                %repo,
+                upstream_path = body.get("path_with_namespace").and_then(|path| path.as_str()).unwrap_or(""),
+                "GitLab project canonical path did not match requested path"
+            );
+            return Ok(Permission::None);
+        }
         Ok(access_level_to_permission(&body))
     }
 

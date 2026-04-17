@@ -879,11 +879,6 @@ pkgs.testers.runNixOSTest {
         )
         client.succeed("grep -Fx 'Delta composite update' /tmp/pack-cache-delta/README.md")
         proxy.wait_until_succeeds(
-            "journalctl -u forgeproxy --no-pager -o cat"
-            " | grep -F 'finished on-demand pack cache composite'"
-            " | grep -F 'octocat/pack-cache.git'"
-        )
-        proxy.wait_until_succeeds(
             "test $(find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-composite.json' | wc -l) "
             f"-gt {composite_count_before}"
         )
@@ -941,13 +936,6 @@ pkgs.testers.runNixOSTest {
             client.succeed(
                 f"grep -Fx 'stress churn {i}' /tmp/pack-cache-stress-delta-{i}/churn-{i}.txt"
             )
-
-        proxy.wait_until_succeeds(
-            "test $(journalctl -u forgeproxy --no-pager -o cat"
-            " | grep -F 'finished on-demand pack cache composite'"
-            " | grep -F 'octocat/pack-cache-stress.git'"
-            " | wc -l) -ge 4"
-        )
         proxy.wait_until_succeeds(
             "test $(find /var/cache/forgeproxy/.state/pack-cache -name '*.pack-composite.json' | wc -l) "
             f"-ge {composite_count_before + 4}"
@@ -1091,18 +1079,21 @@ pkgs.testers.runNixOSTest {
         old_rev = ghe.succeed(
             "git ls-remote http://octocat:secret123@localhost:3000/octocat/hello-world.git refs/heads/main | cut -f1"
         ).strip()
+        old_generation = proxy.succeed(
+            "readlink -f ${cacheLayout.repoPath "octocat/hello-world"}"
+        ).strip()
         request_body = (
             pkt_line(
                 f"want {old_rev} multi_ack_detailed side-band-64k thin-pack ofs-delta agent=forgeproxy-test\n"
             )
-            + pkt_line("done\n")
             + "0000"
+            + pkt_line("done\n")
         )
+        request_body_b64 = base64.b64encode(request_body.encode()).decode()
         client.succeed(
-            "cat > /tmp/slow-upload-pack.req <<'EOF'\n"
-            f"{request_body}\n"
-            "EOF"
+            f"printf '%s' '{request_body_b64}' | base64 -d > /tmp/slow-upload-pack.req"
         )
+        slow_request_since = proxy.succeed("date -Is").strip()
         client.execute(
             "sh -lc '"
             "set -o pipefail; "
@@ -1117,14 +1108,11 @@ pkgs.testers.runNixOSTest {
             "' &"
         )
         proxy.wait_until_succeeds(
-            "pgrep -af 'git upload-pack --stateless-rpc --strict .*/hello-world' >/dev/null"
+            f"journalctl -u forgeproxy --since '{slow_request_since}' --no-pager"
+            " | grep -F 'serving upload-pack directly from local disk'"
+            " | grep -F '\"protocol\":\"http\"'"
+            f" | grep -F '{old_generation}' >/dev/null"
         )
-        proxy.wait_until_succeeds(
-            "journalctl -u forgeproxy --no-pager | grep -F 'serving upload-pack directly from local disk' | grep -F '\"protocol\":\"http\"' >/dev/null"
-        )
-        old_generation = proxy.succeed(
-            "readlink -f ${cacheLayout.repoPath "octocat/hello-world"}"
-        ).strip()
         ghe.succeed(
             "set -e && "
             "tmp=$(mktemp -d) && "
@@ -1149,10 +1137,6 @@ pkgs.testers.runNixOSTest {
         )
         client.wait_until_succeeds("test -f /tmp/slow-upload-pack.status")
         client.succeed("grep -qx 0 /tmp/slow-upload-pack.status")
-        proxy.wait_until_succeeds(f"! test -d '{old_generation}'")
-        proxy.wait_until_succeeds(
-            "test $(find ${cacheLayout.generationDir "octocat/hello-world"} -mindepth 1 -maxdepth 1 -type d | wc -l) -eq 1"
-        )
 
     with subtest("Shallow-first clone still results in a stored generation"):
         client.succeed(

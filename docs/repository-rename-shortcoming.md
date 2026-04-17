@@ -128,3 +128,22 @@ path-keyed repositories. At minimum:
 
 Without this migration step, the design change would avoid future duplication
 but still strand existing bundle and generation state under older names.
+
+## Current Mitigation
+
+Until cache state is keyed by stable upstream repository IDs, forgeproxy treats
+repository path canonicalization as a boundary concern:
+
+- internal state uses a canonical `owner/repo` spelling that strips the Git
+  transport suffix `.git`
+- client-facing and upstream Git URLs preserve the request path used by the
+  client
+- forge API responses that expose a canonical path (`full_name` for
+  GitHub/Gitea/Forgejo, `path_with_namespace` for GitLab) are compared against
+  the requested canonical path before local cache serving is allowed
+
+This does not solve rename aliasing. It only prevents serving local state when
+the upstream API says the requested path currently means a different canonical
+path than the one being served. The still-desired follow-up is to persist stable
+upstream repository IDs and alias mappings so old and new names can be proven to
+refer to the same repository instead of falling back to path equality.

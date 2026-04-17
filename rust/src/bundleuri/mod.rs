@@ -78,6 +78,7 @@ fn join_s3_key(prefix: &str, suffix: &str) -> String {
 }
 
 pub fn bundle_counter_s3_key(prefix: &str, owner_repo: &str) -> String {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     join_s3_key(prefix, &format!("{owner_repo}/gen.counter"))
 }
 
@@ -87,6 +88,7 @@ pub fn repo_bundle_object_s3_key(
     creation_token: u64,
     bundle_kind: BundleKind,
 ) -> String {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     join_s3_key(
         prefix,
         &format!(
@@ -97,13 +99,16 @@ pub fn repo_bundle_object_s3_key(
 }
 
 pub fn bundle_metadata_s3_key(prefix: &str, owner_repo: &str, publisher_id: &str) -> String {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     join_s3_key(prefix, &format!("{owner_repo}/bundles/{publisher_id}.json"))
 }
 
 pub fn bundle_metadata_s3_prefix(prefix: &str, owner_repo: &str) -> String {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     join_s3_key(prefix, &format!("{owner_repo}/bundles/"))
 }
 
 pub fn repo_bundle_manifest_s3_key(prefix: &str, owner_repo: &str) -> String {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     join_s3_key(prefix, &format!("{owner_repo}/bundle-manifest.json"))
 }

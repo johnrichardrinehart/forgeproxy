@@ -60,8 +60,9 @@ pub async fn handle_webhook_payload(
 
 /// Invalidate all auth cache entries for a specific repository.
 async fn invalidate_repo_auth(state: &AppState, full_name: &str) {
-    let http_pattern = format!("forgeproxy:http:auth:*:{full_name}");
-    let ssh_pattern = format!("forgeproxy:ssh:access:*:{full_name}");
+    let canonical = crate::repo_identity::canonicalize_owner_repo(full_name);
+    let http_pattern = format!("forgeproxy:http:auth:*:{canonical}");
+    let ssh_pattern = format!("forgeproxy:ssh:access:*:{canonical}");
 
     let http_count = cache::invalidate_auth(&state.valkey, &http_pattern)
         .await
@@ -71,7 +72,7 @@ async fn invalidate_repo_auth(state: &AppState, full_name: &str) {
         .unwrap_or(0);
 
     info!(
-        repo = %full_name,
+        repo = %canonical,
         http_invalidated = http_count,
         ssh_invalidated = ssh_count,
         "invalidated auth cache for repository event"

@@ -773,7 +773,12 @@ fn bundle_fetch_credential<'a>(
 /// per-repo overrides from the configuration.
 fn effective_interval(state: &AppState, owner_repo: &str, schedule_secs: u64) -> u64 {
     // Check for a per-repo override.
-    if let Some(override_cfg) = state.config.repo_overrides.get(owner_repo)
+    let canonical_owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    if let Some(override_cfg) = state
+        .config
+        .repo_overrides
+        .get(owner_repo)
+        .or_else(|| state.config.repo_overrides.get(&canonical_owner_repo))
         && let Some(interval) = override_cfg.fetch_interval
     {
         return interval;

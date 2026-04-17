@@ -902,6 +902,7 @@ fn pack_cache_key(
     normalized_request: &str,
     base: Option<PackCacheBaseMetadata>,
 ) -> PackCacheKey {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     let mut hasher = Sha256::new();
     hasher.update(b"forgeproxy-pack-cache-v1\0");
     hasher.update(owner_repo.as_bytes());
@@ -912,7 +913,7 @@ fn pack_cache_key(
 
     PackCacheKey {
         digest: hex_digest(hasher.finalize().as_slice()),
-        owner_repo: owner_repo.to_string(),
+        owner_repo,
         base,
     }
 }
@@ -1462,6 +1463,46 @@ mod tests {
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         );
         assert!(!base.full_tip);
+    }
+
+    #[test]
+    fn fresh_clone_key_canonicalizes_git_suffix_for_cross_protocol_hits() {
+        let temp = tempfile::tempdir().unwrap();
+        let refs_heads = temp.path().join("refs").join("heads");
+        std::fs::create_dir_all(&refs_heads).unwrap();
+        std::fs::write(
+            refs_heads.join("main"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                ttl_secs: 900,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+            },
+            1024 * 1024,
+            MetricsRegistry::new(),
+        );
+        let mut request = Vec::new();
+        request.extend_from_slice(&pkt(b"command=fetch\n"));
+        request.extend_from_slice(&pkt(b"want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"));
+        request.extend_from_slice(&pkt(b"done\n"));
+        request.extend_from_slice(b"0000");
+
+        let without_suffix = cache
+            .key_for_fresh_clone("owner/repo", temp.path(), &request, Some("version=2"))
+            .unwrap();
+        let with_suffix = cache
+            .key_for_fresh_clone("owner/repo.git", temp.path(), &request, Some("version=2"))
+            .unwrap();
+
+        assert_eq!(without_suffix.as_str(), with_suffix.as_str());
+        assert_eq!(without_suffix.owner_repo, "owner/repo");
+        assert_eq!(with_suffix.owner_repo, "owner/repo");
     }
 
     #[tokio::test]

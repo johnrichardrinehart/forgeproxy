@@ -266,7 +266,7 @@ impl UpstreamHydrationTracker {
         protocol_name: &'static str,
         request: UpstreamHydrationRequest<'_>,
     ) -> Self {
-        let owner_repo = format!("{owner}/{repo}");
+        let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
         let tee_capture_permits = if request.enable_hydration {
             match crate::coordination::registry::try_acquire_tee_capture_permits(state, &owner_repo)
                 .await
