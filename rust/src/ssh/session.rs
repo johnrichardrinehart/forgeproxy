@@ -522,7 +522,7 @@ struct LocalUploadPackReplayContext<'a> {
 async fn replay_ssh_pack_cache_hit(
     state: &AppState,
     owner_repo: &str,
-    hit: crate::pack_cache::PackCacheHit,
+    hit: crate::pack_cache::PackCacheReadLease,
     completion: &CloneCompletion,
     replay: LocalUploadPackReplayContext<'_>,
 ) -> Result<u64> {
@@ -543,61 +543,28 @@ async fn replay_ssh_pack_cache_hit(
     let _active_clone_guard =
         state.begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
 
-    match hit.artifact {
-        crate::pack_cache::PackCacheArtifact::Full => {
-            let mut file = tokio::fs::File::open(&hit.path).await?;
-            let mut buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
-            loop {
-                let read = file.read(&mut buf).await?;
-                if read == 0 {
-                    break;
-                }
-                if send_channel_response_data(
-                    replay.handle,
-                    replay.channel_id,
-                    stream_writer.as_mut(),
-                    replay.channel_states,
-                    &buf[..read],
-                )
-                .await
-                .is_err()
-                {
-                    warn!(
-                        repo = %owner_repo,
-                        total_bytes,
-                        "client disconnected during SSH pack cache replay"
-                    );
-                    break;
-                }
-                total_bytes += read as u64;
-                downstream_counter.inc_by(read as u64);
-            }
+    let mut stream = hit.into_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if send_channel_response_data(
+            replay.handle,
+            replay.channel_id,
+            stream_writer.as_mut(),
+            replay.channel_states,
+            &chunk,
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                repo = %owner_repo,
+                total_bytes,
+                "client disconnected during SSH pack cache replay"
+            );
+            break;
         }
-        crate::pack_cache::PackCacheArtifact::Composite { .. } => {
-            let mut stream = state.pack_cache.stream_composite_response(&hit)?;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                if send_channel_response_data(
-                    replay.handle,
-                    replay.channel_id,
-                    stream_writer.as_mut(),
-                    replay.channel_states,
-                    &chunk,
-                )
-                .await
-                .is_err()
-                {
-                    warn!(
-                        repo = %owner_repo,
-                        total_bytes,
-                        "client disconnected during SSH composite pack cache replay"
-                    );
-                    break;
-                }
-                total_bytes += chunk.len() as u64;
-                downstream_counter.inc_by(chunk.len() as u64);
-            }
-        }
+        total_bytes += chunk.len() as u64;
+        downstream_counter.inc_by(chunk.len() as u64);
     }
 
     completion.record_success(&state.metrics, Protocol::Ssh);

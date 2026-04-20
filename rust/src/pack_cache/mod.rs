@@ -4,17 +4,21 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::ReaderStream;
 use tracing::{debug, warn};
 
 use crate::config::{EvictionPolicy, PackCacheConfig};
@@ -35,6 +39,8 @@ pub struct PackCache {
     config: PackCacheConfig,
     local_cache_max_percent: f64,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    artifact_lifecycle: Arc<std::sync::Mutex<()>>,
+    active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
     metrics: MetricsRegistry,
 }
@@ -93,15 +99,40 @@ struct PackCacheBaseMetadata {
     full_tip: bool,
 }
 
-pub struct PackCacheHit {
-    pub path: PathBuf,
-    pub size_bytes: u64,
-    pub artifact: PackCacheArtifact,
+struct PackCacheHit {
+    key: PackCacheKey,
+    path: PathBuf,
+    artifact: PackCacheArtifact,
 }
 
-pub enum PackCacheArtifact {
+enum PackCacheArtifact {
     Full,
     Composite { key: PackCacheKey },
+}
+
+enum PackCacheReadArtifact {
+    Full {
+        file: std::fs::File,
+    },
+    Composite {
+        base_response: std::fs::File,
+        deltas: Vec<stitch::OpenedDeltaPack>,
+    },
+}
+
+pub struct PackCacheReadLease {
+    artifact: PackCacheReadArtifact,
+    _guard: PackCacheReadGuard,
+}
+
+struct PackCacheReadGuard {
+    keys: Vec<String>,
+    active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+}
+
+struct LeasedPackCacheStream<S> {
+    inner: S,
+    _guard: PackCacheReadGuard,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,6 +141,72 @@ struct CompositeManifest {
     base_key: String,
     delta_pack_file: String,
     delta_size_bytes: u64,
+}
+
+impl PackCacheReadLease {
+    #[cfg(test)]
+    fn is_composite(&self) -> bool {
+        matches!(self.artifact, PackCacheReadArtifact::Composite { .. })
+    }
+
+    pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>> {
+        let Self { artifact, _guard } = self;
+        match artifact {
+            PackCacheReadArtifact::Full { file } => Box::pin(LeasedPackCacheStream {
+                inner: ReaderStream::new(tokio::fs::File::from_std(file)),
+                _guard,
+            }),
+            PackCacheReadArtifact::Composite {
+                base_response,
+                deltas,
+            } => {
+                let (sender, receiver) = tokio::sync::mpsc::channel(8);
+                tokio::task::spawn_blocking(move || {
+                    let result = stitch::stream_stitched_response_from_open_files(
+                        base_response,
+                        deltas,
+                        |chunk| {
+                            sender.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| {
+                                io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed")
+                            })
+                        },
+                    );
+                    if let Err(error) = result {
+                        let _ = sender.blocking_send(Err(io::Error::other(error.to_string())));
+                    }
+                });
+                Box::pin(LeasedPackCacheStream {
+                    inner: ReceiverStream::new(receiver),
+                    _guard,
+                })
+            }
+        }
+    }
+}
+
+impl Drop for PackCacheReadGuard {
+    fn drop(&mut self) {
+        let mut active = self.active_readers.lock().unwrap();
+        for key in &self.keys {
+            if let Some(count) = active.get_mut(key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    active.remove(key);
+                }
+            }
+        }
+    }
+}
+
+impl<S> Stream for LeasedPackCacheStream<S>
+where
+    S: Stream<Item = io::Result<Bytes>> + Unpin,
+{
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -126,7 +223,7 @@ struct PackCacheMetadata {
 }
 
 pub enum PackCacheLookup {
-    Hit(PackCacheHit),
+    Hit(PackCacheReadLease),
     Generate(Box<PackCacheWriter>),
     BypassAfterWait,
 }
@@ -143,6 +240,8 @@ pub struct PackCacheWriter {
     min_response_bytes: u64,
     started_at: Instant,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    artifact_lifecycle: Arc<std::sync::Mutex<()>>,
+    active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
     notify: Arc<Notify>,
     metrics: MetricsRegistry,
@@ -163,6 +262,8 @@ impl PackCache {
             config,
             local_cache_max_percent,
             inflight: Arc::new(Mutex::new(HashMap::new())),
+            artifact_lifecycle: Arc::new(std::sync::Mutex::new(())),
+            active_readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recent_pack_cache_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics,
         }
@@ -274,7 +375,7 @@ impl PackCache {
         protocol: Protocol,
         key: PackCacheKey,
     ) -> Result<PackCacheLookup> {
-        if let Some(hit) = self.lookup(&key).await? {
+        if let Some(hit) = self.lookup_read_lease(&key)? {
             crate::metrics::inc_pack_cache_request(&self.metrics, protocol, "hit", "ready");
             return Ok(PackCacheLookup::Hit(hit));
         }
@@ -284,7 +385,7 @@ impl PackCache {
             if let Some(notify) = inflight.get(key.as_str()) {
                 Some(Arc::clone(notify).notified_owned())
             } else {
-                if let Some(hit) = self.lookup_sync(&key)? {
+                if let Some(hit) = self.lookup_read_lease(&key)? {
                     crate::metrics::inc_pack_cache_request(
                         &self.metrics,
                         protocol,
@@ -310,7 +411,7 @@ impl PackCache {
             let wait_result = tokio::time::timeout(timeout, notified).await;
             match wait_result {
                 Ok(()) => {
-                    if let Some(hit) = self.lookup(&key).await? {
+                    if let Some(hit) = self.lookup_read_lease(&key)? {
                         crate::metrics::inc_pack_cache_inflight_wait(
                             &self.metrics,
                             protocol.clone(),
@@ -365,40 +466,16 @@ impl PackCache {
         }
     }
 
-    pub async fn lookup_by_key(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
-        self.lookup(key).await
+    pub async fn lookup_by_key(&self, key: &PackCacheKey) -> Result<Option<PackCacheReadLease>> {
+        self.lookup_read_lease(key)
     }
 
-    pub fn stream_composite_response(
-        &self,
-        hit: &PackCacheHit,
-    ) -> Result<ReceiverStream<io::Result<Bytes>>> {
-        let PackCacheArtifact::Composite { key } = &hit.artifact else {
-            anyhow::bail!("pack cache hit is not a composite artifact");
+    fn lookup_read_lease(&self, key: &PackCacheKey) -> Result<Option<PackCacheReadLease>> {
+        let _lifecycle = self.artifact_lifecycle.lock().unwrap();
+        let Some(hit) = self.lookup_sync(key)? else {
+            return Ok(None);
         };
-        let (base_path, delta_paths) = self.composite_chain(key)?;
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
-
-        tokio::task::spawn_blocking(move || {
-            let result =
-                stitch::stream_stitched_response_from_paths(&base_path, &delta_paths, |chunk| {
-                    sender
-                        .blocking_send(Ok(Bytes::from(chunk)))
-                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed"))
-                });
-            if let Err(error) = result {
-                let _ = sender.blocking_send(Err(io::Error::other(error.to_string())));
-            }
-        });
-
-        Ok(ReceiverStream::new(receiver))
-    }
-
-    async fn lookup(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
-        if let Some(hit) = self.lookup_full_path(key)? {
-            return Ok(Some(hit));
-        }
-        self.lookup_composite_path(key)
+        self.open_read_lease_for_hit(hit).map(Some)
     }
 
     fn lookup_sync(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
@@ -411,7 +488,7 @@ impl PackCache {
     fn lookup_full_path(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
         let path = self.final_path(key);
         self.lookup_existing_file(&path).map(|metadata| {
-            metadata.map(|metadata| {
+            metadata.map(|_| {
                 if let Err(error) = record_metadata_hit(&self.root, key.as_str()) {
                     warn!(
                         key = %key.as_str(),
@@ -420,8 +497,8 @@ impl PackCache {
                     );
                 }
                 PackCacheHit {
+                    key: key.clone(),
                     path,
-                    size_bytes: metadata.len(),
                     artifact: PackCacheArtifact::Full,
                 }
             })
@@ -430,7 +507,7 @@ impl PackCache {
 
     fn lookup_composite_path(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
         let manifest_path = self.composite_manifest_path(key);
-        let Some(metadata) = self.lookup_existing_file(&manifest_path)? else {
+        let Some(_metadata) = self.lookup_existing_file(&manifest_path)? else {
             return Ok(None);
         };
         if self.composite_chain(key).is_err() {
@@ -446,8 +523,8 @@ impl PackCache {
         }
 
         Ok(Some(PackCacheHit {
+            key: key.clone(),
             path: manifest_path,
-            size_bytes: metadata.len(),
             artifact: PackCacheArtifact::Composite { key: key.clone() },
         }))
     }
@@ -487,6 +564,83 @@ impl PackCache {
                 .with_context(|| format!("missing pack cache delta {}", delta_path.display()))?;
             delta_paths.push(delta_path);
             current_key = PackCacheKey::from_digest(manifest.base_key);
+        }
+    }
+
+    fn open_read_lease_for_hit(&self, hit: PackCacheHit) -> Result<PackCacheReadLease> {
+        match hit.artifact {
+            PackCacheArtifact::Full => {
+                let file = std::fs::File::open(&hit.path)
+                    .with_context(|| format!("open pack cache artifact {}", hit.path.display()))?;
+                let guard = self.acquire_read_guard(vec![hit.key.as_str().to_string()]);
+                Ok(PackCacheReadLease {
+                    artifact: PackCacheReadArtifact::Full { file },
+                    _guard: guard,
+                })
+            }
+            PackCacheArtifact::Composite { key } => {
+                let (base_response, deltas, keys) = self.open_composite_artifact(&key)?;
+                let guard = self.acquire_read_guard(keys);
+                Ok(PackCacheReadLease {
+                    artifact: PackCacheReadArtifact::Composite {
+                        base_response,
+                        deltas,
+                    },
+                    _guard: guard,
+                })
+            }
+        }
+    }
+
+    fn open_composite_artifact(
+        &self,
+        key: &PackCacheKey,
+    ) -> Result<(std::fs::File, Vec<stitch::OpenedDeltaPack>, Vec<String>)> {
+        let mut current_key = key.clone();
+        let mut delta_packs = Vec::new();
+        let mut active_keys = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        loop {
+            if !seen.insert(current_key.as_str().to_string()) {
+                anyhow::bail!("cycle in pack cache composite chain");
+            }
+
+            let full_path = self.final_path(&current_key);
+            if self.lookup_existing_file(&full_path)?.is_some() {
+                let base_response = std::fs::File::open(&full_path).with_context(|| {
+                    format!("open base pack cache response {}", full_path.display())
+                })?;
+                active_keys.push(current_key.as_str().to_string());
+                delta_packs.reverse();
+                active_keys.sort();
+                active_keys.dedup();
+                return Ok((base_response, delta_packs, active_keys));
+            }
+
+            let manifest = self.read_composite_manifest(&current_key)?;
+            let delta_path = self.root.join(&manifest.delta_pack_file);
+            self.lookup_existing_file(&delta_path)?
+                .with_context(|| format!("missing pack cache delta {}", delta_path.display()))?;
+            let delta_pack = stitch::OpenedDeltaPack::from_path(&delta_path)?;
+            active_keys.push(current_key.as_str().to_string());
+            delta_packs.push(delta_pack);
+            current_key = PackCacheKey::from_digest(manifest.base_key);
+        }
+    }
+
+    fn acquire_read_guard(&self, keys: Vec<String>) -> PackCacheReadGuard {
+        let mut keys = keys;
+        keys.sort();
+        keys.dedup();
+
+        let mut active = self.active_readers.lock().unwrap();
+        for key in &keys {
+            *active.entry(key.clone()).or_insert(0) += 1;
+        }
+        PackCacheReadGuard {
+            keys,
+            active_readers: Arc::clone(&self.active_readers),
         }
     }
 
@@ -558,6 +712,8 @@ impl PackCache {
             min_response_bytes: self.config.min_response_bytes,
             started_at: Instant::now(),
             inflight: Arc::clone(&self.inflight),
+            artifact_lifecycle: Arc::clone(&self.artifact_lifecycle),
+            active_readers: Arc::clone(&self.active_readers),
             recent_pack_cache_keys: Arc::clone(&self.recent_pack_cache_keys),
             notify,
             metrics: self.metrics.clone(),
@@ -703,7 +859,7 @@ impl PackCacheWriter {
         mut self,
         base_key: &PackCacheKey,
         delta_pack: &[u8],
-    ) -> Result<PackCacheHit> {
+    ) -> Result<()> {
         self.writer
             .shutdown()
             .await
@@ -785,13 +941,7 @@ impl PackCacheWriter {
         );
         self.release_inflight().await;
 
-        Ok(PackCacheHit {
-            path: final_manifest_path,
-            size_bytes: delta_pack.len() as u64,
-            artifact: PackCacheArtifact::Composite {
-                key: self.key.clone(),
-            },
-        })
+        Ok(())
     }
 
     pub async fn abort(mut self) {
@@ -838,23 +988,29 @@ impl PackCacheWriter {
                 );
             }
         }
-        if let Err(error) =
-            prune_to_watermarks(&self.root, self.local_cache_max_percent, &self.config)
         {
-            warn!(
-                root = %self.root.display(),
-                error = %error,
-                "failed to prune pack cache after artifact promotion"
+            let _lifecycle = self.artifact_lifecycle.lock().unwrap();
+            if let Err(error) = prune_to_watermarks(
+                &self.root,
+                self.local_cache_max_percent,
+                &self.config,
+                &self.active_readers,
+            ) {
+                warn!(
+                    root = %self.root.display(),
+                    error = %error,
+                    "failed to prune pack cache after artifact promotion"
+                );
+            }
+            retain_existing_recent_entries(
+                &self.root,
+                &mut self.recent_pack_cache_keys.lock().unwrap(),
+            );
+            crate::metrics::set_pack_cache_size_bytes(
+                &self.metrics,
+                directory_size(&self.root).unwrap_or(0),
             );
         }
-        retain_existing_recent_entries(
-            &self.root,
-            &mut self.recent_pack_cache_keys.lock().unwrap(),
-        );
-        crate::metrics::set_pack_cache_size_bytes(
-            &self.metrics,
-            directory_size(&self.root).unwrap_or(0),
-        );
         debug!(
             key = %self.key.as_str(),
             bytes = self.bytes_written,
@@ -1394,6 +1550,7 @@ fn prune_to_watermarks(
     root: &Path,
     local_cache_max_percent: f64,
     config: &PackCacheConfig,
+    active_readers: &Arc<std::sync::Mutex<HashMap<String, usize>>>,
 ) -> Result<()> {
     let budget_bytes = crate::cache::capacity::nested_budget_bytes_for_path(
         root,
@@ -1403,14 +1560,38 @@ fn prune_to_watermarks(
     let high_bytes = crate::cache::capacity::percent_of_bytes(budget_bytes, config.high_water_mark);
     let low_bytes = crate::cache::capacity::percent_of_bytes(budget_bytes, config.low_water_mark);
 
-    prune_to_byte_watermarks(root, high_bytes, low_bytes, config.eviction_policy)
+    let active_keys = active_reader_keys(active_readers);
+    prune_to_byte_watermarks_with_active(
+        root,
+        high_bytes,
+        low_bytes,
+        config.eviction_policy,
+        &active_keys,
+    )
 }
 
+#[cfg(test)]
 fn prune_to_byte_watermarks(
     root: &Path,
     high_bytes: u64,
     low_bytes: u64,
     eviction_policy: EvictionPolicy,
+) -> Result<()> {
+    prune_to_byte_watermarks_with_active(
+        root,
+        high_bytes,
+        low_bytes,
+        eviction_policy,
+        &HashSet::new(),
+    )
+}
+
+fn prune_to_byte_watermarks_with_active(
+    root: &Path,
+    high_bytes: u64,
+    low_bytes: u64,
+    eviction_policy: EvictionPolicy,
+    active_keys: &HashSet<String>,
 ) -> Result<()> {
     let (mut entries, mut total) = collect_prune_entries(root)?;
     if total <= high_bytes {
@@ -1457,12 +1638,22 @@ fn prune_to_byte_watermarks(
         }
 
         let mut stack = vec![candidate_key];
+        let mut remove_keys = Vec::new();
         while let Some(key) = stack.pop() {
-            if !deleted.insert(key.clone()) {
+            if deleted.contains(&key) || remove_keys.contains(&key) {
                 continue;
             }
             if let Some(children) = dependents.get(&key) {
                 stack.extend(children.iter().cloned());
+            }
+            remove_keys.push(key);
+        }
+        if remove_keys.iter().any(|key| active_keys.contains(key)) {
+            continue;
+        }
+        for key in remove_keys {
+            if !deleted.insert(key.clone()) {
+                continue;
             }
             if let Some(entry) = entries.remove(&key) {
                 let removed = remove_prune_entry(entry)
@@ -1473,6 +1664,18 @@ fn prune_to_byte_watermarks(
     }
 
     Ok(())
+}
+
+fn active_reader_keys(
+    active_readers: &Arc<std::sync::Mutex<HashMap<String, usize>>>,
+) -> HashSet<String> {
+    active_readers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -1488,10 +1691,10 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PackCache, PackCacheArtifact, PackCacheBaseMetadata, PackCacheKey, PackCacheMetadata,
+        PackCache, PackCacheBaseMetadata, PackCacheKey, PackCacheMetadata, active_reader_keys,
         collect_prune_entries, collect_repo_ref_tips, metadata_path, normalize_fresh_clone_request,
-        normalize_fresh_clone_request_parts, prune_to_byte_watermarks, unique_tip_oids,
-        write_pack_cache_metadata,
+        normalize_fresh_clone_request_parts, prune_to_byte_watermarks,
+        prune_to_byte_watermarks_with_active, unique_tip_oids, write_pack_cache_metadata,
     };
     use crate::config::{EvictionPolicy, PackCacheConfig};
     use crate::metrics::{MetricsRegistry, Protocol};
@@ -1832,8 +2035,8 @@ mod tests {
             .unwrap();
 
         let hit = cache.lookup_by_key(&composite_key).await.unwrap().unwrap();
-        assert!(matches!(hit.artifact, PackCacheArtifact::Composite { .. }));
-        let mut stream = cache.stream_composite_response(&hit).unwrap();
+        assert!(hit.is_composite());
+        let mut stream = hit.into_stream();
         let mut replayed = Vec::new();
         while let Some(chunk) = stream.next().await {
             replayed.extend_from_slice(&chunk.unwrap());
@@ -1843,6 +2046,303 @@ mod tests {
         assert_eq!(&raw[..4], b"PACK");
         assert_eq!(u32::from_be_bytes(raw[8..12].try_into().unwrap()), 3);
         assert_eq!(&raw[12..raw.len() - 20], b"base-bodydelta-body");
+    }
+
+    #[tokio::test]
+    async fn full_read_lease_survives_unlink_after_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+        let key = PackCacheKey {
+            digest: "active-full".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        write_prune_test_entry(&cache.root, key.as_str(), 128, 0, 10);
+
+        let lease = cache.lookup_by_key(&key).await.unwrap().unwrap();
+        std::fs::remove_file(cache.final_path(&key)).unwrap();
+
+        let mut replayed = Vec::new();
+        let mut stream = lease.into_stream();
+        while let Some(chunk) = stream.next().await {
+            replayed.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(replayed.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn composite_read_lease_survives_unlink_after_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+        let base_key = PackCacheKey {
+            digest: "base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        let composite_key = PackCacheKey {
+            digest: "composite".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        let base_pack = raw_pack(1, b"base-body");
+        let delta_pack = raw_pack(2, b"delta-body");
+        std::fs::write(cache.final_path(&base_key), pack_response(&base_pack)).unwrap();
+        std::fs::write(
+            cache.root.join(format!(
+                "{}.{}",
+                composite_key.as_str(),
+                super::DELTA_PACK_EXT
+            )),
+            &delta_pack,
+        )
+        .unwrap();
+        std::fs::write(
+            cache.composite_manifest_path(&composite_key),
+            serde_json::to_vec(&super::CompositeManifest {
+                version: super::COMPOSITE_MANIFEST_VERSION,
+                base_key: base_key.as_str().to_string(),
+                delta_pack_file: format!("{}.{}", composite_key.as_str(), super::DELTA_PACK_EXT),
+                delta_size_bytes: delta_pack.len() as u64,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        write_pack_cache_metadata(
+            &cache.root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: base_key.as_str().to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: Vec::new(),
+                request_template: Vec::new(),
+                full_tip: false,
+                created_at_unix_secs: 10,
+                last_accessed_unix_secs: 10,
+                hit_count: 0,
+            },
+        )
+        .unwrap();
+        write_pack_cache_metadata(
+            &cache.root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: composite_key.as_str().to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: Vec::new(),
+                request_template: Vec::new(),
+                full_tip: false,
+                created_at_unix_secs: 20,
+                last_accessed_unix_secs: 20,
+                hit_count: 0,
+            },
+        )
+        .unwrap();
+
+        let lease = cache.lookup_by_key(&composite_key).await.unwrap().unwrap();
+        std::fs::remove_file(cache.final_path(&base_key)).unwrap();
+        std::fs::remove_file(cache.root.join(format!(
+            "{}.{}",
+            composite_key.as_str(),
+            super::DELTA_PACK_EXT
+        )))
+        .unwrap();
+        std::fs::remove_file(cache.composite_manifest_path(&composite_key)).unwrap();
+
+        let mut replayed = Vec::new();
+        let mut stream = lease.into_stream();
+        while let Some(chunk) = stream.next().await {
+            replayed.extend_from_slice(&chunk.unwrap());
+        }
+        let raw = super::stitch::extract_raw_pack(&replayed).unwrap();
+
+        assert_eq!(&raw[..4], b"PACK");
+        assert_eq!(u32::from_be_bytes(raw[8..12].try_into().unwrap()), 3);
+        assert_eq!(&raw[12..raw.len() - 20], b"base-bodydelta-body");
+    }
+
+    #[tokio::test]
+    async fn pruning_skips_active_full_readers() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+        let key = PackCacheKey {
+            digest: "active-full".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        write_prune_test_entry(&cache.root, key.as_str(), 128, 0, 10);
+
+        let lease = cache.lookup_by_key(&key).await.unwrap().unwrap();
+        let (_, total) = collect_prune_entries(&cache.root).unwrap();
+        prune_to_byte_watermarks_with_active(
+            &cache.root,
+            total.saturating_sub(1),
+            0,
+            EvictionPolicy::Lru,
+            &active_reader_keys(&cache.active_readers),
+        )
+        .unwrap();
+        assert!(cache.final_path(&key).exists());
+
+        drop(lease);
+        prune_to_byte_watermarks(&cache.root, total.saturating_sub(1), 0, EvictionPolicy::Lru)
+            .unwrap();
+        assert!(!cache.final_path(&key).exists());
+    }
+
+    #[tokio::test]
+    async fn pruning_skips_active_composite_dependency_closure() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+        let base_key = PackCacheKey {
+            digest: "base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        let composite_key = PackCacheKey {
+            digest: "composite".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        let base_pack = raw_pack(1, b"base-body");
+        let delta_pack = raw_pack(2, b"delta-body");
+        std::fs::write(cache.final_path(&base_key), pack_response(&base_pack)).unwrap();
+        std::fs::write(
+            cache.root.join(format!(
+                "{}.{}",
+                composite_key.as_str(),
+                super::DELTA_PACK_EXT
+            )),
+            &delta_pack,
+        )
+        .unwrap();
+        std::fs::write(
+            cache.composite_manifest_path(&composite_key),
+            serde_json::to_vec(&super::CompositeManifest {
+                version: super::COMPOSITE_MANIFEST_VERSION,
+                base_key: base_key.as_str().to_string(),
+                delta_pack_file: format!("{}.{}", composite_key.as_str(), super::DELTA_PACK_EXT),
+                delta_size_bytes: delta_pack.len() as u64,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        write_pack_cache_metadata(
+            &cache.root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: base_key.as_str().to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: Vec::new(),
+                request_template: Vec::new(),
+                full_tip: false,
+                created_at_unix_secs: 10,
+                last_accessed_unix_secs: 10,
+                hit_count: 0,
+            },
+        )
+        .unwrap();
+        write_pack_cache_metadata(
+            &cache.root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: composite_key.as_str().to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: Vec::new(),
+                request_template: Vec::new(),
+                full_tip: false,
+                created_at_unix_secs: 20,
+                last_accessed_unix_secs: 20,
+                hit_count: 0,
+            },
+        )
+        .unwrap();
+
+        let lease = cache.lookup_by_key(&composite_key).await.unwrap().unwrap();
+        let (_, total) = collect_prune_entries(&cache.root).unwrap();
+        prune_to_byte_watermarks_with_active(
+            &cache.root,
+            total.saturating_sub(1),
+            0,
+            EvictionPolicy::Lru,
+            &active_reader_keys(&cache.active_readers),
+        )
+        .unwrap();
+        assert!(cache.final_path(&base_key).exists());
+        assert!(cache.composite_manifest_path(&composite_key).exists());
+        assert!(
+            cache
+                .root
+                .join(format!(
+                    "{}.{}",
+                    composite_key.as_str(),
+                    super::DELTA_PACK_EXT
+                ))
+                .exists()
+        );
+
+        drop(lease);
+        prune_to_byte_watermarks(&cache.root, total.saturating_sub(1), 0, EvictionPolicy::Lru)
+            .unwrap();
+        assert!(!cache.final_path(&base_key).exists());
+        assert!(!cache.composite_manifest_path(&composite_key).exists());
+        assert!(
+            !cache
+                .root
+                .join(format!(
+                    "{}.{}",
+                    composite_key.as_str(),
+                    super::DELTA_PACK_EXT
+                ))
+                .exists()
+        );
     }
 
     #[test]

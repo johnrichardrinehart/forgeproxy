@@ -1906,7 +1906,7 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
     owner_repo: &str,
     repo_path: &Path,
     writer: Box<crate::pack_cache::PackCacheWriter>,
-) -> std::result::Result<crate::pack_cache::PackCacheHit, PackCacheCompositeMiss> {
+) -> std::result::Result<crate::pack_cache::PackCacheReadLease, PackCacheCompositeMiss> {
     let Some(prev_entry) = state.pack_cache.lookup_recent_compatible_key(writer.key()) else {
         return Err(PackCacheCompositeMiss {
             writer: Some(writer),
@@ -1949,7 +1949,8 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
         }
     };
 
-    let hit = writer
+    let composite_key = writer.key().clone();
+    writer
         .finish_composite(&prev_entry.key, &delta_pack)
         .await
         .map_err(|error| {
@@ -1961,6 +1962,31 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
             PackCacheCompositeMiss {
                 writer: None,
                 reason: "finish_composite",
+            }
+        })?;
+    let hit = state
+        .pack_cache
+        .lookup_by_key(&composite_key)
+        .await
+        .map_err(|error| {
+            warn!(
+                repo = %owner_repo,
+                error = %error,
+                "failed to open on-demand pack cache composite"
+            );
+            PackCacheCompositeMiss {
+                writer: None,
+                reason: "artifact_open_failed",
+            }
+        })?
+        .ok_or_else(|| {
+            warn!(
+                repo = %owner_repo,
+                "on-demand pack cache composite disappeared before replay"
+            );
+            PackCacheCompositeMiss {
+                writer: None,
+                reason: "artifact_open_failed",
             }
         })?;
     info!(
