@@ -59,13 +59,15 @@ bundles:
 pack_cache:
   enabled: true
   max_percent: 0.20
-  ttl_secs: 900
+  high_water_mark: 0.90
+  low_water_mark: 0.75
+  eviction_policy: "lru"
   wait_for_inflight_secs: 120
   min_response_bytes: 67108864
 storage:
   local:
     path: "/var/cache/forgeproxy"
-    max_bytes: 536870912000
+    max_percent: 0.80
     high_water_mark: 0.90
     low_water_mark: 0.75
     eviction_policy: "lfu"

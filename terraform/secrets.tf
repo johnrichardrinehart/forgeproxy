@@ -31,7 +31,7 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     aws_region                                 = var.aws_region
     s3_use_fips                                = var.s3_use_fips
     s3_presigned_url_ttl                       = var.s3_presigned_url_ttl
-    local_cache_max_bytes                      = var.local_cache_max_bytes
+    local_cache_max_percent                    = var.local_cache_max_percent
     eviction_policy                            = var.eviction_policy
     prepare_published_generation_indexes       = var.prepare_published_generation_indexes
     generation_coalescing_window_secs          = var.generation_coalescing_window_secs
@@ -39,7 +39,9 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     max_concurrent_local_upload_packs_per_repo = var.max_concurrent_local_upload_packs_per_repo
     pack_cache_enabled                         = var.pack_cache_enabled
     pack_cache_max_percent                     = var.pack_cache_max_percent
-    pack_cache_ttl_secs                        = var.pack_cache_ttl_secs
+    pack_cache_high_water_mark                 = var.pack_cache_high_water_mark
+    pack_cache_low_water_mark                  = var.pack_cache_low_water_mark
+    pack_cache_eviction_policy                 = var.pack_cache_eviction_policy
     pack_cache_wait_for_inflight_secs          = var.pack_cache_wait_for_inflight_secs
     pack_cache_min_response_bytes              = var.pack_cache_min_response_bytes
     bundle_pack_threads                        = var.bundle_pack_threads

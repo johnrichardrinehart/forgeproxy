@@ -4158,7 +4158,7 @@ mod tests {
     fn test_cache_manager(base_path: &Path) -> crate::cache::CacheManager {
         crate::cache::CacheManager {
             base_path: base_path.to_path_buf(),
-            max_bytes: 100_000_000_000,
+            max_percent: 1.0,
             high_water: 0.90,
             low_water: 0.75,
             eviction_policy: crate::config::EvictionPolicy::Lfu,

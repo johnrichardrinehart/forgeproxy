@@ -1,11 +1,11 @@
 pub(crate) mod stitch;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
-use crate::config::PackCacheConfig;
+use crate::config::{EvictionPolicy, PackCacheConfig};
 use crate::metrics::{MetricsRegistry, Protocol};
 
 const PACK_CACHE_DIR: &str = "pack-cache";
@@ -26,14 +26,14 @@ const COMPOSITE_MANIFEST_EXT: &str = "pack-composite.json";
 const DELTA_PACK_EXT: &str = "delta.pack";
 const METADATA_EXT: &str = "pack-cache-meta.json";
 const COMPOSITE_MANIFEST_VERSION: u32 = 1;
-const PACK_CACHE_METADATA_VERSION: u32 = 1;
+const PACK_CACHE_METADATA_VERSION: u32 = 2;
 const MAX_RECENT_ENTRIES_PER_REPO: usize = 16;
 
 #[derive(Clone)]
 pub struct PackCache {
     root: PathBuf,
     config: PackCacheConfig,
-    max_bytes: u64,
+    local_cache_max_percent: f64,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
     metrics: MetricsRegistry,
@@ -120,6 +120,9 @@ struct PackCacheMetadata {
     request_wants: Vec<String>,
     request_template: Vec<String>,
     full_tip: bool,
+    created_at_unix_secs: u64,
+    last_accessed_unix_secs: u64,
+    hit_count: u64,
 }
 
 pub enum PackCacheLookup {
@@ -133,7 +136,8 @@ pub struct PackCacheWriter {
     final_path: PathBuf,
     tmp_path: PathBuf,
     root: PathBuf,
-    max_bytes: u64,
+    config: PackCacheConfig,
+    local_cache_max_percent: f64,
     writer: BufWriter<File>,
     bytes_written: u64,
     min_response_bytes: u64,
@@ -149,16 +153,15 @@ impl PackCache {
     pub fn new(
         base_path: &Path,
         config: PackCacheConfig,
-        local_cache_max_bytes: u64,
+        local_cache_max_percent: f64,
         metrics: MetricsRegistry,
     ) -> Self {
-        let max_bytes = config.effective_max_bytes(local_cache_max_bytes);
         Self {
             root: base_path
                 .join(crate::cache::layout::STATE_ROOT_DIR)
                 .join(PACK_CACHE_DIR),
             config,
-            max_bytes,
+            local_cache_max_percent,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             recent_pack_cache_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics,
@@ -408,10 +411,19 @@ impl PackCache {
     fn lookup_full_path(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
         let path = self.final_path(key);
         self.lookup_existing_file(&path).map(|metadata| {
-            metadata.map(|metadata| PackCacheHit {
-                path,
-                size_bytes: metadata.len(),
-                artifact: PackCacheArtifact::Full,
+            metadata.map(|metadata| {
+                if let Err(error) = record_metadata_hit(&self.root, key.as_str()) {
+                    warn!(
+                        key = %key.as_str(),
+                        error = %error,
+                        "failed to update pack cache hit metadata"
+                    );
+                }
+                PackCacheHit {
+                    path,
+                    size_bytes: metadata.len(),
+                    artifact: PackCacheArtifact::Full,
+                }
             })
         })
     }
@@ -424,6 +436,13 @@ impl PackCache {
         if self.composite_chain(key).is_err() {
             self.remove_composite_files(key);
             return Ok(None);
+        }
+        if let Err(error) = record_composite_chain_hit(&self.root, key) {
+            warn!(
+                key = %key.as_str(),
+                error = %error,
+                "failed to update pack cache composite hit metadata"
+            );
         }
 
         Ok(Some(PackCacheHit {
@@ -442,15 +461,6 @@ impl PackCache {
                     .with_context(|| format!("stat pack cache artifact {}", path.display()));
             }
         };
-
-        if artifact_is_expired(&metadata, self.config.ttl_secs) {
-            if let Err(error) = std::fs::remove_file(path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(path = %path.display(), error = %error, "failed to remove expired pack cache artifact");
-            }
-            return Ok(None);
-        }
 
         Ok(Some(metadata))
     }
@@ -509,6 +519,12 @@ impl PackCache {
         {
             warn!(path = %manifest_path.display(), error = %error, "failed to remove invalid pack cache composite manifest");
         }
+        let stale_metadata_path = metadata_path(&self.root, key.as_str());
+        if let Err(error) = std::fs::remove_file(&stale_metadata_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %stale_metadata_path.display(), error = %error, "failed to remove invalid pack cache metadata");
+        }
     }
 
     async fn open_writer(&self, key: PackCacheKey) -> Result<PackCacheWriter> {
@@ -535,7 +551,8 @@ impl PackCache {
             final_path,
             tmp_path,
             root: self.root.clone(),
-            max_bytes: self.max_bytes,
+            config: self.config.clone(),
+            local_cache_max_percent: self.local_cache_max_percent,
             writer: BufWriter::with_capacity(1024 * 1024, file),
             bytes_written: 0,
             min_response_bytes: self.config.min_response_bytes,
@@ -594,8 +611,7 @@ impl PackCache {
                 warn!(path = %path.display(), version = metadata.version, "ignoring unsupported pack cache metadata version");
                 continue;
             }
-            let key = PackCacheKey::from_digest(metadata.key.clone());
-            if self.lookup_sync(&key)?.is_none() {
+            if !cache_entry_artifact_exists(&self.root, &metadata.key) {
                 continue;
             }
             insert_recent_entry(
@@ -822,14 +838,19 @@ impl PackCacheWriter {
                 );
             }
         }
-        if let Err(error) = prune_to_limit(&self.root, self.max_bytes) {
+        if let Err(error) =
+            prune_to_watermarks(&self.root, self.local_cache_max_percent, &self.config)
+        {
             warn!(
                 root = %self.root.display(),
-                max_bytes = self.max_bytes,
                 error = %error,
                 "failed to prune pack cache after artifact promotion"
             );
         }
+        retain_existing_recent_entries(
+            &self.root,
+            &mut self.recent_pack_cache_keys.lock().unwrap(),
+        );
         crate::metrics::set_pack_cache_size_bytes(
             &self.metrics,
             directory_size(&self.root).unwrap_or(0),
@@ -843,6 +864,7 @@ impl PackCacheWriter {
     }
 
     fn write_metadata(&self, entry: &PackCacheRecentEntry) -> Result<()> {
+        let now = now_unix_secs();
         let metadata = PackCacheMetadata {
             version: PACK_CACHE_METADATA_VERSION,
             key: self.key.as_str().to_string(),
@@ -850,6 +872,9 @@ impl PackCacheWriter {
             request_wants: entry.request_wants.clone(),
             request_template: entry.request_template.clone(),
             full_tip: entry.full_tip,
+            created_at_unix_secs: now,
+            last_accessed_unix_secs: now,
+            hit_count: 0,
         };
         let path = self
             .root
@@ -1133,16 +1158,6 @@ fn parse_pkt_len(header: &[u8]) -> Option<usize> {
     usize::from_str_radix(text, 16).ok()
 }
 
-fn artifact_is_expired(metadata: &std::fs::Metadata, ttl_secs: u64) -> bool {
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or_default()
-        > Duration::from_secs(ttl_secs)
-}
-
 fn directory_size(root: &Path) -> std::io::Result<u64> {
     if !root.exists() {
         return Ok(0);
@@ -1158,53 +1173,302 @@ fn directory_size(root: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-fn is_pack_cache_artifact(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.ends_with(PACK_RESPONSE_EXT)
-                || name.ends_with(COMPOSITE_MANIFEST_EXT)
-                || name.ends_with(DELTA_PACK_EXT)
-        })
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
-fn prune_to_limit(root: &Path, max_bytes: u64) -> std::io::Result<()> {
-    if !root.exists() {
-        return Ok(());
+fn cache_entry_artifact_exists(root: &Path, key: &str) -> bool {
+    root.join(format!("{key}.{PACK_RESPONSE_EXT}")).is_file()
+        || root
+            .join(format!("{key}.{COMPOSITE_MANIFEST_EXT}"))
+            .is_file()
+}
+
+fn metadata_path(root: &Path, key: &str) -> PathBuf {
+    root.join(format!("{key}.{METADATA_EXT}"))
+}
+
+fn read_pack_cache_metadata(root: &Path, key: &str) -> Result<PackCacheMetadata> {
+    let path = metadata_path(root, key);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read pack cache metadata {}", path.display()))?;
+    let metadata: PackCacheMetadata = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse pack cache metadata {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.version == PACK_CACHE_METADATA_VERSION,
+        "unsupported pack cache metadata version {}",
+        metadata.version
+    );
+    Ok(metadata)
+}
+
+fn write_pack_cache_metadata(root: &Path, metadata: &PackCacheMetadata) -> Result<()> {
+    let path = metadata_path(root, &metadata.key);
+    let tmp_path = root.join(format!(
+        "{}.tmp.{}.{}",
+        metadata.key,
+        std::process::id(),
+        METADATA_EXT
+    ));
+    let bytes = serde_json::to_vec(metadata).context("serialize pack cache metadata")?;
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("write pack cache metadata {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path).with_context(|| {
+        format!(
+            "promote pack cache metadata {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn record_metadata_hit(root: &Path, key: &str) -> Result<()> {
+    let mut metadata = read_pack_cache_metadata(root, key)?;
+    metadata.last_accessed_unix_secs = now_unix_secs();
+    metadata.hit_count = metadata.hit_count.saturating_add(1);
+    write_pack_cache_metadata(root, &metadata)
+}
+
+fn record_composite_chain_hit(root: &Path, key: &PackCacheKey) -> Result<()> {
+    let mut current_key = key.as_str().to_string();
+    let mut seen = HashSet::new();
+
+    loop {
+        if !seen.insert(current_key.clone()) {
+            anyhow::bail!("cycle in pack cache composite chain");
+        }
+        record_metadata_hit(root, &current_key)?;
+
+        let manifest_path = root.join(format!("{current_key}.{COMPOSITE_MANIFEST_EXT}"));
+        if !manifest_path.is_file() {
+            return Ok(());
+        }
+        let bytes = std::fs::read(&manifest_path).with_context(|| {
+            format!(
+                "read pack cache composite manifest {}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: CompositeManifest = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parse pack cache composite manifest {}",
+                manifest_path.display()
+            )
+        })?;
+        current_key = manifest.base_key;
+    }
+}
+
+fn retain_existing_recent_entries(
+    root: &Path,
+    recent: &mut HashMap<String, Vec<PackCacheRecentEntry>>,
+) {
+    recent.retain(|_, entries| {
+        entries.retain(|entry| cache_entry_artifact_exists(root, entry.key.as_str()));
+        !entries.is_empty()
+    });
+}
+
+#[derive(Debug)]
+struct PackCachePruneEntry {
+    key: String,
+    paths: Vec<(PathBuf, u64)>,
+    size_bytes: u64,
+    created_at_unix_secs: u64,
+    last_accessed_unix_secs: u64,
+    hit_count: u64,
+    base_key: Option<String>,
+}
+
+impl PackCachePruneEntry {
+    fn new(key: String) -> Self {
+        Self {
+            key,
+            paths: Vec::new(),
+            size_bytes: 0,
+            created_at_unix_secs: 0,
+            last_accessed_unix_secs: 0,
+            hit_count: 0,
+            base_key: None,
+        }
     }
 
-    let mut artifacts = Vec::new();
+    fn add_path(&mut self, path: PathBuf, size_bytes: u64) {
+        self.size_bytes = self.size_bytes.saturating_add(size_bytes);
+        self.paths.push((path, size_bytes));
+    }
+}
+
+fn pack_cache_key_from_file_name(name: &str) -> Option<String> {
+    for ext in [
+        PACK_RESPONSE_EXT,
+        COMPOSITE_MANIFEST_EXT,
+        DELTA_PACK_EXT,
+        METADATA_EXT,
+    ] {
+        let suffix = format!(".{ext}");
+        if let Some(key) = name.strip_suffix(&suffix) {
+            return Some(key.to_string());
+        }
+    }
+    None
+}
+
+fn collect_prune_entries(root: &Path) -> Result<(HashMap<String, PackCachePruneEntry>, u64)> {
+    let mut entries = HashMap::<String, PackCachePruneEntry>::new();
     let mut total = 0u64;
-    for entry in std::fs::read_dir(root)? {
+
+    if !root.exists() {
+        return Ok((entries, total));
+    }
+
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("read pack cache root {}", root.display()))?
+    {
         let entry = entry?;
         let path = entry.path();
-        if !is_pack_cache_artifact(&path) {
-            continue;
-        }
         let metadata = entry.metadata()?;
         if !metadata.is_file() {
             continue;
         }
-        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        total = total.saturating_add(metadata.len());
-        artifacts.push((modified, metadata.len(), path));
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name.contains(".tmp.") {
+            continue;
+        }
+        let Some(key) = pack_cache_key_from_file_name(file_name) else {
+            continue;
+        };
+        let size = metadata.len();
+        total = total.saturating_add(size);
+        entries
+            .entry(key.clone())
+            .or_insert_with(|| PackCachePruneEntry::new(key))
+            .add_path(path, size);
     }
 
-    if total <= max_bytes {
+    let keys = entries.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        if let Ok(metadata) = read_pack_cache_metadata(root, &key)
+            && let Some(entry) = entries.get_mut(&key)
+        {
+            entry.created_at_unix_secs = metadata.created_at_unix_secs;
+            entry.last_accessed_unix_secs = metadata.last_accessed_unix_secs;
+            entry.hit_count = metadata.hit_count;
+        }
+
+        let manifest_path = root.join(format!("{key}.{COMPOSITE_MANIFEST_EXT}"));
+        if manifest_path.is_file()
+            && let Ok(bytes) = std::fs::read(&manifest_path)
+            && let Ok(manifest) = serde_json::from_slice::<CompositeManifest>(&bytes)
+            && let Some(entry) = entries.get_mut(&key)
+        {
+            entry.base_key = Some(manifest.base_key);
+        }
+    }
+
+    Ok((entries, total))
+}
+
+fn remove_prune_entry(entry: PackCachePruneEntry) -> std::io::Result<u64> {
+    let mut removed = 0u64;
+    for (path, size) in entry.paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed = removed.saturating_add(size),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                removed = removed.saturating_add(size);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
+fn prune_to_watermarks(
+    root: &Path,
+    local_cache_max_percent: f64,
+    config: &PackCacheConfig,
+) -> Result<()> {
+    let budget_bytes = crate::cache::capacity::nested_budget_bytes_for_path(
+        root,
+        local_cache_max_percent,
+        config.max_percent,
+    )?;
+    let high_bytes = crate::cache::capacity::percent_of_bytes(budget_bytes, config.high_water_mark);
+    let low_bytes = crate::cache::capacity::percent_of_bytes(budget_bytes, config.low_water_mark);
+
+    prune_to_byte_watermarks(root, high_bytes, low_bytes, config.eviction_policy)
+}
+
+fn prune_to_byte_watermarks(
+    root: &Path,
+    high_bytes: u64,
+    low_bytes: u64,
+    eviction_policy: EvictionPolicy,
+) -> Result<()> {
+    let (mut entries, mut total) = collect_prune_entries(root)?;
+    if total <= high_bytes {
         return Ok(());
     }
 
-    artifacts.sort_by_key(|(modified, _, _)| *modified);
-    for (_, size, path) in artifacts {
-        if total <= max_bytes {
+    let mut dependents = HashMap::<String, Vec<String>>::new();
+    for entry in entries.values() {
+        if let Some(base_key) = &entry.base_key {
+            dependents
+                .entry(base_key.clone())
+                .or_default()
+                .push(entry.key.clone());
+        }
+    }
+
+    let mut candidates = entries
+        .values()
+        .map(|entry| {
+            (
+                entry.key.clone(),
+                entry.hit_count,
+                entry.last_accessed_unix_secs,
+                entry.created_at_unix_secs,
+            )
+        })
+        .collect::<Vec<_>>();
+    match eviction_policy {
+        EvictionPolicy::Lru => candidates.sort_by_key(|(key, _, last_accessed, created)| {
+            (*last_accessed, *created, key.clone())
+        }),
+        EvictionPolicy::Lfu => candidates.sort_by_key(|(key, hit_count, last_accessed, _)| {
+            (*hit_count, *last_accessed, key.clone())
+        }),
+    }
+
+    let mut deleted = HashSet::new();
+    for (candidate_key, _, _, _) in candidates {
+        if total <= low_bytes {
             break;
         }
-        match std::fs::remove_file(&path) {
-            Ok(()) => total = total.saturating_sub(size),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                total = total.saturating_sub(size);
+        if deleted.contains(&candidate_key) {
+            continue;
+        }
+
+        let mut stack = vec![candidate_key];
+        while let Some(key) = stack.pop() {
+            if !deleted.insert(key.clone()) {
+                continue;
             }
-            Err(error) => return Err(error),
+            if let Some(children) = dependents.get(&key) {
+                stack.extend(children.iter().cloned());
+            }
+            if let Some(entry) = entries.remove(&key) {
+                let removed = remove_prune_entry(entry)
+                    .with_context(|| format!("remove pack cache entry {key}"))?;
+                total = total.saturating_sub(removed);
+            }
         }
     }
 
@@ -1224,10 +1488,12 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PackCache, PackCacheArtifact, PackCacheBaseMetadata, PackCacheKey, collect_repo_ref_tips,
-        normalize_fresh_clone_request, normalize_fresh_clone_request_parts, unique_tip_oids,
+        PackCache, PackCacheArtifact, PackCacheBaseMetadata, PackCacheKey, PackCacheMetadata,
+        collect_prune_entries, collect_repo_ref_tips, metadata_path, normalize_fresh_clone_request,
+        normalize_fresh_clone_request_parts, prune_to_byte_watermarks, unique_tip_oids,
+        write_pack_cache_metadata,
     };
-    use crate::config::PackCacheConfig;
+    use crate::config::{EvictionPolicy, PackCacheConfig};
     use crate::metrics::{MetricsRegistry, Protocol};
     use futures::StreamExt;
     use sha1::{Digest, Sha1};
@@ -1263,6 +1529,36 @@ mod tests {
         response.extend_from_slice(&pkt(&sideband_packet(1, pack)));
         response.extend_from_slice(b"0000");
         response
+    }
+
+    fn write_prune_test_entry(
+        root: &std::path::Path,
+        key: &str,
+        size_bytes: usize,
+        hit_count: u64,
+        last_accessed_unix_secs: u64,
+    ) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join(format!("{}.{}", key, super::PACK_RESPONSE_EXT)),
+            vec![0_u8; size_bytes],
+        )
+        .unwrap();
+        write_pack_cache_metadata(
+            root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: key.to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: Vec::new(),
+                request_template: Vec::new(),
+                full_tip: false,
+                created_at_unix_secs: last_accessed_unix_secs,
+                last_accessed_unix_secs,
+                hit_count,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1350,6 +1646,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lru_pruning_evicts_oldest_accessed_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_prune_test_entry(root, "old", 128, 10, 10);
+        write_prune_test_entry(root, "new", 128, 1, 20);
+
+        let (entries, total) = collect_prune_entries(root).unwrap();
+        let old_size = entries.get("old").unwrap().size_bytes;
+
+        prune_to_byte_watermarks(
+            root,
+            total.saturating_sub(1),
+            total.saturating_sub(old_size),
+            EvictionPolicy::Lru,
+        )
+        .unwrap();
+
+        assert!(
+            !root
+                .join(format!("old.{}", super::PACK_RESPONSE_EXT))
+                .exists()
+        );
+        assert!(!metadata_path(root, "old").exists());
+        assert!(
+            root.join(format!("new.{}", super::PACK_RESPONSE_EXT))
+                .exists()
+        );
+        assert!(metadata_path(root, "new").exists());
+    }
+
+    #[test]
+    fn lfu_pruning_evicts_lowest_hit_count_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_prune_test_entry(root, "popular", 128, 10, 10);
+        write_prune_test_entry(root, "cold", 128, 1, 20);
+
+        let (entries, total) = collect_prune_entries(root).unwrap();
+        let cold_size = entries.get("cold").unwrap().size_bytes;
+
+        prune_to_byte_watermarks(
+            root,
+            total.saturating_sub(1),
+            total.saturating_sub(cold_size),
+            EvictionPolicy::Lfu,
+        )
+        .unwrap();
+
+        assert!(
+            !root
+                .join(format!("cold.{}", super::PACK_RESPONSE_EXT))
+                .exists()
+        );
+        assert!(!metadata_path(root, "cold").exists());
+        assert!(
+            root.join(format!("popular.{}", super::PACK_RESPONSE_EXT))
+                .exists()
+        );
+        assert!(metadata_path(root, "popular").exists());
+    }
+
+    #[test]
+    fn pruning_base_entry_removes_dependent_composites() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_prune_test_entry(root, "base", 128, 0, 10);
+        write_pack_cache_metadata(
+            root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: "composite".to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: Vec::new(),
+                request_template: Vec::new(),
+                full_tip: false,
+                created_at_unix_secs: 20,
+                last_accessed_unix_secs: 20,
+                hit_count: 5,
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!("composite.{}", super::DELTA_PACK_EXT)),
+            vec![0_u8; 64],
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!("composite.{}", super::COMPOSITE_MANIFEST_EXT)),
+            serde_json::to_vec(&super::CompositeManifest {
+                version: super::COMPOSITE_MANIFEST_VERSION,
+                base_key: "base".to_string(),
+                delta_pack_file: format!("composite.{}", super::DELTA_PACK_EXT),
+                delta_size_bytes: 64,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (entries, total) = collect_prune_entries(root).unwrap();
+        let base_size = entries.get("base").unwrap().size_bytes;
+        let composite_size = entries.get("composite").unwrap().size_bytes;
+
+        prune_to_byte_watermarks(
+            root,
+            total.saturating_sub(1),
+            total
+                .saturating_sub(base_size)
+                .saturating_sub(composite_size),
+            EvictionPolicy::Lru,
+        )
+        .unwrap();
+
+        assert!(
+            !root
+                .join(format!("base.{}", super::PACK_RESPONSE_EXT))
+                .exists()
+        );
+        assert!(!metadata_path(root, "base").exists());
+        assert!(
+            !root
+                .join(format!("composite.{}", super::COMPOSITE_MANIFEST_EXT))
+                .exists()
+        );
+        assert!(
+            !root
+                .join(format!("composite.{}", super::DELTA_PACK_EXT))
+                .exists()
+        );
+        assert!(!metadata_path(root, "composite").exists());
+    }
+
     #[tokio::test]
     async fn composite_artifact_replays_base_plus_delta_pack() {
         let temp = tempfile::tempdir().unwrap();
@@ -1358,11 +1786,11 @@ mod tests {
             PackCacheConfig {
                 enabled: true,
                 max_percent: 1.0,
-                ttl_secs: 900,
                 wait_for_inflight_secs: 1,
                 min_response_bytes: 0,
+                ..PackCacheConfig::default()
             },
-            1024 * 1024,
+            1.0,
             MetricsRegistry::new(),
         );
         cache.ensure_ready().await.unwrap();
@@ -1437,11 +1865,11 @@ mod tests {
             PackCacheConfig {
                 enabled: true,
                 max_percent: 1.0,
-                ttl_secs: 900,
                 wait_for_inflight_secs: 1,
                 min_response_bytes: 0,
+                ..PackCacheConfig::default()
             },
-            1024 * 1024,
+            1.0,
             MetricsRegistry::new(),
         );
         let mut request = Vec::new();
@@ -1480,11 +1908,11 @@ mod tests {
             PackCacheConfig {
                 enabled: true,
                 max_percent: 1.0,
-                ttl_secs: 900,
                 wait_for_inflight_secs: 1,
                 min_response_bytes: 0,
+                ..PackCacheConfig::default()
             },
-            1024 * 1024,
+            1.0,
             MetricsRegistry::new(),
         );
         let mut request = Vec::new();
@@ -1511,16 +1939,11 @@ mod tests {
         let config = PackCacheConfig {
             enabled: true,
             max_percent: 1.0,
-            ttl_secs: 900,
             wait_for_inflight_secs: 1,
             min_response_bytes: 0,
+            ..PackCacheConfig::default()
         };
-        let cache = PackCache::new(
-            temp.path(),
-            config.clone(),
-            1024 * 1024,
-            MetricsRegistry::new(),
-        );
+        let cache = PackCache::new(temp.path(), config.clone(), 1.0, MetricsRegistry::new());
         cache.ensure_ready().await.unwrap();
         let base_key = PackCacheKey {
             digest: "persisted-base".to_string(),
@@ -1544,8 +1967,19 @@ mod tests {
         };
         writer.write_chunk(b"not a real response").await.unwrap();
         writer.finish().await.unwrap();
+        cache.lookup_by_key(&base_key).await.unwrap().unwrap();
 
-        let reloaded = PackCache::new(temp.path(), config, 1024 * 1024, MetricsRegistry::new());
+        let metadata = super::read_pack_cache_metadata(
+            &temp
+                .path()
+                .join(crate::cache::layout::STATE_ROOT_DIR)
+                .join(super::PACK_CACHE_DIR),
+            base_key.as_str(),
+        )
+        .unwrap();
+        assert_eq!(metadata.hit_count, 1);
+
+        let reloaded = PackCache::new(temp.path(), config, 1.0, MetricsRegistry::new());
         reloaded.ensure_ready().await.unwrap();
         let future_key = PackCacheKey {
             digest: "future".to_string(),

@@ -44,14 +44,16 @@ clone:
 pack_cache:
   enabled: ${pack_cache_enabled}
   max_percent: ${pack_cache_max_percent}
-  ttl_secs: ${pack_cache_ttl_secs}
+  high_water_mark: ${pack_cache_high_water_mark}
+  low_water_mark: ${pack_cache_low_water_mark}
+  eviction_policy: "${pack_cache_eviction_policy}"
   wait_for_inflight_secs: ${pack_cache_wait_for_inflight_secs}
   min_response_bytes: ${pack_cache_min_response_bytes}
 
 storage:
   local:
     path: "/var/cache/forgeproxy"
-    max_bytes: ${local_cache_max_bytes}
+    max_percent: ${local_cache_max_percent}
     eviction_policy: "${eviction_policy}"
   s3:
     bucket: "${bundle_bucket}"

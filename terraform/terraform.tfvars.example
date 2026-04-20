@@ -68,8 +68,8 @@ metrics_scrape_cidrs = []              # Add CIDRs for Prometheus scraping
 ec2_key_pair_name = ""
 
 # Cache configuration
-local_cache_max_bytes = 53687091200  # 50 GiB
-eviction_policy       = "lfu"         # or "lru"
+local_cache_max_percent = 0.80
+eviction_policy         = "lfu" # or "lru"
 
 # S3 storage configuration
 s3_bundle_prefix     = "forgeproxy/"

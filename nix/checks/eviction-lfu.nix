@@ -88,7 +88,7 @@ let
     storage:
       local:
         path: "${cacheLayout.cacheRoot}"
-        max_bytes: 10485760
+        max_percent: 0.80
         high_water_mark: 0.50
         low_water_mark: 0.25
         eviction_policy: "lfu"

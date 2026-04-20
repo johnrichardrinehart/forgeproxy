@@ -190,18 +190,16 @@ fn token_expiration_from_headers(headers: &HeaderMap) -> Result<Option<DateTime<
 async fn check_disk(config: &Config) -> CheckResult {
     let cache_path = &config.storage.local.path;
 
-    // Use statvfs via a blocking call to avoid blocking the async runtime.
     let path = cache_path.clone();
-    let max_bytes = config.storage.local.max_bytes;
+    let max_percent = config.storage.local.max_percent;
 
-    let result = tokio::task::spawn_blocking(move || disk_usage(&path, max_bytes)).await;
+    let result = tokio::task::spawn_blocking(move || disk_usage(&path, max_percent)).await;
 
     match result {
-        Ok(Ok((used, capacity))) => {
-            // Check against max_bytes configured ceiling.
-            if used > max_bytes {
+        Ok(Ok((used, capacity, budget))) => {
+            if used > budget {
                 CheckResult::unhealthy(format!(
-                    "cache usage {used} bytes exceeds max_bytes {max_bytes}"
+                    "cache usage {used} bytes exceeds configured budget {budget}"
                 ))
             } else {
                 let pct = if capacity > 0 {
@@ -212,7 +210,7 @@ async fn check_disk(config: &Config) -> CheckResult {
                 CheckResult {
                     ok: true,
                     detail: Some(format!(
-                        "used {used} / {max_bytes} max ({pct:.1}% of filesystem)"
+                        "used {used} / {budget} budget ({pct:.1}% of filesystem)"
                     )),
                 }
             }
@@ -222,25 +220,14 @@ async fn check_disk(config: &Config) -> CheckResult {
     }
 }
 
-/// Compute (used_bytes_in_dir, filesystem_capacity) for the path's mount.
-///
-/// We cannot use `statvfs` without an FFI binding, so we fall back to
-/// `std::fs::metadata`-based traversal for the used-bytes component and
-/// a simple `available + used` estimate from `std::fs` for the fs capacity.
-fn disk_usage(path: &str, _max_bytes: u64) -> anyhow::Result<(u64, u64)> {
+/// Compute (used_bytes_in_dir, filesystem_capacity, configured_budget_bytes)
+/// for the path's mount.
+fn disk_usage(path: &str, max_percent: f64) -> anyhow::Result<(u64, u64, u64)> {
     let dir = std::path::Path::new(path);
     let used = crate::cache::manager::dir_size(dir)?;
-    let capacity = fs_capacity_for(dir).unwrap_or(0);
-    Ok((used, capacity))
-}
-
-/// Best-effort attempt to read filesystem capacity via `/proc/mounts` and
-/// `statfs`. Returns `None` when unavailable.
-fn fs_capacity_for(_path: &std::path::Path) -> Option<u64> {
-    // In a production build this would call libc::statvfs.  We avoid
-    // pulling in the `nix` crate here and return None so the health
-    // endpoint still functions (just without filesystem capacity info).
-    None
+    let capacity = crate::cache::capacity::filesystem_capacity_bytes(dir)?;
+    let budget = crate::cache::capacity::percent_of_bytes(capacity, max_percent);
+    Ok((used, capacity, budget))
 }
 
 // ---------------------------------------------------------------------------

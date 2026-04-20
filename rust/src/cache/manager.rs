@@ -2,9 +2,10 @@
 //!
 //! Repos are exposed to readers under
 //! `{base_path}/published/{owner}/{repo}.git`, with mutable mirrors and other
-//! operational state stored in sibling subtrees. When disk usage exceeds the configured
-//! high-water mark, the least-frequently-used repos (that have an S3 bundle
-//! backup) are evicted until usage drops below the low-water mark.
+//! operational state stored in sibling subtrees. When disk usage exceeds the
+//! configured high-water mark for the filesystem-relative cache budget, repos
+//! that have an S3 bundle backup are evicted until usage drops below the
+//! low-water mark.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,8 +29,8 @@ use super::{lfu, lru};
 pub struct CacheManager {
     /// Root directory for forgeproxy cache state (e.g. `/var/cache/forgeproxy`).
     pub base_path: PathBuf,
-    /// Hard ceiling for total cache usage in bytes.
-    pub max_bytes: u64,
+    /// Fraction of the backing filesystem capacity usable by forgeproxy cache state.
+    pub max_percent: f64,
     /// Eviction starts when usage fraction exceeds this value (0.0 .. 1.0).
     pub high_water: f64,
     /// Eviction stops when usage fraction drops to or below this value.
@@ -51,7 +52,7 @@ impl CacheManager {
     pub fn new(config: &LocalStorageConfig) -> Self {
         Self {
             base_path: PathBuf::from(&config.path),
-            max_bytes: config.max_bytes,
+            max_percent: config.max_percent,
             high_water: config.high_water_mark,
             low_water: config.low_water_mark,
             eviction_policy: config.eviction_policy,
@@ -427,13 +428,16 @@ impl CacheManager {
         })
     }
 
-    /// Return the current cache usage as a fraction of `max_bytes`.
+    pub fn budget_bytes(&self) -> Result<u64> {
+        super::capacity::budget_bytes_for_path(&self.base_path, self.max_percent)
+    }
+
+    /// Return the current cache usage as a fraction of the filesystem-relative
+    /// cache budget.
     pub fn usage_fraction(&self) -> Result<f64> {
-        if self.max_bytes == 0 {
-            return Ok(0.0);
-        }
         let used = self.total_size_bytes()?;
-        Ok(used as f64 / self.max_bytes as f64)
+        let budget = self.budget_bytes()?;
+        Ok(used as f64 / budget as f64)
     }
 
     /// Return `true` when cache usage exceeds the high-water mark and
@@ -841,7 +845,7 @@ mod tests {
     fn test_manager(base_path: &Path) -> CacheManager {
         CacheManager {
             base_path: base_path.to_path_buf(),
-            max_bytes: 100_000_000_000,
+            max_percent: 1.0,
             high_water: 0.90,
             low_water: 0.75,
             eviction_policy: EvictionPolicy::Lfu,

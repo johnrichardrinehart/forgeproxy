@@ -694,14 +694,21 @@ pub struct PackCacheConfig {
     /// clone requests.
     #[serde(default)]
     pub enabled: bool,
-    /// Fraction of `storage.local.max_bytes` retained by the disk-backed pack
-    /// response cache.
+    /// Fraction of the local forgeproxy cache budget retained by the
+    /// disk-backed pack response cache.
     #[serde(default = "default_pack_cache_max_percent")]
     pub max_percent: f64,
-    /// Maximum age of a cache artifact before it is ignored and removed by a
-    /// future sweep.
-    #[serde(default = "default_pack_cache_ttl_secs")]
-    pub ttl_secs: u64,
+    /// Eviction starts when pack cache usage exceeds this fraction of its
+    /// budget.
+    #[serde(default = "default_high_water")]
+    pub high_water_mark: f64,
+    /// Eviction stops when pack cache usage drops to or below this fraction of
+    /// its budget.
+    #[serde(default = "default_low_water")]
+    pub low_water_mark: f64,
+    /// Eviction policy: `lru` or `lfu`.
+    #[serde(default = "default_eviction_policy")]
+    pub eviction_policy: EvictionPolicy,
     /// Maximum time a same-key request waits for an in-flight pack artifact
     /// before bypassing the cache and running its own local upload-pack.
     #[serde(default = "default_pack_cache_wait_for_inflight_secs")]
@@ -717,7 +724,9 @@ impl Default for PackCacheConfig {
         Self {
             enabled: false,
             max_percent: default_pack_cache_max_percent(),
-            ttl_secs: default_pack_cache_ttl_secs(),
+            high_water_mark: default_high_water(),
+            low_water_mark: default_low_water(),
+            eviction_policy: default_eviction_policy(),
             wait_for_inflight_secs: default_pack_cache_wait_for_inflight_secs(),
             min_response_bytes: default_pack_cache_min_response_bytes(),
         }
@@ -728,22 +737,12 @@ fn default_pack_cache_max_percent() -> f64 {
     0.20
 }
 
-fn default_pack_cache_ttl_secs() -> u64 {
-    900
-}
-
 fn default_pack_cache_wait_for_inflight_secs() -> u64 {
     120
 }
 
 fn default_pack_cache_min_response_bytes() -> u64 {
     64 * 1024 * 1024
-}
-
-impl PackCacheConfig {
-    pub fn effective_max_bytes(&self, local_cache_max_bytes: u64) -> u64 {
-        ((local_cache_max_bytes as f64 * self.max_percent) as u64).max(1)
-    }
 }
 
 impl Default for BundleConfig {
@@ -821,8 +820,9 @@ pub struct StorageConfig {
 pub struct LocalStorageConfig {
     /// Root directory for bare repos and bundles.
     pub path: String,
-    /// Hard ceiling for local cache usage in bytes.
-    pub max_bytes: u64,
+    /// Fraction of the backing filesystem capacity usable by forgeproxy local
+    /// cache state.
+    pub max_percent: f64,
     /// Eviction starts when usage exceeds this fraction (0.0 .. 1.0).
     #[serde(default = "default_high_water")]
     pub high_water_mark: f64,
@@ -914,11 +914,15 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
 fn validate_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.storage.local.high_water_mark > config.storage.local.low_water_mark,
-        "high_water_mark must be greater than low_water_mark"
+        "storage.local.high_water_mark must be greater than storage.local.low_water_mark"
     );
     anyhow::ensure!(
         config.storage.local.high_water_mark <= 1.0 && config.storage.local.low_water_mark >= 0.0,
-        "water marks must be in range [0.0, 1.0]"
+        "storage.local water marks must be in range [0.0, 1.0]"
+    );
+    anyhow::ensure!(
+        config.storage.local.max_percent > 0.0 && config.storage.local.max_percent <= 1.0,
+        "storage.local.max_percent must be in range (0.0, 1.0]"
     );
     anyhow::ensure!(
         config.bundles.max_concurrent_generations > 0,
@@ -941,8 +945,12 @@ fn validate_config(config: &Config) -> Result<()> {
         "pack_cache.max_percent must be in range (0.0, 1.0]"
     );
     anyhow::ensure!(
-        !config.pack_cache.enabled || config.pack_cache.ttl_secs > 0,
-        "pack_cache.ttl_secs must be greater than 0 when pack cache is enabled"
+        config.pack_cache.high_water_mark > config.pack_cache.low_water_mark,
+        "pack_cache.high_water_mark must be greater than pack_cache.low_water_mark"
+    );
+    anyhow::ensure!(
+        config.pack_cache.high_water_mark <= 1.0 && config.pack_cache.low_water_mark >= 0.0,
+        "pack_cache water marks must be in range [0.0, 1.0]"
     );
     anyhow::ensure!(
         (0.0..=1.0).contains(&config.observability.traces.sample_ratio),
@@ -1010,6 +1018,22 @@ mod tests {
         let config = include_str!("../../config.example.yaml").replace(
             "  metrics:\n    prometheus:\n      enabled: true\n",
             "  metrics:\n    prometheus:\n      enabled: true\n      refresh_interval_secs: 0\n",
+        );
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_local_max_bytes() {
+        let config = include_str!("../../config.example.yaml")
+            .replace("    max_percent: 0.80\n", "    max_bytes: 536870912000\n");
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_legacy_pack_cache_ttl() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  wait_for_inflight_secs: 120\n",
+            "  ttl_secs: 900\n  wait_for_inflight_secs: 120\n",
         );
         assert!(parse_config_str(&config).is_err());
     }

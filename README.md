@@ -99,7 +99,7 @@ Top-level sections:
 | `clone`                | Freshness threshold, lock TTLs, concurrency semaphores         |
 | `fetch_schedule`       | Background re-fetch interval, backoff, rolling window          |
 | `bundles`              | Consolidation schedule, min clone count, filtered bundles      |
-| `storage`              | Local disk path/limits/eviction policy, S3 bucket/region/FIPS  |
+| `storage`              | Local disk path/percentages/eviction policy, S3 bucket/region/FIPS |
 | `repo_overrides`       | Per-repo overrides for fetch interval, freshness, bundles      |
 
 ## NixOS Deployment

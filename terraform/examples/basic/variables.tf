@@ -265,10 +265,15 @@ variable "ec2_key_pair_name" {
   description = "EC2 key pair name for SSH access (optional; SSM access always available)"
 }
 
-variable "local_cache_max_bytes" {
+variable "local_cache_max_percent" {
   type        = number
-  default     = 53687091200
-  description = "Maximum size of local cache in bytes"
+  default     = 0.80
+  description = "Fraction of the cache filesystem capacity usable by forgeproxy local cache state."
+
+  validation {
+    condition     = var.local_cache_max_percent > 0 && var.local_cache_max_percent <= 1
+    error_message = "local_cache_max_percent must be in range (0, 1]."
+  }
 }
 
 variable "max_concurrent_local_upload_packs" {
@@ -298,13 +303,40 @@ variable "pack_cache_enabled" {
 variable "pack_cache_max_percent" {
   type        = number
   default     = 0.20
-  description = "Fraction of local_cache_max_bytes usable by the local pack response cache."
+  description = "Fraction of the forgeproxy local cache budget usable by the local pack response cache."
 }
 
-variable "pack_cache_ttl_secs" {
+variable "pack_cache_high_water_mark" {
   type        = number
-  default     = 900
-  description = "TTL for local pack response cache artifacts in seconds."
+  default     = 0.90
+  description = "Pack-cache eviction starts when usage exceeds this fraction of the pack-cache budget."
+
+  validation {
+    condition     = var.pack_cache_high_water_mark > 0 && var.pack_cache_high_water_mark <= 1
+    error_message = "pack_cache_high_water_mark must be in range (0, 1]."
+  }
+}
+
+variable "pack_cache_low_water_mark" {
+  type        = number
+  default     = 0.75
+  description = "Pack-cache eviction stops when usage drops to or below this fraction of the pack-cache budget."
+
+  validation {
+    condition     = var.pack_cache_low_water_mark >= 0 && var.pack_cache_low_water_mark < 1
+    error_message = "pack_cache_low_water_mark must be in range [0, 1)."
+  }
+}
+
+variable "pack_cache_eviction_policy" {
+  type        = string
+  default     = "lru"
+  description = "Pack-cache eviction policy (lru or lfu)."
+
+  validation {
+    condition     = contains(["lru", "lfu"], var.pack_cache_eviction_policy)
+    error_message = "pack_cache_eviction_policy must be either lru or lfu."
+  }
 }
 
 variable "pack_cache_wait_for_inflight_secs" {
