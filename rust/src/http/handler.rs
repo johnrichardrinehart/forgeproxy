@@ -1102,6 +1102,238 @@ async fn forward_upstream_response(upstream_resp: reqwest::Response) -> Result<R
     ))
 }
 
+const MAX_GIT_PKT_LINE_LEN: usize = 65520;
+const PKT_HEADER_LEN: usize = 4;
+const SIDEBAND_PREFIX_LEN: usize = 1;
+const SIDEBAND_ERROR_CHANNEL: u8 = 3;
+
+fn pkt_line(payload: &[u8]) -> Bytes {
+    let payload = &payload[..payload.len().min(MAX_GIT_PKT_LINE_LEN - PKT_HEADER_LEN)];
+    let total = PKT_HEADER_LEN + payload.len();
+    let mut pkt = Vec::with_capacity(total);
+    pkt.extend_from_slice(format!("{total:04x}").as_bytes());
+    pkt.extend_from_slice(payload);
+    Bytes::from(pkt)
+}
+
+/// Build a git sideband-3 (error) pkt-line packet.
+///
+/// The length field counts the 4-byte prefix itself. Git's practical pkt-line
+/// maximum is 65,520 bytes, so the message is capped before framing.
+fn sideband_error_pkt_line(message: &str) -> Bytes {
+    let max_message_len = MAX_GIT_PKT_LINE_LEN - PKT_HEADER_LEN - SIDEBAND_PREFIX_LEN;
+    let message = &message.as_bytes()[..message.len().min(max_message_len)];
+    let mut payload = Vec::with_capacity(SIDEBAND_PREFIX_LEN + message.len());
+    payload.push(SIDEBAND_ERROR_CHANNEL);
+    payload.extend_from_slice(message);
+    pkt_line(&payload)
+}
+
+fn git_err_pkt_line(message: &str) -> Bytes {
+    const ERR_PREFIX: &[u8] = b"ERR ";
+    let max_message_len = MAX_GIT_PKT_LINE_LEN - PKT_HEADER_LEN - ERR_PREFIX.len();
+    let message = &message.as_bytes()[..message.len().min(max_message_len)];
+    let mut payload = Vec::with_capacity(ERR_PREFIX.len() + message.len());
+    payload.extend_from_slice(ERR_PREFIX);
+    payload.extend_from_slice(message);
+    pkt_line(&payload)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitStreamErrorPacket {
+    Err,
+    Sideband,
+}
+
+impl GitStreamErrorPacket {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Err => "err-pkt-line",
+            Self::Sideband => "sideband-3",
+        }
+    }
+
+    fn encode(self, message: &str) -> Bytes {
+        match self {
+            Self::Err => git_err_pkt_line(message),
+            Self::Sideband => {
+                let message = format!("error: {message}");
+                sideband_error_pkt_line(&message)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitPktLineSpecial {
+    Flush,
+    Delimiter,
+    ResponseEnd,
+}
+
+#[derive(Debug)]
+struct GitPktLineStreamTracker {
+    header: [u8; PKT_HEADER_LEN],
+    header_len: usize,
+    payload: Vec<u8>,
+    payload_remaining: usize,
+    at_boundary: bool,
+    invalid: bool,
+    saw_v2_packfile_section: bool,
+    saw_sideband_packet: bool,
+    last_special: Option<GitPktLineSpecial>,
+}
+
+impl Default for GitPktLineStreamTracker {
+    fn default() -> Self {
+        Self {
+            header: [0; PKT_HEADER_LEN],
+            header_len: 0,
+            payload: Vec::new(),
+            payload_remaining: 0,
+            at_boundary: true,
+            invalid: false,
+            saw_v2_packfile_section: false,
+            saw_sideband_packet: false,
+            last_special: None,
+        }
+    }
+}
+
+impl GitPktLineStreamTracker {
+    fn observe(&mut self, mut bytes: &[u8]) {
+        if self.invalid {
+            return;
+        }
+
+        while !bytes.is_empty() {
+            if self.payload_remaining > 0 {
+                let take = self.payload_remaining.min(bytes.len());
+                self.payload.extend_from_slice(&bytes[..take]);
+                bytes = &bytes[take..];
+                self.payload_remaining -= take;
+                self.at_boundary = false;
+
+                if self.payload_remaining == 0 {
+                    self.observe_payload();
+                    self.payload.clear();
+                    self.at_boundary = true;
+                }
+                continue;
+            }
+
+            let header_needed = PKT_HEADER_LEN - self.header_len;
+            let take = header_needed.min(bytes.len());
+            self.header[self.header_len..self.header_len + take].copy_from_slice(&bytes[..take]);
+            self.header_len += take;
+            bytes = &bytes[take..];
+            self.at_boundary = self.header_len == 0;
+
+            if self.header_len < PKT_HEADER_LEN {
+                return;
+            }
+
+            let Some(len) = std::str::from_utf8(&self.header)
+                .ok()
+                .and_then(|text| usize::from_str_radix(text, 16).ok())
+            else {
+                self.invalidate();
+                return;
+            };
+            self.header_len = 0;
+
+            if let Some(special) = match len {
+                0 => Some(GitPktLineSpecial::Flush),
+                1 => Some(GitPktLineSpecial::Delimiter),
+                2 => Some(GitPktLineSpecial::ResponseEnd),
+                _ => None,
+            } {
+                self.last_special = Some(special);
+                self.at_boundary = true;
+                continue;
+            }
+            if !(PKT_HEADER_LEN..=MAX_GIT_PKT_LINE_LEN).contains(&len) {
+                self.invalidate();
+                return;
+            }
+
+            let payload_len = len - PKT_HEADER_LEN;
+            if payload_len == 0 {
+                self.at_boundary = true;
+                continue;
+            }
+
+            self.payload.clear();
+            self.payload.reserve(payload_len);
+            self.payload_remaining = payload_len;
+            self.at_boundary = false;
+        }
+    }
+
+    fn can_inject_error_packet(&self) -> bool {
+        !self.invalid && self.at_boundary
+    }
+
+    fn invalidate(&mut self) {
+        self.invalid = true;
+        self.at_boundary = false;
+        self.header_len = 0;
+        self.payload_remaining = 0;
+        self.payload.clear();
+    }
+
+    fn observe_payload(&mut self) {
+        self.last_special = None;
+        if self.payload == b"packfile\n" {
+            self.saw_v2_packfile_section = true;
+        }
+        if self
+            .payload
+            .first()
+            .is_some_and(|band| matches!(*band, 1..=SIDEBAND_ERROR_CHANNEL))
+        {
+            self.saw_sideband_packet = true;
+        }
+    }
+}
+
+fn stream_error_packet_for_phase(
+    request_phase: &crate::tee_hydration::UploadPackRequestPhase,
+    tracker: &GitPktLineStreamTracker,
+) -> Option<GitStreamErrorPacket> {
+    if !tracker.can_inject_error_packet() {
+        return None;
+    }
+    if matches!(
+        tracker.last_special,
+        Some(GitPktLineSpecial::Flush | GitPktLineSpecial::ResponseEnd)
+    ) {
+        return None;
+    }
+
+    match request_phase {
+        crate::tee_hydration::UploadPackRequestPhase::V2LsRefs
+        | crate::tee_hydration::UploadPackRequestPhase::V2Command(_) => {
+            Some(GitStreamErrorPacket::Err)
+        }
+        crate::tee_hydration::UploadPackRequestPhase::V2Fetch => {
+            if tracker.saw_v2_packfile_section || tracker.saw_sideband_packet {
+                Some(GitStreamErrorPacket::Sideband)
+            } else {
+                Some(GitStreamErrorPacket::Err)
+            }
+        }
+        crate::tee_hydration::UploadPackRequestPhase::LegacyUploadPack => {
+            if tracker.saw_sideband_packet {
+                Some(GitStreamErrorPacket::Sideband)
+            } else {
+                Some(GitStreamErrorPacket::Err)
+            }
+        }
+        crate::tee_hydration::UploadPackRequestPhase::Unknown => None,
+    }
+}
+
 fn stream_upstream_response(upstream_resp: reqwest::Response) -> Response {
     let status = upstream_resp.status();
     let headers = collect_forwarded_response_headers(upstream_resp.headers());
@@ -1212,6 +1444,16 @@ async fn local_http_clone_access(
                 %message,
                 auth_kind,
                 "local HTTP clone access probe was capacity-limited; proxying upstream"
+            );
+            LocalHttpAccess::Indeterminate
+        }
+        Err(AppError::BadGateway(message)) => {
+            warn!(
+                %owner,
+                %repo,
+                %message,
+                auth_kind,
+                "local HTTP clone access probe could not reach upstream; proxying upstream"
             );
             LocalHttpAccess::Indeterminate
         }
@@ -1631,9 +1873,18 @@ async fn proxy_upload_pack_to_upstream(
             )
             .await
             .map_err(AppError::Internal)?;
-            return Err(AppError::Internal(
-                anyhow::Error::new(error).context("failed to reach upstream forge for upload-pack"),
-            ));
+            let upstream_host = crate::git::commands::redact_url_secret(
+                &state.config.upstream.git_url_base(),
+                state.config.upstream.log_secret_unmask_chars,
+            );
+            error!(
+                repo = %owner_repo,
+                %error,
+                "upstream forge unreachable for upload-pack"
+            );
+            return Err(AppError::BadGateway(format!(
+                "upstream git server ({upstream_host}) is unreachable: {error}\n"
+            )));
         }
     };
 
@@ -1736,6 +1987,7 @@ async fn proxy_upload_pack_to_upstream(
                 },
             )
             .await;
+            let mut response_frame_tracker = GitPktLineStreamTracker::default();
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1743,6 +1995,7 @@ async fn proxy_upload_pack_to_upstream(
                         let chunk_len = chunk.len() as u64;
                         upstream_counter.inc_by(chunk_len);
                         let capture_chunk = chunk.clone();
+                        let frame_chunk = chunk.clone();
 
                         if tx.send(Ok(chunk)).await.is_err() {
                             hydration.handle_stream_error().await;
@@ -1762,6 +2015,7 @@ async fn proxy_upload_pack_to_upstream(
                             }
                             return;
                         }
+                        response_frame_tracker.observe(&frame_chunk);
                         downstream_counter.inc_by(chunk_len);
 
                         if let Some(response_buf) = ls_refs_response.as_mut() {
@@ -1771,7 +2025,31 @@ async fn proxy_upload_pack_to_upstream(
                     }
                     Err(e) => {
                         hydration.handle_stream_error().await;
-                        let _ = tx.send(Err(e)).await;
+                        let upstream_host = crate::git::commands::redact_url_secret(
+                            &state_for_stream.config.upstream.git_url_base(),
+                            state_for_stream.config.upstream.log_secret_unmask_chars,
+                        );
+                        let error_message = e.to_string();
+                        let git_error_packet =
+                            stream_error_packet_for_phase(&request_phase, &response_frame_tracker);
+                        error!(
+                            repo = %owner_repo_for_cache,
+                            error = %error_message,
+                            synthetic_git_error = git_error_packet.map(GitStreamErrorPacket::as_str).unwrap_or("none"),
+                            "upstream forge reset connection mid-stream during upload-pack proxy"
+                        );
+                        let human_message = format!(
+                            "upstream git server ({upstream_host}) reset the connection: {error_message}\n"
+                        );
+                        if let Some(packet_kind) = git_error_packet {
+                            let packet = packet_kind.encode(&human_message);
+                            let packet_len = packet.len() as u64;
+                            if tx.send(Ok(packet)).await.is_ok() {
+                                downstream_counter.inc_by(packet_len);
+                            }
+                        } else {
+                            let _ = tx.send(Err(e)).await;
+                        }
                         if let Some(permits) = upstream_clone_permits.take()
                             && let Err(error) =
                                 crate::coordination::registry::release_clone_hydration_permits(
@@ -1885,6 +2163,8 @@ pub enum AppError {
     /// Ask the fronting proxy to retry this Git request directly against the
     /// upstream forge.
     UpstreamFallback(String),
+    /// The upstream forge was unreachable before response bytes were sent.
+    BadGateway(String),
     /// An unexpected internal error.
     Internal(anyhow::Error),
 }
@@ -1931,6 +2211,7 @@ impl IntoResponse for AppError {
                 );
                 response
             }
+            AppError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg).into_response(),
             AppError::Internal(err) => {
                 error!(error = %format!("{err:#}"), "internal server error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error\n").into_response()
@@ -2109,6 +2390,123 @@ mod tests {
         assert!(validate_path_segment("my_repo.v2", "repo").is_ok());
         assert!(validate_path_segment("123", "owner").is_ok());
         assert!(validate_path_segment("a", "owner").is_ok());
+    }
+
+    #[test]
+    fn sideband_error_pkt_line_has_correct_length_prefix() {
+        let msg = "error: upstream reset\n";
+        let pkt = sideband_error_pkt_line(msg);
+        let prefix = std::str::from_utf8(&pkt[..PKT_HEADER_LEN]).unwrap();
+        let declared_len = usize::from_str_radix(prefix, 16).unwrap();
+
+        assert_eq!(declared_len, pkt.len());
+        assert_eq!(pkt[PKT_HEADER_LEN], SIDEBAND_ERROR_CHANNEL);
+        assert_eq!(&pkt[PKT_HEADER_LEN + SIDEBAND_PREFIX_LEN..], msg.as_bytes());
+    }
+
+    #[test]
+    fn sideband_error_pkt_line_caps_at_git_pkt_line_limit() {
+        let msg = "x".repeat(MAX_GIT_PKT_LINE_LEN);
+        let pkt = sideband_error_pkt_line(&msg);
+        let prefix = std::str::from_utf8(&pkt[..PKT_HEADER_LEN]).unwrap();
+        let declared_len = usize::from_str_radix(prefix, 16).unwrap();
+
+        assert_eq!(declared_len, MAX_GIT_PKT_LINE_LEN);
+        assert_eq!(pkt.len(), MAX_GIT_PKT_LINE_LEN);
+        assert_eq!(pkt[PKT_HEADER_LEN], SIDEBAND_ERROR_CHANNEL);
+    }
+
+    #[test]
+    fn git_err_pkt_line_wraps_message_as_error_packet() {
+        let pkt = git_err_pkt_line("upstream reset\n");
+        let prefix = std::str::from_utf8(&pkt[..PKT_HEADER_LEN]).unwrap();
+        let declared_len = usize::from_str_radix(prefix, 16).unwrap();
+
+        assert_eq!(declared_len, pkt.len());
+        assert_eq!(&pkt[PKT_HEADER_LEN..], b"ERR upstream reset\n");
+    }
+
+    #[test]
+    fn git_pkt_line_tracker_rejects_injection_mid_packet() {
+        let mut tracker = GitPktLineStreamTracker::default();
+
+        tracker.observe(b"0008ab");
+        assert!(!tracker.can_inject_error_packet());
+        assert_eq!(
+            stream_error_packet_for_phase(
+                &crate::tee_hydration::UploadPackRequestPhase::V2LsRefs,
+                &tracker,
+            ),
+            None
+        );
+
+        tracker.observe(b"cd");
+        assert!(tracker.can_inject_error_packet());
+        assert_eq!(
+            stream_error_packet_for_phase(
+                &crate::tee_hydration::UploadPackRequestPhase::V2LsRefs,
+                &tracker,
+            ),
+            Some(GitStreamErrorPacket::Err)
+        );
+    }
+
+    #[test]
+    fn stream_error_packet_uses_sideband_after_v2_packfile_section() {
+        let mut tracker = GitPktLineStreamTracker::default();
+        tracker.observe(&pkt_line(b"packfile\n"));
+
+        assert_eq!(
+            stream_error_packet_for_phase(
+                &crate::tee_hydration::UploadPackRequestPhase::V2Fetch,
+                &tracker,
+            ),
+            Some(GitStreamErrorPacket::Sideband)
+        );
+    }
+
+    #[test]
+    fn stream_error_packet_uses_err_packet_for_ls_refs_boundaries() {
+        let mut tracker = GitPktLineStreamTracker::default();
+        tracker.observe(&pkt_line(
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n",
+        ));
+
+        assert_eq!(
+            stream_error_packet_for_phase(
+                &crate::tee_hydration::UploadPackRequestPhase::V2LsRefs,
+                &tracker,
+            ),
+            Some(GitStreamErrorPacket::Err)
+        );
+    }
+
+    #[test]
+    fn stream_error_packet_does_not_inject_after_invalid_framing() {
+        let mut tracker = GitPktLineStreamTracker::default();
+        tracker.observe(b"PACK");
+
+        assert_eq!(
+            stream_error_packet_for_phase(
+                &crate::tee_hydration::UploadPackRequestPhase::V2Fetch,
+                &tracker,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn stream_error_packet_does_not_inject_after_terminal_flush() {
+        let mut tracker = GitPktLineStreamTracker::default();
+        tracker.observe(b"0000");
+
+        assert_eq!(
+            stream_error_packet_for_phase(
+                &crate::tee_hydration::UploadPackRequestPhase::V2LsRefs,
+                &tracker,
+            ),
+            None
+        );
     }
 
     #[test]
