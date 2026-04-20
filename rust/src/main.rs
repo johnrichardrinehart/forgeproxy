@@ -77,6 +77,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Validate the configuration file and exit without connecting to dependencies.
+    #[command(name = "validate-config", hide = true)]
+    ValidateConfig,
     /// Run bundle lifecycle work on demand without waiting for the scheduler.
     #[cfg(feature = "dev")]
     Bundle {
@@ -687,9 +690,15 @@ async fn run_node_heartbeat(state: AppState) -> Result<()> {
     Ok(())
 }
 
+fn validate_config_file(path: &str) -> Result<()> {
+    let _config = config::load_config(path)?;
+    Ok(())
+}
+
 #[cfg(feature = "dev")]
 async fn run_dev_command(state: AppState, command: Command) -> Result<()> {
     match command {
+        Command::ValidateConfig => unreachable!(),
         Command::Bundle { no_summary } => {
             let started_at = Instant::now();
             tracing::info!("running dev bundle command");
@@ -831,6 +840,10 @@ async fn main() -> Result<()> {
             eprintln!("forgeproxy: warning: {warning}");
         }
         return Ok(());
+    }
+
+    if matches!(cli.command, Some(Command::ValidateConfig)) {
+        return validate_config_file(&cli.config);
     }
 
     // ---- Config ----

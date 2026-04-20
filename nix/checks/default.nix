@@ -28,4 +28,5 @@
   nixos-vm-test-startup-init-failure = pkgs.callPackage ./startup-init-failure.nix {
     inherit self;
   };
+  terraform-config-sync = pkgs.callPackage ./terraform-config.nix { inherit self; };
 }
