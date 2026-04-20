@@ -5,6 +5,7 @@
 //! and a hydrator that can reconstruct a local repo from S3 bundles.
 
 pub mod archive;
+pub(crate) mod capacity;
 pub mod hydrator;
 pub(crate) mod layout;
 pub mod lfu;

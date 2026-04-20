@@ -1596,6 +1596,7 @@ dependencies = [
  "hmac",
  "hyper 1.9.0",
  "hyper-util",
+ "libc",
  "linux-keyutils",
  "opentelemetry",
  "opentelemetry-otlp",
