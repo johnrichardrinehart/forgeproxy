@@ -137,7 +137,7 @@ pkgs.testers.runNixOSTest {
   # This scenario boots five VMs and includes a large stale-fetch regression
   # with thousands of generated refs. Give it enough room to finish on slower
   # builders without weakening the coverage.
-  globalTimeout = 900;
+  globalTimeout = 1200;
 
   # ---------------------------------------------------------------------------
   # Node definitions
