@@ -1222,21 +1222,11 @@ async fn local_http_clone_access(
 /// response body.
 async fn serve_http_pack_cache_hit_response(
     state: &AppState,
-    hit: crate::pack_cache::PackCacheHit,
+    hit: crate::pack_cache::PackCacheReadLease,
     completion: CloneCompletion,
 ) -> Result<Response, anyhow::Error> {
     let source_stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-        match hit.artifact {
-            crate::pack_cache::PackCacheArtifact::Full => {
-                let file = tokio::fs::File::open(&hit.path)
-                    .await
-                    .with_context(|| format!("open pack cache artifact {}", hit.path.display()))?;
-                Box::pin(ReaderStream::new(file))
-            }
-            crate::pack_cache::PackCacheArtifact::Composite { .. } => {
-                Box::pin(state.pack_cache.stream_composite_response(&hit)?)
-            }
-        };
+        hit.into_stream();
 
     let downstream_counter = state
         .metrics

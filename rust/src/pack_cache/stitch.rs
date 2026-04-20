@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail, ensure};
 use sha1::{Digest, Sha1};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 const MAX_PKT_LINE_LEN: usize = 65520;
 const PKT_HEADER_LEN: usize = 4;
@@ -111,6 +113,32 @@ pub fn stitch_raw_packs(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub(crate) struct OpenedDeltaPack {
+    name: String,
+    file: File,
+    version: u32,
+    count: u32,
+}
+
+impl OpenedDeltaPack {
+    pub(crate) fn from_path(path: &Path) -> Result<Self> {
+        let mut file =
+            File::open(path).with_context(|| format!("open delta pack {}", path.display()))?;
+        let mut header = [0u8; PACK_HEADER_LEN];
+        file.read_exact(&mut header)
+            .with_context(|| format!("read delta pack header {}", path.display()))?;
+        let version = pack_header_version(&header, "delta")?;
+        let count = u32::from_be_bytes(header[8..12].try_into()?);
+        Ok(Self {
+            name: path.display().to_string(),
+            file,
+            version,
+            count,
+        })
+    }
+}
+
+#[cfg(test)]
 pub fn stream_stitched_response_from_paths<F>(
     base_response_path: &Path,
     delta_pack_paths: &[PathBuf],
@@ -123,10 +151,21 @@ where
         .with_context(|| format!("open base response {}", base_response_path.display()))?;
     let delta_infos = delta_pack_paths
         .iter()
-        .map(|path| DeltaPackInfo::from_path(path))
+        .map(|path| OpenedDeltaPack::from_path(path))
         .collect::<Result<Vec<_>>>()?;
+    stream_stitched_response_from_open_files(base_file, delta_infos, emit)
+}
+
+pub(crate) fn stream_stitched_response_from_open_files<F>(
+    base_response: File,
+    delta_infos: Vec<OpenedDeltaPack>,
+    emit: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> io::Result<()>,
+{
     let mut streamer = ResponseStreamer::new(delta_infos, emit);
-    streamer.stream_response(BufReader::new(base_file))?;
+    streamer.stream_response(BufReader::new(base_response))?;
     streamer.finish()
 }
 
@@ -213,34 +252,11 @@ fn pack_header(pack: &[u8], name: &str) -> Result<(u32, u32)> {
     Ok((version, count))
 }
 
-struct DeltaPackInfo {
-    path: PathBuf,
-    version: u32,
-    count: u32,
-}
-
-impl DeltaPackInfo {
-    fn from_path(path: &Path) -> Result<Self> {
-        let mut file =
-            File::open(path).with_context(|| format!("open delta pack {}", path.display()))?;
-        let mut header = [0u8; PACK_HEADER_LEN];
-        file.read_exact(&mut header)
-            .with_context(|| format!("read delta pack header {}", path.display()))?;
-        let version = pack_header_version(&header, "delta")?;
-        let count = u32::from_be_bytes(header[8..12].try_into()?);
-        Ok(Self {
-            path: path.to_path_buf(),
-            version,
-            count,
-        })
-    }
-}
-
 struct ResponseStreamer<F>
 where
     F: FnMut(Vec<u8>) -> io::Result<()>,
 {
-    delta_infos: Vec<DeltaPackInfo>,
+    delta_infos: Vec<OpenedDeltaPack>,
     emit: F,
     pack_streamer: Option<PackStreamer>,
     saw_sideband1: bool,
@@ -250,7 +266,7 @@ impl<F> ResponseStreamer<F>
 where
     F: FnMut(Vec<u8>) -> io::Result<()>,
 {
-    fn new(delta_infos: Vec<DeltaPackInfo>, emit: F) -> Self {
+    fn new(delta_infos: Vec<OpenedDeltaPack>, emit: F) -> Self {
         Self {
             delta_infos,
             emit,
@@ -300,7 +316,7 @@ where
 
     fn finish_pack_streamer(&mut self) -> Result<()> {
         if let Some(mut pack_streamer) = self.pack_streamer.take() {
-            pack_streamer.finish(&self.delta_infos, &mut self.emit)?;
+            pack_streamer.finish(&mut self.delta_infos, &mut self.emit)?;
         }
         Ok(())
     }
@@ -315,7 +331,7 @@ struct PackStreamer {
 }
 
 impl PackStreamer {
-    fn new(delta_infos: &[DeltaPackInfo]) -> Self {
+    fn new(delta_infos: &[OpenedDeltaPack]) -> Self {
         let delta_count = delta_infos
             .iter()
             .fold(0u64, |total, info| total + u64::from(info.count));
@@ -347,7 +363,7 @@ impl PackStreamer {
         Ok(())
     }
 
-    fn finish<F>(&mut self, delta_infos: &[DeltaPackInfo], emit: &mut F) -> Result<()>
+    fn finish<F>(&mut self, delta_infos: &mut [OpenedDeltaPack], emit: &mut F) -> Result<()>
     where
         F: FnMut(Vec<u8>) -> io::Result<()>,
     {
@@ -406,17 +422,11 @@ impl PackStreamer {
         self.emit_sideband1(&emit_bytes, emit)
     }
 
-    fn stream_delta_body<F>(&mut self, info: &DeltaPackInfo, emit: &mut F) -> Result<()>
+    fn stream_delta_body<F>(&mut self, info: &mut OpenedDeltaPack, emit: &mut F) -> Result<()>
     where
         F: FnMut(Vec<u8>) -> io::Result<()>,
     {
-        let mut file = BufReader::new(
-            File::open(&info.path)
-                .with_context(|| format!("open delta pack {}", info.path.display()))?,
-        );
-        let mut header = [0u8; PACK_HEADER_LEN];
-        file.read_exact(&mut header)
-            .with_context(|| format!("read delta pack header {}", info.path.display()))?;
+        let mut file = BufReader::new(&mut info.file);
         ensure!(
             Some(info.version) == self.version,
             "delta pack version {} does not match base pack version {:?}",
@@ -429,7 +439,7 @@ impl PackStreamer {
         loop {
             let read = file
                 .read(&mut buf)
-                .with_context(|| format!("read delta pack {}", info.path.display()))?;
+                .with_context(|| format!("read delta pack {}", info.name))?;
             if read == 0 {
                 break;
             }
