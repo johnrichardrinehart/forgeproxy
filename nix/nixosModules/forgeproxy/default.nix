@@ -26,11 +26,9 @@ let
 
       cache_root=${lib.escapeShellArg "${cfg.cacheDir}"}
       generations_root=${lib.escapeShellArg cacheLayout.generationsRoot}
-      mirrors_root=${lib.escapeShellArg cacheLayout.mirrorsRoot}
       state_generations_root=${lib.escapeShellArg cacheLayout.stateGenerationsRoot}
       bundle_tmp_root=${lib.escapeShellArg cacheLayout.stateBundleTmpRoot}
       tee_root=${lib.escapeShellArg cacheLayout.stateTeeRoot}
-      delta_root=${lib.escapeShellArg cacheLayout.stateDeltaRoot}
       tee_max_age_minutes=15
 
       if [[ ! -d "$cache_root" ]]; then
@@ -57,27 +55,136 @@ let
         git -c safe.directory='*' -C "$repo_path" "$@"
       }
 
-      remove_repo_family() {
+      repo_generation_dir() {
         local repo_entry=$1
-        local repo_name owner_name generations_dir mirror_dir delta_dir tee_dir
+        local repo_name owner_name
 
         repo_name=$(basename "$repo_entry" .git)
         owner_name=$(basename "$(dirname "$repo_entry")")
-        generations_dir="$state_generations_root/$owner_name/$repo_name.git"
-        mirror_dir="$mirrors_root/$owner_name/$repo_name.git"
-        delta_dir="$delta_root/$owner_name/$repo_name.git"
-        tee_dir="$tee_root/$owner_name/$repo_name"
+        printf '%s\n' "$state_generations_root/$owner_name/$repo_name.git"
+      }
 
+      canonical_path() {
+        readlink -f "$1" 2>/dev/null || true
+      }
+
+      path_is_within() {
+        local path=$1
+        local root=$2
+
+        path=$(canonical_path "$path")
+        root=$(canonical_path "$root")
+        [[ -n "$path" && -n "$root" && "$path" == "$root"/* ]]
+      }
+
+      published_points_to() {
+        local repo_entry=$1
+        local repo_target=$2
+        local published_target
+
+        [[ -L "$repo_entry" ]] || return 1
+        published_target=$(canonical_path "$repo_entry")
+        [[ -n "$published_target" && "$published_target" == "$repo_target" ]]
+      }
+
+      publish_latest_valid_generation() {
+        local repo_entry=$1
+        local excluded_target=$2
+        local generations_dir candidate tmp_link
+
+        generations_dir=$(repo_generation_dir "$repo_entry")
+        [[ -d "$generations_dir" ]] || return 1
+
+        while IFS= read -r candidate; do
+          [[ -n "$excluded_target" && "$candidate" == "$excluded_target" ]] && continue
+
+          if ! is_usable_bare_repo "$candidate"; then
+            continue
+          fi
+          if ! git_repo_check "$candidate" rev-parse --is-bare-repository >/dev/null 2>&1; then
+            continue
+          fi
+          if ! git_repo_check "$candidate" fsck --connectivity-only >/dev/null 2>&1; then
+            continue
+          fi
+
+          mkdir -p "$(dirname "$repo_entry")"
+          tmp_link="$repo_entry.scrub-tmp.$$"
+          rm -f "$tmp_link"
+          ln -s "$candidate" "$tmp_link"
+          mv -Tf "$tmp_link" "$repo_entry"
+          echo "forgeproxy-cache-scrub: repointed published repo $repo_entry to valid generation $candidate" >&2
+          return 0
+        done < <(find "$generations_dir" -mindepth 1 -maxdepth 1 -type d -name 'gen-*.git' -printf '%T@ %p\n' 2>/dev/null | sort -nr | sed 's/^[^ ]* //')
+
+        echo "forgeproxy-cache-scrub: no valid replacement generation found for $repo_entry" >&2
+        return 1
+      }
+
+      remove_published_entry() {
+        local repo_entry=$1
+        local reason=$2
+
+        echo "forgeproxy-cache-scrub: removing $reason published entry $repo_entry" >&2
         rm -rf "$repo_entry"
-        rm -rf "$generations_dir"
-        rm -rf "$mirror_dir"
-        rm -rf "$delta_dir"
-        rm -rf "$tee_dir"
+        publish_latest_valid_generation "$repo_entry" "" || true
+      }
+
+      remove_generation_target() {
+        local repo_entry=$1
+        local repo_target=$2
+        local reason=$3
+        local generations_dir
+
+        generations_dir=$(repo_generation_dir "$repo_entry")
+
+        if published_points_to "$repo_entry" "$repo_target"; then
+          rm -f "$repo_entry"
+        fi
+
+        if path_is_within "$repo_target" "$generations_dir"; then
+          echo "forgeproxy-cache-scrub: removing $reason generation $repo_target for $repo_entry" >&2
+          rm -rf "$repo_target"
+        else
+          echo "forgeproxy-cache-scrub: removing $reason published entry outside generation store $repo_entry" >&2
+          rm -rf "$repo_entry"
+        fi
+
+        publish_latest_valid_generation "$repo_entry" "$repo_target" || true
       }
 
       repo_is_active() {
         local repo_path=$1
         lsof +D "$repo_path" >/dev/null 2>&1
+      }
+
+      run_interruptible_full_fsck() {
+        local repo_entry=$1
+        local repo_target=$2
+        local fsck_pid wait_status
+
+        # Full fsck is intentionally background-only work. If a client starts
+        # using the repo while fsck is running, stop fsck and leave cache state
+        # intact so request-path operations get priority.
+        if repo_is_active "$repo_target"; then
+          return 75
+        fi
+
+        git_repo_check "$repo_target" fsck --full >/dev/null 2>&1 &
+        fsck_pid=$!
+
+        while kill -0 "$fsck_pid" >/dev/null 2>&1; do
+          sleep 2
+          if repo_is_active "$repo_target"; then
+            echo "forgeproxy-cache-scrub: stopping full fsck for active repo $repo_entry" >&2
+            kill "$fsck_pid" >/dev/null 2>&1 || true
+            wait "$fsck_pid" >/dev/null 2>&1 || true
+            return 75
+          fi
+        done
+
+        wait "$fsck_pid" || wait_status=$?
+        return "''${wait_status:-0}"
       }
 
       scrub_stale_tee_capture() {
@@ -106,8 +213,7 @@ let
         fi
 
         if [[ -z "$repo_target" || ! -d "$repo_target" ]]; then
-          echo "forgeproxy-cache-scrub: removing broken repo entry $repo_path" >&2
-          remove_repo_family "$repo_path"
+          remove_published_entry "$repo_path" "broken"
           continue
         fi
 
@@ -117,24 +223,23 @@ let
         fi
 
         if ! is_usable_bare_repo "$repo_target"; then
-          echo "forgeproxy-cache-scrub: removing unusable bare repo $repo_path" >&2
-          remove_repo_family "$repo_path"
+          remove_generation_target "$repo_path" "$repo_target" "unusable"
           continue
         fi
 
         if ! git_repo_check "$repo_target" rev-parse --is-bare-repository >/dev/null 2>&1; then
-          echo "forgeproxy-cache-scrub: removing non-bare repo $repo_path" >&2
-          remove_repo_family "$repo_path"
+          remove_generation_target "$repo_path" "$repo_target" "non-bare"
           continue
         fi
 
-        if ! git_repo_check "$repo_target" fsck --full >/dev/null 2>&1; then
-          if repo_is_active "$repo_target"; then
-            echo "forgeproxy-cache-scrub: skipping invalid-but-active repo $repo_path" >&2
-            continue
-          fi
-          echo "forgeproxy-cache-scrub: removing invalid repo $repo_path" >&2
-          remove_repo_family "$repo_path"
+        fsck_status=0
+        run_interruptible_full_fsck "$repo_path" "$repo_target" || fsck_status=$?
+        if [[ "$fsck_status" -eq 75 ]]; then
+          echo "forgeproxy-cache-scrub: skipping repo with client activity $repo_path" >&2
+          continue
+        fi
+        if [[ "$fsck_status" -ne 0 ]]; then
+          remove_generation_target "$repo_path" "$repo_target" "invalid"
         fi
       done < <(find "$generations_root" -mindepth 2 -maxdepth 2 \( -type d -o -type l \) -name '*.git' -print 2>/dev/null)
 
@@ -244,9 +349,12 @@ in
       example = 86400;
       description = ''
         When set, a separate systemd timer runs a `git fsck --full` scrub over
-        on-disk cached bare repos at this interval in seconds. Invalid local
-        repos are removed so the next request rehydrates them from upstream or
-        S3 instead of serving broken state. Set to `null` to disable the timer.
+        on-disk published generations at this interval in seconds. Invalid
+        generations are removed and the published repo symlink is repointed to
+        another valid generation when possible; writer-owned mirrors and delta
+        metadata are preserved so the next request can recover cheaply. The
+        scrubber skips active repos and stops an in-flight full fsck if client
+        activity appears. Set to `null` to disable the timer.
       '';
     };
   };
