@@ -98,7 +98,10 @@ struct PackCacheHit {
 }
 
 enum PackCacheReadArtifact {
-    Entry { packs: Vec<stitch::OpenedPack> },
+    Entry {
+        packs: Vec<stitch::OpenedPack>,
+        synthetic_trailer_sha1: Option<[u8; 20]>,
+    },
 }
 
 pub struct PackCacheReadLease {
@@ -120,6 +123,8 @@ struct LeasedPackCacheStream<S> {
 struct PackEntryManifest {
     version: u32,
     pack_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stitched_trailer_sha1: Option<String>,
 }
 
 impl PackCacheReadLease {
@@ -127,21 +132,28 @@ impl PackCacheReadLease {
     fn is_composite(&self) -> bool {
         matches!(
             &self.artifact,
-            PackCacheReadArtifact::Entry { packs } if packs.len() > 1
+            PackCacheReadArtifact::Entry { packs, .. } if packs.len() > 1
         )
     }
 
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>> {
         let Self { artifact, _guard } = self;
         match artifact {
-            PackCacheReadArtifact::Entry { packs } => {
+            PackCacheReadArtifact::Entry {
+                packs,
+                synthetic_trailer_sha1,
+            } => {
                 let (sender, receiver) = tokio::sync::mpsc::channel(8);
                 tokio::task::spawn_blocking(move || {
-                    let result = stitch::stream_packfile_response_from_open_files(packs, |chunk| {
-                        sender.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| {
-                            io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed")
-                        })
-                    });
+                    let result = stitch::stream_packfile_response_from_open_files_with_trailer(
+                        packs,
+                        synthetic_trailer_sha1,
+                        |chunk| {
+                            sender.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| {
+                                io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed")
+                            })
+                        },
+                    );
                     if let Err(error) = result {
                         let _ = sender.blocking_send(Err(io::Error::other(error.to_string())));
                     }
@@ -619,6 +631,12 @@ impl PackCache {
     }
 
     fn open_read_lease_for_hit(&self, hit: PackCacheHit) -> Result<PackCacheReadLease> {
+        let synthetic_trailer_sha1 = hit
+            .manifest
+            .stitched_trailer_sha1
+            .as_deref()
+            .map(parse_sha1_hex)
+            .transpose()?;
         let packs = self
             .entry_replay_pack_paths(&hit.manifest)?
             .into_iter()
@@ -626,7 +644,10 @@ impl PackCache {
             .collect::<Result<Vec<_>>>()?;
         let guard = self.acquire_read_guard(vec![hit.key.as_str().to_string()]);
         Ok(PackCacheReadLease {
-            artifact: PackCacheReadArtifact::Entry { packs },
+            artifact: PackCacheReadArtifact::Entry {
+                packs,
+                synthetic_trailer_sha1,
+            },
             _guard: guard,
         })
     }
@@ -891,6 +912,7 @@ impl PackCacheWriter {
             self.write_entry_manifest(&PackEntryManifest {
                 version: PACK_ENTRY_MANIFEST_VERSION,
                 pack_ids: vec![pack_id],
+                stitched_trailer_sha1: None,
             })?;
             self.completed = true;
             crate::metrics::set_pack_cache_size_bytes(
@@ -944,9 +966,15 @@ impl PackCacheWriter {
             .await?;
         let mut pack_ids = self.read_entry_manifest(base_key)?.pack_ids;
         pack_ids.push(pack_id);
+        let pack_paths = pack_ids
+            .iter()
+            .map(|pack_id| self.pack_path_for_id(pack_id))
+            .collect::<Vec<_>>();
+        let stitched_trailer_sha1 = stitch::synthetic_pack_trailer_from_paths(&pack_paths)?;
         self.write_entry_manifest(&PackEntryManifest {
             version: PACK_ENTRY_MANIFEST_VERSION,
             pack_ids,
+            stitched_trailer_sha1: Some(hex_digest(&stitched_trailer_sha1)),
         })?;
         self.raw_pack_bytes_written = delta_pack.len() as u64;
         self.completed = true;
@@ -1962,6 +1990,20 @@ fn hex_digest(bytes: &[u8]) -> String {
     out
 }
 
+fn parse_sha1_hex(value: &str) -> Result<[u8; 20]> {
+    anyhow::ensure!(
+        value.len() == 40,
+        "pack cache stitched trailer SHA-1 must be 40 hex characters"
+    );
+    let mut out = [0u8; 20];
+    for (idx, byte) in out.iter_mut().enumerate() {
+        let start = idx * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .with_context(|| format!("parse pack cache stitched trailer SHA-1 byte {idx}"))?;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2043,6 +2085,7 @@ mod tests {
             serde_json::to_vec(&super::PackEntryManifest {
                 version: super::PACK_ENTRY_MANIFEST_VERSION,
                 pack_ids: vec![key.to_string()],
+                stitched_trailer_sha1: None,
             })
             .unwrap(),
         )
@@ -2077,6 +2120,7 @@ mod tests {
             serde_json::to_vec(&super::PackEntryManifest {
                 version: super::PACK_ENTRY_MANIFEST_VERSION,
                 pack_ids: pack_ids.to_vec(),
+                stitched_trailer_sha1: None,
             })
             .unwrap(),
         )
@@ -2370,6 +2414,7 @@ mod tests {
             serde_json::to_vec(&super::PackEntryManifest {
                 version: super::PACK_ENTRY_MANIFEST_VERSION,
                 pack_ids: vec!["base".to_string(), "composite-delta".to_string()],
+                stitched_trailer_sha1: None,
             })
             .unwrap(),
         )
@@ -2478,12 +2523,21 @@ mod tests {
         let raw = super::stitch::extract_raw_pack(&replayed).unwrap();
         let expected_count = u32::from_be_bytes(base_pack[8..12].try_into().unwrap())
             + u32::from_be_bytes(delta_pack[8..12].try_into().unwrap());
+        let manifest = cache.read_entry_manifest(&composite_key).unwrap();
+        let stitched_trailer_sha1 = manifest
+            .stitched_trailer_sha1
+            .as_deref()
+            .map(super::parse_sha1_hex)
+            .transpose()
+            .unwrap()
+            .expect("composite manifest should persist stitched trailer");
 
         assert_eq!(&raw[..4], b"PACK");
         assert_eq!(
             u32::from_be_bytes(raw[8..12].try_into().unwrap()),
             expected_count
         );
+        assert_eq!(&raw[raw.len() - 20..], stitched_trailer_sha1.as_slice());
     }
 
     #[tokio::test]
