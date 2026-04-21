@@ -1754,6 +1754,12 @@ fn spawn_published_generation_index_preparation(
             }
         };
 
+        let Some(_upload_pack_idle_gate) =
+            try_acquire_idle_local_upload_pack_gate(&state, &owner_repo, &source)
+        else {
+            return;
+        };
+
         let result = crate::git::commands::git_prepare_published_generation_indexes(
             &published_path,
             state.bundle_pack_threads,
@@ -1783,6 +1789,57 @@ fn spawn_published_generation_index_preparation(
             }
         }
     });
+}
+
+fn try_acquire_idle_local_upload_pack_gate(
+    state: &crate::AppState,
+    owner_repo: &str,
+    source: &str,
+) -> Option<OwnedSemaphorePermit> {
+    let permit_count = match u32::try_from(state.config.clone.max_concurrent_local_upload_packs) {
+        Ok(permit_count) => permit_count,
+        Err(_) => {
+            warn!(
+                repo = %owner_repo,
+                source,
+                max_concurrent_local_upload_packs = state.config.clone.max_concurrent_local_upload_packs,
+                "skipping background bitmap/MIDX preparation because upload-pack semaphore size exceeds git maintenance gate capacity"
+            );
+            return None;
+        }
+    };
+
+    match state
+        .local_upload_pack_semaphore
+        .clone()
+        .try_acquire_many_owned(permit_count)
+    {
+        Ok(permit) => {
+            debug!(
+                repo = %owner_repo,
+                source,
+                permits = permit_count,
+                "acquired idle local upload-pack gate for background bitmap/MIDX preparation"
+            );
+            Some(permit)
+        }
+        Err(TryAcquireError::NoPermits) => {
+            info!(
+                repo = %owner_repo,
+                source,
+                "skipping background bitmap/MIDX preparation because local upload-pack is active"
+            );
+            None
+        }
+        Err(TryAcquireError::Closed) => {
+            warn!(
+                repo = %owner_repo,
+                source,
+                "skipping background bitmap/MIDX preparation because local upload-pack semaphore is closed"
+            );
+            None
+        }
+    }
 }
 
 struct PackCacheStitchFailure {
@@ -3590,7 +3647,7 @@ async fn hydrate_repo_from_tee_capture(
         destination = %repo_path.display(),
         "starting tee hydration index-pack"
     );
-    crate::git::commands::git_index_pack(repo_path, &pack_path).await?;
+    crate::git::commands::git_index_pack(repo_path, &pack_path, state.index_pack_threads).await?;
     if state.cache_manager.has_repo(owner_repo) && !allow_existing_repo_publish {
         info!(
             repo = %owner_repo,
@@ -5257,7 +5314,7 @@ mod tests {
         let base_pack_path = pack_dir.join("pack-base.pack");
         let base_idx_path = pack_dir.join("pack-base.idx");
         std::fs::write(&base_pack_path, &base_pack).unwrap();
-        crate::git::commands::git_index_pack_to_idx(&base_pack_path, &base_idx_path)
+        crate::git::commands::git_index_pack_to_idx(&base_pack_path, &base_idx_path, 1)
             .await
             .unwrap();
 
@@ -5319,7 +5376,7 @@ mod tests {
         let stitched_path = tmp.path().join("stitched.pack");
         let stitched_idx_path = tmp.path().join("stitched.idx");
         std::fs::write(&stitched_path, stitched).unwrap();
-        crate::git::commands::git_index_pack_to_idx(&stitched_path, &stitched_idx_path)
+        crate::git::commands::git_index_pack_to_idx(&stitched_path, &stitched_idx_path, 1)
             .await
             .expect("filtered composite pack should index without duplicate objects");
     }

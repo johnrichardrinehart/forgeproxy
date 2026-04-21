@@ -5,6 +5,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+pub const DEFAULT_INDEX_PACK_THREADS: usize = 2;
+
 // ---------------------------------------------------------------------------
 // Backend type
 // ---------------------------------------------------------------------------
@@ -450,15 +452,24 @@ pub struct CloneConfig {
     /// forgeproxy instance.
     #[serde(default = "default_max_concurrent_upstream_clones_per_repo_per_instance")]
     pub max_concurrent_upstream_clones_per_repo_per_instance: usize,
-    /// Maximum concurrent local `git upload-pack` subprocesses on this
-    /// instance. This bounds pack-objects CPU even when many requests are
-    /// served from warm local disk.
+    /// Request path: maximum concurrent local `git upload-pack` subprocesses
+    /// on this instance. This bounds pack-objects CPU even when many requests
+    /// are served from warm local disk.
     #[serde(default = "default_max_concurrent_local_upload_packs")]
     pub max_concurrent_local_upload_packs: usize,
-    /// Maximum concurrent local `git upload-pack` subprocesses for a single
-    /// repository on this instance.
+    /// Request path: maximum concurrent local `git upload-pack` subprocesses
+    /// for a single repository on this instance.
     #[serde(default = "default_max_concurrent_local_upload_packs_per_repo")]
     pub max_concurrent_local_upload_packs_per_repo: usize,
+    /// Request-adjacent CPU: number of worker threads allowed for local
+    /// `git index-pack` subprocesses.
+    ///
+    /// Tee imports and pack-cache indexing can be triggered by client traffic
+    /// and run while clients are active. `index-pack` otherwise auto-scales to
+    /// many cores on large packs, which can starve live upload-pack work on
+    /// busy instances.
+    #[serde(default = "default_index_pack_threads")]
+    pub index_pack_threads: usize,
     /// Strategy used after tee capture successfully materializes the cloned
     /// pack into a staging generation.
     #[serde(default)]
@@ -507,6 +518,7 @@ impl Default for CloneConfig {
             max_concurrent_local_upload_packs: default_max_concurrent_local_upload_packs(),
             max_concurrent_local_upload_packs_per_repo:
                 default_max_concurrent_local_upload_packs_per_repo(),
+            index_pack_threads: default_index_pack_threads(),
             hydration_mode: HydrationMode::default(),
             prepare_published_generation_indexes: false,
             generation_coalescing_window_secs: 0,
@@ -584,6 +596,10 @@ fn default_max_concurrent_local_upload_packs() -> usize {
 
 fn default_max_concurrent_local_upload_packs_per_repo() -> usize {
     1
+}
+
+fn default_index_pack_threads() -> usize {
+    DEFAULT_INDEX_PACK_THREADS
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +681,9 @@ pub struct BundleConfig {
     /// When unset, forgeproxy derives a value from the host's CPU count and
     /// the resolved bundle-generation concurrency so the total pack thread
     /// budget stays roughly within the machine's parallelism.
+    ///
+    /// Request path: request-time pack-cache composite delta generation also
+    /// uses this thread budget, so this is not only a background bundle knob.
     #[serde(default)]
     pub pack_threads: Option<usize>,
     /// Whether to produce filtered (blobless / treeless) bundle variants.
@@ -953,6 +972,10 @@ fn validate_config(config: &Config) -> Result<()> {
         "max_concurrent_local_upload_packs_per_repo must be greater than 0"
     );
     anyhow::ensure!(
+        config.clone.index_pack_threads > 0,
+        "clone.index_pack_threads must be greater than 0"
+    );
+    anyhow::ensure!(
         config.pack_cache.max_percent > 0.0 && config.pack_cache.max_percent <= 1.0,
         "pack_cache.max_percent must be in range (0.0, 1.0]"
     );
@@ -1044,6 +1067,13 @@ mod tests {
             "  max_concurrent_request_deltas: 1\n",
             "  max_concurrent_request_deltas: 0\n",
         );
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_index_pack_threads() {
+        let config = include_str!("../../config.example.yaml")
+            .replace("  index_pack_threads: 2\n", "  index_pack_threads: 0\n");
         assert!(parse_config_str(&config).is_err());
     }
 

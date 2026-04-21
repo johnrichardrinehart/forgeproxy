@@ -25,6 +25,7 @@ let
         generation_coalescing_window_secs          = 60
         max_concurrent_local_upload_packs          = 4
         max_concurrent_local_upload_packs_per_repo = 1
+        index_pack_threads                         = 2
         pack_cache_enabled                         = true
         pack_cache_max_percent                     = 0.20
         pack_cache_high_water_mark                 = 0.90
