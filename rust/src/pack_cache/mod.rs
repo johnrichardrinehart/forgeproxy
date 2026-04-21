@@ -792,7 +792,7 @@ impl PackCache {
         self.root.join(PACKSTORE_DIR)
     }
 
-    fn packstore_object_dir(&self) -> PathBuf {
+    pub(crate) fn packstore_object_dir(&self) -> PathBuf {
         self.packstore_root().join(PACKSTORE_OBJECTS_DIR)
     }
 

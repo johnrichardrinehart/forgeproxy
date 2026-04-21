@@ -75,6 +75,7 @@ fn hydration_in_progress_on_this_node(info: &RepoInfo, node_id: &str) -> bool {
 
 const VALKEY_RETRY_ATTEMPTS: usize = 5;
 const VALKEY_RETRY_BASE_DELAY_MS: u64 = 250;
+const MAX_LARGE_NO_ANCESTRY_REDUCTION_FILTER_OBJECTS: usize = 8192;
 type RepoPublishMutex = std::sync::Arc<tokio::sync::Mutex<()>>;
 type RepoPublishMutexes = std::sync::Arc<tokio::sync::Mutex<HashMap<String, RepoPublishMutex>>>;
 type RepoCatchUpMutex = std::sync::Arc<tokio::sync::Mutex<()>>;
@@ -1852,6 +1853,11 @@ async fn warm_pack_cache_for_generation(
 
     let missing_objects = pack_cache_delta_objects_from_pinned_generation(
         published_path,
+        &state
+            .pack_cache
+            .pack_paths_for_key(&prev_entry.key)
+            .map_err(|error| PackCacheStitchFailure::new("base_pack_paths", error))?,
+        None,
         &new_request_wants,
         &prev_entry,
     )
@@ -1920,6 +1926,7 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
     };
     let selected_base = match select_pack_cache_base_entry(
         repo_path,
+        &state.pack_cache,
         &candidates,
         &new_request_wants,
     )
@@ -2050,6 +2057,7 @@ struct SelectedPackCacheBase {
 
 async fn select_pack_cache_base_entry(
     repo_path: &Path,
+    pack_cache: &crate::pack_cache::PackCache,
     candidates: &[crate::pack_cache::PackCacheRecentEntry],
     new_request_wants: &[String],
 ) -> Result<Option<SelectedPackCacheBase>> {
@@ -2062,8 +2070,11 @@ async fn select_pack_cache_base_entry(
     let full_object_count = full_objects.len();
     let mut best: Option<SelectedPackCacheBase> = None;
     for candidate in candidates {
+        let base_pack_paths = pack_cache.pack_paths_for_key(&candidate.key)?;
         let missing_objects = pack_cache_delta_objects_from_pinned_generation(
             repo_path,
+            &base_pack_paths,
+            Some(full_object_count),
             new_request_wants,
             candidate,
         )
@@ -2092,6 +2103,8 @@ async fn select_pack_cache_base_entry(
 
 async fn pack_cache_delta_objects_from_pinned_generation(
     repo_path: &Path,
+    base_pack_paths: &[PathBuf],
+    full_object_count: Option<usize>,
     new_request_wants: &[String],
     base: &crate::pack_cache::PackCacheRecentEntry,
 ) -> Result<Vec<String>> {
@@ -2106,12 +2119,93 @@ async fn pack_cache_delta_objects_from_pinned_generation(
         bail!("pack cache base did not record covered wants");
     }
 
-    crate::git::commands::git_rev_list_objects_excluding(
+    // `git rev-list --objects` with negative tips prunes commit ancestry, but
+    // it can still emit tree/blob objects shared with an unrelated base
+    // lineage. A stitched pack cannot contain duplicate objects, so filter the
+    // ancestry candidate set against the base component packs already present
+    // in the synthetic packstore.
+    let candidates = crate::git::commands::git_rev_list_objects_excluding(
         repo_path,
         new_request_wants,
         excluded_wants,
     )
-    .await
+    .await?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    if full_object_count.is_some_and(|count| {
+        candidates.len() >= count
+            && candidates.len() > MAX_LARGE_NO_ANCESTRY_REDUCTION_FILTER_OBJECTS
+    }) {
+        return Ok(candidates);
+    }
+    git_missing_objects_from_pack_paths(base_pack_paths, &candidates).await
+}
+
+async fn git_missing_objects_from_pack_paths(
+    pack_paths: &[PathBuf],
+    object_ids: &[String],
+) -> Result<Vec<String>> {
+    if object_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        !pack_paths.is_empty(),
+        "cannot filter objects against an empty pack set"
+    );
+
+    let temp_parent = pack_paths[0]
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .with_context(|| {
+            format!(
+                "resolve packstore root for pack cache base object view from {}",
+                pack_paths[0].display()
+            )
+        })?;
+    let tempdir = tempfile::Builder::new()
+        .prefix("base-object-view.")
+        .tempdir_in(temp_parent)
+        .with_context(|| {
+            format!(
+                "create pack cache base object view under {}",
+                temp_parent.display()
+            )
+        })?;
+    crate::git::commands::git_init_bare(tempdir.path())
+        .await
+        .with_context(|| {
+            format!(
+                "initialize pack cache base object view {}",
+                tempdir.path().display()
+            )
+        })?;
+    let pack_dir = tempdir.path().join("objects").join("pack");
+    std::fs::create_dir_all(&pack_dir)
+        .with_context(|| format!("create pack cache base object view {}", pack_dir.display()))?;
+
+    for (index, pack_path) in pack_paths.iter().enumerate() {
+        let idx_path = pack_path.with_extension("idx");
+        let dst_pack = pack_dir.join(format!("pack-base-{index}.pack"));
+        let dst_idx = pack_dir.join(format!("pack-base-{index}.idx"));
+        link_pack_cache_component(pack_path, &dst_pack)
+            .with_context(|| format!("link base pack {}", pack_path.display()))?;
+        link_pack_cache_component(&idx_path, &dst_idx)
+            .with_context(|| format!("link base pack index {}", idx_path.display()))?;
+    }
+
+    crate::git::commands::git_missing_objects(tempdir.path(), object_ids).await
+}
+
+fn link_pack_cache_component(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::hard_link(source, destination).with_context(|| {
+        format!(
+            "hard-link pack cache component {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })
 }
 
 async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
@@ -4372,6 +4466,43 @@ mod tests {
         request
     }
 
+    async fn store_pack_cache_base(
+        cache: &crate::pack_cache::PackCache,
+        key: crate::pack_cache::PackCacheKey,
+        pack_path: &Path,
+    ) {
+        let mut response = Vec::new();
+        crate::pack_cache::stitch::stream_packfile_response_from_paths(
+            &[pack_path.to_path_buf()],
+            |chunk| {
+                response.extend_from_slice(&chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        let mut writer = match cache
+            .lookup_or_reserve(crate::metrics::Protocol::Https, key.clone())
+            .await
+            .unwrap()
+        {
+            crate::pack_cache::PackCacheLookup::Generate(writer) => writer,
+            _ => panic!("expected pack cache reservation"),
+        };
+        writer.write_chunk(&response).await.unwrap();
+        writer.finish().await.unwrap();
+
+        for _ in 0..50 {
+            if cache.pack_paths_for_key(&key).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cache
+            .pack_paths_for_key(&key)
+            .expect("pack cache base should be indexed");
+    }
+
     #[test]
     fn repo_info_round_trip_preserves_hydration_fields() {
         let info = RepoInfo {
@@ -4538,11 +4669,123 @@ mod tests {
             &tmp.path().join("cache"),
             crate::config::PackCacheConfig {
                 enabled: true,
+                min_response_bytes: 0,
                 ..Default::default()
             },
             1.0,
             crate::metrics::MetricsRegistry::new(),
         );
+        cache.ensure_ready().await.unwrap();
+        let main_key = cache
+            .key_for_fresh_clone_with_ref_tips(
+                "owner/repo",
+                &fetch_request_for(&main),
+                Some("version=2"),
+                &BTreeMap::from([("refs/heads/main".to_string(), main.clone())]),
+            )
+            .unwrap();
+        let main_objects =
+            crate::git::commands::git_rev_list_objects(&repo, std::slice::from_ref(&main))
+                .await
+                .unwrap();
+        let base_pack = crate::git::commands::git_pack_objects_exact(&repo, &main_objects, 1)
+            .await
+            .unwrap();
+        let base_pack_path = tmp.path().join("main.pack");
+        std::fs::write(&base_pack_path, base_pack).unwrap();
+        store_pack_cache_base(&cache, main_key.clone(), &base_pack_path).await;
+        let candidate = crate::pack_cache::PackCacheRecentEntry {
+            key: main_key,
+            request_wants: vec![main.clone()],
+            covered_wants: vec![main],
+            request_template: vec![
+                "command=fetch".to_string(),
+                "done".to_string(),
+                "flush".to_string(),
+            ],
+            full_tip: false,
+        };
+
+        let selected = select_pack_cache_base_entry(
+            &repo,
+            &cache,
+            &[candidate],
+            std::slice::from_ref(&unrelated),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            selected.is_none(),
+            "unrelated history should fall back to a full pack capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn pack_cache_delta_filters_objects_already_present_in_packstore() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let status = Command::new("git").arg("init").arg(&repo).status().unwrap();
+        assert!(status.success());
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("shared.txt"), "same tree and blob\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "main"]);
+        let main = git_stdout(&repo, &["rev-parse", "HEAD"]);
+        let shared_tree = git_stdout(&repo, &["rev-parse", "HEAD^{tree}"]);
+        let shared_blob = git_stdout(&repo, &["rev-parse", "HEAD:shared.txt"]);
+
+        git(&repo, &["checkout", "--orphan", "same-tree"]);
+        git(&repo, &["rm", "-r", "--cached", "."]);
+        std::fs::write(repo.join("shared.txt"), "same tree and blob\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "same tree"]);
+        let same_tree = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+        let cache = crate::pack_cache::PackCache::new(
+            &tmp.path().join("cache"),
+            crate::config::PackCacheConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            1.0,
+            crate::metrics::MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+        let packstore_object_dir = cache.packstore_object_dir();
+        let pack_dir = packstore_object_dir.join("pack");
+
+        let main_objects =
+            crate::git::commands::git_rev_list_objects(&repo, std::slice::from_ref(&main))
+                .await
+                .unwrap();
+        let base_pack = crate::git::commands::git_pack_objects_exact(&repo, &main_objects, 1)
+            .await
+            .unwrap();
+        let base_pack_path = pack_dir.join("pack-base.pack");
+        let base_idx_path = pack_dir.join("pack-base.idx");
+        std::fs::write(&base_pack_path, &base_pack).unwrap();
+        crate::git::commands::git_index_pack_to_idx(&base_pack_path, &base_idx_path)
+            .await
+            .unwrap();
+
+        let raw_candidates = crate::git::commands::git_rev_list_objects_excluding(
+            &repo,
+            std::slice::from_ref(&same_tree),
+            std::slice::from_ref(&main),
+        )
+        .await
+        .unwrap();
+        assert!(
+            raw_candidates.contains(&shared_tree),
+            "rev-list candidate set should expose the shared tree regression"
+        );
+        assert!(
+            raw_candidates.contains(&shared_blob),
+            "rev-list candidate set should expose the shared blob regression"
+        );
+
         let main_key = cache
             .key_for_fresh_clone_with_ref_tips(
                 "owner/repo",
@@ -4563,15 +4806,31 @@ mod tests {
             full_tip: false,
         };
 
-        let selected =
-            select_pack_cache_base_entry(&repo, &[candidate], std::slice::from_ref(&unrelated))
-                .await
-                .unwrap();
+        let missing_objects = pack_cache_delta_objects_from_pinned_generation(
+            &repo,
+            std::slice::from_ref(&base_pack_path),
+            Some(raw_candidates.len()),
+            std::slice::from_ref(&same_tree),
+            &candidate,
+        )
+        .await
+        .unwrap();
 
-        assert!(
-            selected.is_none(),
-            "unrelated history should fall back to a full pack capture"
-        );
+        assert!(missing_objects.contains(&same_tree));
+        assert!(!missing_objects.contains(&shared_tree));
+        assert!(!missing_objects.contains(&shared_blob));
+
+        let delta_pack = crate::git::commands::git_pack_objects_exact(&repo, &missing_objects, 1)
+            .await
+            .unwrap();
+        let stitched = crate::pack_cache::stitch::stitch_raw_packs(&base_pack, &delta_pack)
+            .expect("filtered composite should stitch into a raw pack");
+        let stitched_path = tmp.path().join("stitched.pack");
+        let stitched_idx_path = tmp.path().join("stitched.idx");
+        std::fs::write(&stitched_path, stitched).unwrap();
+        crate::git::commands::git_index_pack_to_idx(&stitched_path, &stitched_idx_path)
+            .await
+            .expect("filtered composite pack should index without duplicate objects");
     }
 
     #[tokio::test]
