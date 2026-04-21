@@ -1350,10 +1350,36 @@ pkgs.testers.runNixOSTest {
 
     # ── Subtest 5l: External scrubber handles published generation layout ──
     with subtest("External scrubber succeeds and keeps generation-backed repos"):
+        scrub_repo = "${cacheLayout.repoPath "octocat/repo-generations"}"
+        scrub_generation_dir = "${cacheLayout.generationDir "octocat/repo-generations"}"
+        scrub_mirror = "${cacheLayout.mirrorPath "octocat/repo-generations"}"
+        scrub_valid_generation = "${cacheLayout.generationDir "octocat/repo-generations"}/gen-scrub-valid.git"
+        scrub_failed_generation = "${cacheLayout.generationDir "octocat/repo-generations"}/gen-scrub-failed.git"
+
+        proxy.wait_until_succeeds(
+            f"test -L {scrub_repo} && test -f $(readlink -f {scrub_repo})/HEAD"
+        )
+        proxy.succeed(
+            "set -euo pipefail; "
+            f"current=$(readlink -f {scrub_repo}); "
+            f"rm -rf {scrub_valid_generation} {scrub_failed_generation}; "
+            f"cp -a \"$current\" {scrub_valid_generation}; "
+            f"touch {scrub_valid_generation}; "
+            f"cp -a \"$current\" {scrub_failed_generation}; "
+            f"mkdir -p {scrub_failed_generation}/refs/heads; "
+            f"printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\\n' > {scrub_failed_generation}/refs/heads/fsck-broken; "
+            f"ln -sfnT {scrub_failed_generation} {scrub_repo}; "
+            f"test -d {scrub_mirror} && test -f {scrub_mirror}/HEAD"
+        )
         proxy.succeed("systemctl start forgeproxy-cache-scrub.service")
         proxy.succeed(
             "systemctl show forgeproxy-cache-scrub.service"
             " -p Result --value | grep -qx success"
+        )
+        proxy.succeed(
+            f"test ! -e {scrub_failed_generation} && "
+            f"test -d {scrub_mirror} && test -f {scrub_mirror}/HEAD && "
+            f"test \"$(readlink -f {scrub_repo})\" = {scrub_valid_generation}"
         )
         proxy.succeed("systemctl is-active forgeproxy-cache-scrub.timer | grep -qx active")
         proxy.succeed(
