@@ -29,6 +29,7 @@ const METADATA_EXT: &str = "pack-cache-meta.json";
 const PACK_ENTRY_MANIFEST_VERSION: u32 = 1;
 const PACK_CACHE_METADATA_VERSION: u32 = 4;
 const MAX_RECENT_ENTRIES_PER_REPO: usize = 16;
+const METADATA_HIT_UPDATE_INTERVAL_SECS: u64 = 60;
 const PACKSTORE_DIR: &str = "packstore";
 const PACKSTORE_OBJECTS_DIR: &str = "objects";
 const PACKSTORE_PACK_DIR: &str = "pack";
@@ -391,8 +392,38 @@ impl PackCache {
 
         let request = normalize_fresh_clone_request_parts(request_body)?;
         let ref_tips = collect_repo_ref_tips(repo_path)?;
-        let tip_oids = unique_tip_oids(&ref_tips);
-        let ref_tips_digest = repo_ref_tips_digest(&ref_tips);
+        self.key_for_normalized_fresh_clone(owner_repo, request, &ref_tips)
+    }
+
+    pub fn key_for_fresh_clone_with_ref_tips(
+        &self,
+        owner_repo: &str,
+        request_body: &[u8],
+        git_protocol: Option<&str>,
+        ref_tips: &BTreeMap<String, String>,
+    ) -> std::result::Result<PackCacheKey, &'static str> {
+        if !self.config.enabled {
+            return Err("disabled");
+        }
+        if git_protocol != Some("version=2") {
+            return Err("non_v2");
+        }
+
+        let request = normalize_fresh_clone_request_parts(request_body)?;
+        self.key_for_normalized_fresh_clone(owner_repo, request, ref_tips)
+    }
+
+    fn key_for_normalized_fresh_clone(
+        &self,
+        owner_repo: &str,
+        request: NormalizedFreshCloneRequest,
+        ref_tips: &BTreeMap<String, String>,
+    ) -> std::result::Result<PackCacheKey, &'static str> {
+        if ref_tips.is_empty() {
+            return Err("no_refs");
+        }
+        let tip_oids = unique_tip_oids(ref_tips);
+        let ref_tips_digest = repo_ref_tips_digest(ref_tips);
         let base = Some(PackCacheBaseMetadata {
             full_tip: request.wants == tip_oids,
             request_wants: request.wants.clone(),
@@ -1634,7 +1665,18 @@ fn record_metadata_hit(root: &Path, key: &str) -> Result<()> {
 
 fn record_metadata_hit_if_present(root: &Path, key: &str) -> Result<()> {
     let path = metadata_path(root, key);
-    if !path.is_file() {
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stat pack cache metadata {}", path.display()));
+        }
+    };
+    if let Ok(modified) = metadata.modified()
+        && modified.elapsed().unwrap_or_default().as_secs() < METADATA_HIT_UPDATE_INTERVAL_SECS
+    {
         return Ok(());
     }
     record_metadata_hit(root, key)
@@ -2289,6 +2331,46 @@ mod tests {
     }
 
     #[test]
+    fn fresh_clone_key_can_use_advertised_ref_tips_without_disk_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        let refs_heads = temp.path().join("refs").join("heads");
+        std::fs::create_dir_all(&refs_heads).unwrap();
+        std::fs::write(
+            refs_heads.join("main"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        let mut request = Vec::new();
+        request.extend_from_slice(&pkt(b"command=fetch\n"));
+        request.extend_from_slice(&pkt(b"want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"));
+        request.extend_from_slice(&pkt(b"done\n"));
+        request.extend_from_slice(b"0000");
+        let ref_tips = collect_repo_ref_tips(temp.path()).unwrap();
+
+        let disk_key = cache
+            .key_for_fresh_clone("owner/repo", temp.path(), &request, Some("version=2"))
+            .unwrap();
+        let advertised_key = cache
+            .key_for_fresh_clone_with_ref_tips("owner/repo", &request, Some("version=2"), &ref_tips)
+            .unwrap();
+
+        assert_eq!(disk_key.as_str(), advertised_key.as_str());
+        assert_eq!(
+            advertised_key.base_request_wants().unwrap(),
+            &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()]
+        );
+    }
+
+    #[test]
     fn repo_ref_tip_collection_dedupes_tip_oids() {
         let temp = tempfile::tempdir().unwrap();
         let refs_heads = temp.path().join("refs").join("heads");
@@ -2318,6 +2400,33 @@ mod tests {
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ]
         );
+    }
+
+    #[test]
+    fn metadata_hit_updates_are_throttled_when_metadata_file_is_fresh() {
+        let temp = tempfile::tempdir().unwrap();
+        write_pack_cache_metadata(
+            temp.path(),
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: "hot".to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: Vec::new(),
+                covered_wants: Vec::new(),
+                request_template: Vec::new(),
+                full_tip: false,
+                created_at_unix_secs: 1,
+                last_accessed_unix_secs: 1,
+                hit_count: 7,
+            },
+        )
+        .unwrap();
+
+        super::record_metadata_hit_if_present(temp.path(), "hot").unwrap();
+
+        let metadata = super::read_pack_cache_metadata(temp.path(), "hot").unwrap();
+        assert_eq!(metadata.hit_count, 7);
+        assert_eq!(metadata.last_accessed_unix_secs, 1);
     }
 
     #[test]

@@ -519,6 +519,11 @@ struct LocalUploadPackReplayContext<'a> {
     should_close_channel: bool,
 }
 
+struct FreshClonePackCacheKeyContext<'a> {
+    git_protocol: Option<&'a str>,
+    advertised_ref_tips: Option<&'a std::collections::BTreeMap<String, String>>,
+}
+
 async fn replay_ssh_pack_cache_hit(
     state: &AppState,
     owner_repo: &str,
@@ -589,7 +594,7 @@ async fn serve_local_upload_pack_once(
     owner_repo: &str,
     serve_from: LocalServeRepoSource,
     request_body: &[u8],
-    git_protocol: Option<&str>,
+    pack_cache_key_context: FreshClonePackCacheKeyContext<'_>,
     completion: CloneCompletion,
     response: LocalUploadPackResponseContext,
 ) {
@@ -621,12 +626,24 @@ async fn serve_local_upload_pack_once(
     };
     let mut pack_cache_writer = None;
 
-    match state.pack_cache.key_for_fresh_clone(
-        owner_repo,
-        repo_lease.repo_path(),
-        request_body,
-        git_protocol,
-    ) {
+    match pack_cache_key_context
+        .advertised_ref_tips
+        .map(|ref_tips| {
+            state.pack_cache.key_for_fresh_clone_with_ref_tips(
+                owner_repo,
+                request_body,
+                pack_cache_key_context.git_protocol,
+                ref_tips,
+            )
+        })
+        .unwrap_or_else(|| {
+            state.pack_cache.key_for_fresh_clone(
+                owner_repo,
+                repo_lease.repo_path(),
+                request_body,
+                pack_cache_key_context.git_protocol,
+            )
+        }) {
         Ok(key) => match state.pack_cache.lookup_or_reserve(Protocol::Ssh, key).await {
             Ok(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
                 match replay_ssh_pack_cache_hit(
@@ -735,7 +752,7 @@ async fn serve_local_upload_pack_once(
         serve_from,
         repo_lease,
         LocalUploadPackMode::StatelessRpc,
-        git_protocol,
+        pack_cache_key_context.git_protocol,
     )
     .await
     {
@@ -2256,6 +2273,73 @@ async fn proxy_upstream_upload_pack(
             .collect::<Vec<String>>()
             .join(",");
         let advertised_refs = capture_metadata.lock().await.get(&channel_id).cloned();
+        let advertised_ref_tips = advertised_refs
+            .as_ref()
+            .and_then(crate::coordination::registry::advertised_ref_tips);
+        if authenticated
+            && let Some(ref_tips) = advertised_ref_tips.as_ref()
+            && let Ok(key) = state.pack_cache.key_for_fresh_clone_with_ref_tips(
+                &owner_repo,
+                &want_have,
+                git_protocol.as_deref(),
+                ref_tips,
+            )
+        {
+            match state.pack_cache.lookup_by_key(&key).await {
+                Ok(Some(hit)) => {
+                    crate::metrics::inc_pack_cache_request(
+                        &state.metrics,
+                        Protocol::Ssh,
+                        "hit",
+                        "pre_local_decision",
+                    );
+                    match replay_ssh_pack_cache_hit(
+                        &state,
+                        &owner_repo,
+                        hit,
+                        &CloneCompletion {
+                            cache_status: CacheStatus::Warm,
+                            started_at: fetch_started_at
+                                .expect("fetch start time must be set for fetch requests"),
+                            metric_username: metric_username.clone(),
+                            metric_repo: owner_repo.clone(),
+                        },
+                        LocalUploadPackReplayContext {
+                            handle: &handle,
+                            channel_states: &channel_states,
+                            channel_id,
+                            stream_channel: stream_channel.as_ref(),
+                            should_close_channel: behavior.should_close_channel,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(_) => return,
+                        Err(error) => {
+                            warn!(
+                                repo = %owner_repo,
+                                error = %error,
+                                "SSH pack cache hit from advertised refs could not be replayed; continuing to local serveability check"
+                            );
+                            crate::metrics::inc_pack_cache_request(
+                                &state.metrics,
+                                Protocol::Ssh,
+                                "bypass",
+                                "pre_local_artifact_open_failed",
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        repo = %owner_repo,
+                        error = %error,
+                        "SSH pack cache hit lookup from advertised refs failed; continuing to local serveability check"
+                    );
+                }
+            }
+        }
         let auth_header = if authenticated {
             build_clone_auth_header_for_repo(&state, &owner_repo).await
         } else {
@@ -2294,7 +2378,10 @@ async fn proxy_upstream_upload_pack(
                     &owner_repo,
                     *serve_from,
                     &want_have,
-                    git_protocol.as_deref(),
+                    FreshClonePackCacheKeyContext {
+                        git_protocol: git_protocol.as_deref(),
+                        advertised_ref_tips: advertised_ref_tips.as_ref(),
+                    },
                     CloneCompletion {
                         cache_status: crate::coordination::registry::clone_cache_status(
                             &local_decision,
