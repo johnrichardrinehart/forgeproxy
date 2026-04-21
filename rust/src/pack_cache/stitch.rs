@@ -1,4 +1,6 @@
-use anyhow::{Context, Result, bail, ensure};
+#[cfg(test)]
+use anyhow::bail;
+use anyhow::{Context, Result, ensure};
 use sha1::{Digest, Sha1};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -26,6 +28,10 @@ pub fn extract_raw_pack(response: &[u8]) -> Result<Vec<u8>> {
         }
 
         let payload = &response[offset + PKT_HEADER_LEN..next_offset];
+        if payload == b"packfile\n" {
+            offset = next_offset;
+            continue;
+        }
         if let Some((&band, rest)) = payload.split_first()
             && band == 1
         {
@@ -48,16 +54,17 @@ pub fn extract_raw_pack(response: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 pub fn replace_sideband1_in_response(
     base_response: &[u8],
-    stitched_pack: &[u8],
+    replacement_pack: &[u8],
 ) -> Result<Vec<u8>> {
     ensure!(
-        stitched_pack.len() >= PACK_HEADER_LEN + SHA1_TRAILER_LEN && &stitched_pack[..4] == b"PACK",
-        "stitched payload is not a raw pack"
+        replacement_pack.len() >= PACK_HEADER_LEN + SHA1_TRAILER_LEN
+            && &replacement_pack[..4] == b"PACK",
+        "replacement payload is not a raw pack"
     );
 
     let mut offset = 0usize;
-    let mut out = Vec::with_capacity(base_response.len() + stitched_pack.len());
-    let mut emitted_stitched_pack = false;
+    let mut out = Vec::with_capacity(base_response.len() + replacement_pack.len());
+    let mut emitted_replacement = false;
     let mut saw_sideband1 = false;
 
     while offset < base_response.len() {
@@ -69,11 +76,15 @@ pub fn replace_sideband1_in_response(
         }
 
         let payload = &base_response[offset + PKT_HEADER_LEN..next_offset];
-        if payload.first() == Some(&1) {
+        if payload == b"packfile\n" {
+            out.extend_from_slice(&base_response[offset..next_offset]);
+        } else if payload.first() == Some(&1) {
             saw_sideband1 = true;
-            if !emitted_stitched_pack {
-                write_sideband1_pack(&mut out, stitched_pack);
-                emitted_stitched_pack = true;
+            if !emitted_replacement {
+                for chunk in sideband1_chunks(replacement_pack) {
+                    out.extend_from_slice(&chunk);
+                }
+                emitted_replacement = true;
             }
         } else {
             out.extend_from_slice(&base_response[offset..next_offset]);
@@ -113,60 +124,75 @@ pub fn stitch_raw_packs(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub(crate) struct OpenedDeltaPack {
+pub(crate) struct OpenedPack {
     name: String,
     file: File,
     version: u32,
     count: u32,
+    header: [u8; PACK_HEADER_LEN],
 }
 
-impl OpenedDeltaPack {
+impl OpenedPack {
     pub(crate) fn from_path(path: &Path) -> Result<Self> {
-        let mut file =
-            File::open(path).with_context(|| format!("open delta pack {}", path.display()))?;
+        let mut file = File::open(path).with_context(|| format!("open pack {}", path.display()))?;
         let mut header = [0u8; PACK_HEADER_LEN];
         file.read_exact(&mut header)
-            .with_context(|| format!("read delta pack header {}", path.display()))?;
-        let version = pack_header_version(&header, "delta")?;
+            .with_context(|| format!("read pack header {}", path.display()))?;
+        let version = pack_header_version(&header, "pack")?;
         let count = u32::from_be_bytes(header[8..12].try_into()?);
         Ok(Self {
             name: path.display().to_string(),
             file,
             version,
             count,
+            header,
         })
     }
 }
 
 #[cfg(test)]
-pub fn stream_stitched_response_from_paths<F>(
-    base_response_path: &Path,
-    delta_pack_paths: &[PathBuf],
-    emit: F,
-) -> Result<()>
+pub fn stream_packfile_response_from_paths<F>(pack_paths: &[PathBuf], emit: F) -> Result<()>
 where
     F: FnMut(Vec<u8>) -> io::Result<()>,
 {
-    let base_file = File::open(base_response_path)
-        .with_context(|| format!("open base response {}", base_response_path.display()))?;
-    let delta_infos = delta_pack_paths
+    let pack_infos = pack_paths
         .iter()
-        .map(|path| OpenedDeltaPack::from_path(path))
+        .map(|path| OpenedPack::from_path(path))
         .collect::<Result<Vec<_>>>()?;
-    stream_stitched_response_from_open_files(base_file, delta_infos, emit)
+    stream_packfile_response_from_open_files(pack_infos, emit)
 }
 
-pub(crate) fn stream_stitched_response_from_open_files<F>(
-    base_response: File,
-    delta_infos: Vec<OpenedDeltaPack>,
-    emit: F,
+pub(crate) fn stream_packfile_response_from_open_files<F>(
+    mut pack_infos: Vec<OpenedPack>,
+    mut emit: F,
 ) -> Result<()>
 where
     F: FnMut(Vec<u8>) -> io::Result<()>,
 {
-    let mut streamer = ResponseStreamer::new(delta_infos, emit);
-    streamer.stream_response(BufReader::new(base_response))?;
-    streamer.finish()
+    ensure!(
+        !pack_infos.is_empty(),
+        "cannot stream response without packs"
+    );
+
+    emit(encode_data_pkt(b"packfile\n")).context("emit packfile section")?;
+
+    let first_header = pack_infos[0].header;
+    let total_count = pack_infos
+        .iter()
+        .fold(0u64, |total, info| total + u64::from(info.count));
+    ensure!(
+        total_count <= u64::from(u32::MAX),
+        "pack object count overflow"
+    );
+
+    let mut streamer = PackStreamer::new(first_header, total_count as u32);
+    streamer.emit_rewritten_header(&mut emit)?;
+    for pack in &mut pack_infos {
+        streamer.stream_pack_body(pack, &mut emit)?;
+    }
+    streamer.finish(&mut emit)?;
+    emit(encode_control_pkt(0)?).context("emit packfile flush")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -188,22 +214,6 @@ fn read_packet_len(bytes: &[u8], offset: usize) -> Result<(usize, usize)> {
     }
 }
 
-fn read_packet_header<R: Read>(reader: &mut R) -> Result<Option<usize>> {
-    let mut header = [0u8; PKT_HEADER_LEN];
-    let mut read = 0usize;
-    while read < PKT_HEADER_LEN {
-        match reader.read(&mut header[read..]) {
-            Ok(0) if read == 0 => return Ok(None),
-            Ok(0) => bail!("truncated pkt-line header"),
-            Ok(n) => read += n,
-            Err(error) => return Err(error).context("read pkt-line header"),
-        }
-    }
-    let header_text = std::str::from_utf8(&header).context("non-utf8 pkt-line header")?;
-    let len = usize::from_str_radix(header_text, 16).context("invalid pkt-line length")?;
-    Ok(Some(len))
-}
-
 fn encode_control_pkt(len: usize) -> Result<Vec<u8>> {
     ensure!(len <= 2, "invalid control pkt length {len}");
     Ok(format!("{len:04x}").into_bytes())
@@ -213,16 +223,6 @@ fn encode_data_pkt(payload: &[u8]) -> Vec<u8> {
     let mut out = format!("{:04x}", payload.len() + PKT_HEADER_LEN).into_bytes();
     out.extend_from_slice(payload);
     out
-}
-
-#[cfg(test)]
-fn write_sideband1_pack(out: &mut Vec<u8>, pack: &[u8]) {
-    for chunk in pack.chunks(MAX_SIDEBAND_PACK_CHUNK) {
-        let packet_len = PKT_HEADER_LEN + SIDEBAND_PREFIX_LEN + chunk.len();
-        out.extend_from_slice(format!("{packet_len:04x}").as_bytes());
-        out.push(1);
-        out.extend_from_slice(chunk);
-    }
 }
 
 fn sideband1_chunks(bytes: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
@@ -252,194 +252,51 @@ fn pack_header(pack: &[u8], name: &str) -> Result<(u32, u32)> {
     Ok((version, count))
 }
 
-struct ResponseStreamer<F>
-where
-    F: FnMut(Vec<u8>) -> io::Result<()>,
-{
-    delta_infos: Vec<OpenedDeltaPack>,
-    emit: F,
-    pack_streamer: Option<PackStreamer>,
-    saw_sideband1: bool,
-}
-
-impl<F> ResponseStreamer<F>
-where
-    F: FnMut(Vec<u8>) -> io::Result<()>,
-{
-    fn new(delta_infos: Vec<OpenedDeltaPack>, emit: F) -> Self {
-        Self {
-            delta_infos,
-            emit,
-            pack_streamer: None,
-            saw_sideband1: false,
-        }
-    }
-
-    fn stream_response<R: Read>(&mut self, mut reader: R) -> Result<()> {
-        while let Some(packet_len) = read_packet_header(&mut reader)? {
-            if packet_len <= 2 {
-                if self.saw_sideband1 {
-                    self.finish_pack_streamer()?;
-                }
-                (self.emit)(encode_control_pkt(packet_len)?).context("emit control pkt-line")?;
-                continue;
-            }
-            ensure!(
-                packet_len >= PKT_HEADER_LEN,
-                "invalid pkt-line length {packet_len}"
-            );
-            let payload_len = packet_len - PKT_HEADER_LEN;
-            let mut payload = vec![0u8; payload_len];
-            reader
-                .read_exact(&mut payload)
-                .context("read pkt-line payload")?;
-
-            if payload.first() == Some(&1) {
-                self.saw_sideband1 = true;
-                self.pack_streamer
-                    .get_or_insert_with(|| PackStreamer::new(&self.delta_infos))
-                    .feed_base_pack_payload(&payload[1..], &mut self.emit)?;
-            } else {
-                (self.emit)(encode_data_pkt(&payload)).context("emit non-pack pkt-line")?;
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<()> {
-        ensure!(
-            self.saw_sideband1,
-            "base response contained no sideband-1 pack data"
-        );
-        self.finish_pack_streamer()
-    }
-
-    fn finish_pack_streamer(&mut self) -> Result<()> {
-        if let Some(mut pack_streamer) = self.pack_streamer.take() {
-            pack_streamer.finish(&mut self.delta_infos, &mut self.emit)?;
-        }
-        Ok(())
-    }
-}
-
 struct PackStreamer {
-    delta_count: u64,
-    header: Vec<u8>,
-    version: Option<u32>,
-    trailer_window: Vec<u8>,
+    version: u32,
+    total_count: u32,
     sha1: Sha1,
 }
 
 impl PackStreamer {
-    fn new(delta_infos: &[OpenedDeltaPack]) -> Self {
-        let delta_count = delta_infos
-            .iter()
-            .fold(0u64, |total, info| total + u64::from(info.count));
+    fn new(first_header: [u8; PACK_HEADER_LEN], total_count: u32) -> Self {
         Self {
-            delta_count,
-            header: Vec::with_capacity(PACK_HEADER_LEN),
-            version: None,
-            trailer_window: Vec::with_capacity(SHA1_TRAILER_LEN),
+            version: pack_header_version(&first_header, "pack").unwrap_or(2),
+            total_count,
             sha1: Sha1::new(),
         }
-    }
-
-    fn feed_base_pack_payload<F>(&mut self, mut bytes: &[u8], emit: &mut F) -> Result<()>
-    where
-        F: FnMut(Vec<u8>) -> io::Result<()>,
-    {
-        if self.header.len() < PACK_HEADER_LEN {
-            let needed = PACK_HEADER_LEN - self.header.len();
-            let take = needed.min(bytes.len());
-            self.header.extend_from_slice(&bytes[..take]);
-            bytes = &bytes[take..];
-            if self.header.len() == PACK_HEADER_LEN {
-                self.emit_rewritten_header(emit)?;
-            }
-        }
-        if !bytes.is_empty() {
-            self.feed_body_bytes(bytes, emit)?;
-        }
-        Ok(())
-    }
-
-    fn finish<F>(&mut self, delta_infos: &mut [OpenedDeltaPack], emit: &mut F) -> Result<()>
-    where
-        F: FnMut(Vec<u8>) -> io::Result<()>,
-    {
-        ensure!(self.version.is_some(), "base pack header was incomplete");
-        ensure!(
-            self.trailer_window.len() == SHA1_TRAILER_LEN,
-            "base pack trailer was incomplete"
-        );
-        self.trailer_window.clear();
-
-        for info in delta_infos {
-            self.stream_delta_body(info, emit)?;
-        }
-
-        let trailer = self.sha1.clone().finalize();
-        self.emit_sideband1(&trailer, emit)?;
-        Ok(())
     }
 
     fn emit_rewritten_header<F>(&mut self, emit: &mut F) -> Result<()>
     where
         F: FnMut(Vec<u8>) -> io::Result<()>,
     {
-        ensure!(&self.header[..4] == b"PACK", "base pack has invalid magic");
-        let version = pack_header_version(&self.header, "base")?;
-        let base_count = u32::from_be_bytes(self.header[8..12].try_into()?);
-        let total_count = u64::from(base_count) + self.delta_count;
-        ensure!(
-            total_count <= u64::from(u32::MAX),
-            "pack object count overflow"
-        );
-
         let mut rewritten = Vec::with_capacity(PACK_HEADER_LEN);
         rewritten.extend_from_slice(b"PACK");
-        rewritten.extend_from_slice(&version.to_be_bytes());
-        rewritten.extend_from_slice(&(total_count as u32).to_be_bytes());
+        rewritten.extend_from_slice(&self.version.to_be_bytes());
+        rewritten.extend_from_slice(&self.total_count.to_be_bytes());
         self.sha1.update(&rewritten);
-        self.emit_sideband1(&rewritten, emit)?;
-        self.version = Some(version);
-        Ok(())
+        self.emit_sideband1(&rewritten, emit)
     }
 
-    fn feed_body_bytes<F>(&mut self, bytes: &[u8], emit: &mut F) -> Result<()>
+    fn stream_pack_body<F>(&mut self, info: &mut OpenedPack, emit: &mut F) -> Result<()>
     where
         F: FnMut(Vec<u8>) -> io::Result<()>,
     {
-        self.trailer_window.extend_from_slice(bytes);
-        if self.trailer_window.len() <= SHA1_TRAILER_LEN {
-            return Ok(());
-        }
-
-        let emit_len = self.trailer_window.len() - SHA1_TRAILER_LEN;
-        let emit_bytes = self.trailer_window[..emit_len].to_vec();
-        self.trailer_window.drain(..emit_len);
-        self.sha1.update(&emit_bytes);
-        self.emit_sideband1(&emit_bytes, emit)
-    }
-
-    fn stream_delta_body<F>(&mut self, info: &mut OpenedDeltaPack, emit: &mut F) -> Result<()>
-    where
-        F: FnMut(Vec<u8>) -> io::Result<()>,
-    {
-        let mut file = BufReader::new(&mut info.file);
         ensure!(
-            Some(info.version) == self.version,
-            "delta pack version {} does not match base pack version {:?}",
+            info.version == self.version,
+            "pack version {} does not match base pack version {}",
             info.version,
             self.version
         );
 
+        let mut reader = BufReader::new(&mut info.file);
         let mut trailer_window = Vec::with_capacity(SHA1_TRAILER_LEN);
         let mut buf = [0u8; 64 * 1024];
         loop {
-            let read = file
+            let read = reader
                 .read(&mut buf)
-                .with_context(|| format!("read delta pack {}", info.name))?;
+                .with_context(|| format!("read pack body {}", info.name))?;
             if read == 0 {
                 break;
             }
@@ -455,8 +312,18 @@ impl PackStreamer {
         }
         ensure!(
             trailer_window.len() == SHA1_TRAILER_LEN,
-            "delta pack trailer was incomplete"
+            "pack trailer was incomplete for {}",
+            info.name
         );
+        Ok(())
+    }
+
+    fn finish<F>(&mut self, emit: &mut F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>) -> io::Result<()>,
+    {
+        let trailer = self.sha1.clone().finalize();
+        self.emit_sideband1(&trailer, emit)?;
         Ok(())
     }
 
@@ -552,23 +419,17 @@ mod tests {
     }
 
     #[test]
-    fn streams_stitched_response_from_files() {
+    fn streams_packfile_response_from_files() {
         let temp = tempfile::tempdir().unwrap();
         let base_pack = raw_pack(1, b"base");
         let delta_pack = raw_pack(2, b"delta");
-        let base_response_path = temp.path().join("base.pack-response");
+        let base_path = temp.path().join("base.pack");
         let delta_path = temp.path().join("delta.pack");
-        let mut response = Vec::new();
-        response.extend_from_slice(&pkt(b"packfile\n"));
-        response.extend_from_slice(&pkt(&sideband_packet(2, b"progress\n")));
-        response.extend_from_slice(&pkt(&sideband_packet(1, &base_pack[..6])));
-        response.extend_from_slice(&pkt(&sideband_packet(1, &base_pack[6..])));
-        response.extend_from_slice(b"0000");
-        std::fs::write(&base_response_path, response).unwrap();
+        std::fs::write(&base_path, &base_pack).unwrap();
         std::fs::write(&delta_path, &delta_pack).unwrap();
 
         let mut streamed = Vec::new();
-        stream_stitched_response_from_paths(&base_response_path, &[delta_path], |chunk| {
+        stream_packfile_response_from_paths(&[base_path, delta_path], |chunk| {
             streamed.extend_from_slice(&chunk);
             Ok(())
         })
@@ -579,8 +440,9 @@ mod tests {
         assert_eq!(&raw[12..raw.len() - SHA1_TRAILER_LEN], b"basedelta");
         assert!(
             streamed
-                .windows(b"progress\n".len())
-                .any(|w| w == b"progress\n")
+                .windows(b"packfile\n".len())
+                .any(|w| w == b"packfile\n")
         );
+        assert!(streamed.ends_with(b"0000"));
     }
 }

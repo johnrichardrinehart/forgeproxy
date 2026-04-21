@@ -18,20 +18,20 @@ use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::io::ReaderStream;
 use tracing::{debug, warn};
 
 use crate::config::{EvictionPolicy, PackCacheConfig};
 use crate::metrics::{MetricsRegistry, Protocol};
 
 const PACK_CACHE_DIR: &str = "pack-cache";
-const PACK_RESPONSE_EXT: &str = "pack-response";
-const COMPOSITE_MANIFEST_EXT: &str = "pack-composite.json";
-const DELTA_PACK_EXT: &str = "delta.pack";
+const ENTRY_MANIFEST_EXT: &str = "pack-entry.json";
 const METADATA_EXT: &str = "pack-cache-meta.json";
-const COMPOSITE_MANIFEST_VERSION: u32 = 2;
-const PACK_CACHE_METADATA_VERSION: u32 = 3;
+const PACK_ENTRY_MANIFEST_VERSION: u32 = 1;
+const PACK_CACHE_METADATA_VERSION: u32 = 4;
 const MAX_RECENT_ENTRIES_PER_REPO: usize = 16;
+const PACKSTORE_DIR: &str = "packstore";
+const PACKSTORE_OBJECTS_DIR: &str = "objects";
+const PACKSTORE_PACK_DIR: &str = "pack";
 
 #[derive(Clone)]
 pub struct PackCache {
@@ -74,14 +74,6 @@ impl PackCacheKey {
     pub(crate) fn base_request_wants(&self) -> Option<&[String]> {
         self.base.as_ref().map(|base| base.request_wants.as_slice())
     }
-
-    fn from_digest(digest: String) -> Self {
-        Self {
-            digest,
-            owner_repo: String::new(),
-            base: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,23 +94,11 @@ struct PackCacheBaseMetadata {
 
 struct PackCacheHit {
     key: PackCacheKey,
-    path: PathBuf,
-    artifact: PackCacheArtifact,
-}
-
-enum PackCacheArtifact {
-    Full,
-    Composite { key: PackCacheKey },
+    manifest: PackEntryManifest,
 }
 
 enum PackCacheReadArtifact {
-    Full {
-        file: std::fs::File,
-    },
-    Composite {
-        base_response: std::fs::File,
-        deltas: Vec<stitch::OpenedDeltaPack>,
-    },
+    Entry { packs: Vec<stitch::OpenedPack> },
 }
 
 pub struct PackCacheReadLease {
@@ -136,42 +116,32 @@ struct LeasedPackCacheStream<S> {
     _guard: PackCacheReadGuard,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CompositeManifest {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PackEntryManifest {
     version: u32,
-    base_key: String,
-    delta_pack_file: String,
-    delta_size_bytes: u64,
+    pack_ids: Vec<String>,
 }
 
 impl PackCacheReadLease {
     #[cfg(test)]
     fn is_composite(&self) -> bool {
-        matches!(self.artifact, PackCacheReadArtifact::Composite { .. })
+        matches!(
+            &self.artifact,
+            PackCacheReadArtifact::Entry { packs } if packs.len() > 1
+        )
     }
 
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>> {
         let Self { artifact, _guard } = self;
         match artifact {
-            PackCacheReadArtifact::Full { file } => Box::pin(LeasedPackCacheStream {
-                inner: ReaderStream::new(tokio::fs::File::from_std(file)),
-                _guard,
-            }),
-            PackCacheReadArtifact::Composite {
-                base_response,
-                deltas,
-            } => {
+            PackCacheReadArtifact::Entry { packs } => {
                 let (sender, receiver) = tokio::sync::mpsc::channel(8);
                 tokio::task::spawn_blocking(move || {
-                    let result = stitch::stream_stitched_response_from_open_files(
-                        base_response,
-                        deltas,
-                        |chunk| {
-                            sender.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| {
-                                io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed")
-                            })
-                        },
-                    );
+                    let result = stitch::stream_packfile_response_from_open_files(packs, |chunk| {
+                        sender.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| {
+                            io::Error::new(io::ErrorKind::BrokenPipe, "receiver closed")
+                        })
+                    });
                     if let Err(error) = result {
                         let _ = sender.blocking_send(Err(io::Error::other(error.to_string())));
                     }
@@ -243,13 +213,14 @@ pub enum PackCacheLookup {
 
 pub struct PackCacheWriter {
     key: PackCacheKey,
-    final_path: PathBuf,
-    tmp_path: PathBuf,
     root: PathBuf,
     config: PackCacheConfig,
     local_cache_max_percent: f64,
-    writer: BufWriter<File>,
-    bytes_written: u64,
+    tmp_pack_path: PathBuf,
+    pack_writer: BufWriter<File>,
+    pack_extractor: RawPackExtractor,
+    response_bytes_written: u64,
+    raw_pack_bytes_written: u64,
     min_response_bytes: u64,
     started_at: Instant,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
@@ -259,6 +230,71 @@ pub struct PackCacheWriter {
     notify: Arc<Notify>,
     metrics: MetricsRegistry,
     completed: bool,
+}
+
+#[derive(Default)]
+struct RawPackExtractor {
+    buffer: Vec<u8>,
+    wrote_pack: bool,
+    disabled: bool,
+}
+
+impl RawPackExtractor {
+    async fn write_response_chunk(
+        &mut self,
+        bytes: &[u8],
+        pack_writer: &mut BufWriter<File>,
+    ) -> Result<u64> {
+        if self.disabled {
+            return Ok(0);
+        }
+        self.buffer.extend_from_slice(bytes);
+        let mut bytes_written = 0u64;
+
+        loop {
+            if self.buffer.len() < 4 {
+                return Ok(bytes_written);
+            }
+
+            let Some(len) = std::str::from_utf8(&self.buffer[..4])
+                .ok()
+                .and_then(|text| usize::from_str_radix(text, 16).ok())
+            else {
+                self.disabled = true;
+                self.buffer.clear();
+                return Ok(bytes_written);
+            };
+
+            if len == 0 || len == 1 || len == 2 {
+                self.buffer.drain(..4);
+                continue;
+            }
+            if len < 4 {
+                self.disabled = true;
+                self.buffer.clear();
+                return Ok(bytes_written);
+            }
+            if self.buffer.len() < len {
+                return Ok(bytes_written);
+            }
+
+            let packet = self.buffer[4..len].to_vec();
+            self.buffer.drain(..len);
+            if packet == b"packfile\n" {
+                continue;
+            }
+            if let Some((band, rest)) = packet.split_first()
+                && *band == 1
+            {
+                pack_writer
+                    .write_all(rest)
+                    .await
+                    .context("write pack cache raw pack chunk")?;
+                bytes_written = bytes_written.saturating_add(rest.len() as u64);
+                self.wrote_pack = true;
+            }
+        }
+    }
 }
 
 impl PackCache {
@@ -287,11 +323,40 @@ impl PackCache {
             tokio::fs::create_dir_all(&self.root)
                 .await
                 .with_context(|| format!("create pack cache root {}", self.root.display()))?;
+            self.ensure_packstore_git_dir().await?;
+            tokio::fs::create_dir_all(self.packstore_pack_dir())
+                .await
+                .with_context(|| {
+                    format!(
+                        "create pack cache packstore {}",
+                        self.packstore_pack_dir().display()
+                    )
+                })?;
             self.reload_recent_metadata()
                 .with_context(|| format!("reload pack cache metadata {}", self.root.display()))?;
             self.refresh_size_metric().await;
         }
         Ok(())
+    }
+
+    async fn ensure_packstore_git_dir(&self) -> Result<()> {
+        let packstore_root = self.packstore_root();
+        let head_path = packstore_root.join("HEAD");
+        if tokio::fs::try_exists(&head_path)
+            .await
+            .with_context(|| format!("stat synthetic packstore head {}", head_path.display()))?
+        {
+            return Ok(());
+        }
+
+        crate::git::commands::git_init_bare(&packstore_root)
+            .await
+            .with_context(|| {
+                format!(
+                    "initialize synthetic packstore {}",
+                    packstore_root.display()
+                )
+            })
     }
 
     pub fn enabled(&self) -> bool {
@@ -357,19 +422,28 @@ impl PackCache {
         ))
     }
 
-    pub fn lookup_recent_compatible_key(&self, key: &PackCacheKey) -> Option<PackCacheRecentEntry> {
-        let base = key.base.as_ref()?;
+    pub fn lookup_recent_compatible_keys(&self, key: &PackCacheKey) -> Vec<PackCacheRecentEntry> {
+        let Some(base) = key.base.as_ref() else {
+            return Vec::new();
+        };
         self.recent_pack_cache_keys
             .lock()
-            .ok()?
-            .get(&key.owner_repo)?
-            .iter()
+            .ok()
+            .and_then(|entries| entries.get(&key.owner_repo).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.request_template == base.request_template && entry.key != *key)
+            .collect()
+    }
+
+    pub fn lookup_recent_compatible_key(&self, key: &PackCacheKey) -> Option<PackCacheRecentEntry> {
+        self.lookup_recent_compatible_keys(key)
+            .into_iter()
             .find(|entry| {
-                entry.request_template == base.request_template
-                    && entry.request_wants.len() == base.request_wants.len()
-                    && entry.key != *key
+                key.base
+                    .as_ref()
+                    .is_some_and(|base| entry.request_wants.len() == base.request_wants.len())
             })
-            .cloned()
     }
 
     pub fn lookup_recent_full_tip_keys(&self, owner_repo: &str) -> Vec<PackCacheRecentEntry> {
@@ -483,6 +557,11 @@ impl PackCache {
         self.lookup_read_lease(key)
     }
 
+    pub fn pack_paths_for_key(&self, key: &PackCacheKey) -> Result<Vec<PathBuf>> {
+        let manifest = self.read_entry_manifest(key)?;
+        self.entry_pack_paths(&manifest)
+    }
+
     fn lookup_read_lease(&self, key: &PackCacheKey) -> Result<Option<PackCacheReadLease>> {
         let _lifecycle = self.artifact_lifecycle.lock().unwrap();
         let Some(hit) = self.lookup_sync(key)? else {
@@ -492,53 +571,37 @@ impl PackCache {
     }
 
     fn lookup_sync(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
-        if let Some(hit) = self.lookup_full_path(key)? {
-            return Ok(Some(hit));
-        }
-        self.lookup_composite_path(key)
-    }
-
-    fn lookup_full_path(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
-        let path = self.final_path(key);
-        self.lookup_existing_file(&path).map(|metadata| {
-            metadata.map(|_| {
-                if let Err(error) = record_metadata_hit(&self.root, key.as_str()) {
-                    warn!(
-                        key = %key.as_str(),
-                        error = %error,
-                        "failed to update pack cache hit metadata"
-                    );
-                }
-                PackCacheHit {
-                    key: key.clone(),
-                    path,
-                    artifact: PackCacheArtifact::Full,
-                }
-            })
-        })
-    }
-
-    fn lookup_composite_path(&self, key: &PackCacheKey) -> Result<Option<PackCacheHit>> {
-        let manifest_path = self.composite_manifest_path(key);
-        let Some(_metadata) = self.lookup_existing_file(&manifest_path)? else {
+        let path = self.entry_manifest_path(key);
+        let Some(_metadata) = self.lookup_existing_file(&path)? else {
             return Ok(None);
         };
-        if self.composite_chain(key).is_err() {
-            self.remove_composite_files(key);
+        let manifest = match self.read_entry_manifest(key) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                warn!(
+                    key = %key.as_str(),
+                    error = %error,
+                    "invalid pack cache entry manifest; removing stale entry"
+                );
+                self.remove_entry_files(key);
+                return Ok(None);
+            }
+        };
+        if self.entry_pack_paths(&manifest).is_err() {
+            self.remove_entry_files(key);
             return Ok(None);
         }
-        if let Err(error) = record_composite_chain_hit(&self.root, key) {
+        if let Err(error) = record_metadata_hit(&self.root, key.as_str()) {
             warn!(
                 key = %key.as_str(),
                 error = %error,
-                "failed to update pack cache composite hit metadata"
+                "failed to update pack cache hit metadata"
             );
         }
 
         Ok(Some(PackCacheHit {
             key: key.clone(),
-            path: manifest_path,
-            artifact: PackCacheArtifact::Composite { key: key.clone() },
+            manifest,
         }))
     }
 
@@ -555,91 +618,17 @@ impl PackCache {
         Ok(Some(metadata))
     }
 
-    fn composite_chain(&self, key: &PackCacheKey) -> Result<(PathBuf, Vec<PathBuf>)> {
-        let mut current_key = key.clone();
-        let mut delta_paths = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        loop {
-            if !seen.insert(current_key.as_str().to_string()) {
-                anyhow::bail!("cycle in pack cache composite chain");
-            }
-
-            let full_path = self.final_path(&current_key);
-            if self.lookup_existing_file(&full_path)?.is_some() {
-                delta_paths.reverse();
-                return Ok((full_path, delta_paths));
-            }
-
-            let manifest = self.read_composite_manifest(&current_key)?;
-            let delta_path = self.root.join(&manifest.delta_pack_file);
-            self.lookup_existing_file(&delta_path)?
-                .with_context(|| format!("missing pack cache delta {}", delta_path.display()))?;
-            delta_paths.push(delta_path);
-            current_key = PackCacheKey::from_digest(manifest.base_key);
-        }
-    }
-
     fn open_read_lease_for_hit(&self, hit: PackCacheHit) -> Result<PackCacheReadLease> {
-        match hit.artifact {
-            PackCacheArtifact::Full => {
-                let file = std::fs::File::open(&hit.path)
-                    .with_context(|| format!("open pack cache artifact {}", hit.path.display()))?;
-                let guard = self.acquire_read_guard(vec![hit.key.as_str().to_string()]);
-                Ok(PackCacheReadLease {
-                    artifact: PackCacheReadArtifact::Full { file },
-                    _guard: guard,
-                })
-            }
-            PackCacheArtifact::Composite { key } => {
-                let (base_response, deltas, keys) = self.open_composite_artifact(&key)?;
-                let guard = self.acquire_read_guard(keys);
-                Ok(PackCacheReadLease {
-                    artifact: PackCacheReadArtifact::Composite {
-                        base_response,
-                        deltas,
-                    },
-                    _guard: guard,
-                })
-            }
-        }
-    }
-
-    fn open_composite_artifact(
-        &self,
-        key: &PackCacheKey,
-    ) -> Result<(std::fs::File, Vec<stitch::OpenedDeltaPack>, Vec<String>)> {
-        let mut current_key = key.clone();
-        let mut delta_packs = Vec::new();
-        let mut active_keys = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        loop {
-            if !seen.insert(current_key.as_str().to_string()) {
-                anyhow::bail!("cycle in pack cache composite chain");
-            }
-
-            let full_path = self.final_path(&current_key);
-            if self.lookup_existing_file(&full_path)?.is_some() {
-                let base_response = std::fs::File::open(&full_path).with_context(|| {
-                    format!("open base pack cache response {}", full_path.display())
-                })?;
-                active_keys.push(current_key.as_str().to_string());
-                delta_packs.reverse();
-                active_keys.sort();
-                active_keys.dedup();
-                return Ok((base_response, delta_packs, active_keys));
-            }
-
-            let manifest = self.read_composite_manifest(&current_key)?;
-            let delta_path = self.root.join(&manifest.delta_pack_file);
-            self.lookup_existing_file(&delta_path)?
-                .with_context(|| format!("missing pack cache delta {}", delta_path.display()))?;
-            let delta_pack = stitch::OpenedDeltaPack::from_path(&delta_path)?;
-            active_keys.push(current_key.as_str().to_string());
-            delta_packs.push(delta_pack);
-            current_key = PackCacheKey::from_digest(manifest.base_key);
-        }
+        let packs = self
+            .entry_pack_paths(&hit.manifest)?
+            .into_iter()
+            .map(|path| stitch::OpenedPack::from_path(&path))
+            .collect::<Result<Vec<_>>>()?;
+        let guard = self.acquire_read_guard(vec![hit.key.as_str().to_string()]);
+        Ok(PackCacheReadLease {
+            artifact: PackCacheReadArtifact::Entry { packs },
+            _guard: guard,
+        })
     }
 
     fn acquire_read_guard(&self, keys: Vec<String>) -> PackCacheReadGuard {
@@ -657,34 +646,26 @@ impl PackCache {
         }
     }
 
-    fn read_composite_manifest(&self, key: &PackCacheKey) -> Result<CompositeManifest> {
-        let path = self.composite_manifest_path(key);
+    fn read_entry_manifest(&self, key: &PackCacheKey) -> Result<PackEntryManifest> {
+        let path = self.entry_manifest_path(key);
         let bytes = std::fs::read(&path)
-            .with_context(|| format!("read pack cache composite manifest {}", path.display()))?;
-        let manifest: CompositeManifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse pack cache composite manifest {}", path.display()))?;
+            .with_context(|| format!("read pack cache entry manifest {}", path.display()))?;
+        let manifest: PackEntryManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse pack cache entry manifest {}", path.display()))?;
         anyhow::ensure!(
-            manifest.version == COMPOSITE_MANIFEST_VERSION,
-            "unsupported pack cache composite manifest version {}",
+            manifest.version == PACK_ENTRY_MANIFEST_VERSION,
+            "unsupported pack cache entry manifest version {}",
             manifest.version
         );
         Ok(manifest)
     }
 
-    fn remove_composite_files(&self, key: &PackCacheKey) {
-        if let Ok(manifest) = self.read_composite_manifest(key) {
-            let delta_path = self.root.join(manifest.delta_pack_file);
-            if let Err(error) = std::fs::remove_file(&delta_path)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(path = %delta_path.display(), error = %error, "failed to remove invalid pack cache delta");
-            }
-        }
-        let manifest_path = self.composite_manifest_path(key);
+    fn remove_entry_files(&self, key: &PackCacheKey) {
+        let manifest_path = self.entry_manifest_path(key);
         if let Err(error) = std::fs::remove_file(&manifest_path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            warn!(path = %manifest_path.display(), error = %error, "failed to remove invalid pack cache composite manifest");
+            warn!(path = %manifest_path.display(), error = %error, "failed to remove invalid pack cache entry manifest");
         }
         let stale_metadata_path = metadata_path(&self.root, key.as_str());
         if let Err(error) = std::fs::remove_file(&stale_metadata_path)
@@ -692,19 +673,34 @@ impl PackCache {
         {
             warn!(path = %stale_metadata_path.display(), error = %error, "failed to remove invalid pack cache metadata");
         }
+        if let Err(error) = garbage_collect_unreferenced_pack_files(&self.root)
+            && !matches!(error.kind(), std::io::ErrorKind::NotFound)
+        {
+            warn!(root = %self.root.display(), error = %error, "failed to garbage collect pack cache packstore after entry removal");
+        }
     }
 
     async fn open_writer(&self, key: PackCacheKey) -> Result<PackCacheWriter> {
         tokio::fs::create_dir_all(&self.root)
             .await
             .with_context(|| format!("create pack cache root {}", self.root.display()))?;
-        let final_path = self.final_path(&key);
-        let tmp_path = self
-            .root
-            .join(format!("{}.tmp.{}", key.as_str(), std::process::id()));
-        let file = File::create(&tmp_path)
+        let packstore_pack_dir = self.packstore_pack_dir();
+        tokio::fs::create_dir_all(&packstore_pack_dir)
             .await
-            .with_context(|| format!("create pack cache temp artifact {}", tmp_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "create pack cache pack dir {}",
+                    packstore_pack_dir.display()
+                )
+            })?;
+        let tmp_pack_path = packstore_pack_dir.join(format!(
+            "pack-{}.tmp.{}.pack",
+            key.as_str(),
+            std::process::id()
+        ));
+        let file = File::create(&tmp_pack_path)
+            .await
+            .with_context(|| format!("create pack cache temp pack {}", tmp_pack_path.display()))?;
         let notify = self
             .inflight
             .lock()
@@ -715,13 +711,14 @@ impl PackCache {
 
         Ok(PackCacheWriter {
             key,
-            final_path,
-            tmp_path,
             root: self.root.clone(),
             config: self.config.clone(),
             local_cache_max_percent: self.local_cache_max_percent,
-            writer: BufWriter::with_capacity(1024 * 1024, file),
-            bytes_written: 0,
+            tmp_pack_path,
+            pack_writer: BufWriter::with_capacity(1024 * 1024, file),
+            pack_extractor: RawPackExtractor::default(),
+            response_bytes_written: 0,
+            raw_pack_bytes_written: 0,
             min_response_bytes: self.config.min_response_bytes,
             started_at: Instant::now(),
             inflight: Arc::clone(&self.inflight),
@@ -734,14 +731,45 @@ impl PackCache {
         })
     }
 
-    fn final_path(&self, key: &PackCacheKey) -> PathBuf {
+    fn entry_manifest_path(&self, key: &PackCacheKey) -> PathBuf {
         self.root
-            .join(format!("{}.{}", key.as_str(), PACK_RESPONSE_EXT))
+            .join(format!("{}.{}", key.as_str(), ENTRY_MANIFEST_EXT))
     }
 
-    fn composite_manifest_path(&self, key: &PackCacheKey) -> PathBuf {
-        self.root
-            .join(format!("{}.{}", key.as_str(), COMPOSITE_MANIFEST_EXT))
+    fn packstore_root(&self) -> PathBuf {
+        self.root.join(PACKSTORE_DIR)
+    }
+
+    fn packstore_object_dir(&self) -> PathBuf {
+        self.packstore_root().join(PACKSTORE_OBJECTS_DIR)
+    }
+
+    fn packstore_pack_dir(&self) -> PathBuf {
+        self.packstore_object_dir().join(PACKSTORE_PACK_DIR)
+    }
+
+    fn pack_path_for_id(&self, pack_id: &str) -> PathBuf {
+        self.packstore_pack_dir()
+            .join(format!("pack-{pack_id}.pack"))
+    }
+
+    fn pack_index_path_for_id(&self, pack_id: &str) -> PathBuf {
+        self.packstore_pack_dir()
+            .join(format!("pack-{pack_id}.idx"))
+    }
+
+    fn entry_pack_paths(&self, manifest: &PackEntryManifest) -> Result<Vec<PathBuf>> {
+        let mut paths = Vec::with_capacity(manifest.pack_ids.len());
+        for pack_id in &manifest.pack_ids {
+            let pack_path = self.pack_path_for_id(pack_id);
+            let idx_path = self.pack_index_path_for_id(pack_id);
+            self.lookup_existing_file(&pack_path)?
+                .with_context(|| format!("missing pack cache pack {}", pack_path.display()))?;
+            self.lookup_existing_file(&idx_path)?
+                .with_context(|| format!("missing pack cache pack index {}", idx_path.display()))?;
+            paths.push(pack_path);
+        }
+        Ok(paths)
     }
 
     fn reload_recent_metadata(&self) -> Result<()> {
@@ -826,39 +854,39 @@ impl PackCacheWriter {
     }
 
     pub async fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
-        self.writer
-            .write_all(bytes)
-            .await
-            .context("write pack cache artifact chunk")?;
-        self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
+        self.response_bytes_written = self
+            .response_bytes_written
+            .saturating_add(bytes.len() as u64);
+        self.raw_pack_bytes_written = self.raw_pack_bytes_written.saturating_add(
+            self.pack_extractor
+                .write_response_chunk(bytes, &mut self.pack_writer)
+                .await?,
+        );
         Ok(())
     }
 
     pub async fn finish(mut self) -> Result<()> {
-        self.writer
+        self.pack_writer
             .flush()
             .await
-            .context("flush pack cache artifact")?;
-        self.writer
+            .context("flush pack cache raw pack")?;
+        self.pack_writer
             .shutdown()
             .await
-            .context("shutdown pack cache artifact writer")?;
+            .context("shutdown pack cache raw pack writer")?;
 
-        if self.bytes_written >= self.min_response_bytes {
-            tokio::fs::rename(&self.tmp_path, &self.final_path)
-                .await
-                .with_context(|| {
-                    format!(
-                        "promote pack cache artifact {} to {}",
-                        self.tmp_path.display(),
-                        self.final_path.display()
-                    )
-                })?;
+        if self.response_bytes_written >= self.min_response_bytes && self.pack_extractor.wrote_pack
+        {
+            let pack_id = self.promote_pack_file(&self.tmp_pack_path).await?;
+            self.write_entry_manifest(&PackEntryManifest {
+                version: PACK_ENTRY_MANIFEST_VERSION,
+                pack_ids: vec![pack_id],
+            })?;
             self.record_promotion(None);
-        } else if let Err(error) = tokio::fs::remove_file(&self.tmp_path).await
+        } else if let Err(error) = tokio::fs::remove_file(&self.tmp_pack_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            warn!(path = %self.tmp_path.display(), error = %error, "failed to remove undersized pack cache temp artifact");
+            warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove undersized pack cache temp pack");
         }
 
         self.completed = true;
@@ -875,79 +903,24 @@ impl PackCacheWriter {
         base_key: &PackCacheKey,
         delta_pack: &[u8],
     ) -> Result<()> {
-        self.writer
+        self.pack_writer
             .shutdown()
             .await
-            .context("shutdown unused full pack cache temp artifact writer")?;
-        if let Err(error) = tokio::fs::remove_file(&self.tmp_path).await
+            .context("shutdown unused pack cache temp raw pack writer")?;
+        if let Err(error) = tokio::fs::remove_file(&self.tmp_pack_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            warn!(path = %self.tmp_path.display(), error = %error, "failed to remove unused full pack cache temp artifact");
+            warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove unused pack cache temp raw pack");
         }
 
-        let final_delta_path = self
-            .root
-            .join(format!("{}.{}", self.key.as_str(), DELTA_PACK_EXT));
-        let final_manifest_path =
-            self.root
-                .join(format!("{}.{}", self.key.as_str(), COMPOSITE_MANIFEST_EXT));
-        let tmp_delta_path = self.root.join(format!(
-            "{}.tmp.{}.{}",
-            self.key.as_str(),
-            std::process::id(),
-            DELTA_PACK_EXT
-        ));
-        let tmp_manifest_path = self.root.join(format!(
-            "{}.tmp.{}.{}",
-            self.key.as_str(),
-            std::process::id(),
-            COMPOSITE_MANIFEST_EXT
-        ));
-        let delta_file_name = final_delta_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("pack cache delta path is not valid UTF-8")?
-            .to_string();
-
-        tokio::fs::write(&tmp_delta_path, delta_pack)
-            .await
-            .with_context(|| format!("write pack cache delta {}", tmp_delta_path.display()))?;
-        let manifest = CompositeManifest {
-            version: COMPOSITE_MANIFEST_VERSION,
-            base_key: base_key.as_str().to_string(),
-            delta_pack_file: delta_file_name,
-            delta_size_bytes: delta_pack.len() as u64,
-        };
-        let manifest_bytes =
-            serde_json::to_vec(&manifest).context("serialize pack cache composite manifest")?;
-        tokio::fs::write(&tmp_manifest_path, manifest_bytes)
-            .await
-            .with_context(|| {
-                format!(
-                    "write pack cache composite manifest {}",
-                    tmp_manifest_path.display()
-                )
-            })?;
-        tokio::fs::rename(&tmp_delta_path, &final_delta_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "promote pack cache delta {} to {}",
-                    tmp_delta_path.display(),
-                    final_delta_path.display()
-                )
-            })?;
-        tokio::fs::rename(&tmp_manifest_path, &final_manifest_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "promote pack cache composite manifest {} to {}",
-                    tmp_manifest_path.display(),
-                    final_manifest_path.display()
-                )
-            })?;
-
-        self.bytes_written = delta_pack.len() as u64;
+        let pack_id = self.write_exact_pack(delta_pack, "delta").await?;
+        let mut pack_ids = self.read_entry_manifest(base_key)?.pack_ids;
+        pack_ids.push(pack_id);
+        self.write_entry_manifest(&PackEntryManifest {
+            version: PACK_ENTRY_MANIFEST_VERSION,
+            pack_ids,
+        })?;
+        self.raw_pack_bytes_written = delta_pack.len() as u64;
         self.record_promotion(Some(base_key));
         self.completed = true;
         crate::metrics::set_pack_cache_size_bytes(
@@ -959,11 +932,35 @@ impl PackCacheWriter {
         Ok(())
     }
 
-    pub async fn abort(mut self) {
-        if let Err(error) = tokio::fs::remove_file(&self.tmp_path).await
+    pub async fn finish_alias(mut self, base_key: &PackCacheKey) -> Result<()> {
+        self.pack_writer
+            .shutdown()
+            .await
+            .context("shutdown unused alias pack cache temp raw pack writer")?;
+        if let Err(error) = tokio::fs::remove_file(&self.tmp_pack_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            warn!(path = %self.tmp_path.display(), error = %error, "failed to remove aborted pack cache temp artifact");
+            warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove unused alias pack cache temp raw pack");
+        }
+
+        let manifest = self.read_entry_manifest(base_key)?;
+        self.write_entry_manifest(&manifest)?;
+        self.raw_pack_bytes_written = 0;
+        self.record_promotion(Some(base_key));
+        self.completed = true;
+        crate::metrics::set_pack_cache_size_bytes(
+            &self.metrics,
+            directory_size(&self.root).unwrap_or(0),
+        );
+        self.release_inflight().await;
+        Ok(())
+    }
+
+    pub async fn abort(mut self) {
+        if let Err(error) = tokio::fs::remove_file(&self.tmp_pack_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove aborted pack cache temp raw pack");
         }
         self.completed = true;
         crate::metrics::set_pack_cache_size_bytes(
@@ -1030,10 +1027,152 @@ impl PackCacheWriter {
         }
         debug!(
             key = %self.key.as_str(),
-            bytes = self.bytes_written,
-            path = %self.final_path.display(),
+            bytes = self.raw_pack_bytes_written,
+            path = %self.entry_manifest_path().display(),
             "stored pack cache artifact"
         );
+    }
+
+    async fn promote_pack_file(&self, tmp_pack_path: &Path) -> Result<String> {
+        let pack_id = self.key.as_str().to_string();
+        let final_pack_path = self.pack_path_for_id(&pack_id);
+        let final_idx_path = self.pack_index_path_for_id(&pack_id);
+        let tmp_idx_path = self.root.join(format!(
+            "pack-{}.tmp.{}.idx",
+            self.key.as_str(),
+            std::process::id()
+        ));
+
+        crate::git::commands::git_index_pack_to_idx(tmp_pack_path, &tmp_idx_path).await?;
+        tokio::fs::rename(tmp_pack_path, &final_pack_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "promote pack cache pack {} to {}",
+                    tmp_pack_path.display(),
+                    final_pack_path.display()
+                )
+            })?;
+        tokio::fs::rename(&tmp_idx_path, &final_idx_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "promote pack cache pack index {} to {}",
+                    tmp_idx_path.display(),
+                    final_idx_path.display()
+                )
+            })?;
+        self.refresh_packstore_midx().await?;
+        Ok(pack_id)
+    }
+
+    async fn write_exact_pack(&self, pack_bytes: &[u8], suffix: &str) -> Result<String> {
+        let pack_id = format!("{}-{suffix}", self.key.as_str());
+        let tmp_pack_path =
+            self.root
+                .join(format!("pack-{}.tmp.{}.pack", pack_id, std::process::id()));
+        tokio::fs::write(&tmp_pack_path, pack_bytes)
+            .await
+            .with_context(|| format!("write pack cache pack {}", tmp_pack_path.display()))?;
+        let final_pack_path = self.pack_path_for_id(&pack_id);
+        let final_idx_path = self.pack_index_path_for_id(&pack_id);
+        let tmp_idx_path =
+            self.root
+                .join(format!("pack-{}.tmp.{}.idx", pack_id, std::process::id()));
+        crate::git::commands::git_index_pack_to_idx(&tmp_pack_path, &tmp_idx_path).await?;
+        tokio::fs::rename(&tmp_pack_path, &final_pack_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "promote pack cache exact pack {} to {}",
+                    tmp_pack_path.display(),
+                    final_pack_path.display()
+                )
+            })?;
+        tokio::fs::rename(&tmp_idx_path, &final_idx_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "promote pack cache exact pack index {} to {}",
+                    tmp_idx_path.display(),
+                    final_idx_path.display()
+                )
+            })?;
+        self.refresh_packstore_midx().await?;
+        Ok(pack_id)
+    }
+
+    async fn refresh_packstore_midx(&self) -> Result<()> {
+        crate::git::commands::git_multi_pack_index_write_for_object_dir(
+            &self.packstore_object_dir(),
+            false,
+            1,
+        )
+        .await
+        .or_else(|error| {
+            warn!(root = %self.root.display(), error = %error, "failed to refresh pack cache packstore MIDX");
+            Ok(())
+        })
+    }
+
+    fn write_entry_manifest(&self, manifest: &PackEntryManifest) -> Result<()> {
+        let path = self.entry_manifest_path();
+        let tmp_path = self.root.join(format!(
+            "{}.tmp.{}.{}",
+            self.key.as_str(),
+            std::process::id(),
+            ENTRY_MANIFEST_EXT
+        ));
+        let bytes = serde_json::to_vec(manifest).context("serialize pack cache entry manifest")?;
+        std::fs::write(&tmp_path, bytes)
+            .with_context(|| format!("write pack cache entry manifest {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!(
+                "promote pack cache entry manifest {} to {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn read_entry_manifest(&self, key: &PackCacheKey) -> Result<PackEntryManifest> {
+        let path = self
+            .root
+            .join(format!("{}.{}", key.as_str(), ENTRY_MANIFEST_EXT));
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read pack cache entry manifest {}", path.display()))?;
+        let manifest: PackEntryManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse pack cache entry manifest {}", path.display()))?;
+        anyhow::ensure!(
+            manifest.version == PACK_ENTRY_MANIFEST_VERSION,
+            "unsupported pack cache entry manifest version {}",
+            manifest.version
+        );
+        Ok(manifest)
+    }
+
+    fn entry_manifest_path(&self) -> PathBuf {
+        self.root
+            .join(format!("{}.{}", self.key.as_str(), ENTRY_MANIFEST_EXT))
+    }
+
+    fn packstore_object_dir(&self) -> PathBuf {
+        self.root.join(PACKSTORE_DIR).join(PACKSTORE_OBJECTS_DIR)
+    }
+
+    fn packstore_pack_dir(&self) -> PathBuf {
+        self.packstore_object_dir().join(PACKSTORE_PACK_DIR)
+    }
+
+    fn pack_path_for_id(&self, pack_id: &str) -> PathBuf {
+        self.packstore_pack_dir()
+            .join(format!("pack-{pack_id}.pack"))
+    }
+
+    fn pack_index_path_for_id(&self, pack_id: &str) -> PathBuf {
+        self.packstore_pack_dir()
+            .join(format!("pack-{pack_id}.idx"))
     }
 
     fn covered_wants_for_promotion(
@@ -1102,14 +1241,14 @@ impl Drop for PackCacheWriter {
         }
 
         let key = self.key.as_str().to_string();
-        let tmp_path = self.tmp_path.clone();
+        let tmp_path = self.tmp_pack_path.clone();
         let inflight = Arc::clone(&self.inflight);
         let notify = Arc::clone(&self.notify);
         tokio::spawn(async move {
             if let Err(error) = tokio::fs::remove_file(&tmp_path).await
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                warn!(path = %tmp_path.display(), error = %error, "failed to remove dropped pack cache temp artifact");
+                warn!(path = %tmp_path.display(), error = %error, "failed to remove dropped pack cache temp raw pack");
             }
             inflight.lock().await.remove(&key);
             notify.notify_waiters();
@@ -1372,6 +1511,8 @@ fn directory_size(root: &Path) -> std::io::Result<u64> {
         let metadata = entry.metadata()?;
         if metadata.is_file() {
             total = total.saturating_add(metadata.len());
+        } else if metadata.is_dir() {
+            total = total.saturating_add(directory_size(&entry.path())?);
         }
     }
     Ok(total)
@@ -1385,10 +1526,7 @@ fn now_unix_secs() -> u64 {
 }
 
 fn cache_entry_artifact_exists(root: &Path, key: &str) -> bool {
-    root.join(format!("{key}.{PACK_RESPONSE_EXT}")).is_file()
-        || root
-            .join(format!("{key}.{COMPOSITE_MANIFEST_EXT}"))
-            .is_file()
+    root.join(format!("{key}.{ENTRY_MANIFEST_EXT}")).is_file()
 }
 
 fn metadata_path(root: &Path, key: &str) -> PathBuf {
@@ -1437,36 +1575,6 @@ fn record_metadata_hit(root: &Path, key: &str) -> Result<()> {
     write_pack_cache_metadata(root, &metadata)
 }
 
-fn record_composite_chain_hit(root: &Path, key: &PackCacheKey) -> Result<()> {
-    let mut current_key = key.as_str().to_string();
-    let mut seen = HashSet::new();
-
-    loop {
-        if !seen.insert(current_key.clone()) {
-            anyhow::bail!("cycle in pack cache composite chain");
-        }
-        record_metadata_hit(root, &current_key)?;
-
-        let manifest_path = root.join(format!("{current_key}.{COMPOSITE_MANIFEST_EXT}"));
-        if !manifest_path.is_file() {
-            return Ok(());
-        }
-        let bytes = std::fs::read(&manifest_path).with_context(|| {
-            format!(
-                "read pack cache composite manifest {}",
-                manifest_path.display()
-            )
-        })?;
-        let manifest: CompositeManifest = serde_json::from_slice(&bytes).with_context(|| {
-            format!(
-                "parse pack cache composite manifest {}",
-                manifest_path.display()
-            )
-        })?;
-        current_key = manifest.base_key;
-    }
-}
-
 fn retain_existing_recent_entries(
     root: &Path,
     recent: &mut HashMap<String, Vec<PackCacheRecentEntry>>,
@@ -1485,7 +1593,6 @@ struct PackCachePruneEntry {
     created_at_unix_secs: u64,
     last_accessed_unix_secs: u64,
     hit_count: u64,
-    base_key: Option<String>,
 }
 
 impl PackCachePruneEntry {
@@ -1497,7 +1604,6 @@ impl PackCachePruneEntry {
             created_at_unix_secs: 0,
             last_accessed_unix_secs: 0,
             hit_count: 0,
-            base_key: None,
         }
     }
 
@@ -1505,15 +1611,14 @@ impl PackCachePruneEntry {
         self.size_bytes = self.size_bytes.saturating_add(size_bytes);
         self.paths.push((path, size_bytes));
     }
+
+    fn add_owned_bytes(&mut self, size_bytes: u64) {
+        self.size_bytes = self.size_bytes.saturating_add(size_bytes);
+    }
 }
 
 fn pack_cache_key_from_file_name(name: &str) -> Option<String> {
-    for ext in [
-        PACK_RESPONSE_EXT,
-        COMPOSITE_MANIFEST_EXT,
-        DELTA_PACK_EXT,
-        METADATA_EXT,
-    ] {
+    for ext in [ENTRY_MANIFEST_EXT, METADATA_EXT] {
         let suffix = format!(".{ext}");
         if let Some(key) = name.strip_suffix(&suffix) {
             return Some(key.to_string());
@@ -1524,10 +1629,11 @@ fn pack_cache_key_from_file_name(name: &str) -> Option<String> {
 
 fn collect_prune_entries(root: &Path) -> Result<(HashMap<String, PackCachePruneEntry>, u64)> {
     let mut entries = HashMap::<String, PackCachePruneEntry>::new();
-    let mut total = 0u64;
+    let mut manifests = HashMap::<String, PackEntryManifest>::new();
+    let mut pack_refcounts = HashMap::<String, usize>::new();
 
     if !root.exists() {
-        return Ok((entries, total));
+        return Ok((entries, 0));
     }
 
     for entry in std::fs::read_dir(root)
@@ -1550,7 +1656,6 @@ fn collect_prune_entries(root: &Path) -> Result<(HashMap<String, PackCachePruneE
             continue;
         };
         let size = metadata.len();
-        total = total.saturating_add(size);
         entries
             .entry(key.clone())
             .or_insert_with(|| PackCachePruneEntry::new(key))
@@ -1567,17 +1672,47 @@ fn collect_prune_entries(root: &Path) -> Result<(HashMap<String, PackCachePruneE
             entry.hit_count = metadata.hit_count;
         }
 
-        let manifest_path = root.join(format!("{key}.{COMPOSITE_MANIFEST_EXT}"));
+        let manifest_path = root.join(format!("{key}.{ENTRY_MANIFEST_EXT}"));
         if manifest_path.is_file()
             && let Ok(bytes) = std::fs::read(&manifest_path)
-            && let Ok(manifest) = serde_json::from_slice::<CompositeManifest>(&bytes)
-            && let Some(entry) = entries.get_mut(&key)
+            && let Ok(manifest) = serde_json::from_slice::<PackEntryManifest>(&bytes)
+            && manifest.version == PACK_ENTRY_MANIFEST_VERSION
         {
-            entry.base_key = Some(manifest.base_key);
+            for pack_id in &manifest.pack_ids {
+                *pack_refcounts.entry(pack_id.clone()).or_insert(0) += 1;
+            }
+            manifests.insert(key.clone(), manifest);
         }
     }
 
-    Ok((entries, total))
+    let pack_dir = root
+        .join(PACKSTORE_DIR)
+        .join(PACKSTORE_OBJECTS_DIR)
+        .join(PACKSTORE_PACK_DIR);
+    for (key, manifest) in manifests {
+        if let Some(entry) = entries.get_mut(&key) {
+            for pack_id in manifest.pack_ids {
+                if pack_id != key && !pack_id.starts_with(&format!("{key}-")) {
+                    continue;
+                }
+                if pack_refcounts.get(&pack_id).copied().unwrap_or_default() > 1 {
+                    continue;
+                }
+                for path in [
+                    pack_dir.join(format!("pack-{pack_id}.pack")),
+                    pack_dir.join(format!("pack-{pack_id}.idx")),
+                ] {
+                    if let Ok(metadata) = std::fs::metadata(&path)
+                        && metadata.is_file()
+                    {
+                        entry.add_owned_bytes(metadata.len());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((entries, directory_size(root).unwrap_or(0)))
 }
 
 fn remove_prune_entry(entry: PackCachePruneEntry) -> std::io::Result<u64> {
@@ -1592,6 +1727,79 @@ fn remove_prune_entry(entry: PackCachePruneEntry) -> std::io::Result<u64> {
         }
     }
     Ok(removed)
+}
+
+fn garbage_collect_unreferenced_pack_files(root: &Path) -> std::io::Result<()> {
+    let mut referenced = HashSet::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(ENTRY_MANIFEST_EXT) {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let manifest = match serde_json::from_slice::<PackEntryManifest>(&bytes) {
+            Ok(manifest) if manifest.version == PACK_ENTRY_MANIFEST_VERSION => manifest,
+            _ => continue,
+        };
+        referenced.extend(manifest.pack_ids);
+    }
+
+    let pack_dir = root
+        .join(PACKSTORE_DIR)
+        .join(PACKSTORE_OBJECTS_DIR)
+        .join(PACKSTORE_PACK_DIR);
+    if !pack_dir.is_dir() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(&pack_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name == "multi-pack-index"
+            || (name.starts_with("multi-pack-index-") && name.ends_with(".bitmap"))
+        {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            continue;
+        }
+        let pack_id = name.strip_prefix("pack-").and_then(|value| {
+            value
+                .strip_suffix(".pack")
+                .or_else(|| value.strip_suffix(".idx"))
+        });
+        let Some(pack_id) = pack_id else {
+            continue;
+        };
+        if referenced.contains(pack_id) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
 }
 
 fn prune_to_watermarks(
@@ -1646,16 +1854,6 @@ fn prune_to_byte_watermarks_with_active(
         return Ok(());
     }
 
-    let mut dependents = HashMap::<String, Vec<String>>::new();
-    for entry in entries.values() {
-        if let Some(base_key) = &entry.base_key {
-            dependents
-                .entry(base_key.clone())
-                .or_default()
-                .push(entry.key.clone());
-        }
-    }
-
     let mut candidates = entries
         .values()
         .map(|entry| {
@@ -1684,30 +1882,21 @@ fn prune_to_byte_watermarks_with_active(
         if deleted.contains(&candidate_key) {
             continue;
         }
-
-        let mut stack = vec![candidate_key];
-        let mut remove_keys = Vec::new();
-        while let Some(key) = stack.pop() {
-            if deleted.contains(&key) || remove_keys.contains(&key) {
-                continue;
-            }
-            if let Some(children) = dependents.get(&key) {
-                stack.extend(children.iter().cloned());
-            }
-            remove_keys.push(key);
-        }
-        if remove_keys.iter().any(|key| active_keys.contains(key)) {
+        if active_keys.contains(&candidate_key) {
             continue;
         }
-        for key in remove_keys {
-            if !deleted.insert(key.clone()) {
-                continue;
-            }
-            if let Some(entry) = entries.remove(&key) {
-                let removed = remove_prune_entry(entry)
-                    .with_context(|| format!("remove pack cache entry {key}"))?;
-                total = total.saturating_sub(removed);
-            }
+        if !deleted.insert(candidate_key.clone()) {
+            continue;
+        }
+        if let Some(entry) = entries.remove(&candidate_key) {
+            remove_prune_entry(entry)
+                .with_context(|| format!("remove pack cache entry {candidate_key}"))?;
+            garbage_collect_unreferenced_pack_files(root).with_context(|| {
+                format!(
+                    "garbage collect unreferenced pack cache packs after removing {candidate_key}"
+                )
+            })?;
+            total = directory_size(root).unwrap_or(0);
         }
     }
 
@@ -1790,9 +1979,25 @@ mod tests {
         last_accessed_unix_secs: u64,
     ) {
         std::fs::create_dir_all(root).unwrap();
+        let pack_dir = root
+            .join(super::PACKSTORE_DIR)
+            .join(super::PACKSTORE_OBJECTS_DIR)
+            .join(super::PACKSTORE_PACK_DIR);
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let body_size = size_bytes.saturating_sub(32);
         std::fs::write(
-            root.join(format!("{}.{}", key, super::PACK_RESPONSE_EXT)),
-            vec![0_u8; size_bytes],
+            pack_dir.join(format!("pack-{key}.pack")),
+            raw_pack(1, &vec![b'x'; body_size]),
+        )
+        .unwrap();
+        std::fs::write(pack_dir.join(format!("pack-{key}.idx")), []).unwrap();
+        std::fs::write(
+            root.join(format!("{key}.{}", super::ENTRY_MANIFEST_EXT)),
+            serde_json::to_vec(&super::PackEntryManifest {
+                version: super::PACK_ENTRY_MANIFEST_VERSION,
+                pack_ids: vec![key.to_string()],
+            })
+            .unwrap(),
         )
         .unwrap();
         write_pack_cache_metadata(
@@ -1811,6 +2016,132 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    fn write_test_pack(cache: &PackCache, pack_id: &str, bytes: &[u8]) {
+        std::fs::create_dir_all(cache.packstore_pack_dir()).unwrap();
+        std::fs::write(cache.pack_path_for_id(pack_id), bytes).unwrap();
+        std::fs::write(cache.pack_index_path_for_id(pack_id), []).unwrap();
+    }
+
+    fn write_test_entry_manifest(cache: &PackCache, key: &PackCacheKey, pack_ids: &[String]) {
+        std::fs::write(
+            cache.entry_manifest_path(key),
+            serde_json::to_vec(&super::PackEntryManifest {
+                version: super::PACK_ENTRY_MANIFEST_VERSION,
+                pack_ids: pack_ids.to_vec(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn valid_base_and_delta_packs() -> (Vec<u8>, Vec<u8>) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("config")
+            .arg("user.email")
+            .arg("test@example.com")
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("config")
+            .arg("user.name")
+            .arg("Test User")
+            .status()
+            .unwrap();
+
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("add")
+            .arg(".")
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("commit")
+            .arg("-m")
+            .arg("base")
+            .status()
+            .unwrap();
+        let base_head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .arg("rev-parse")
+                .arg("HEAD")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let base_objects =
+            crate::git::commands::git_rev_list_objects(&repo, std::slice::from_ref(&base_head))
+                .await
+                .unwrap();
+        let base_pack = crate::git::commands::git_pack_objects_exact(&repo, &base_objects, 1)
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join("file.txt"), "base\ndelta\n").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("add")
+            .arg(".")
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .arg("commit")
+            .arg("-m")
+            .arg("delta")
+            .status()
+            .unwrap();
+        let delta_head = String::from_utf8(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .arg("rev-parse")
+                .arg("HEAD")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let delta_objects = crate::git::commands::git_rev_list_objects(&repo, &[delta_head])
+            .await
+            .unwrap();
+        let base_set = base_objects
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let missing_objects = delta_objects
+            .into_iter()
+            .filter(|oid| !base_set.contains(oid))
+            .collect::<Vec<_>>();
+        let delta_pack = crate::git::commands::git_pack_objects_exact(&repo, &missing_objects, 1)
+            .await
+            .unwrap();
+
+        (base_pack, delta_pack)
     }
 
     #[test]
@@ -1918,12 +2249,12 @@ mod tests {
 
         assert!(
             !root
-                .join(format!("old.{}", super::PACK_RESPONSE_EXT))
+                .join(format!("old.{}", super::ENTRY_MANIFEST_EXT))
                 .exists()
         );
         assert!(!metadata_path(root, "old").exists());
         assert!(
-            root.join(format!("new.{}", super::PACK_RESPONSE_EXT))
+            root.join(format!("new.{}", super::ENTRY_MANIFEST_EXT))
                 .exists()
         );
         assert!(metadata_path(root, "new").exists());
@@ -1949,22 +2280,26 @@ mod tests {
 
         assert!(
             !root
-                .join(format!("cold.{}", super::PACK_RESPONSE_EXT))
+                .join(format!("cold.{}", super::ENTRY_MANIFEST_EXT))
                 .exists()
         );
         assert!(!metadata_path(root, "cold").exists());
         assert!(
-            root.join(format!("popular.{}", super::PACK_RESPONSE_EXT))
+            root.join(format!("popular.{}", super::ENTRY_MANIFEST_EXT))
                 .exists()
         );
         assert!(metadata_path(root, "popular").exists());
     }
 
     #[test]
-    fn pruning_base_entry_removes_dependent_composites() {
+    fn pruning_base_entry_keeps_shared_packs_needed_by_composites() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         write_prune_test_entry(root, "base", 128, 0, 10);
+        let pack_dir = root
+            .join(super::PACKSTORE_DIR)
+            .join(super::PACKSTORE_OBJECTS_DIR)
+            .join(super::PACKSTORE_PACK_DIR);
         write_pack_cache_metadata(
             root,
             &PackCacheMetadata {
@@ -1981,18 +2316,13 @@ mod tests {
             },
         )
         .unwrap();
+        std::fs::write(pack_dir.join("pack-composite-delta.pack"), vec![0_u8; 64]).unwrap();
+        std::fs::write(pack_dir.join("pack-composite-delta.idx"), []).unwrap();
         std::fs::write(
-            root.join(format!("composite.{}", super::DELTA_PACK_EXT)),
-            vec![0_u8; 64],
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(format!("composite.{}", super::COMPOSITE_MANIFEST_EXT)),
-            serde_json::to_vec(&super::CompositeManifest {
-                version: super::COMPOSITE_MANIFEST_VERSION,
-                base_key: "base".to_string(),
-                delta_pack_file: format!("composite.{}", super::DELTA_PACK_EXT),
-                delta_size_bytes: 64,
+            root.join(format!("composite.{}", super::ENTRY_MANIFEST_EXT)),
+            serde_json::to_vec(&super::PackEntryManifest {
+                version: super::PACK_ENTRY_MANIFEST_VERSION,
+                pack_ids: vec!["base".to_string(), "composite-delta".to_string()],
             })
             .unwrap(),
         )
@@ -2000,35 +2330,28 @@ mod tests {
 
         let (entries, total) = collect_prune_entries(root).unwrap();
         let base_size = entries.get("base").unwrap().size_bytes;
-        let composite_size = entries.get("composite").unwrap().size_bytes;
 
         prune_to_byte_watermarks(
             root,
             total.saturating_sub(1),
-            total
-                .saturating_sub(base_size)
-                .saturating_sub(composite_size),
+            total.saturating_sub(base_size),
             EvictionPolicy::Lru,
         )
         .unwrap();
 
         assert!(
             !root
-                .join(format!("base.{}", super::PACK_RESPONSE_EXT))
+                .join(format!("base.{}", super::ENTRY_MANIFEST_EXT))
                 .exists()
         );
         assert!(!metadata_path(root, "base").exists());
         assert!(
-            !root
-                .join(format!("composite.{}", super::COMPOSITE_MANIFEST_EXT))
+            root.join(format!("composite.{}", super::ENTRY_MANIFEST_EXT))
                 .exists()
         );
-        assert!(
-            !root
-                .join(format!("composite.{}", super::DELTA_PACK_EXT))
-                .exists()
-        );
-        assert!(!metadata_path(root, "composite").exists());
+        assert!(metadata_path(root, "composite").exists());
+        assert!(pack_dir.join("pack-base.pack").exists());
+        assert!(pack_dir.join("pack-composite-delta.pack").exists());
     }
 
     #[tokio::test]
@@ -2066,11 +2389,25 @@ mod tests {
                 full_tip: false,
             }),
         };
-        let base_pack = raw_pack(1, b"base-body");
-        let delta_pack = raw_pack(2, b"delta-body");
-        tokio::fs::write(cache.final_path(&base_key), pack_response(&base_pack))
-            .await
-            .unwrap();
+        let (base_pack, delta_pack) = valid_base_and_delta_packs().await;
+        write_test_pack(&cache, base_key.as_str(), &base_pack);
+        write_test_entry_manifest(&cache, &base_key, &[base_key.as_str().to_string()]);
+        write_pack_cache_metadata(
+            &cache.root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: base_key.as_str().to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: Vec::new(),
+                covered_wants: Vec::new(),
+                request_template: Vec::new(),
+                full_tip: false,
+                created_at_unix_secs: 10,
+                last_accessed_unix_secs: 10,
+                hit_count: 0,
+            },
+        )
+        .unwrap();
 
         let lookup = cache
             .lookup_or_reserve(Protocol::Https, composite_key.clone())
@@ -2092,10 +2429,14 @@ mod tests {
             replayed.extend_from_slice(&chunk.unwrap());
         }
         let raw = super::stitch::extract_raw_pack(&replayed).unwrap();
+        let expected_count = u32::from_be_bytes(base_pack[8..12].try_into().unwrap())
+            + u32::from_be_bytes(delta_pack[8..12].try_into().unwrap());
 
         assert_eq!(&raw[..4], b"PACK");
-        assert_eq!(u32::from_be_bytes(raw[8..12].try_into().unwrap()), 3);
-        assert_eq!(&raw[12..raw.len() - 20], b"base-bodydelta-body");
+        assert_eq!(
+            u32::from_be_bytes(raw[8..12].try_into().unwrap()),
+            expected_count
+        );
     }
 
     #[tokio::test]
@@ -2145,11 +2486,9 @@ mod tests {
                 full_tip: false,
             }),
         };
-        std::fs::write(
-            cache.final_path(&base_key),
-            pack_response(&raw_pack(1, b"base")),
-        )
-        .unwrap();
+        let (base_pack, delta_pack) = valid_base_and_delta_packs().await;
+        write_test_pack(&cache, base_key.as_str(), &base_pack);
+        write_test_entry_manifest(&cache, &base_key, &[base_key.as_str().to_string()]);
         write_pack_cache_metadata(
             &cache.root,
             &PackCacheMetadata {
@@ -2179,7 +2518,7 @@ mod tests {
             panic!("expected cache reservation");
         };
         writer
-            .finish_composite(&base_key, &raw_pack(1, b"delta"))
+            .finish_composite(&base_key, &delta_pack)
             .await
             .unwrap();
 
@@ -2234,14 +2573,17 @@ mod tests {
         write_prune_test_entry(&cache.root, key.as_str(), 128, 0, 10);
 
         let lease = cache.lookup_by_key(&key).await.unwrap().unwrap();
-        std::fs::remove_file(cache.final_path(&key)).unwrap();
+        std::fs::remove_file(cache.entry_manifest_path(&key)).unwrap();
 
         let mut replayed = Vec::new();
         let mut stream = lease.into_stream();
         while let Some(chunk) = stream.next().await {
             replayed.extend_from_slice(&chunk.unwrap());
         }
-        assert_eq!(replayed.len(), 128);
+        assert_eq!(
+            super::stitch::extract_raw_pack(&replayed).unwrap().len(),
+            128
+        );
     }
 
     #[tokio::test]
@@ -2272,27 +2614,14 @@ mod tests {
         };
         let base_pack = raw_pack(1, b"base-body");
         let delta_pack = raw_pack(2, b"delta-body");
-        std::fs::write(cache.final_path(&base_key), pack_response(&base_pack)).unwrap();
-        std::fs::write(
-            cache.root.join(format!(
-                "{}.{}",
-                composite_key.as_str(),
-                super::DELTA_PACK_EXT
-            )),
-            &delta_pack,
-        )
-        .unwrap();
-        std::fs::write(
-            cache.composite_manifest_path(&composite_key),
-            serde_json::to_vec(&super::CompositeManifest {
-                version: super::COMPOSITE_MANIFEST_VERSION,
-                base_key: base_key.as_str().to_string(),
-                delta_pack_file: format!("{}.{}", composite_key.as_str(), super::DELTA_PACK_EXT),
-                delta_size_bytes: delta_pack.len() as u64,
-            })
-            .unwrap(),
-        )
-        .unwrap();
+        write_test_pack(&cache, base_key.as_str(), &base_pack);
+        write_test_pack(&cache, "composite-delta", &delta_pack);
+        write_test_entry_manifest(&cache, &base_key, &[base_key.as_str().to_string()]);
+        write_test_entry_manifest(
+            &cache,
+            &composite_key,
+            &[base_key.as_str().to_string(), "composite-delta".to_string()],
+        );
         write_pack_cache_metadata(
             &cache.root,
             &PackCacheMetadata {
@@ -2327,14 +2656,10 @@ mod tests {
         .unwrap();
 
         let lease = cache.lookup_by_key(&composite_key).await.unwrap().unwrap();
-        std::fs::remove_file(cache.final_path(&base_key)).unwrap();
-        std::fs::remove_file(cache.root.join(format!(
-            "{}.{}",
-            composite_key.as_str(),
-            super::DELTA_PACK_EXT
-        )))
-        .unwrap();
-        std::fs::remove_file(cache.composite_manifest_path(&composite_key)).unwrap();
+        std::fs::remove_file(cache.entry_manifest_path(&base_key)).unwrap();
+        std::fs::remove_file(cache.pack_path_for_id(base_key.as_str())).unwrap();
+        std::fs::remove_file(cache.pack_path_for_id("composite-delta")).unwrap();
+        std::fs::remove_file(cache.entry_manifest_path(&composite_key)).unwrap();
 
         let mut replayed = Vec::new();
         let mut stream = lease.into_stream();
@@ -2381,12 +2706,12 @@ mod tests {
             &active_reader_keys(&cache.active_readers),
         )
         .unwrap();
-        assert!(cache.final_path(&key).exists());
+        assert!(cache.entry_manifest_path(&key).exists());
 
         drop(lease);
         prune_to_byte_watermarks(&cache.root, total.saturating_sub(1), 0, EvictionPolicy::Lru)
             .unwrap();
-        assert!(!cache.final_path(&key).exists());
+        assert!(!cache.entry_manifest_path(&key).exists());
     }
 
     #[tokio::test]
@@ -2417,27 +2742,14 @@ mod tests {
         };
         let base_pack = raw_pack(1, b"base-body");
         let delta_pack = raw_pack(2, b"delta-body");
-        std::fs::write(cache.final_path(&base_key), pack_response(&base_pack)).unwrap();
-        std::fs::write(
-            cache.root.join(format!(
-                "{}.{}",
-                composite_key.as_str(),
-                super::DELTA_PACK_EXT
-            )),
-            &delta_pack,
-        )
-        .unwrap();
-        std::fs::write(
-            cache.composite_manifest_path(&composite_key),
-            serde_json::to_vec(&super::CompositeManifest {
-                version: super::COMPOSITE_MANIFEST_VERSION,
-                base_key: base_key.as_str().to_string(),
-                delta_pack_file: format!("{}.{}", composite_key.as_str(), super::DELTA_PACK_EXT),
-                delta_size_bytes: delta_pack.len() as u64,
-            })
-            .unwrap(),
-        )
-        .unwrap();
+        write_test_pack(&cache, base_key.as_str(), &base_pack);
+        write_test_pack(&cache, "composite-delta", &delta_pack);
+        write_test_entry_manifest(&cache, &base_key, &[base_key.as_str().to_string()]);
+        write_test_entry_manifest(
+            &cache,
+            &composite_key,
+            &[base_key.as_str().to_string(), "composite-delta".to_string()],
+        );
         write_pack_cache_metadata(
             &cache.root,
             &PackCacheMetadata {
@@ -2481,33 +2793,26 @@ mod tests {
             &active_reader_keys(&cache.active_readers),
         )
         .unwrap();
-        assert!(cache.final_path(&base_key).exists());
-        assert!(cache.composite_manifest_path(&composite_key).exists());
+        assert!(cache.entry_manifest_path(&composite_key).exists());
         assert!(
-            cache
-                .root
-                .join(format!(
-                    "{}.{}",
-                    composite_key.as_str(),
-                    super::DELTA_PACK_EXT
-                ))
-                .exists()
+            cache.pack_path_for_id(base_key.as_str()).exists()
+                && cache.pack_path_for_id("composite-delta").exists()
         );
 
         drop(lease);
-        prune_to_byte_watermarks(&cache.root, total.saturating_sub(1), 0, EvictionPolicy::Lru)
-            .unwrap();
-        assert!(!cache.final_path(&base_key).exists());
-        assert!(!cache.composite_manifest_path(&composite_key).exists());
+        let (_, total_after_drop) = collect_prune_entries(&cache.root).unwrap();
+        prune_to_byte_watermarks(
+            &cache.root,
+            total_after_drop.saturating_sub(1),
+            0,
+            EvictionPolicy::Lru,
+        )
+        .unwrap();
+        assert!(!cache.entry_manifest_path(&base_key).exists());
+        assert!(!cache.entry_manifest_path(&composite_key).exists());
         assert!(
-            !cache
-                .root
-                .join(format!(
-                    "{}.{}",
-                    composite_key.as_str(),
-                    super::DELTA_PACK_EXT
-                ))
-                .exists()
+            !cache.pack_path_for_id(base_key.as_str()).exists()
+                && !cache.pack_path_for_id("composite-delta").exists()
         );
     }
 
@@ -2631,7 +2936,11 @@ mod tests {
         let super::PackCacheLookup::Generate(mut writer) = lookup else {
             panic!("expected cache reservation");
         };
-        writer.write_chunk(b"not a real response").await.unwrap();
+        let (base_pack, _) = valid_base_and_delta_packs().await;
+        writer
+            .write_chunk(&pack_response(&base_pack))
+            .await
+            .unwrap();
         writer.finish().await.unwrap();
         cache.lookup_by_key(&base_key).await.unwrap().unwrap();
 

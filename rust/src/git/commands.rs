@@ -7,7 +7,7 @@
 //!
 //! All functions are fully `async` and use the Tokio process runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
 
@@ -241,12 +241,29 @@ async fn run_git_multi_pack_index_write(
     bitmap: bool,
     pack_threads: usize,
 ) -> Result<()> {
+    git_multi_pack_index_write_for_object_dir(&repo_path.join("objects"), bitmap, pack_threads)
+        .await
+}
+
+#[instrument(fields(object_dir = %object_dir.display(), bitmap, pack_threads))]
+pub async fn git_multi_pack_index_write_for_object_dir(
+    object_dir: &Path,
+    bitmap: bool,
+    pack_threads: usize,
+) -> Result<()> {
+    let git_dir = object_dir.parent().with_context(|| {
+        format!(
+            "multi-pack-index object dir {} has no parent git dir",
+            object_dir.display()
+        )
+    })?;
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
-        .arg(repo_path)
+    cmd.current_dir(git_dir)
+        .env("GIT_DIR", git_dir)
         .arg("-c")
         .arg(format!("pack.threads={pack_threads}"))
         .arg("multi-pack-index")
+        .arg(format!("--object-dir={}", object_dir.display()))
         .arg("write");
     if bitmap {
         cmd.arg("--bitmap");
@@ -258,16 +275,19 @@ async fn run_git_multi_pack_index_write(
 
     debug!(bitmap, "spawning git multi-pack-index write");
 
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn git multi-pack-index write bitmap={bitmap}"))?;
+    let output = cmd.output().await.with_context(|| {
+        format!(
+            "failed to spawn git multi-pack-index write bitmap={bitmap} object_dir={}",
+            object_dir.display()
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "git multi-pack-index write bitmap={} failed (status {}): {}",
+            "git multi-pack-index write bitmap={} object_dir={} failed (status {}): {}",
             bitmap,
+            object_dir.display(),
             output.status,
             stderr.trim(),
         );
@@ -657,6 +677,37 @@ pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[instrument(fields(pack = %pack_path.display(), idx = %idx_path.display()))]
+pub async fn git_index_pack_to_idx(pack_path: &Path, idx_path: &Path) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.arg("index-pack").arg("-o").arg(idx_path).arg(pack_path);
+
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let output = cmd.output().await.with_context(|| {
+        format!(
+            "failed to spawn git index-pack for {} -> {}",
+            pack_path.display(),
+            idx_path.display()
+        )
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git index-pack {} -> {} failed (status {}): {}",
+            pack_path.display(),
+            idx_path.display(),
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Run `git fsck --connectivity-only` in a bare repo.
 #[instrument(fields(repo = %repo_path.display()))]
 pub async fn git_fsck_connectivity_only(repo_path: &Path) -> Result<()> {
@@ -761,8 +812,82 @@ pub async fn git_missing_objects(repo_path: &Path, oids: &[String]) -> Result<Ve
     Ok(missing)
 }
 
+#[instrument(fields(repo = %repo_path.display(), tips = tips.len()))]
+pub async fn git_rev_list_objects(repo_path: &Path, tips: &[String]) -> Result<Vec<String>> {
+    if tips.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut input = Vec::with_capacity(tips.iter().map(|tip| tip.len() + 1).sum());
+    for tip in tips {
+        input.extend_from_slice(tip.as_bytes());
+        input.push(b'\n');
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("rev-list")
+        .arg("--objects")
+        .arg("--stdin");
+
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn git rev-list --objects")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to capture git rev-list stdin")?;
+    let stdin_writer = tokio::spawn(async move {
+        stdin
+            .write_all(&input)
+            .await
+            .context("failed to write revisions to git rev-list --objects")?;
+        stdin
+            .shutdown()
+            .await
+            .context("failed to close git rev-list stdin")?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to wait on git rev-list --objects")?;
+    stdin_writer
+        .await
+        .context("git rev-list --objects stdin writer task join failed")??;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git rev-list --objects failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("git rev-list output was not UTF-8")?;
+    let mut objects = Vec::new();
+    let mut seen = HashSet::new();
+    for line in stdout.lines() {
+        let Some(oid) = line.split_whitespace().next() else {
+            continue;
+        };
+        if oid.len() == 40 && seen.insert(oid.to_string()) {
+            objects.push(oid.to_string());
+        }
+    }
+    Ok(objects)
+}
+
 /// Return true when every revision in `candidate_ancestors` is reachable from
 /// at least one revision in `descendants`.
+#[cfg(test)]
 #[instrument(fields(repo = %repo_path.display(), candidate_ancestors = candidate_ancestors.len(), descendants = descendants.len()))]
 pub async fn git_revisions_reachable_from_any(
     repo_path: &Path,
@@ -1070,24 +1195,18 @@ pub async fn git_bundle_create_filtered(
 
 /// Generate a raw pack containing objects reachable from `new_tips` but not
 /// reachable from `prev_tips`.
-#[instrument(fields(repo = %repo_path.display(), prev_tips = prev_tips.len(), new_tips = new_tips.len()))]
-pub async fn git_pack_objects_delta(
+#[instrument(fields(repo = %repo_path.display(), object_count = object_ids.len(), pack_threads))]
+pub async fn git_pack_objects_exact(
     repo_path: &Path,
-    prev_tips: &[String],
-    new_tips: &[String],
+    object_ids: &[String],
     pack_threads: usize,
 ) -> Result<Vec<u8>> {
-    if new_tips.is_empty() {
-        bail!("cannot create delta pack without new tips");
+    if object_ids.is_empty() {
+        bail!("cannot create exact pack without object ids");
     }
 
-    let mut input = Vec::new();
-    for oid in prev_tips {
-        input.push(b'^');
-        input.extend_from_slice(oid.as_bytes());
-        input.push(b'\n');
-    }
-    for oid in new_tips {
+    let mut input = Vec::with_capacity(object_ids.iter().map(|oid| oid.len() + 1).sum());
+    for oid in object_ids {
         input.extend_from_slice(oid.as_bytes());
         input.push(b'\n');
     }
@@ -1098,59 +1217,54 @@ pub async fn git_pack_objects_delta(
         .arg("-c")
         .arg(format!("pack.threads={pack_threads}"))
         .arg("pack-objects")
-        .arg("--revs")
         .arg("--stdout")
+        .arg("--non-empty")
+        .arg("--no-reuse-delta")
         .arg("--no-delta-base-offset");
 
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    debug!("spawning git pack-objects delta");
-
     let mut child = cmd
         .spawn()
-        .context("failed to spawn git pack-objects delta")?;
+        .context("failed to spawn git pack-objects exact")?;
     let mut stdin = child
         .stdin
         .take()
-        .context("failed to capture git pack-objects stdin")?;
+        .context("failed to capture git pack-objects exact stdin")?;
     let stdin_writer = tokio::spawn(async move {
         stdin
             .write_all(&input)
             .await
-            .context("failed to write revs to git pack-objects")?;
+            .context("failed to write object ids to git pack-objects exact")?;
         stdin
             .shutdown()
             .await
-            .context("failed to close git pack-objects stdin")?;
+            .context("failed to close git pack-objects exact stdin")?;
         Ok::<(), anyhow::Error>(())
     });
 
     let output = child
         .wait_with_output()
         .await
-        .context("failed to wait on git pack-objects delta")?;
+        .context("failed to wait on git pack-objects exact")?;
     stdin_writer
         .await
-        .context("git pack-objects stdin writer task join failed")??;
+        .context("git pack-objects exact stdin writer task join failed")??;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "git pack-objects delta failed (status {}): {}",
+            "git pack-objects exact failed (status {}): {}",
             output.status,
             stderr.trim(),
         );
     }
     if output.stdout.is_empty() {
-        bail!("git pack-objects delta produced an empty pack");
+        bail!("git pack-objects exact produced an empty pack");
     }
 
-    debug!(
-        bytes = output.stdout.len(),
-        "git pack-objects delta succeeded"
-    );
     Ok(output.stdout)
 }
 
@@ -1575,6 +1689,237 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
     }
 
     #[tokio::test]
+    async fn exact_missing_object_sets_shrink_for_shared_history_candidates() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let repo_path = tempdir.path().join("repo");
+        let cache_view_path = tempdir.path().join("cache-view.git");
+
+        assert_git_success(StdCommand::new("git").arg("init").arg(&repo_path));
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("switch")
+                .arg("-c")
+                .arg("main"),
+        );
+
+        std::fs::write(repo_path.join("shared.txt"), "shared\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("base"),
+        );
+        let base = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("switch")
+                .arg("-c")
+                .arg("feature"),
+        );
+        std::fs::write(repo_path.join("feature.txt"), "feature\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("feature"),
+        );
+        let feature = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("switch")
+                .arg("main"),
+        );
+        std::fs::write(repo_path.join("main.txt"), "main\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("main"),
+        );
+        let main = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("switch")
+                .arg("--orphan")
+                .arg("unrelated"),
+        );
+        std::fs::write(repo_path.join("unrelated.txt"), "unrelated\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("unrelated"),
+        );
+        let unrelated = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        let base_objects = git_rev_list_objects(&repo_path, std::slice::from_ref(&base))
+            .await
+            .unwrap();
+        let base_pack = git_pack_objects_exact(&repo_path, &base_objects, 1)
+            .await
+            .unwrap();
+
+        git_init_bare(&cache_view_path).await.unwrap();
+        let pack_dir = cache_view_path.join("objects").join("pack");
+        let pack_path = pack_dir.join("pack-base.pack");
+        let idx_path = pack_dir.join("pack-base.idx");
+        std::fs::write(&pack_path, &base_pack).unwrap();
+        git_index_pack_to_idx(&pack_path, &idx_path).await.unwrap();
+
+        let main_objects = git_rev_list_objects(&repo_path, std::slice::from_ref(&main))
+            .await
+            .unwrap();
+        let missing_main = git_missing_objects(&cache_view_path, &main_objects)
+            .await
+            .unwrap();
+        assert!(!main_objects.is_empty());
+        assert!(missing_main.len() < main_objects.len());
+        let main_full_pack = git_pack_objects_exact(&repo_path, &main_objects, 1)
+            .await
+            .unwrap();
+        let main_delta_pack = git_pack_objects_exact(&repo_path, &missing_main, 1)
+            .await
+            .unwrap();
+        assert!(
+            main_delta_pack.len() < main_full_pack.len(),
+            "fast-forward delta pack should be smaller than a full pack"
+        );
+
+        let feature_objects = git_rev_list_objects(&repo_path, std::slice::from_ref(&feature))
+            .await
+            .unwrap();
+        let missing_feature = git_missing_objects(&cache_view_path, &feature_objects)
+            .await
+            .unwrap();
+        assert!(!feature_objects.is_empty());
+        assert!(missing_feature.len() < feature_objects.len());
+        let feature_full_pack = git_pack_objects_exact(&repo_path, &feature_objects, 1)
+            .await
+            .unwrap();
+        let feature_delta_pack = git_pack_objects_exact(&repo_path, &missing_feature, 1)
+            .await
+            .unwrap();
+        assert!(
+            feature_delta_pack.len() < feature_full_pack.len(),
+            "shared-history delta pack should be smaller than a full pack"
+        );
+
+        let unrelated_objects = git_rev_list_objects(&repo_path, std::slice::from_ref(&unrelated))
+            .await
+            .unwrap();
+        let missing_unrelated = git_missing_objects(&cache_view_path, &unrelated_objects)
+            .await
+            .unwrap();
+        assert_eq!(missing_unrelated.len(), unrelated_objects.len());
+        let unrelated_full_pack = git_pack_objects_exact(&repo_path, &unrelated_objects, 1)
+            .await
+            .unwrap();
+        let unrelated_delta_pack = git_pack_objects_exact(&repo_path, &missing_unrelated, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            unrelated_delta_pack.len(),
+            unrelated_full_pack.len(),
+            "unrelated histories should not see pack shrinkage from the cache base"
+        );
+    }
+
+    #[tokio::test]
     async fn git_fetch_refspecs_handles_large_selected_fetch_via_stdin() {
         let tempdir = tempfile::tempdir().unwrap();
         let remote_path = tempdir.path().join("remote");
@@ -1779,13 +2124,91 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
                 .unwrap()
                 .success()
         );
-        assert!(
+    }
+
+    #[tokio::test]
+    async fn git_multi_pack_index_write_supports_synthetic_packstores() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let work_path = tempdir.path().join("work");
+        let packstore_path = tempdir.path().join("packstore");
+        let object_dir = packstore_path.join("objects");
+        let pack_dir = object_dir.join("pack");
+
+        assert_git_success(StdCommand::new("git").arg("init").arg(&work_path));
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("init")
+                .arg("--bare")
+                .arg(&packstore_path),
+        );
+        assert_git_success(
             StdCommand::new("git")
                 .arg("-C")
-                .arg(&bare_path)
-                .arg("rev-list")
-                .arg("--test-bitmap")
-                .arg("HEAD")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User"),
+        );
+
+        std::fs::write(work_path.join("file.txt"), "hello\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("add")
+                .arg("file.txt"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("initial"),
+        );
+
+        let head = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+        let object_ids = git_rev_list_objects(&work_path, std::slice::from_ref(&head))
+            .await
+            .unwrap();
+        let pack = git_pack_objects_exact(&work_path, &object_ids, 1)
+            .await
+            .unwrap();
+
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let pack_path = pack_dir.join("pack-base.pack");
+        let idx_path = pack_dir.join("pack-base.idx");
+        std::fs::write(&pack_path, &pack).unwrap();
+        git_index_pack_to_idx(&pack_path, &idx_path).await.unwrap();
+
+        git_multi_pack_index_write_for_object_dir(&object_dir, false, 1)
+            .await
+            .unwrap();
+        assert!(pack_dir.join("multi-pack-index").is_file());
+
+        assert!(
+            StdCommand::new("git")
+                .current_dir(&packstore_path)
+                .env("GIT_DIR", &packstore_path)
+                .arg("multi-pack-index")
+                .arg(format!("--object-dir={}", object_dir.display()))
+                .arg("verify")
                 .status()
                 .unwrap()
                 .success()
