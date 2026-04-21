@@ -631,6 +631,9 @@ async fn handle_upload_pack(
     let advertised_refs = recent_advertised_refs
         .as_ref()
         .map(|recent| recent.advertised_refs.clone());
+    let advertised_ref_tips = advertised_refs
+        .as_ref()
+        .and_then(crate::coordination::registry::advertised_ref_tips);
     let git_session_id = recent_advertised_refs
         .as_ref()
         .map(|recent| recent.session_id.clone())
@@ -648,6 +651,63 @@ async fn handle_upload_pack(
     );
     let span = tracing::Span::current();
     observation.record_span(&span, &request_phase);
+
+    if local_authz_confirmed
+        && request_metadata.request_phase.expects_local_pack_serve()
+        && let Some(ref_tips) = advertised_ref_tips.as_ref()
+        && let Ok(key) = state.pack_cache.key_for_fresh_clone_with_ref_tips(
+            &repo_slug,
+            &decoded_body,
+            git_protocol.as_deref(),
+            ref_tips,
+        )
+    {
+        match state.pack_cache.lookup_by_key(&key).await {
+            Ok(Some(hit)) => {
+                crate::metrics::inc_pack_cache_request(
+                    &state.metrics,
+                    Protocol::Https,
+                    "hit",
+                    "pre_local_decision",
+                );
+                match serve_http_pack_cache_hit_response(
+                    &state,
+                    hit,
+                    CloneCompletion {
+                        cache_status: CacheStatus::Warm,
+                        started_at,
+                        metric_username: metric_username.clone(),
+                        metric_repo: repo_slug.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err(error) => {
+                        warn!(
+                            repo = %repo_slug,
+                            error = %error,
+                            "pack cache hit from advertised refs could not be replayed; continuing to local serveability check"
+                        );
+                        crate::metrics::inc_pack_cache_request(
+                            &state.metrics,
+                            Protocol::Https,
+                            "bypass",
+                            "pre_local_artifact_open_failed",
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    repo = %repo_slug,
+                    error = %error,
+                    "pack cache hit lookup from advertised refs failed; continuing to local serveability check"
+                );
+            }
+        }
+    }
     info!(
         repo = %repo_slug,
         wants = wants.len(),
@@ -796,7 +856,10 @@ async fn handle_upload_pack(
                     &repo,
                     *serve_from,
                     &decoded_body,
-                    git_protocol.as_deref(),
+                    FreshClonePackCacheKeyContext {
+                        git_protocol: git_protocol.as_deref(),
+                        advertised_ref_tips: advertised_ref_tips.as_ref(),
+                    },
                     CloneCompletion {
                         cache_status: effective_cache_status.clone(),
                         started_at,
@@ -1501,13 +1564,18 @@ async fn serve_http_pack_cache_hit_response(
         .into_response())
 }
 
+struct FreshClonePackCacheKeyContext<'a> {
+    git_protocol: Option<&'a str>,
+    advertised_ref_tips: Option<&'a std::collections::BTreeMap<String, String>>,
+}
+
 async fn serve_local_upload_pack(
     state: &AppState,
     owner: &str,
     repo: &str,
     serve_from: LocalServeRepoSource,
     request_body: &[u8],
-    git_protocol: Option<&str>,
+    pack_cache_key_context: FreshClonePackCacheKeyContext<'_>,
     completion: CloneCompletion,
 ) -> Result<Response, AppError> {
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
@@ -1517,12 +1585,24 @@ async fn serve_local_upload_pack(
         serve_from,
     )
     .await?;
-    let mut pack_cache_lookup = match state.pack_cache.key_for_fresh_clone(
-        &owner_repo,
-        repo_lease.repo_path(),
-        request_body,
-        git_protocol,
-    ) {
+    let mut pack_cache_lookup = match pack_cache_key_context
+        .advertised_ref_tips
+        .map(|ref_tips| {
+            state.pack_cache.key_for_fresh_clone_with_ref_tips(
+                &owner_repo,
+                request_body,
+                pack_cache_key_context.git_protocol,
+                ref_tips,
+            )
+        })
+        .unwrap_or_else(|| {
+            state.pack_cache.key_for_fresh_clone(
+                &owner_repo,
+                repo_lease.repo_path(),
+                request_body,
+                pack_cache_key_context.git_protocol,
+            )
+        }) {
         Ok(key) => Some(
             state
                 .pack_cache
@@ -1613,7 +1693,7 @@ async fn serve_local_upload_pack(
         serve_from,
         repo_lease,
         LocalUploadPackMode::StatelessRpc,
-        git_protocol,
+        pack_cache_key_context.git_protocol,
     )
     .await?;
 

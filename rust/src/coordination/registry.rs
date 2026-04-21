@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -3590,6 +3590,24 @@ pub struct RequestAdvertisedRefs {
     pub ls_refs_response: Option<Vec<u8>>,
     pub ls_refs_request: Option<Vec<u8>>,
     pub info_refs_advertisement: Option<Vec<u8>>,
+}
+
+pub fn advertised_ref_tips(
+    advertised_refs: &RequestAdvertisedRefs,
+) -> Option<BTreeMap<String, String>> {
+    let metadata = if let Some(ls_refs_response) = advertised_refs.ls_refs_response.as_deref() {
+        crate::tee_hydration::parse_ls_refs_response_metadata(ls_refs_response)
+    } else if let Some(info_refs_advertisement) = advertised_refs.info_refs_advertisement.as_deref()
+    {
+        crate::tee_hydration::parse_info_refs_advertisement_metadata(info_refs_advertisement)
+    } else {
+        return None;
+    };
+    if metadata.refs.is_empty() {
+        None
+    } else {
+        Some(metadata.refs)
+    }
 }
 
 pub fn derive_request_catch_up_plan(
