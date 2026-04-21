@@ -4484,14 +4484,14 @@ async fn try_start_request_time_catch_up(
     auth_header: Option<&str>,
     wants: &[String],
     request_refspecs: Option<Vec<String>>,
-) -> Option<tokio::task::JoinHandle<Result<()>>> {
+) -> RequestTimeCatchUp {
     let Some(catch_up_guard) = try_acquire_local_repo_catch_up_guard(state, owner_repo).await
     else {
         debug!(
             repo = %owner_repo,
             "request-time local catch-up is already running; waiting for publish before rechecking wants"
         );
-        return None;
+        return RequestTimeCatchUp::AlreadyRunning;
     };
 
     info!(
@@ -4506,7 +4506,7 @@ async fn try_start_request_time_catch_up(
     let repo = repo.to_string();
     let auth_header = auth_header.map(ToOwned::to_owned);
     let wants = wants.to_vec();
-    Some(tokio::spawn(async move {
+    RequestTimeCatchUp::Started(tokio::spawn(async move {
         let _catch_up_guard = catch_up_guard;
         let result = async {
             let current_decision = classify_local_wants_satisfaction_without_request_restore(
@@ -4545,6 +4545,11 @@ async fn try_start_request_time_catch_up(
         }
         result
     }))
+}
+
+enum RequestTimeCatchUp {
+    Started(tokio::task::JoinHandle<Result<()>>),
+    AlreadyRunning,
 }
 
 async fn try_publish_mirror_generation_for_satisfied_wants(
@@ -4618,7 +4623,14 @@ pub async fn wait_for_local_catch_up(
     wants: &[String],
     request_refspecs: Option<Vec<String>>,
 ) -> Result<LocalServeDecision> {
-    let timeout = Duration::from_secs(state.config.clone.request_wait_for_local_catch_up_secs);
+    let quick_timeout =
+        Duration::from_secs(state.config.clone.request_wait_for_local_catch_up_secs);
+    let active_timeout = Duration::from_secs(
+        state
+            .config
+            .clone
+            .request_wait_for_active_local_catch_up_secs,
+    );
     let repo_clean = crate::repo_identity::canonical_repo_leaf(repo);
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
 
@@ -4628,7 +4640,7 @@ pub async fn wait_for_local_catch_up(
     if matches!(initial_decision, LocalServeDecision::SatisfiesWants { .. }) {
         return Ok(initial_decision);
     }
-    if timeout.is_zero() {
+    if quick_timeout.is_zero() && active_timeout.is_zero() {
         return Ok(initial_decision);
     }
 
@@ -4666,37 +4678,60 @@ pub async fn wait_for_local_catch_up(
         has_repo_mirror,
         hydration_lease_count,
     );
-    let mut refresh_handle = if should_start_refresh {
-        try_start_request_time_catch_up(
-            state,
-            &owner_repo,
-            owner,
-            repo_clean,
-            auth_header,
-            wants,
-            request_refspecs.clone(),
+    let mut catch_up = if should_start_refresh {
+        Some(
+            try_start_request_time_catch_up(
+                state,
+                &owner_repo,
+                owner,
+                repo_clean,
+                auth_header,
+                wants,
+                request_refspecs.clone(),
+            )
+            .await,
         )
-        .await
     } else {
         None
     };
+    let using_active_wait = catch_up.is_some();
+    let timeout = if using_active_wait {
+        quick_timeout.max(active_timeout)
+    } else {
+        quick_timeout
+    };
+    if timeout.is_zero() {
+        return Ok(initial_decision);
+    }
+    if using_active_wait {
+        crate::metrics::inc_request_time_catch_up(&state.metrics, "active_wait");
+        if matches!(catch_up, Some(RequestTimeCatchUp::AlreadyRunning)) {
+            crate::metrics::inc_request_time_catch_up(&state.metrics, "joined_active");
+        }
+    }
 
     let started_at = Instant::now();
     let mut last_decision = initial_decision;
+    let mut fallback_suppressed = false;
     info!(
         repo = %owner_repo,
         timeout_secs = timeout.as_secs(),
+        quick_timeout_secs = quick_timeout.as_secs(),
+        active_timeout_secs = active_timeout.as_secs(),
         started_refresh = should_start_refresh,
+        active_catch_up_wait = using_active_wait,
         has_published_repo,
         has_repo_mirror = state.cache_manager.has_repo_mirror(&owner_repo),
         "waiting for local published-generation catch-up before deciding whether to proxy upstream"
     );
     while started_at.elapsed() < timeout {
-        if refresh_handle
-            .as_ref()
-            .is_some_and(tokio::task::JoinHandle::is_finished)
+        if let Some(RequestTimeCatchUp::Started(handle)) = catch_up.as_ref()
+            && handle.is_finished()
         {
-            let refresh_result = refresh_handle.take().unwrap().await;
+            let Some(RequestTimeCatchUp::Started(handle)) = catch_up.take() else {
+                unreachable!("catch-up state changed after finished check");
+            };
+            let refresh_result = handle.await;
             match refresh_result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -4716,13 +4751,15 @@ pub async fn wait_for_local_catch_up(
                     return Ok(last_decision);
                 }
             }
-            refresh_handle = None;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
         let decision =
             classify_local_wants_satisfaction_without_request_restore(state, &owner_repo, wants)
                 .await?;
         if matches!(decision, LocalServeDecision::SatisfiesWants { .. }) {
+            if using_active_wait {
+                crate::metrics::inc_request_time_catch_up(&state.metrics, "active_wait_completed");
+            }
             info!(
                 repo = %owner_repo,
                 elapsed_ms = started_at.elapsed().as_millis(),
@@ -4731,20 +4768,39 @@ pub async fn wait_for_local_catch_up(
             return Ok(decision);
         }
         last_decision = decision;
-        if should_start_refresh && refresh_handle.is_none() {
-            refresh_handle = try_start_request_time_catch_up(
-                state,
-                &owner_repo,
-                owner,
-                repo_clean,
-                auth_header,
-                wants,
-                request_refspecs.clone(),
-            )
-            .await;
+        if using_active_wait && !fallback_suppressed && started_at.elapsed() >= quick_timeout {
+            fallback_suppressed = true;
+            crate::metrics::inc_request_time_catch_up(
+                &state.metrics,
+                "fallback_suppressed_by_active_catch_up",
+            );
+            info!(
+                repo = %owner_repo,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                quick_timeout_secs = quick_timeout.as_secs(),
+                active_timeout_secs = active_timeout.as_secs(),
+                "continuing to wait for active local catch-up instead of proxying upstream"
+            );
+        }
+        if should_start_refresh && !matches!(catch_up, Some(RequestTimeCatchUp::Started(_))) {
+            catch_up = Some(
+                try_start_request_time_catch_up(
+                    state,
+                    &owner_repo,
+                    owner,
+                    repo_clean,
+                    auth_header,
+                    wants,
+                    request_refspecs.clone(),
+                )
+                .await,
+            );
         }
     }
 
+    if using_active_wait {
+        crate::metrics::inc_request_time_catch_up(&state.metrics, "active_wait_timeout");
+    }
     info!(
         repo = %owner_repo,
         elapsed_ms = started_at.elapsed().as_millis(),

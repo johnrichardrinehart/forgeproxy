@@ -23,6 +23,7 @@ let
         eviction_policy                            = "lfu"
         prepare_published_generation_indexes       = false
         generation_coalescing_window_secs          = 60
+        request_wait_for_active_local_catch_up_secs = 300
         max_concurrent_local_upload_packs          = 4
         max_concurrent_local_upload_packs_per_repo = 1
         index_pack_threads                         = 2

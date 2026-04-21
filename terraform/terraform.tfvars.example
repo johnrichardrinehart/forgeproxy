@@ -94,6 +94,7 @@ org_creds = [
 metrics_enabled = true
 metrics_refresh_interval_secs = 60
 prepare_published_generation_indexes = false
+request_wait_for_active_local_catch_up_secs = 300
 bundle_pack_threads = 4
 logs_enabled = true
 traces_enabled = false

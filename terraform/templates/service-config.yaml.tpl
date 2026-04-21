@@ -38,6 +38,7 @@ auth:
 clone:
   prepare_published_generation_indexes: ${prepare_published_generation_indexes}
   generation_coalescing_window_secs: ${generation_coalescing_window_secs}
+  request_wait_for_active_local_catch_up_secs: ${request_wait_for_active_local_catch_up_secs}
   # Request path: every local disk serve acquires these before spawning git upload-pack.
   # Higher values improve parallel clone/fetch throughput but allow more concurrent pack-objects CPU.
   max_concurrent_local_upload_packs: ${max_concurrent_local_upload_packs}
