@@ -680,6 +680,7 @@ async fn serve_local_upload_pack_once(
             Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
                 match try_finish_pack_cache_delta_composite(
                     state,
+                    Protocol::Ssh,
                     owner_repo,
                     repo_lease.repo_path(),
                     writer,

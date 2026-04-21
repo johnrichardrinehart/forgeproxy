@@ -7,12 +7,16 @@
 //! that have an S3 bundle backup are evicted until usage drops below the
 //! low-water mark.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use fred::interfaces::HashesInterface;
 use tracing::{debug, info, warn};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use crate::AppState;
 use crate::cache::layout;
@@ -41,10 +45,19 @@ pub struct CacheManager {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheMetricsSnapshot {
-    pub total_size_bytes: u64,
+    pub total_apparent_usage_bytes: u64,
+    pub total_physical_usage_bytes: u64,
     pub repo_count: usize,
-    pub mirror_sizes: Vec<(String, u64)>,
-    pub subtree_sizes: Vec<(String, u64)>,
+    pub mirror_apparent_sizes: Vec<(String, u64)>,
+    pub mirror_physical_sizes: Vec<(String, u64)>,
+    pub subtree_apparent_sizes: Vec<(String, u64)>,
+    pub subtree_physical_sizes: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DiskUsage {
+    pub apparent_bytes: u64,
+    pub physical_bytes: u64,
 }
 
 impl CacheManager {
@@ -389,9 +402,13 @@ impl CacheManager {
         is_usable_bare_repo(&self.repo_mirror_path(owner_repo))
     }
 
-    /// Walk [`base_path`] and return the total size of all files in bytes.
-    pub fn total_size_bytes(&self) -> Result<u64> {
-        dir_size(&self.base_path)
+    /// Walk [`base_path`] and return the physical bytes allocated by unique files.
+    pub fn total_physical_usage_bytes(&self) -> Result<u64> {
+        Ok(dir_usage(&self.base_path)?.physical_bytes)
+    }
+
+    pub(crate) fn total_usage_bytes(&self) -> Result<DiskUsage> {
+        dir_usage(&self.base_path)
     }
 
     pub fn metrics_snapshot(&self) -> Result<CacheMetricsSnapshot> {
@@ -406,25 +423,33 @@ impl CacheManager {
             ("state_tee", layout::state_tee_root(&self.base_path)),
         ];
 
-        let mut subtree_sizes = Vec::with_capacity(subtree_paths.len());
-        let mut total_size_bytes = 0_u64;
+        let mut subtree_apparent_sizes = Vec::with_capacity(subtree_paths.len());
+        let mut subtree_physical_sizes = Vec::with_capacity(subtree_paths.len());
         for (subtree, path) in subtree_paths {
-            let size_bytes = dir_size(&path)?;
-            total_size_bytes = total_size_bytes.saturating_add(size_bytes);
-            subtree_sizes.push((subtree.to_string(), size_bytes));
+            let usage = dir_usage(&path)?;
+            subtree_apparent_sizes.push((subtree.to_string(), usage.apparent_bytes));
+            subtree_physical_sizes.push((subtree.to_string(), usage.physical_bytes));
         }
+        let total_usage = self.total_usage_bytes()?;
 
-        let mirror_sizes = self
-            .list_mirror_repo_dirs()?
-            .into_iter()
-            .map(|(owner_repo, repo_path)| dir_size(&repo_path).map(|size| (owner_repo, size)))
-            .collect::<Result<Vec<_>>>()?;
+        let mut mirror_apparent_sizes = Vec::new();
+        let mut mirror_physical_sizes = Vec::new();
+        for (owner_repo, repo_path) in self.list_mirror_repo_dirs()? {
+            let usage = dir_usage(&repo_path)?;
+            mirror_apparent_sizes.push((owner_repo.clone(), usage.apparent_bytes));
+            mirror_physical_sizes.push((owner_repo, usage.physical_bytes));
+        }
+        let mirror_apparent_sizes = mirror_apparent_sizes;
+        let mirror_physical_sizes = mirror_physical_sizes;
 
         Ok(CacheMetricsSnapshot {
-            total_size_bytes,
+            total_apparent_usage_bytes: total_usage.apparent_bytes,
+            total_physical_usage_bytes: total_usage.physical_bytes,
             repo_count: self.list_repos()?.len(),
-            mirror_sizes,
-            subtree_sizes,
+            mirror_apparent_sizes,
+            mirror_physical_sizes,
+            subtree_apparent_sizes,
+            subtree_physical_sizes,
         })
     }
 
@@ -432,18 +457,18 @@ impl CacheManager {
         super::capacity::budget_bytes_for_path(&self.base_path, self.max_percent)
     }
 
-    /// Return the current cache usage as a fraction of the filesystem-relative
-    /// cache budget.
-    pub fn usage_fraction(&self) -> Result<f64> {
-        let used = self.total_size_bytes()?;
+    /// Return the current physical cache usage as a fraction of the
+    /// filesystem-relative cache budget.
+    pub fn physical_usage_fraction(&self) -> Result<f64> {
+        let used = self.total_physical_usage_bytes()?;
         let budget = self.budget_bytes()?;
         Ok(used as f64 / budget as f64)
     }
 
-    /// Return `true` when cache usage exceeds the high-water mark and
+    /// Return `true` when physical cache usage exceeds the high-water mark and
     /// eviction should be triggered.
     pub fn needs_eviction(&self) -> Result<bool> {
-        let fraction = self.usage_fraction()?;
+        let fraction = self.physical_usage_fraction()?;
         Ok(fraction > self.high_water)
     }
 
@@ -485,11 +510,14 @@ impl CacheManager {
                 .flatten();
 
             // Re-check whether we still need to evict.
-            let fraction = self.usage_fraction()?;
+            let fraction = self.physical_usage_fraction()?;
             if fraction <= self.low_water {
+                let usage = self.total_usage_bytes().unwrap_or_default();
                 info!(
                     evicted,
-                    usage_fraction = fraction,
+                    physical_usage_fraction = fraction,
+                    apparent_usage_bytes = usage.apparent_bytes,
+                    physical_usage_bytes = usage.physical_bytes,
                     "eviction complete: reached low-water mark"
                 );
                 // Record remaining candidates as not-evicted.
@@ -573,7 +601,13 @@ impl CacheManager {
             .await;
         }
 
-        info!(evicted, "eviction sweep finished");
+        let usage = self.total_usage_bytes().unwrap_or_default();
+        info!(
+            evicted,
+            apparent_usage_bytes = usage.apparent_bytes,
+            physical_usage_bytes = usage.physical_bytes,
+            "eviction sweep finished"
+        );
         Ok(evicted)
     }
 
@@ -651,7 +685,7 @@ impl CacheManager {
 
         let mut evicted: usize = 0;
         for (path, _) in &files {
-            let fraction = self.usage_fraction()?;
+            let fraction = self.physical_usage_fraction()?;
             if fraction <= self.low_water {
                 break;
             }
@@ -664,7 +698,13 @@ impl CacheManager {
         }
 
         if evicted > 0 {
-            info!(evicted, "archive eviction sweep finished");
+            let usage = self.total_usage_bytes().unwrap_or_default();
+            info!(
+                evicted,
+                apparent_usage_bytes = usage.apparent_bytes,
+                physical_usage_bytes = usage.physical_bytes,
+                "archive eviction sweep finished"
+            );
         }
 
         Ok(evicted)
@@ -706,14 +746,15 @@ impl CacheManager {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Recursively compute the total size of all files under `dir`.
-pub(crate) fn dir_size(dir: &Path) -> Result<u64> {
-    let mut total: u64 = 0;
+/// Recursively compute de-duplicated apparent and physical file usage.
+pub(crate) fn dir_usage(dir: &Path) -> Result<DiskUsage> {
+    let mut usage = DiskUsage::default();
 
     if !dir.exists() {
-        return Ok(0);
+        return Ok(usage);
     }
 
+    let mut seen = HashSet::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
         let entries = match std::fs::read_dir(&current) {
@@ -731,13 +772,56 @@ pub(crate) fn dir_size(dir: &Path) -> Result<u64> {
             };
             if meta.is_dir() {
                 stack.push(entry.path());
-            } else {
-                total += meta.len();
+            } else if meta.is_file() {
+                add_file_usage(&mut usage, &mut seen, &meta);
             }
         }
     }
 
-    Ok(total)
+    Ok(usage)
+}
+
+#[cfg(unix)]
+fn add_file_usage(usage: &mut DiskUsage, seen: &mut HashSet<(u64, u64)>, meta: &std::fs::Metadata) {
+    if !seen.insert((meta.dev(), meta.ino())) {
+        return;
+    }
+    let file_usage = file_disk_usage(meta);
+    usage.apparent_bytes = usage
+        .apparent_bytes
+        .saturating_add(file_usage.apparent_bytes);
+    usage.physical_bytes = usage
+        .physical_bytes
+        .saturating_add(file_usage.physical_bytes);
+}
+
+#[cfg(not(unix))]
+fn add_file_usage(usage: &mut DiskUsage, seen: &mut HashSet<PathBuf>, meta: &std::fs::Metadata) {
+    let _ = seen;
+    let file_usage = file_disk_usage(meta);
+    usage.apparent_bytes = usage
+        .apparent_bytes
+        .saturating_add(file_usage.apparent_bytes);
+    usage.physical_bytes = usage
+        .physical_bytes
+        .saturating_add(file_usage.physical_bytes);
+}
+
+pub(crate) fn file_disk_usage(meta: &std::fs::Metadata) -> DiskUsage {
+    DiskUsage {
+        apparent_bytes: meta.len(),
+        physical_bytes: physical_file_bytes(meta),
+    }
+}
+
+#[cfg(unix)]
+fn physical_file_bytes(meta: &std::fs::Metadata) -> u64 {
+    meta.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn physical_file_bytes(meta: &std::fs::Metadata) -> u64 {
+    meta.len()
 }
 
 pub(crate) fn is_usable_bare_repo(path: &Path) -> bool {
@@ -1055,47 +1139,69 @@ deadbeef refs/heads/main\n",
         assert_eq!(snapshot.repo_count, 0);
         assert!(
             snapshot
-                .mirror_sizes
+                .mirror_apparent_sizes
                 .iter()
                 .any(|(repo, size)| repo == owner_repo && *size >= 11)
         );
         assert!(
             snapshot
-                .subtree_sizes
+                .mirror_physical_sizes
+                .iter()
+                .any(|(repo, size)| repo == owner_repo && *size > 0)
+        );
+        assert!(
+            snapshot
+                .subtree_apparent_sizes
                 .iter()
                 .any(|(subtree, size)| subtree == "mirrors" && *size >= 11)
         );
         assert!(
             snapshot
-                .subtree_sizes
+                .subtree_apparent_sizes
                 .iter()
                 .any(|(subtree, size)| subtree == "snapshots" && *size >= 7)
         );
         assert!(
             snapshot
-                .subtree_sizes
+                .subtree_apparent_sizes
                 .iter()
                 .any(|(subtree, size)| subtree == "state_generations" && *size >= 5)
         );
         assert!(
             snapshot
-                .subtree_sizes
+                .subtree_apparent_sizes
                 .iter()
                 .any(|(subtree, size)| subtree == "state_delta" && *size >= 3)
         );
         assert!(
             snapshot
-                .subtree_sizes
+                .subtree_apparent_sizes
                 .iter()
                 .any(|(subtree, size)| subtree == "state_tee" && *size >= 2)
         );
         assert_eq!(
-            snapshot.total_size_bytes,
+            snapshot.total_apparent_usage_bytes,
             snapshot
-                .subtree_sizes
+                .subtree_apparent_sizes
                 .iter()
                 .map(|(_, size)| *size)
                 .sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn disk_usage_deduplicates_hardlinks_for_physical_usage() {
+        let tmp = tempdir().unwrap();
+        let original = tmp.path().join("pack");
+        let hardlink = tmp.path().join("pack.link");
+        fs::write(&original, vec![1_u8; 4096]).unwrap();
+        fs::hard_link(&original, &hardlink).unwrap();
+
+        let usage = dir_usage(tmp.path()).unwrap();
+        assert_eq!(usage.apparent_bytes, 4096);
+        assert_eq!(
+            usage.physical_bytes,
+            file_disk_usage(&fs::metadata(&original).unwrap()).physical_bytes
         );
     }
 }

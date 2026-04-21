@@ -898,13 +898,17 @@ impl PackCache {
     }
 
     async fn refresh_size_metric(&self) {
-        let size = tokio::task::spawn_blocking({
+        let usage = tokio::task::spawn_blocking({
             let root = self.root.clone();
-            move || directory_size(&root).unwrap_or(0)
+            move || directory_usage(&root).unwrap_or_default()
         })
         .await
-        .unwrap_or(0);
-        crate::metrics::set_pack_cache_size_bytes(&self.metrics, size);
+        .unwrap_or_default();
+        crate::metrics::set_pack_cache_usage_bytes(
+            &self.metrics,
+            usage.apparent_bytes,
+            usage.physical_bytes,
+        );
     }
 }
 
@@ -946,10 +950,7 @@ impl PackCacheWriter {
                 stitched_trailer_sha1: None,
             })?;
             self.completed = true;
-            crate::metrics::set_pack_cache_size_bytes(
-                &self.metrics,
-                directory_size(&self.root).unwrap_or(0),
-            );
+            self.record_pack_cache_usage_metric();
             self.release_inflight().await;
             let pack_id = self.key.as_str().to_string();
             self.spawn_indexed_promotion(pack_id, None);
@@ -959,19 +960,13 @@ impl PackCacheWriter {
         {
             warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove undersized pack cache temp pack");
             self.completed = true;
-            crate::metrics::set_pack_cache_size_bytes(
-                &self.metrics,
-                directory_size(&self.root).unwrap_or(0),
-            );
+            self.record_pack_cache_usage_metric();
             self.release_inflight().await;
             return Ok(());
         }
         if !self.completed {
             self.completed = true;
-            crate::metrics::set_pack_cache_size_bytes(
-                &self.metrics,
-                directory_size(&self.root).unwrap_or(0),
-            );
+            self.record_pack_cache_usage_metric();
             self.release_inflight().await;
         }
         Ok(())
@@ -1009,10 +1004,7 @@ impl PackCacheWriter {
         })?;
         self.raw_pack_bytes_written = delta_pack.len() as u64;
         self.completed = true;
-        crate::metrics::set_pack_cache_size_bytes(
-            &self.metrics,
-            directory_size(&self.root).unwrap_or(0),
-        );
+        self.record_pack_cache_usage_metric();
         self.release_inflight().await;
         let pack_id = format!("{}-delta", self.key.as_str());
         self.spawn_indexed_promotion(pack_id, Some(base_key.clone()));
@@ -1034,10 +1026,7 @@ impl PackCacheWriter {
         self.write_entry_manifest(&manifest)?;
         self.raw_pack_bytes_written = 0;
         self.completed = true;
-        crate::metrics::set_pack_cache_size_bytes(
-            &self.metrics,
-            directory_size(&self.root).unwrap_or(0),
-        );
+        self.record_pack_cache_usage_metric();
         self.release_inflight().await;
         self.record_promotion(Some(base_key));
         Ok(())
@@ -1050,10 +1039,7 @@ impl PackCacheWriter {
             warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove aborted pack cache temp raw pack");
         }
         self.completed = true;
-        crate::metrics::set_pack_cache_size_bytes(
-            &self.metrics,
-            directory_size(&self.root).unwrap_or(0),
-        );
+        self.record_pack_cache_usage_metric();
         self.release_inflight().await;
     }
 
@@ -1107,16 +1093,22 @@ impl PackCacheWriter {
                 &self.root,
                 &mut self.recent_pack_cache_keys.lock().unwrap(),
             );
-            crate::metrics::set_pack_cache_size_bytes(
-                &self.metrics,
-                directory_size(&self.root).unwrap_or(0),
-            );
+            self.record_pack_cache_usage_metric();
         }
         debug!(
             key = %self.key.as_str(),
             bytes = self.raw_pack_bytes_written,
             path = %self.entry_manifest_path().display(),
             "stored pack cache artifact"
+        );
+    }
+
+    fn record_pack_cache_usage_metric(&self) {
+        let usage = directory_usage(&self.root).unwrap_or_default();
+        crate::metrics::set_pack_cache_usage_bytes(
+            &self.metrics,
+            usage.apparent_bytes,
+            usage.physical_bytes,
         );
     }
 
@@ -1589,21 +1581,8 @@ fn parse_pkt_len(header: &[u8]) -> Option<usize> {
     usize::from_str_radix(text, 16).ok()
 }
 
-fn directory_size(root: &Path) -> std::io::Result<u64> {
-    if !root.exists() {
-        return Ok(0);
-    }
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-        } else if metadata.is_dir() {
-            total = total.saturating_add(directory_size(&entry.path())?);
-        }
-    }
-    Ok(total)
+fn directory_usage(root: &Path) -> std::io::Result<crate::cache::manager::DiskUsage> {
+    crate::cache::manager::dir_usage(root).map_err(std::io::Error::other)
 }
 
 fn now_unix_secs() -> u64 {
@@ -1762,7 +1741,7 @@ fn collect_prune_entries(root: &Path) -> Result<(HashMap<String, PackCachePruneE
         let Some(key) = pack_cache_key_from_file_name(file_name) else {
             continue;
         };
-        let size = metadata.len();
+        let size = crate::cache::manager::file_disk_usage(&metadata).physical_bytes;
         entries
             .entry(key.clone())
             .or_insert_with(|| PackCachePruneEntry::new(key))
@@ -1812,14 +1791,21 @@ fn collect_prune_entries(root: &Path) -> Result<(HashMap<String, PackCachePruneE
                     if let Ok(metadata) = std::fs::metadata(&path)
                         && metadata.is_file()
                     {
-                        entry.add_owned_bytes(metadata.len());
+                        entry.add_owned_bytes(
+                            crate::cache::manager::file_disk_usage(&metadata).physical_bytes,
+                        );
                     }
                 }
             }
         }
     }
 
-    Ok((entries, directory_size(root).unwrap_or(0)))
+    Ok((
+        entries,
+        directory_usage(root)
+            .map(|usage| usage.physical_bytes)
+            .unwrap_or(0),
+    ))
 }
 
 fn remove_prune_entry(entry: PackCachePruneEntry) -> std::io::Result<u64> {
@@ -2003,7 +1989,9 @@ fn prune_to_byte_watermarks_with_active(
                     "garbage collect unreferenced pack cache packs after removing {candidate_key}"
                 )
             })?;
-            total = directory_size(root).unwrap_or(0);
+            total = directory_usage(root)
+                .map(|usage| usage.physical_bytes)
+                .unwrap_or(0);
         }
     }
 

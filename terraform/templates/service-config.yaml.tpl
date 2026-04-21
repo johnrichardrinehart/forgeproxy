@@ -48,6 +48,7 @@ pack_cache:
   low_water_mark: ${pack_cache_low_water_mark}
   eviction_policy: "${pack_cache_eviction_policy}"
   wait_for_inflight_secs: ${pack_cache_wait_for_inflight_secs}
+  max_concurrent_request_deltas: ${pack_cache_max_concurrent_request_deltas}
   min_response_bytes: ${pack_cache_min_response_bytes}
 
 storage:

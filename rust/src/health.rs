@@ -196,21 +196,23 @@ async fn check_disk(config: &Config) -> CheckResult {
     let result = tokio::task::spawn_blocking(move || disk_usage(&path, max_percent)).await;
 
     match result {
-        Ok(Ok((used, capacity, budget))) => {
-            if used > budget {
+        Ok(Ok((usage, capacity, budget))) => {
+            if usage.physical_bytes > budget {
                 CheckResult::unhealthy(format!(
-                    "cache usage {used} bytes exceeds configured budget {budget}"
+                    "cache physical_usage {} bytes exceeds configured budget {budget}; apparent_usage {} bytes",
+                    usage.physical_bytes, usage.apparent_bytes,
                 ))
             } else {
                 let pct = if capacity > 0 {
-                    (used as f64 / capacity as f64) * 100.0
+                    (usage.physical_bytes as f64 / capacity as f64) * 100.0
                 } else {
                     0.0
                 };
                 CheckResult {
                     ok: true,
                     detail: Some(format!(
-                        "used {used} / {budget} budget ({pct:.1}% of filesystem)"
+                        "physical_usage {} / {budget} budget ({pct:.1}% of filesystem); apparent_usage {}",
+                        usage.physical_bytes, usage.apparent_bytes,
                     )),
                 }
             }
@@ -220,11 +222,14 @@ async fn check_disk(config: &Config) -> CheckResult {
     }
 }
 
-/// Compute (used_bytes_in_dir, filesystem_capacity, configured_budget_bytes)
+/// Compute (cache_usage, filesystem_capacity, configured_budget_bytes)
 /// for the path's mount.
-fn disk_usage(path: &str, max_percent: f64) -> anyhow::Result<(u64, u64, u64)> {
+fn disk_usage(
+    path: &str,
+    max_percent: f64,
+) -> anyhow::Result<(crate::cache::manager::DiskUsage, u64, u64)> {
     let dir = std::path::Path::new(path);
-    let used = crate::cache::manager::dir_size(dir)?;
+    let used = crate::cache::manager::dir_usage(dir)?;
     let capacity = crate::cache::capacity::filesystem_capacity_bytes(dir)?;
     let budget = crate::cache::capacity::percent_of_bytes(capacity, max_percent);
     Ok((used, capacity, budget))

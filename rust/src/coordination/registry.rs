@@ -1741,6 +1741,18 @@ impl PackCacheStitchFailure {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PackCacheDeltaPriority {
+    Background,
+    Request,
+}
+
+struct PackCacheDeltaBuild {
+    pack: Vec<u8>,
+    semaphore_wait: Duration,
+    pack_objects_elapsed: Duration,
+}
+
 fn spawn_pack_cache_warming(
     state: crate::AppState,
     owner_repo: String,
@@ -1869,10 +1881,16 @@ async fn warm_pack_cache_for_generation(
             .await
             .map_err(|error| PackCacheStitchFailure::new("finish_alias", error));
     }
-    let delta_pack = build_pack_cache_delta(state, published_path, &missing_objects).await?;
+    let delta_build = build_pack_cache_delta(
+        state,
+        published_path,
+        &missing_objects,
+        PackCacheDeltaPriority::Background,
+    )
+    .await?;
 
     writer
-        .finish_composite(&prev_entry.key, &delta_pack)
+        .finish_composite(&prev_entry.key, &delta_build.pack)
         .await
         .map(|_| ())
         .map_err(|error| PackCacheStitchFailure::new("finish_composite", error))
@@ -1882,13 +1900,15 @@ async fn build_pack_cache_delta(
     state: &crate::AppState,
     published_path: &Path,
     object_ids: &[String],
-) -> std::result::Result<Vec<u8>, PackCacheStitchFailure> {
-    let permit = state
-        .bundle_generation_semaphore
-        .clone()
+    priority: PackCacheDeltaPriority,
+) -> std::result::Result<PackCacheDeltaBuild, PackCacheStitchFailure> {
+    let wait_started_at = Instant::now();
+    let permit = semaphore_for_pack_cache_delta(state, priority)
         .acquire_owned()
         .await
         .map_err(|error| PackCacheStitchFailure::new("semaphore", error))?;
+    let semaphore_wait = wait_started_at.elapsed();
+    let pack_started_at = Instant::now();
     let delta_pack = crate::git::commands::git_pack_objects_exact(
         published_path,
         object_ids,
@@ -1896,8 +1916,53 @@ async fn build_pack_cache_delta(
     )
     .await
     .map_err(|error| PackCacheStitchFailure::new("delta_pack", error))?;
+    let pack_objects_elapsed = pack_started_at.elapsed();
     drop(permit);
-    Ok(delta_pack)
+    Ok(PackCacheDeltaBuild {
+        pack: delta_pack,
+        semaphore_wait,
+        pack_objects_elapsed,
+    })
+}
+
+fn semaphore_for_pack_cache_delta(
+    state: &crate::AppState,
+    priority: PackCacheDeltaPriority,
+) -> std::sync::Arc<tokio::sync::Semaphore> {
+    select_pack_cache_delta_semaphore(
+        &state.bundle_generation_semaphore,
+        &state.request_pack_delta_semaphore,
+        priority,
+    )
+}
+
+fn select_pack_cache_delta_semaphore(
+    background: &std::sync::Arc<tokio::sync::Semaphore>,
+    request: &std::sync::Arc<tokio::sync::Semaphore>,
+    priority: PackCacheDeltaPriority,
+) -> std::sync::Arc<tokio::sync::Semaphore> {
+    match priority {
+        PackCacheDeltaPriority::Background => background.clone(),
+        PackCacheDeltaPriority::Request => request.clone(),
+    }
+}
+
+fn observe_on_demand_composite_stage(
+    state: &crate::AppState,
+    protocol: crate::metrics::Protocol,
+    owner_repo: &str,
+    stage: &str,
+    result: &str,
+    elapsed: Duration,
+) {
+    crate::metrics::observe_pack_cache_on_demand_composite_stage(
+        &state.metrics,
+        protocol,
+        owner_repo,
+        stage,
+        result,
+        elapsed,
+    );
 }
 
 pub(crate) struct PackCacheCompositeMiss {
@@ -1907,23 +1972,59 @@ pub(crate) struct PackCacheCompositeMiss {
 
 pub(crate) async fn try_finish_pack_cache_delta_composite(
     state: &crate::AppState,
+    protocol: crate::metrics::Protocol,
     owner_repo: &str,
     repo_path: &Path,
     writer: Box<crate::pack_cache::PackCacheWriter>,
 ) -> std::result::Result<crate::pack_cache::PackCacheReadLease, PackCacheCompositeMiss> {
+    let total_started_at = Instant::now();
+    let candidate_started_at = Instant::now();
     let candidates = state.pack_cache.lookup_recent_compatible_keys(writer.key());
     if candidates.is_empty() {
+        observe_on_demand_composite_stage(
+            state,
+            protocol.clone(),
+            owner_repo,
+            "candidate_lookup",
+            "no_base",
+            candidate_started_at.elapsed(),
+        );
+        observe_on_demand_composite_stage(
+            state,
+            protocol,
+            owner_repo,
+            "total",
+            "no_base",
+            total_started_at.elapsed(),
+        );
         return Err(PackCacheCompositeMiss {
             writer: Some(writer),
             reason: "no_base",
         });
     }
+    observe_on_demand_composite_stage(
+        state,
+        protocol.clone(),
+        owner_repo,
+        "candidate_lookup",
+        "ok",
+        candidate_started_at.elapsed(),
+    );
     let Some(new_request_wants) = writer.key().base_request_wants().map(<[String]>::to_vec) else {
+        observe_on_demand_composite_stage(
+            state,
+            protocol.clone(),
+            owner_repo,
+            "total",
+            "missing_request_wants",
+            total_started_at.elapsed(),
+        );
         return Err(PackCacheCompositeMiss {
             writer: Some(writer),
             reason: "missing_request_wants",
         });
     };
+    let base_select_started_at = Instant::now();
     let selected_base = match select_pack_cache_base_entry(
         repo_path,
         &state.pack_cache,
@@ -1932,14 +2033,56 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
     )
     .await
     {
-        Ok(Some(selection)) => selection,
+        Ok(Some(selection)) => {
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "base_select",
+                "ok",
+                base_select_started_at.elapsed(),
+            );
+            selection
+        }
         Ok(None) => {
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "base_select",
+                "no_usable_base",
+                base_select_started_at.elapsed(),
+            );
+            observe_on_demand_composite_stage(
+                state,
+                protocol,
+                owner_repo,
+                "total",
+                "no_usable_base",
+                total_started_at.elapsed(),
+            );
             return Err(PackCacheCompositeMiss {
                 writer: Some(writer),
                 reason: "no_usable_base",
             });
         }
         Err(error) => {
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "base_select",
+                "error",
+                base_select_started_at.elapsed(),
+            );
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "total",
+                "base_eval",
+                total_started_at.elapsed(),
+            );
             warn!(repo = %owner_repo, error = %error, "failed to evaluate pack cache base candidates from mirror");
             return Err(PackCacheCompositeMiss {
                 writer: Some(writer),
@@ -1949,10 +2092,27 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
     };
     if selected_base.missing_objects.is_empty() {
         let alias_key = writer.key().clone();
+        let finish_started_at = Instant::now();
         writer
             .finish_alias(&selected_base.entry.key)
             .await
             .map_err(|error| {
+                observe_on_demand_composite_stage(
+                    state,
+                    protocol.clone(),
+                    owner_repo,
+                    "finish_alias",
+                    "error",
+                    finish_started_at.elapsed(),
+                );
+                observe_on_demand_composite_stage(
+                    state,
+                    protocol.clone(),
+                    owner_repo,
+                    "total",
+                    "finish_alias",
+                    total_started_at.elapsed(),
+                );
                 warn!(
                     repo = %owner_repo,
                     error = %error,
@@ -1963,11 +2123,27 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
                     reason: "finish_alias",
                 }
             })?;
+        observe_on_demand_composite_stage(
+            state,
+            protocol.clone(),
+            owner_repo,
+            "finish_alias",
+            "ok",
+            finish_started_at.elapsed(),
+        );
         let hit = state
             .pack_cache
             .lookup_by_key(&alias_key)
             .await
             .map_err(|error| {
+                observe_on_demand_composite_stage(
+                    state,
+                    protocol.clone(),
+                    owner_repo,
+                    "total",
+                    "artifact_open_failed",
+                    total_started_at.elapsed(),
+                );
                 warn!(
                     repo = %owner_repo,
                     error = %error,
@@ -1982,31 +2158,96 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
                 writer: None,
                 reason: "artifact_open_failed",
             })?;
+        observe_on_demand_composite_stage(
+            state,
+            protocol,
+            owner_repo,
+            "total",
+            "alias",
+            total_started_at.elapsed(),
+        );
         return Ok(hit);
     }
 
-    let delta_pack =
-        match build_pack_cache_delta(state, repo_path, &selected_base.missing_objects).await {
-            Ok(delta_pack) => delta_pack,
-            Err(failure) => {
-                warn!(
-                    repo = %owner_repo,
-                    reason = failure.reason,
-                    error = %failure.error,
-                    "failed to build on-demand pack cache delta"
-                );
-                return Err(PackCacheCompositeMiss {
-                    writer: Some(writer),
-                    reason: failure.reason,
-                });
-            }
-        };
+    let delta_build = match build_pack_cache_delta(
+        state,
+        repo_path,
+        &selected_base.missing_objects,
+        PackCacheDeltaPriority::Request,
+    )
+    .await
+    {
+        Ok(delta_build) => {
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "semaphore_wait",
+                "ok",
+                delta_build.semaphore_wait,
+            );
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "delta_pack_objects",
+                "ok",
+                delta_build.pack_objects_elapsed,
+            );
+            delta_build
+        }
+        Err(failure) => {
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "delta_pack_objects",
+                failure.reason,
+                total_started_at.elapsed(),
+            );
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "total",
+                failure.reason,
+                total_started_at.elapsed(),
+            );
+            warn!(
+                repo = %owner_repo,
+                reason = failure.reason,
+                error = %failure.error,
+                "failed to build on-demand pack cache delta"
+            );
+            return Err(PackCacheCompositeMiss {
+                writer: Some(writer),
+                reason: failure.reason,
+            });
+        }
+    };
 
     let composite_key = writer.key().clone();
+    let finish_started_at = Instant::now();
     writer
-        .finish_composite(&selected_base.entry.key, &delta_pack)
+        .finish_composite(&selected_base.entry.key, &delta_build.pack)
         .await
         .map_err(|error| {
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "finish_composite",
+                "error",
+                finish_started_at.elapsed(),
+            );
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "total",
+                "finish_composite",
+                total_started_at.elapsed(),
+            );
             warn!(
                 repo = %owner_repo,
                 error = %error,
@@ -2017,11 +2258,27 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
                 reason: "finish_composite",
             }
         })?;
+    observe_on_demand_composite_stage(
+        state,
+        protocol.clone(),
+        owner_repo,
+        "finish_composite",
+        "ok",
+        finish_started_at.elapsed(),
+    );
     let hit = state
         .pack_cache
         .lookup_by_key(&composite_key)
         .await
         .map_err(|error| {
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "total",
+                "artifact_open_failed",
+                total_started_at.elapsed(),
+            );
             warn!(
                 repo = %owner_repo,
                 error = %error,
@@ -2033,6 +2290,14 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
             }
         })?
         .ok_or_else(|| {
+            observe_on_demand_composite_stage(
+                state,
+                protocol.clone(),
+                owner_repo,
+                "total",
+                "artifact_open_failed",
+                total_started_at.elapsed(),
+            );
             warn!(
                 repo = %owner_repo,
                 "on-demand pack cache composite disappeared before replay"
@@ -2042,9 +2307,21 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
                 reason: "artifact_open_failed",
             }
         })?;
+    observe_on_demand_composite_stage(
+        state,
+        protocol.clone(),
+        owner_repo,
+        "total",
+        "composite",
+        total_started_at.elapsed(),
+    );
     info!(
         repo = %owner_repo,
-        delta_bytes = delta_pack.len(),
+        missing_objects = selected_base.missing_objects.len(),
+        delta_bytes = delta_build.pack.len(),
+        semaphore_wait_ms = delta_build.semaphore_wait.as_millis(),
+        delta_pack_objects_ms = delta_build.pack_objects_elapsed.as_millis(),
+        total_elapsed_ms = total_started_at.elapsed().as_millis(),
         "finished on-demand pack cache composite"
     );
     Ok(hit)
@@ -4831,6 +5108,26 @@ mod tests {
         crate::git::commands::git_index_pack_to_idx(&stitched_path, &stitched_idx_path)
             .await
             .expect("filtered composite pack should index without duplicate objects");
+    }
+
+    #[test]
+    fn request_delta_semaphore_is_independent_from_background_generation() {
+        let background = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let request = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let _background_permit = background
+            .clone()
+            .try_acquire_owned()
+            .expect("background semaphore should be saturatable");
+
+        let selected = select_pack_cache_delta_semaphore(
+            &background,
+            &request,
+            PackCacheDeltaPriority::Request,
+        );
+        assert!(
+            selected.try_acquire_owned().is_ok(),
+            "request-time delta generation must not queue behind background generation"
+        );
     }
 
     #[tokio::test]

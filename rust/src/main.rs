@@ -126,6 +126,10 @@ pub struct AppState {
     pub tee_capture_semaphore: Arc<Semaphore>,
     /// Semaphore limiting concurrent CPU-heavy bundle-generation subprocesses.
     pub bundle_generation_semaphore: Arc<Semaphore>,
+    /// Semaphore limiting request-time pack-cache delta generation. This is
+    /// intentionally separate from background bundle generation so foreground
+    /// clone misses do not queue behind proactive warming or index preparation.
+    pub request_pack_delta_semaphore: Arc<Semaphore>,
     /// Resolved maximum number of repos to process concurrently during the
     /// bundle lifecycle tick.
     pub bundle_max_concurrency: usize,
@@ -227,12 +231,21 @@ impl AppState {
     pub fn refresh_live_metrics(&self) {
         match self.cache_manager.metrics_snapshot() {
             Ok(snapshot) => {
-                crate::metrics::set_cache_size_bytes(&self.metrics, snapshot.total_size_bytes);
-                crate::metrics::set_cache_repos_total(&self.metrics, snapshot.repo_count);
-                crate::metrics::replace_mirror_size_bytes(&self.metrics, &snapshot.mirror_sizes);
-                crate::metrics::replace_cache_subtree_size_bytes(
+                crate::metrics::set_cache_usage_bytes(
                     &self.metrics,
-                    &snapshot.subtree_sizes,
+                    snapshot.total_apparent_usage_bytes,
+                    snapshot.total_physical_usage_bytes,
+                );
+                crate::metrics::set_cache_repos_total(&self.metrics, snapshot.repo_count);
+                crate::metrics::replace_mirror_usage_bytes(
+                    &self.metrics,
+                    &snapshot.mirror_apparent_sizes,
+                    &snapshot.mirror_physical_sizes,
+                );
+                crate::metrics::replace_cache_subtree_usage_bytes(
+                    &self.metrics,
+                    &snapshot.subtree_apparent_sizes,
+                    &snapshot.subtree_physical_sizes,
                 );
             }
             Err(error) => {
@@ -1151,6 +1164,9 @@ async fn build_app_state(
         tee_capture_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_tee_captures)),
         bundle_generation_semaphore: Arc::new(Semaphore::new(
             bundle_execution_policy.max_concurrent_generations,
+        )),
+        request_pack_delta_semaphore: Arc::new(Semaphore::new(
+            config.pack_cache.max_concurrent_request_deltas,
         )),
         bundle_max_concurrency: bundle_execution_policy.max_concurrent_generations,
         bundle_pack_threads: bundle_execution_policy.pack_threads,

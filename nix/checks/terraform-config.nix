@@ -31,6 +31,7 @@ let
         pack_cache_low_water_mark                  = 0.75
         pack_cache_eviction_policy                 = "lru"
         pack_cache_wait_for_inflight_secs          = 120
+        pack_cache_max_concurrent_request_deltas   = 1
         pack_cache_min_response_bytes              = 67108864
         bundle_pack_threads                        = 4
         bundle_max_incremental_bundles             = 1

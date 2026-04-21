@@ -43,6 +43,7 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     pack_cache_low_water_mark                  = var.pack_cache_low_water_mark
     pack_cache_eviction_policy                 = var.pack_cache_eviction_policy
     pack_cache_wait_for_inflight_secs          = var.pack_cache_wait_for_inflight_secs
+    pack_cache_max_concurrent_request_deltas   = var.pack_cache_max_concurrent_request_deltas
     pack_cache_min_response_bytes              = var.pack_cache_min_response_bytes
     bundle_pack_threads                        = var.bundle_pack_threads
     bundle_max_incremental_bundles             = var.bundle_max_incremental_bundles

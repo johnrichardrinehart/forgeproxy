@@ -454,6 +454,17 @@ variable "pack_cache_wait_for_inflight_secs" {
   description = "Seconds a same-key clone waits for an in-flight cached pack artifact."
 }
 
+variable "pack_cache_max_concurrent_request_deltas" {
+  type        = number
+  default     = 1
+  description = "Maximum request-time pack-cache composite delta builds per forgeproxy instance."
+
+  validation {
+    condition     = var.pack_cache_max_concurrent_request_deltas > 0
+    error_message = "pack_cache_max_concurrent_request_deltas must be greater than 0."
+  }
+}
+
 variable "pack_cache_min_response_bytes" {
   type        = number
   default     = 67108864 # 64 MiB
