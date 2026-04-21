@@ -332,12 +332,22 @@ pub async fn git_fetch(
     remote_url: &str,
     env_vars: &[(String, String)],
 ) -> Result<FetchResult> {
-    git_fetch_refspecs(
+    git_fetch_with_context(repo_path, remote_url, env_vars, None).await
+}
+
+pub async fn git_fetch_with_context(
+    repo_path: &Path,
+    remote_url: &str,
+    env_vars: &[(String, String)],
+    fetch_priority: Option<&str>,
+) -> Result<FetchResult> {
+    git_fetch_refspecs_with_context(
         repo_path,
         remote_url,
         env_vars,
         &["+refs/*:refs/*".to_string()],
         true,
+        fetch_priority,
     )
     .await
 }
@@ -348,12 +358,13 @@ pub async fn git_fetch(
 /// Narrow request-time catch-up fetches should typically disable pruning so a
 /// partial refspec update does not delete unrelated refs.
 #[instrument(skip(env_vars, remote_url, refspecs), fields(repo = %repo_path.display()))]
-pub async fn git_fetch_refspecs(
+pub async fn git_fetch_refspecs_with_context(
     repo_path: &Path,
     remote_url: &str,
     env_vars: &[(String, String)],
     refspecs: &[String],
     prune: bool,
+    fetch_priority: Option<&str>,
 ) -> Result<FetchResult> {
     if refspecs.is_empty() {
         bail!("git fetch requires at least one refspec");
@@ -432,6 +443,7 @@ pub async fn git_fetch_refspecs(
         } else {
             "selected"
         },
+        fetch_priority = fetch_priority.unwrap_or("unspecified"),
         refspec_count = refspecs.len(),
         prune,
         "git fetch started"
@@ -2128,12 +2140,13 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
 
         timeout(
             Duration::from_secs(10),
-            git_fetch_refspecs(
+            git_fetch_refspecs_with_context(
                 &cache_path,
                 remote_path.to_str().unwrap(),
                 &[],
                 &refspecs,
                 false,
+                Some("test"),
             ),
         )
         .await
