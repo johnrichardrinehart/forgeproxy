@@ -389,6 +389,35 @@ enum FetchPriority {
     TeeConvergence,
 }
 
+impl FetchPriority {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::RequestTime => "request_time",
+            Self::Background => "background",
+            Self::TeeConvergence => "tee_convergence",
+        }
+    }
+}
+
+fn is_request_time_selected_catch_up(
+    priority: FetchPriority,
+    request_refspecs: Option<&[String]>,
+) -> bool {
+    priority == FetchPriority::RequestTime && request_refspecs.is_some_and(|refs| !refs.is_empty())
+}
+
+fn should_bypass_same_node_hydration_dedup(
+    priority: FetchPriority,
+    request_refspecs: Option<&[String]>,
+    has_repo_mirror: bool,
+) -> bool {
+    has_repo_mirror && is_request_time_selected_catch_up(priority, request_refspecs)
+}
+
+fn should_update_hydration_state_for_delta_fetch(priority: FetchPriority) -> bool {
+    priority != FetchPriority::RequestTime
+}
+
 fn normalize_owner_repo(owner_repo: &str) -> String {
     crate::repo_identity::canonicalize_owner_repo(owner_repo)
 }
@@ -1047,7 +1076,14 @@ async fn try_ensure_repo_cloned_inner(
             let existing_info = get_repo_info(&state.valkey, &owner_repo)
                 .await?
                 .unwrap_or_default();
-            if hydration_in_progress_on_this_node(&existing_info, &node_id) {
+            let has_repo_mirror = state.cache_manager.has_repo_mirror(&owner_repo);
+            if hydration_in_progress_on_this_node(&existing_info, &node_id)
+                && !should_bypass_same_node_hydration_dedup(
+                    delta_fetch_priority,
+                    request_refspecs,
+                    has_repo_mirror,
+                )
+            {
                 crate::metrics::inc_hydration_skipped(
                     &state.metrics,
                     crate::metrics::HydrationSkipReason::SameNodeDedup,
@@ -1061,6 +1097,18 @@ async fn try_ensure_repo_cloned_inner(
                 );
                 return Ok(());
             }
+            if hydration_in_progress_on_this_node(&existing_info, &node_id) {
+                crate::metrics::inc_request_time_catch_up(&state.metrics, "same_node_overlap");
+                info!(
+                    repo = %owner_repo,
+                    fetch_priority = delta_fetch_priority.as_label(),
+                    request_refspec_count = request_refspecs.map_or(0, |refspecs| refspecs.len()),
+                    published = %published_repo_path.display(),
+                    mirror = %mirror_path.display(),
+                    hydrating_since_ts = existing_info.hydrating_since_ts,
+                    "allowing request-time selected-ref catch-up to overlap same-node hydration"
+                );
+            }
             info!(
                 repo = %owner_repo,
                 mirror = %mirror_path.display(),
@@ -1070,15 +1118,17 @@ async fn try_ensure_repo_cloned_inner(
             if let Some(permits) = clone_hydration_permits.take() {
                 release_clone_hydration_permits(state, permits).await?;
             }
-            let hydrate_started_at = chrono::Utc::now().timestamp();
-            let mut info = get_repo_info(&state.valkey, &owner_repo)
-                .await?
-                .unwrap_or_default();
-            info.status = "hydrating".to_string();
-            info.hydrating_node_id = node_id.clone();
-            info.hydrating_since_ts = hydrate_started_at;
-            info.bootstrap_bundle_pending = false;
-            set_repo_info(&state.valkey, &owner_repo, &info).await?;
+            if should_update_hydration_state_for_delta_fetch(delta_fetch_priority) {
+                let hydrate_started_at = chrono::Utc::now().timestamp();
+                let mut info = get_repo_info(&state.valkey, &owner_repo)
+                    .await?
+                    .unwrap_or_default();
+                info.status = "hydrating".to_string();
+                info.hydrating_node_id = node_id.clone();
+                info.hydrating_since_ts = hydrate_started_at;
+                info.bootstrap_bundle_pending = false;
+                set_repo_info(&state.valkey, &owner_repo, &info).await?;
+            }
 
             let delta_fetch =
                 fetch_delta_into_repo_mirror(
@@ -1090,15 +1140,23 @@ async fn try_ensure_repo_cloned_inner(
                 )
                 .await?;
             let published_repo_path = delta_fetch.published_repo_path;
-            let mut info = get_repo_info(&state.valkey, &owner_repo)
-                .await?
-                .unwrap_or_default();
-            info.status = "ready".to_string();
-            info.node_ids = node_id.clone();
-            info.hydrating_node_id.clear();
-            info.hydrating_since_ts = 0;
-            info.bootstrap_bundle_pending = false;
-            set_repo_info(&state.valkey, &owner_repo, &info).await?;
+            if should_update_hydration_state_for_delta_fetch(delta_fetch_priority) {
+                let mut info = get_repo_info(&state.valkey, &owner_repo)
+                    .await?
+                    .unwrap_or_default();
+                info.status = "ready".to_string();
+                info.node_ids = node_id.clone();
+                info.hydrating_node_id.clear();
+                info.hydrating_since_ts = 0;
+                info.bootstrap_bundle_pending = false;
+                set_repo_info(&state.valkey, &owner_repo, &info).await?;
+            } else {
+                info!(
+                    repo = %owner_repo,
+                    fetch_priority = delta_fetch_priority.as_label(),
+                    "request-time catch-up published without mutating hydration ownership state"
+                );
+            }
             crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
                 .await?;
             info!(
@@ -2754,21 +2812,35 @@ async fn fetch_delta_into_repo_mirror(
         };
         let fetch_result =
             if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
+                if priority == FetchPriority::RequestTime {
+                    crate::metrics::inc_request_time_catch_up(&state.metrics, "selected_fetch");
+                }
                 info!(
                     repo = %owner_repo,
+                    fetch_priority = priority.as_label(),
                     refspec_count = refspecs.len(),
                     "request-time catch-up is fetching only refs needed for the current wants"
                 );
-                crate::git::commands::git_fetch_refspecs(
+                crate::git::commands::git_fetch_refspecs_with_context(
                     &delta_repo_path,
                     clone_url,
                     &[],
                     refspecs,
                     false,
+                    Some(priority.as_label()),
                 )
                 .await?
             } else {
-                crate::git::commands::git_fetch(&delta_repo_path, clone_url, &[]).await?
+                if priority == FetchPriority::RequestTime {
+                    crate::metrics::inc_request_time_catch_up(&state.metrics, "full_fetch");
+                }
+                crate::git::commands::git_fetch_with_context(
+                    &delta_repo_path,
+                    clone_url,
+                    &[],
+                    Some(priority.as_label()),
+                )
+                .await?
             };
         drop(fetch_permits);
         {
@@ -2777,12 +2849,13 @@ async fn fetch_delta_into_repo_mirror(
             let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
             let delta_remote = delta_repo_path.to_string_lossy().to_string();
             if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
-                crate::git::commands::git_fetch_refspecs(
+                crate::git::commands::git_fetch_refspecs_with_context(
                     &mirror_path,
                     &delta_remote,
                     &[],
                     refspecs,
                     false,
+                    Some(priority.as_label()),
                 )
                 .await
                 .with_context(|| {
@@ -2793,15 +2866,20 @@ async fn fetch_delta_into_repo_mirror(
                     )
                 })?;
             } else {
-                crate::git::commands::git_fetch(&mirror_path, &delta_remote, &[])
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to integrate delta workspace {} into mirror {}",
-                            delta_repo_path.display(),
-                            mirror_path.display()
-                        )
-                    })?;
+                crate::git::commands::git_fetch_with_context(
+                    &mirror_path,
+                    &delta_remote,
+                    &[],
+                    Some(priority.as_label()),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to integrate delta workspace {} into mirror {}",
+                        delta_repo_path.display(),
+                        mirror_path.display()
+                    )
+                })?;
             }
             ensure_bare_head_ref(&mirror_path).await?;
             let mirror_validation_started_at = Instant::now();
@@ -2833,6 +2911,9 @@ async fn fetch_delta_into_repo_mirror(
                 priority != FetchPriority::RequestTime,
             )
             .await?;
+            if priority == FetchPriority::RequestTime {
+                crate::metrics::inc_request_time_catch_up(&state.metrics, "published");
+            }
             let published_repo_path = state.cache_manager.repo_path(owner_repo);
             Ok::<PathBuf, anyhow::Error>(published_repo_path)
         }
@@ -3610,7 +3691,13 @@ async fn hydrate_repo_from_tee_capture(
         clone_url = %redacted_clone_url,
         "starting tee hydration follow-on git fetch"
     );
-    let fetch_result = crate::git::commands::git_fetch(repo_path, clone_url, &[]).await;
+    let fetch_result = crate::git::commands::git_fetch_with_context(
+        repo_path,
+        clone_url,
+        &[],
+        Some(FetchPriority::TeeConvergence.as_label()),
+    )
+    .await;
     let cleanup_result = cleanup_temp_want_refs(seeded_want_ref_dir.as_deref()).await;
     let fetch_result = fetch_result?;
     cleanup_result?;
@@ -4355,6 +4442,7 @@ async fn try_start_request_time_catch_up(
         request_refspec_count = request_refspecs.as_ref().map_or(0, Vec::len),
         "starting request-time local catch-up task"
     );
+    crate::metrics::inc_request_time_catch_up(&state.metrics, "started");
     let state = state.clone();
     let owner_repo = owner_repo.to_string();
     let owner = owner.to_string();
@@ -4363,27 +4451,106 @@ async fn try_start_request_time_catch_up(
     let wants = wants.to_vec();
     Some(tokio::spawn(async move {
         let _catch_up_guard = catch_up_guard;
-        let current_decision =
-            classify_local_wants_satisfaction_without_request_restore(&state, &owner_repo, &wants)
-                .await?;
-        if matches!(current_decision, LocalServeDecision::SatisfiesWants { .. }) {
-            info!(
-                repo = %owner_repo,
-                wants = wants.len(),
-                "request-time local catch-up skipped because another publish already satisfied this request"
-            );
-            return Ok(());
-        }
+        let result = async {
+            let current_decision = classify_local_wants_satisfaction_without_request_restore(
+                &state,
+                &owner_repo,
+                &wants,
+            )
+            .await?;
+            if matches!(current_decision, LocalServeDecision::SatisfiesWants { .. }) {
+                info!(
+                    repo = %owner_repo,
+                    wants = wants.len(),
+                    "request-time local catch-up skipped because another publish already satisfied this request"
+                );
+                return Ok(());
+            }
 
-        ensure_repo_cloned_from_upstream_with_refspecs(
-            &state,
-            &owner,
-            &repo,
-            auth_header.as_deref(),
-            request_refspecs.as_deref(),
-        )
-        .await
+            if try_publish_mirror_generation_for_satisfied_wants(&state, &owner_repo, &wants)
+                .await?
+            {
+                return Ok(());
+            }
+
+            ensure_repo_cloned_from_upstream_with_refspecs(
+                &state,
+                &owner,
+                &repo,
+                auth_header.as_deref(),
+                request_refspecs.as_deref(),
+            )
+            .await
+        }
+        .await;
+        if result.is_err() {
+            crate::metrics::inc_request_time_catch_up(&state.metrics, "failed");
+        }
+        result
     }))
+}
+
+async fn try_publish_mirror_generation_for_satisfied_wants(
+    state: &crate::AppState,
+    owner_repo: &str,
+    wants: &[String],
+) -> Result<bool> {
+    if wants.is_empty() || !state.cache_manager.has_repo_mirror(owner_repo) {
+        return Ok(false);
+    }
+
+    let Some(_repo_generation_guard) =
+        try_acquire_local_repo_publish_guard(state, owner_repo).await
+    else {
+        debug!(
+            repo = %owner_repo,
+            wants = wants.len(),
+            "request-time mirror fast path skipped because publish work is already in progress"
+        );
+        return Ok(false);
+    };
+
+    let mirror_path = state.cache_manager.repo_mirror_path(owner_repo);
+    if !state.cache_manager.has_repo_at(&mirror_path) {
+        return Ok(false);
+    }
+
+    let missing_wants = crate::git::commands::git_missing_objects(&mirror_path, wants).await?;
+    if !missing_wants.is_empty() {
+        return Ok(false);
+    }
+
+    info!(
+        repo = %owner_repo,
+        mirror = %mirror_path.display(),
+        wants = wants.len(),
+        "request-time mirror fast path can satisfy all wants; publishing without upstream fetch"
+    );
+    quick_check_ready_repo(
+        state,
+        owner_repo,
+        &mirror_path,
+        "request-time mirror fast path",
+        Some(wants),
+    )
+    .await?;
+    let published_path = publish_repo_mirror_generation_inner(
+        state,
+        owner_repo,
+        "request-time mirror fast path",
+        false,
+    )
+    .await?;
+    crate::metrics::inc_request_time_catch_up(&state.metrics, "mirror_publish");
+    crate::metrics::inc_request_time_catch_up(&state.metrics, "published");
+    info!(
+        repo = %owner_repo,
+        mirror = %mirror_path.display(),
+        published = %published_path.display(),
+        wants = wants.len(),
+        "request-time mirror fast path published a local generation"
+    );
+    Ok(true)
 }
 
 pub async fn wait_for_local_catch_up(
@@ -4526,6 +4693,7 @@ pub async fn wait_for_local_catch_up(
         elapsed_ms = started_at.elapsed().as_millis(),
         "local published-generation catch-up timed out; falling back to upstream proxy"
     );
+    crate::metrics::inc_request_time_catch_up(&state.metrics, "timeout");
     Ok(last_decision)
 }
 
@@ -4833,6 +5001,52 @@ mod tests {
             ..Default::default()
         };
         assert!(!hydration_in_progress_on_this_node(&ready_here, "node-a"));
+    }
+
+    #[test]
+    fn request_time_selected_catch_up_bypasses_same_node_dedup_only_with_mirror() {
+        let refspecs = vec!["+refs/heads/main:refs/heads/main".to_string()];
+
+        assert!(should_bypass_same_node_hydration_dedup(
+            FetchPriority::RequestTime,
+            Some(&refspecs),
+            true,
+        ));
+        assert!(!should_bypass_same_node_hydration_dedup(
+            FetchPriority::RequestTime,
+            Some(&refspecs),
+            false,
+        ));
+        assert!(!should_bypass_same_node_hydration_dedup(
+            FetchPriority::RequestTime,
+            None,
+            true,
+        ));
+        assert!(!should_bypass_same_node_hydration_dedup(
+            FetchPriority::Background,
+            Some(&refspecs),
+            true,
+        ));
+    }
+
+    #[test]
+    fn request_time_delta_fetch_does_not_own_global_hydration_state() {
+        assert!(!should_update_hydration_state_for_delta_fetch(
+            FetchPriority::RequestTime
+        ));
+        assert!(should_update_hydration_state_for_delta_fetch(
+            FetchPriority::Background
+        ));
+        assert!(should_update_hydration_state_for_delta_fetch(
+            FetchPriority::TeeConvergence
+        ));
+    }
+
+    #[test]
+    fn fetch_priority_labels_are_stable_for_logs_and_metrics() {
+        assert_eq!(FetchPriority::RequestTime.as_label(), "request_time");
+        assert_eq!(FetchPriority::Background.as_label(), "background");
+        assert_eq!(FetchPriority::TeeConvergence.as_label(), "tee_convergence");
     }
 
     #[test]

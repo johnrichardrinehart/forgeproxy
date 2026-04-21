@@ -252,6 +252,11 @@ pub struct GenerationCoalescingLabels {
     pub result: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RequestTimeCatchUpLabels {
+    pub result: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum AuthState {
     Anonymous,
@@ -433,6 +438,7 @@ pub struct Metrics {
     pub bundle_presign_total: Family<BundlePresignLabels, Counter>,
     pub bundle_manifest_entries: Family<BundleManifestEntriesLabels, Gauge>,
     pub generation_coalescing_total: Family<GenerationCoalescingLabels, Counter>,
+    pub request_time_catch_up_total: Family<RequestTimeCatchUpLabels, Counter>,
 }
 
 impl Metrics {
@@ -791,6 +797,13 @@ impl Metrics {
             generation_coalescing_total.clone(),
         );
 
+        let request_time_catch_up_total = Family::<RequestTimeCatchUpLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_request_time_catch_up",
+            "Request-time local catch-up decisions by result",
+            request_time_catch_up_total.clone(),
+        );
+
         Self {
             clone_total,
             clone_summary_total,
@@ -840,6 +853,7 @@ impl Metrics {
             bundle_presign_total,
             bundle_manifest_entries,
             generation_coalescing_total,
+            request_time_catch_up_total,
         }
     }
 }
@@ -1289,6 +1303,16 @@ pub fn inc_generation_coalescing(metrics: &MetricsRegistry, result: &str) {
         .inc();
 }
 
+pub fn inc_request_time_catch_up(metrics: &MetricsRegistry, result: &str) {
+    metrics
+        .metrics
+        .request_time_catch_up_total
+        .get_or_create(&RequestTimeCatchUpLabels {
+            result: result.to_string(),
+        })
+        .inc();
+}
+
 pub struct ActiveConnectionGuard {
     metrics: MetricsRegistry,
     protocol: Protocol,
@@ -1488,6 +1512,7 @@ mod tests {
         inc_bundle_uri_advertisement(&metrics, "acme/widgets", "injected");
         inc_bundle_list_request(&metrics, "acme/widgets", "served");
         inc_hydration_skipped(&metrics, HydrationSkipReason::SemaphoreSaturated);
+        inc_request_time_catch_up(&metrics, "selected_fetch");
 
         let encoded = encode_metrics(&metrics.registry);
         assert!(encoded.contains("# HELP forgeproxy_upload_pack_duration_seconds"));
@@ -1499,6 +1524,11 @@ mod tests {
         assert!(encoded.lines().any(
             |line| line.starts_with("forgeproxy_hydration_skipped_total{") && line.ends_with(" 1")
         ));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_request_time_catch_up_total{")
+                && line.contains("result=\"selected_fetch\"")
+                && line.ends_with(" 1")
+        }));
         assert!(encoded.lines().any(|line| {
             line.starts_with("forgeproxy_bundle_uri_advertisement_total{")
                 && line.contains("repo=\"acme/widgets\"")
