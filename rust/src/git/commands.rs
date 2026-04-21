@@ -203,6 +203,15 @@ pub async fn git_prepare_published_generation_indexes(
     let started_at = std::time::Instant::now();
 
     run_git_multi_pack_index_write(repo_path, false, pack_threads).await?;
+    if repo_uses_object_alternates(repo_path)? {
+        info!(
+            repo = %repo_path.display(),
+            pack_threads,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "prepared published generation MIDX without bitmap because the object database uses alternates"
+        );
+        return Ok(());
+    }
     run_git_multi_pack_index_write(repo_path, true, pack_threads).await?;
 
     info!(
@@ -212,6 +221,19 @@ pub async fn git_prepare_published_generation_indexes(
         "prepared published generation bitmap/MIDX indexes"
     );
     Ok(())
+}
+
+fn repo_uses_object_alternates(repo_path: &Path) -> Result<bool> {
+    let alternates_path = repo_path.join("objects").join("info").join("alternates");
+    let contents = match std::fs::read_to_string(&alternates_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", alternates_path.display()));
+        }
+    };
+    Ok(contents.lines().any(|line| !line.trim().is_empty()))
 }
 
 fn repo_has_pack_files(repo_path: &Path) -> Result<bool> {
@@ -2241,6 +2263,22 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
                 .unwrap()
                 .success()
         );
+    }
+
+    #[test]
+    fn repo_uses_object_alternates_detects_nonempty_alternates_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let repo_path = tempdir.path().join("repo.git");
+        let alternates_path = repo_path.join("objects").join("info").join("alternates");
+        std::fs::create_dir_all(alternates_path.parent().unwrap()).unwrap();
+
+        assert!(!repo_uses_object_alternates(&repo_path).unwrap());
+
+        std::fs::write(&alternates_path, "\n  \n").unwrap();
+        assert!(!repo_uses_object_alternates(&repo_path).unwrap());
+
+        std::fs::write(&alternates_path, "/tmp/source.git/objects\n").unwrap();
+        assert!(repo_uses_object_alternates(&repo_path).unwrap());
     }
 
     #[tokio::test]

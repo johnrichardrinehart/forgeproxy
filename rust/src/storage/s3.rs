@@ -7,7 +7,7 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, instrument, warn};
 
 const MIB: u64 = 1024 * 1024;
@@ -133,19 +133,17 @@ async fn upload_bundle_multipart_parts(
     let mut file = tokio::fs::File::open(file_path)
         .await
         .with_context(|| format!("open file for multipart upload: {}", file_path.display()))?;
+    let mut buffer = vec![0_u8; buffer_len];
     let mut completed_parts = Vec::new();
     let mut part_number = 1;
 
     loop {
-        let mut buffer = vec![0_u8; buffer_len];
-        let bytes_read = file
-            .read(&mut buffer)
+        let bytes_read = read_multipart_part(&mut file, &mut buffer)
             .await
             .with_context(|| format!("read multipart upload part from {}", file_path.display()))?;
         if bytes_read == 0 {
             break;
         }
-        buffer.truncate(bytes_read);
 
         let response = client
             .upload_part()
@@ -153,7 +151,7 @@ async fn upload_bundle_multipart_parts(
             .key(key)
             .upload_id(upload_id)
             .part_number(part_number)
-            .body(ByteStream::from(buffer))
+            .body(ByteStream::from(buffer[..bytes_read].to_vec()))
             .send()
             .await
             .with_context(|| format!("S3 UploadPart part_number={part_number}"))?;
@@ -187,6 +185,24 @@ async fn upload_bundle_multipart_parts(
         .await
         .context("S3 CompleteMultipartUpload")?;
     Ok(())
+}
+
+async fn read_multipart_part<R>(reader: &mut R, buffer: &mut [u8]) -> Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let bytes_read = reader
+            .read(&mut buffer[filled..])
+            .await
+            .context("read multipart upload part")?;
+        if bytes_read == 0 {
+            break;
+        }
+        filled += bytes_read;
+    }
+    Ok(filled)
 }
 
 fn multipart_part_size(size_bytes: u64) -> Result<u64> {
@@ -382,6 +398,7 @@ pub async fn generate_presigned_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn multipart_part_size_uses_default_for_typical_large_bundle() {
@@ -400,5 +417,28 @@ mod tests {
 
         assert!(size.div_ceil(part_size) <= S3_MULTIPART_MAX_PARTS);
         assert!(part_size > S3_MULTIPART_DEFAULT_PART_SIZE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_multipart_part_fills_non_final_part_across_short_reads() {
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        let write_task = tokio::spawn(async move {
+            writer.write_all(&[1, 2, 3]).await.unwrap();
+            writer.write_all(&[4, 5, 6, 7]).await.unwrap();
+            writer.write_all(&[8, 9, 10, 11, 12]).await.unwrap();
+        });
+
+        let mut buffer = vec![0_u8; 10];
+        let first_len = read_multipart_part(&mut reader, &mut buffer).await.unwrap();
+        assert_eq!(first_len, 10);
+        assert_eq!(&buffer[..first_len], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+        write_task.await.unwrap();
+        let second_len = read_multipart_part(&mut reader, &mut buffer).await.unwrap();
+        assert_eq!(second_len, 2);
+        assert_eq!(&buffer[..second_len], &[11, 12]);
+
+        let eof_len = read_multipart_part(&mut reader, &mut buffer).await.unwrap();
+        assert_eq!(eof_len, 0);
     }
 }
