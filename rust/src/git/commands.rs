@@ -812,14 +812,31 @@ pub async fn git_missing_objects(repo_path: &Path, oids: &[String]) -> Result<Ve
     Ok(missing)
 }
 
+#[cfg(test)]
 #[instrument(fields(repo = %repo_path.display(), tips = tips.len()))]
 pub async fn git_rev_list_objects(repo_path: &Path, tips: &[String]) -> Result<Vec<String>> {
+    git_rev_list_objects_excluding(repo_path, tips, &[]).await
+}
+
+#[instrument(fields(repo = %repo_path.display(), tips = tips.len(), excluded_tips = excluded_tips.len()))]
+pub async fn git_rev_list_objects_excluding(
+    repo_path: &Path,
+    tips: &[String],
+    excluded_tips: &[String],
+) -> Result<Vec<String>> {
     if tips.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut input = Vec::with_capacity(tips.iter().map(|tip| tip.len() + 1).sum());
+    let input_len = tips.iter().map(|tip| tip.len() + 1).sum::<usize>()
+        + excluded_tips.iter().map(|tip| tip.len() + 2).sum::<usize>();
+    let mut input = Vec::with_capacity(input_len);
     for tip in tips {
+        input.extend_from_slice(tip.as_bytes());
+        input.push(b'\n');
+    }
+    for tip in excluded_tips {
+        input.push(b'^');
         input.extend_from_slice(tip.as_bytes());
         input.push(b'\n');
     }
@@ -1686,6 +1703,106 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn git_rev_list_objects_excluding_returns_only_delta_closure() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let repo_path = tempdir.path();
+
+        assert_git_success(StdCommand::new("git").arg("init").arg(repo_path));
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("switch")
+                .arg("-c")
+                .arg("main"),
+        );
+
+        std::fs::write(repo_path.join("base.txt"), "base\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("base"),
+        );
+        let base = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        std::fs::write(repo_path.join("delta.txt"), "delta\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("delta"),
+        );
+        let head = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        let full = git_rev_list_objects(repo_path, std::slice::from_ref(&head))
+            .await
+            .unwrap();
+        let delta = git_rev_list_objects_excluding(
+            repo_path,
+            std::slice::from_ref(&head),
+            std::slice::from_ref(&base),
+        )
+        .await
+        .unwrap();
+
+        assert!(!delta.is_empty());
+        assert!(delta.len() < full.len());
+        assert!(delta.contains(&head));
+        assert!(!delta.contains(&base));
     }
 
     #[tokio::test]
