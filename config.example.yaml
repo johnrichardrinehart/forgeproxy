@@ -33,8 +33,13 @@ clone:
   max_concurrent_upstream_clones: 5
   max_concurrent_upstream_fetches: 10
   reserved_request_time_upstream_fetches: 2
+  # Request path: every local disk serve acquires these before spawning git upload-pack.
+  # Higher values improve parallel clone/fetch throughput but allow more concurrent pack-objects CPU.
   max_concurrent_local_upload_packs: 4
   max_concurrent_local_upload_packs_per_repo: 1
+  # Request-adjacent CPU: tee imports and pack-cache indexing use this git index-pack thread cap.
+  # It does not gate cache-hit replay, but request-generated artifacts can index while clients are active.
+  index_pack_threads: 2
   max_concurrent_tee_captures: 8
   max_concurrent_tee_captures_per_repo_per_instance: 2
   prepare_published_generation_indexes: false
@@ -53,6 +58,7 @@ bundles:
   bundle_lock_ttl: 300
   # Optional. Defaults to available parallelism divided by max_concurrent_generations.
   # Set explicitly to bound CPU used by bundle and bitmap/MIDX generation.
+  # Request path: request-time pack-cache composite delta generation also uses this pack.threads value.
   pack_threads: 4
   generate_filtered_bundles: true
   max_incremental_bundles: 1

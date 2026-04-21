@@ -38,8 +38,12 @@ auth:
 clone:
   prepare_published_generation_indexes: ${prepare_published_generation_indexes}
   generation_coalescing_window_secs: ${generation_coalescing_window_secs}
+  # Request path: every local disk serve acquires these before spawning git upload-pack.
+  # Higher values improve parallel clone/fetch throughput but allow more concurrent pack-objects CPU.
   max_concurrent_local_upload_packs: ${max_concurrent_local_upload_packs}
   max_concurrent_local_upload_packs_per_repo: ${max_concurrent_local_upload_packs_per_repo}
+  # Request-adjacent CPU: tee imports and pack-cache indexing use this git index-pack thread cap.
+  index_pack_threads: ${index_pack_threads}
 
 pack_cache:
   enabled: ${pack_cache_enabled}
@@ -64,6 +68,7 @@ storage:
     presigned_url_ttl: ${s3_presigned_url_ttl}
 
 bundles:
+  # Request path: request-time pack-cache composite delta generation also uses this pack.threads value.
   pack_threads: ${bundle_pack_threads}
   max_incremental_bundles: ${bundle_max_incremental_bundles}
 

@@ -124,7 +124,8 @@ pub struct AppState {
     pub low_priority_fetch_limit: usize,
     /// Semaphore limiting simultaneous tee capture/import work on this host.
     pub tee_capture_semaphore: Arc<Semaphore>,
-    /// Semaphore limiting concurrent CPU-heavy bundle-generation subprocesses.
+    /// Semaphore limiting CPU-heavy background bundle/MIDX work. Request-time
+    /// pack-cache delta generation has its own foreground semaphore.
     pub bundle_generation_semaphore: Arc<Semaphore>,
     /// Semaphore limiting request-time pack-cache delta generation. This is
     /// intentionally separate from background bundle generation so foreground
@@ -133,8 +134,12 @@ pub struct AppState {
     /// Resolved maximum number of repos to process concurrently during the
     /// bundle lifecycle tick.
     pub bundle_max_concurrency: usize,
-    /// Resolved `git pack-objects` thread budget per bundle generation.
+    /// Resolved `git pack-objects` thread budget per bundle generation and
+    /// request-time pack-cache composite delta.
     pub bundle_pack_threads: usize,
+    /// Resolved request-adjacent `git index-pack` thread budget for tee imports
+    /// and pack-cache indexing.
+    pub index_pack_threads: usize,
     /// Per-repo local semaphore cache limiting concurrent hydrations for the
     /// same repository within this instance.
     pub repo_clone_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
@@ -148,11 +153,11 @@ pub struct AppState {
     /// Per-repo local semaphore cache limiting tee capture/import work for the
     /// same repository within this instance.
     pub repo_tee_capture_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
-    /// Semaphore limiting concurrent local upload-pack subprocesses on this
-    /// instance.
+    /// Request path: semaphore limiting concurrent local upload-pack subprocesses
+    /// on this instance.
     pub local_upload_pack_semaphore: Arc<Semaphore>,
-    /// Per-repo local semaphore cache limiting concurrent local upload-pack
-    /// subprocesses for the same repository within this instance.
+    /// Request path: per-repo local semaphore cache limiting concurrent local
+    /// upload-pack subprocesses for the same repository within this instance.
     pub repo_upload_pack_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
     /// Shared disk-backed upload-pack response cache.
     pub pack_cache: Arc<pack_cache::PackCache>,
@@ -1124,7 +1129,8 @@ async fn build_app_state(
     tracing::info!(
         max_concurrent_generations = bundle_execution_policy.max_concurrent_generations,
         pack_threads = bundle_execution_policy.pack_threads,
-        "resolved bundle execution policy"
+        index_pack_threads = config.clone.index_pack_threads,
+        "resolved git subprocess execution policy"
     );
 
     let bundle_publisher_id = runtime_resource_attributes
@@ -1137,11 +1143,12 @@ async fn build_app_state(
         .clone
         .max_concurrent_upstream_fetches
         .saturating_sub(config.clone.reserved_request_time_upstream_fetches);
-    let pack_cache = Arc::new(pack_cache::PackCache::new(
+    let pack_cache = Arc::new(pack_cache::PackCache::new_with_index_pack_threads(
         std::path::Path::new(&config.storage.local.path),
         config.pack_cache.clone(),
         config.storage.local.max_percent,
         metrics.clone(),
+        config.clone.index_pack_threads,
     ));
     pack_cache.ensure_ready().await?;
 
@@ -1170,6 +1177,7 @@ async fn build_app_state(
         )),
         bundle_max_concurrency: bundle_execution_policy.max_concurrent_generations,
         bundle_pack_threads: bundle_execution_policy.pack_threads,
+        index_pack_threads: config.clone.index_pack_threads,
         repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_publish_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_catch_up_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),

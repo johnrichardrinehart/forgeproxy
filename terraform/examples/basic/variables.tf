@@ -279,7 +279,7 @@ variable "local_cache_max_percent" {
 variable "max_concurrent_local_upload_packs" {
   type        = number
   default     = 4
-  description = "Maximum concurrent local git upload-pack subprocesses per forgeproxy instance."
+  description = "Request path: maximum concurrent local git upload-pack subprocesses per forgeproxy instance."
 }
 
 variable "generation_coalescing_window_secs" {
@@ -291,7 +291,18 @@ variable "generation_coalescing_window_secs" {
 variable "max_concurrent_local_upload_packs_per_repo" {
   type        = number
   default     = 1
-  description = "Maximum concurrent local git upload-pack subprocesses per repository per forgeproxy instance."
+  description = "Request path: maximum concurrent local git upload-pack subprocesses per repository per forgeproxy instance."
+}
+
+variable "index_pack_threads" {
+  type        = number
+  default     = 2
+  description = "Request-adjacent CPU: git index-pack thread limit used for tee imports and pack-cache indexing."
+
+  validation {
+    condition     = var.index_pack_threads > 0
+    error_message = "index_pack_threads must be greater than 0."
+  }
 }
 
 variable "pack_cache_enabled" {
@@ -348,7 +359,7 @@ variable "pack_cache_wait_for_inflight_secs" {
 variable "pack_cache_max_concurrent_request_deltas" {
   type        = number
   default     = 1
-  description = "Maximum request-time pack-cache composite delta builds per forgeproxy instance."
+  description = "Request path: maximum request-time pack-cache composite delta builds per forgeproxy instance."
 
   validation {
     condition     = var.pack_cache_max_concurrent_request_deltas > 0
@@ -427,7 +438,7 @@ variable "prepare_published_generation_indexes" {
 variable "bundle_pack_threads" {
   type        = number
   default     = 4
-  description = "Git pack.threads value used for bundle generation and published-generation bitmap/MIDX preparation."
+  description = "Git pack.threads value used for bundle generation, published-generation bitmap/MIDX preparation, and request-time pack-cache composite deltas."
 
   validation {
     condition     = var.bundle_pack_threads > 0

@@ -39,6 +39,7 @@ pub struct PackCache {
     root: PathBuf,
     config: PackCacheConfig,
     local_cache_max_percent: f64,
+    index_pack_threads: usize,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     artifact_lifecycle: Arc<std::sync::Mutex<()>>,
     active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -229,6 +230,7 @@ pub struct PackCacheWriter {
     root: PathBuf,
     config: PackCacheConfig,
     local_cache_max_percent: f64,
+    index_pack_threads: usize,
     tmp_pack_path: PathBuf,
     pack_writer: BufWriter<File>,
     pack_extractor: RawPackExtractor,
@@ -317,12 +319,29 @@ impl PackCache {
         local_cache_max_percent: f64,
         metrics: MetricsRegistry,
     ) -> Self {
+        Self::new_with_index_pack_threads(
+            base_path,
+            config,
+            local_cache_max_percent,
+            metrics,
+            crate::config::DEFAULT_INDEX_PACK_THREADS,
+        )
+    }
+
+    pub fn new_with_index_pack_threads(
+        base_path: &Path,
+        config: PackCacheConfig,
+        local_cache_max_percent: f64,
+        metrics: MetricsRegistry,
+        index_pack_threads: usize,
+    ) -> Self {
         Self {
             root: base_path
                 .join(crate::cache::layout::STATE_ROOT_DIR)
                 .join(PACK_CACHE_DIR),
             config,
             local_cache_max_percent,
+            index_pack_threads,
             inflight: Arc::new(Mutex::new(HashMap::new())),
             artifact_lifecycle: Arc::new(std::sync::Mutex::new(())),
             active_readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -766,6 +785,7 @@ impl PackCache {
             root: self.root.clone(),
             config: self.config.clone(),
             local_cache_max_percent: self.local_cache_max_percent,
+            index_pack_threads: self.index_pack_threads,
             tmp_pack_path,
             pack_writer: BufWriter::with_capacity(1024 * 1024, file),
             pack_extractor: RawPackExtractor::default(),
@@ -1176,7 +1196,8 @@ impl PackCacheWriter {
     ) -> Result<()> {
         let pack_path = self.pack_path_for_id(pack_id);
         let idx_path = self.pack_index_path_for_id(pack_id);
-        crate::git::commands::git_index_pack_to_idx(&pack_path, &idx_path).await?;
+        crate::git::commands::git_index_pack_to_idx(&pack_path, &idx_path, self.index_pack_threads)
+            .await?;
         self.refresh_packstore_midx().await?;
         self.record_promotion(composite_base_key);
         Ok(())

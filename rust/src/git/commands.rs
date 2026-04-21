@@ -608,8 +608,8 @@ pub async fn git_fetch_bundle(repo_path: &Path, bundle_path: &Path) -> Result<()
 
 /// Run `git index-pack --fix-thin` in a bare repo, reading a pack stream from a
 /// local file and writing a normal pack into `objects/pack`.
-#[instrument(fields(repo = %repo_path.display(), pack = %pack_path.display()))]
-pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
+#[instrument(fields(repo = %repo_path.display(), pack = %pack_path.display(), pack_threads))]
+pub async fn git_index_pack(repo_path: &Path, pack_path: &Path, pack_threads: usize) -> Result<()> {
     let pack_file = std::fs::File::open(pack_path)
         .with_context(|| format!("open pack file {}", pack_path.display()))?;
     let input_pack_size = pack_file.metadata().map(|m| m.len()).unwrap_or_default();
@@ -619,6 +619,7 @@ pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
         .arg(repo_path)
         .arg("index-pack")
         .arg("--stdin")
+        .arg(format!("--threads={pack_threads}"))
         .arg("-v")
         .arg("--fix-thin");
 
@@ -644,6 +645,7 @@ pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
         repo = %repo_path.display(),
         pack = %pack_path.display(),
         pid,
+        pack_threads,
         input_pack_size,
         "git index-pack started"
     );
@@ -683,6 +685,7 @@ pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
                     repo = %repo_path.display(),
                     pack = %pack_path.display(),
                     pid,
+                    pack_threads,
                     elapsed_secs = started_at.elapsed().as_secs(),
                     input_pack_size,
                     pack_dir_bytes,
@@ -704,6 +707,7 @@ pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
         repo = %repo_path.display(),
         pack = %pack_path.display(),
         pid,
+        pack_threads,
         elapsed_secs = started_at.elapsed().as_secs(),
         input_pack_size,
         "git index-pack finished"
@@ -711,14 +715,30 @@ pub async fn git_index_pack(repo_path: &Path, pack_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[instrument(fields(pack = %pack_path.display(), idx = %idx_path.display()))]
-pub async fn git_index_pack_to_idx(pack_path: &Path, idx_path: &Path) -> Result<()> {
+#[instrument(fields(pack = %pack_path.display(), idx = %idx_path.display(), pack_threads))]
+pub async fn git_index_pack_to_idx(
+    pack_path: &Path,
+    idx_path: &Path,
+    pack_threads: usize,
+) -> Result<()> {
     let mut cmd = Command::new("git");
-    cmd.arg("index-pack").arg("-o").arg(idx_path).arg(pack_path);
+    cmd.arg("index-pack")
+        .arg(format!("--threads={pack_threads}"))
+        .arg("-o")
+        .arg(idx_path)
+        .arg(pack_path);
 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    let started_at = std::time::Instant::now();
+    info!(
+        pack = %pack_path.display(),
+        idx = %idx_path.display(),
+        pack_threads,
+        "git index-pack to idx started"
+    );
 
     let output = cmd.output().await.with_context(|| {
         format!(
@@ -738,6 +758,14 @@ pub async fn git_index_pack_to_idx(pack_path: &Path, idx_path: &Path) -> Result<
             stderr.trim(),
         );
     }
+
+    info!(
+        pack = %pack_path.display(),
+        idx = %idx_path.display(),
+        pack_threads,
+        elapsed_secs = started_at.elapsed().as_secs(),
+        "git index-pack to idx finished"
+    );
 
     Ok(())
 }
@@ -2010,7 +2038,9 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
         let pack_path = pack_dir.join("pack-base.pack");
         let idx_path = pack_dir.join("pack-base.idx");
         std::fs::write(&pack_path, &base_pack).unwrap();
-        git_index_pack_to_idx(&pack_path, &idx_path).await.unwrap();
+        git_index_pack_to_idx(&pack_path, &idx_path, 1)
+            .await
+            .unwrap();
 
         let main_objects = git_rev_list_objects(&repo_path, std::slice::from_ref(&main))
             .await
@@ -2363,7 +2393,9 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
         let pack_path = pack_dir.join("pack-base.pack");
         let idx_path = pack_dir.join("pack-base.idx");
         std::fs::write(&pack_path, &pack).unwrap();
-        git_index_pack_to_idx(&pack_path, &idx_path).await.unwrap();
+        git_index_pack_to_idx(&pack_path, &idx_path, 1)
+            .await
+            .unwrap();
 
         git_multi_pack_index_write_for_object_dir(&object_dir, false, 1)
             .await
