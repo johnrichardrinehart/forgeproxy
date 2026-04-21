@@ -3,7 +3,7 @@ use anyhow::bail;
 use anyhow::{Context, Result, ensure};
 use sha1::{Digest, Sha1};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
@@ -148,6 +148,27 @@ impl OpenedPack {
             header,
         })
     }
+
+    fn stream_original_pack<F>(&mut self, emit: &mut F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>) -> io::Result<()>,
+    {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("seek pack {}", self.name))?;
+        let mut reader = BufReader::new(&mut self.file);
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buf)
+                .with_context(|| format!("read pack {}", self.name))?;
+            if read == 0 {
+                break;
+            }
+            emit_sideband1(&buf[..read], emit)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +196,11 @@ where
     );
 
     emit(encode_data_pkt(b"packfile\n")).context("emit packfile section")?;
+    if pack_infos.len() == 1 {
+        pack_infos[0].stream_original_pack(&mut emit)?;
+        emit(encode_control_pkt(0)?).context("emit packfile flush")?;
+        return Ok(());
+    }
 
     let first_header = pack_infos[0].header;
     let total_count = pack_infos
@@ -234,6 +260,16 @@ fn sideband1_chunks(bytes: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
         out.extend_from_slice(chunk);
         out
     })
+}
+
+fn emit_sideband1<F>(bytes: &[u8], emit: &mut F) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> io::Result<()>,
+{
+    for chunk in sideband1_chunks(bytes) {
+        emit(chunk).context("emit sideband-1 chunk")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -331,10 +367,7 @@ impl PackStreamer {
     where
         F: FnMut(Vec<u8>) -> io::Result<()>,
     {
-        for chunk in sideband1_chunks(bytes) {
-            emit(chunk).context("emit sideband-1 chunk")?;
-        }
-        Ok(())
+        emit_sideband1(bytes, emit)
     }
 }
 
@@ -438,6 +471,29 @@ mod tests {
         let raw = extract_raw_pack(&streamed).unwrap();
         assert_eq!(u32::from_be_bytes(raw[8..12].try_into().unwrap()), 3);
         assert_eq!(&raw[12..raw.len() - SHA1_TRAILER_LEN], b"basedelta");
+        assert!(
+            streamed
+                .windows(b"packfile\n".len())
+                .any(|w| w == b"packfile\n")
+        );
+        assert!(streamed.ends_with(b"0000"));
+    }
+
+    #[test]
+    fn streams_single_pack_response_from_original_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let pack = raw_pack(1, &vec![b'x'; MAX_SIDEBAND_PACK_CHUNK + 32]);
+        let pack_path = temp.path().join("single.pack");
+        std::fs::write(&pack_path, &pack).unwrap();
+
+        let mut streamed = Vec::new();
+        stream_packfile_response_from_paths(&[pack_path], |chunk| {
+            streamed.extend_from_slice(&chunk);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(extract_raw_pack(&streamed).unwrap(), pack);
         assert!(
             streamed
                 .windows(b"packfile\n".len())
