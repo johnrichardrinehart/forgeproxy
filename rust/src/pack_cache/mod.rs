@@ -587,11 +587,11 @@ impl PackCache {
                 return Ok(None);
             }
         };
-        if self.entry_pack_paths(&manifest).is_err() {
+        if self.entry_replay_pack_paths(&manifest).is_err() {
             self.remove_entry_files(key);
             return Ok(None);
         }
-        if let Err(error) = record_metadata_hit(&self.root, key.as_str()) {
+        if let Err(error) = record_metadata_hit_if_present(&self.root, key.as_str()) {
             warn!(
                 key = %key.as_str(),
                 error = %error,
@@ -620,7 +620,7 @@ impl PackCache {
 
     fn open_read_lease_for_hit(&self, hit: PackCacheHit) -> Result<PackCacheReadLease> {
         let packs = self
-            .entry_pack_paths(&hit.manifest)?
+            .entry_replay_pack_paths(&hit.manifest)?
             .into_iter()
             .map(|path| stitch::OpenedPack::from_path(&path))
             .collect::<Result<Vec<_>>>()?;
@@ -753,20 +753,28 @@ impl PackCache {
             .join(format!("pack-{pack_id}.pack"))
     }
 
+    #[cfg(test)]
     fn pack_index_path_for_id(&self, pack_id: &str) -> PathBuf {
         self.packstore_pack_dir()
             .join(format!("pack-{pack_id}.idx"))
     }
 
     fn entry_pack_paths(&self, manifest: &PackEntryManifest) -> Result<Vec<PathBuf>> {
+        let paths = self.entry_replay_pack_paths(manifest)?;
+        for pack_path in &paths {
+            let idx_path = pack_path.with_extension("idx");
+            self.lookup_existing_file(&idx_path)?
+                .with_context(|| format!("missing pack cache pack index {}", idx_path.display()))?;
+        }
+        Ok(paths)
+    }
+
+    fn entry_replay_pack_paths(&self, manifest: &PackEntryManifest) -> Result<Vec<PathBuf>> {
         let mut paths = Vec::with_capacity(manifest.pack_ids.len());
         for pack_id in &manifest.pack_ids {
             let pack_path = self.pack_path_for_id(pack_id);
-            let idx_path = self.pack_index_path_for_id(pack_id);
             self.lookup_existing_file(&pack_path)?
                 .with_context(|| format!("missing pack cache pack {}", pack_path.display()))?;
-            self.lookup_existing_file(&idx_path)?
-                .with_context(|| format!("missing pack cache pack index {}", idx_path.display()))?;
             paths.push(pack_path);
         }
         Ok(paths)
@@ -877,24 +885,41 @@ impl PackCacheWriter {
 
         if self.response_bytes_written >= self.min_response_bytes && self.pack_extractor.wrote_pack
         {
-            let pack_id = self.promote_pack_file(&self.tmp_pack_path).await?;
+            let pack_id = self
+                .promote_pack_file_for_replay(&self.tmp_pack_path)
+                .await?;
             self.write_entry_manifest(&PackEntryManifest {
                 version: PACK_ENTRY_MANIFEST_VERSION,
                 pack_ids: vec![pack_id],
             })?;
-            self.record_promotion(None);
+            self.completed = true;
+            crate::metrics::set_pack_cache_size_bytes(
+                &self.metrics,
+                directory_size(&self.root).unwrap_or(0),
+            );
+            self.release_inflight().await;
+            self.finalize_indexed_promotion(self.key.as_str(), None)
+                .await?;
         } else if let Err(error) = tokio::fs::remove_file(&self.tmp_pack_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
             warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove undersized pack cache temp pack");
+            self.completed = true;
+            crate::metrics::set_pack_cache_size_bytes(
+                &self.metrics,
+                directory_size(&self.root).unwrap_or(0),
+            );
+            self.release_inflight().await;
+            return Ok(());
         }
-
-        self.completed = true;
-        crate::metrics::set_pack_cache_size_bytes(
-            &self.metrics,
-            directory_size(&self.root).unwrap_or(0),
-        );
-        self.release_inflight().await;
+        if !self.completed {
+            self.completed = true;
+            crate::metrics::set_pack_cache_size_bytes(
+                &self.metrics,
+                directory_size(&self.root).unwrap_or(0),
+            );
+            self.release_inflight().await;
+        }
         Ok(())
     }
 
@@ -913,7 +938,9 @@ impl PackCacheWriter {
             warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove unused pack cache temp raw pack");
         }
 
-        let pack_id = self.write_exact_pack(delta_pack, "delta").await?;
+        let pack_id = self
+            .write_exact_pack_for_replay(delta_pack, "delta")
+            .await?;
         let mut pack_ids = self.read_entry_manifest(base_key)?.pack_ids;
         pack_ids.push(pack_id);
         self.write_entry_manifest(&PackEntryManifest {
@@ -921,14 +948,14 @@ impl PackCacheWriter {
             pack_ids,
         })?;
         self.raw_pack_bytes_written = delta_pack.len() as u64;
-        self.record_promotion(Some(base_key));
         self.completed = true;
         crate::metrics::set_pack_cache_size_bytes(
             &self.metrics,
             directory_size(&self.root).unwrap_or(0),
         );
         self.release_inflight().await;
-
+        self.finalize_indexed_promotion(&format!("{}-delta", self.key.as_str()), Some(base_key))
+            .await?;
         Ok(())
     }
 
@@ -946,13 +973,13 @@ impl PackCacheWriter {
         let manifest = self.read_entry_manifest(base_key)?;
         self.write_entry_manifest(&manifest)?;
         self.raw_pack_bytes_written = 0;
-        self.record_promotion(Some(base_key));
         self.completed = true;
         crate::metrics::set_pack_cache_size_bytes(
             &self.metrics,
             directory_size(&self.root).unwrap_or(0),
         );
         self.release_inflight().await;
+        self.record_promotion(Some(base_key));
         Ok(())
     }
 
@@ -1033,17 +1060,9 @@ impl PackCacheWriter {
         );
     }
 
-    async fn promote_pack_file(&self, tmp_pack_path: &Path) -> Result<String> {
+    async fn promote_pack_file_for_replay(&self, tmp_pack_path: &Path) -> Result<String> {
         let pack_id = self.key.as_str().to_string();
         let final_pack_path = self.pack_path_for_id(&pack_id);
-        let final_idx_path = self.pack_index_path_for_id(&pack_id);
-        let tmp_idx_path = self.root.join(format!(
-            "pack-{}.tmp.{}.idx",
-            self.key.as_str(),
-            std::process::id()
-        ));
-
-        crate::git::commands::git_index_pack_to_idx(tmp_pack_path, &tmp_idx_path).await?;
         tokio::fs::rename(tmp_pack_path, &final_pack_path)
             .await
             .with_context(|| {
@@ -1053,20 +1072,10 @@ impl PackCacheWriter {
                     final_pack_path.display()
                 )
             })?;
-        tokio::fs::rename(&tmp_idx_path, &final_idx_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "promote pack cache pack index {} to {}",
-                    tmp_idx_path.display(),
-                    final_idx_path.display()
-                )
-            })?;
-        self.refresh_packstore_midx().await?;
         Ok(pack_id)
     }
 
-    async fn write_exact_pack(&self, pack_bytes: &[u8], suffix: &str) -> Result<String> {
+    async fn write_exact_pack_for_replay(&self, pack_bytes: &[u8], suffix: &str) -> Result<String> {
         let pack_id = format!("{}-{suffix}", self.key.as_str());
         let tmp_pack_path =
             self.root
@@ -1075,11 +1084,6 @@ impl PackCacheWriter {
             .await
             .with_context(|| format!("write pack cache pack {}", tmp_pack_path.display()))?;
         let final_pack_path = self.pack_path_for_id(&pack_id);
-        let final_idx_path = self.pack_index_path_for_id(&pack_id);
-        let tmp_idx_path =
-            self.root
-                .join(format!("pack-{}.tmp.{}.idx", pack_id, std::process::id()));
-        crate::git::commands::git_index_pack_to_idx(&tmp_pack_path, &tmp_idx_path).await?;
         tokio::fs::rename(&tmp_pack_path, &final_pack_path)
             .await
             .with_context(|| {
@@ -1089,17 +1093,20 @@ impl PackCacheWriter {
                     final_pack_path.display()
                 )
             })?;
-        tokio::fs::rename(&tmp_idx_path, &final_idx_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "promote pack cache exact pack index {} to {}",
-                    tmp_idx_path.display(),
-                    final_idx_path.display()
-                )
-            })?;
-        self.refresh_packstore_midx().await?;
         Ok(pack_id)
+    }
+
+    async fn finalize_indexed_promotion(
+        &self,
+        pack_id: &str,
+        composite_base_key: Option<&PackCacheKey>,
+    ) -> Result<()> {
+        let pack_path = self.pack_path_for_id(pack_id);
+        let idx_path = self.pack_index_path_for_id(pack_id);
+        crate::git::commands::git_index_pack_to_idx(&pack_path, &idx_path).await?;
+        self.refresh_packstore_midx().await?;
+        self.record_promotion(composite_base_key);
+        Ok(())
     }
 
     async fn refresh_packstore_midx(&self) -> Result<()> {
@@ -1573,6 +1580,14 @@ fn record_metadata_hit(root: &Path, key: &str) -> Result<()> {
     metadata.last_accessed_unix_secs = now_unix_secs();
     metadata.hit_count = metadata.hit_count.saturating_add(1);
     write_pack_cache_metadata(root, &metadata)
+}
+
+fn record_metadata_hit_if_present(root: &Path, key: &str) -> Result<()> {
+    let path = metadata_path(root, key);
+    if !path.is_file() {
+        return Ok(());
+    }
+    record_metadata_hit(root, key)
 }
 
 fn retain_existing_recent_entries(
@@ -2437,6 +2452,43 @@ mod tests {
             u32::from_be_bytes(raw[8..12].try_into().unwrap()),
             expected_count
         );
+    }
+
+    #[tokio::test]
+    async fn replay_hit_is_available_before_index_is_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+
+        let key = PackCacheKey {
+            digest: "replay-only".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        let pack = raw_pack(1, b"replay-before-index");
+        std::fs::create_dir_all(cache.packstore_pack_dir()).unwrap();
+        std::fs::write(cache.pack_path_for_id(key.as_str()), &pack).unwrap();
+        write_test_entry_manifest(&cache, &key, &[key.as_str().to_string()]);
+
+        let hit = cache.lookup_by_key(&key).await.unwrap().unwrap();
+        let mut stream = hit.into_stream();
+        let mut replayed = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            replayed.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(super::stitch::extract_raw_pack(&replayed).unwrap(), pack);
+        assert!(cache.pack_paths_for_key(&key).is_err());
     }
 
     #[tokio::test]
