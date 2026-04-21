@@ -6,6 +6,7 @@
 
 {
   nixos-vm-test-basic = pkgs.callPackage ./basic.nix { inherit self; };
+  nixos-vm-test-pack-cache = pkgs.callPackage ./pack-cache.nix { inherit self; };
   nixos-vm-test-secrets-sops = pkgs.callPackage ./secrets-sops.nix {
     inherit (inputs) sops-nix;
   };
