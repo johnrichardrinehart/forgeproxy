@@ -1850,30 +1850,18 @@ async fn warm_pack_cache_for_generation(
         Err(error) => return Err(PackCacheStitchFailure::new("reserve", error)),
     };
 
-    let requested_objects =
-        crate::git::commands::git_rev_list_objects(published_path, &new_request_wants)
-            .await
-            .map_err(|error| PackCacheStitchFailure::new("enumerate_objects", error))?;
-    let missing_objects = missing_objects_against_pack_cache_entry(
-        state,
+    let missing_objects = pack_cache_delta_objects_from_pinned_generation(
         published_path,
-        &prev_entry.key,
-        &requested_objects,
+        &new_request_wants,
+        &prev_entry,
     )
     .await
-    .map_err(|error| PackCacheStitchFailure::new("missing_objects", error))?;
+    .map_err(|error| PackCacheStitchFailure::new("enumerate_delta_objects", error))?;
     if missing_objects.is_empty() {
         return writer
             .finish_alias(&prev_entry.key)
             .await
             .map_err(|error| PackCacheStitchFailure::new("finish_alias", error));
-    }
-    if overlap_too_small(requested_objects.len(), missing_objects.len()) {
-        writer.abort().await;
-        return Err(PackCacheStitchFailure::new(
-            "low_overlap",
-            anyhow::anyhow!("candidate base does not amortize enough missing objects"),
-        ));
     }
     let delta_pack = build_pack_cache_delta(state, published_path, &missing_objects).await?;
 
@@ -1930,26 +1918,10 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
             reason: "missing_request_wants",
         });
     };
-    let requested_objects = match crate::git::commands::git_rev_list_objects(
-        repo_path,
-        &new_request_wants,
-    )
-    .await
-    {
-        Ok(objects) => objects,
-        Err(error) => {
-            warn!(repo = %owner_repo, error = %error, "failed to enumerate pack cache request objects");
-            return Err(PackCacheCompositeMiss {
-                writer: Some(writer),
-                reason: "enumerate_objects",
-            });
-        }
-    };
     let selected_base = match select_pack_cache_base_entry(
-        state,
         repo_path,
         &candidates,
-        &requested_objects,
+        &new_request_wants,
     )
     .await
     {
@@ -1957,29 +1929,17 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
         Ok(None) => {
             return Err(PackCacheCompositeMiss {
                 writer: Some(writer),
-                reason: "low_overlap",
+                reason: "no_usable_base",
             });
         }
         Err(error) => {
-            warn!(repo = %owner_repo, error = %error, "failed to evaluate pack cache base candidates");
+            warn!(repo = %owner_repo, error = %error, "failed to evaluate pack cache base candidates from mirror");
             return Err(PackCacheCompositeMiss {
                 writer: Some(writer),
                 reason: "base_eval",
             });
         }
     };
-    if overlap_too_small(requested_objects.len(), selected_base.missing_objects.len()) {
-        return Err(PackCacheCompositeMiss {
-            writer: Some(writer),
-            reason: "low_overlap",
-        });
-    }
-    if new_request_wants == selected_base.entry.request_wants {
-        return Err(PackCacheCompositeMiss {
-            writer: Some(writer),
-            reason: "same_tips",
-        });
-    }
     if selected_base.missing_objects.is_empty() {
         let alias_key = writer.key().clone();
         writer
@@ -2088,32 +2048,33 @@ struct SelectedPackCacheBase {
     missing_objects: Vec<String>,
 }
 
-const PACK_CACHE_MIN_OVERLAP_PERCENT: usize = 10;
-
-fn overlap_too_small(requested_objects: usize, missing_objects: usize) -> bool {
-    if requested_objects == 0 {
-        return true;
-    }
-    let present_objects = requested_objects.saturating_sub(missing_objects);
-    present_objects * 100 < requested_objects * PACK_CACHE_MIN_OVERLAP_PERCENT
-}
-
 async fn select_pack_cache_base_entry(
-    state: &crate::AppState,
     repo_path: &Path,
     candidates: &[crate::pack_cache::PackCacheRecentEntry],
-    requested_objects: &[String],
+    new_request_wants: &[String],
 ) -> Result<Option<SelectedPackCacheBase>> {
+    let full_objects =
+        crate::git::commands::git_rev_list_objects_excluding(repo_path, new_request_wants, &[])
+            .await?;
+    if full_objects.is_empty() {
+        return Ok(None);
+    }
+    let full_object_count = full_objects.len();
     let mut best: Option<SelectedPackCacheBase> = None;
     for candidate in candidates {
-        let missing_objects = missing_objects_against_pack_cache_entry(
-            state,
+        let missing_objects = pack_cache_delta_objects_from_pinned_generation(
             repo_path,
-            &candidate.key,
-            requested_objects,
+            new_request_wants,
+            candidate,
         )
         .await?;
-        if overlap_too_small(requested_objects.len(), missing_objects.len()) {
+        if missing_objects.len() >= full_object_count {
+            debug!(
+                candidate_key = %candidate.key.as_str(),
+                full_objects = full_object_count,
+                delta_objects = missing_objects.len(),
+                "skipping pack cache base candidate because it does not reduce the requested object closure"
+            );
             continue;
         }
         let replace = best
@@ -2129,43 +2090,28 @@ async fn select_pack_cache_base_entry(
     Ok(best)
 }
 
-async fn missing_objects_against_pack_cache_entry(
-    state: &crate::AppState,
-    _repo_path: &Path,
-    key: &crate::pack_cache::PackCacheKey,
-    requested_objects: &[String],
+async fn pack_cache_delta_objects_from_pinned_generation(
+    repo_path: &Path,
+    new_request_wants: &[String],
+    base: &crate::pack_cache::PackCacheRecentEntry,
 ) -> Result<Vec<String>> {
-    if requested_objects.is_empty() {
-        return Ok(Vec::new());
+    // Callers pass a concrete published-generation path held by a
+    // PublishedGenerationLease, not the moving reader symlink.
+    let excluded_wants = if base.covered_wants.is_empty() {
+        base.request_wants.as_slice()
+    } else {
+        base.covered_wants.as_slice()
+    };
+    if excluded_wants.is_empty() {
+        bail!("pack cache base did not record covered wants");
     }
 
-    let pack_paths = state.pack_cache.pack_paths_for_key(key)?;
-    let tempdir = tempfile::tempdir().context("create temp pack cache object repo")?;
-    crate::git::commands::git_init_bare(tempdir.path()).await?;
-    let pack_dir = tempdir.path().join("objects").join("pack");
-    for pack_path in pack_paths {
-        let idx_path = pack_path.with_extension("idx");
-        let pack_name = pack_path
-            .file_name()
-            .context("pack cache pack path missing file name")?;
-        let idx_name = idx_path
-            .file_name()
-            .context("pack cache index path missing file name")?;
-        std::fs::hard_link(&pack_path, pack_dir.join(pack_name))
-            .with_context(|| format!("hard link pack cache pack {}", pack_path.display()))?;
-        std::fs::hard_link(&idx_path, pack_dir.join(idx_name))
-            .with_context(|| format!("hard link pack cache index {}", idx_path.display()))?;
-    }
-    if std::fs::read_dir(&pack_dir)?.count() > 2 {
-        crate::git::commands::git_multi_pack_index_write_for_object_dir(
-            &tempdir.path().join("objects"),
-            false,
-            1,
-        )
-        .await?;
-    }
-
-    crate::git::commands::git_missing_objects(tempdir.path(), requested_objects).await
+    crate::git::commands::git_rev_list_objects_excluding(
+        repo_path,
+        new_request_wants,
+        excluded_wants,
+    )
+    .await
 }
 
 async fn reset_partial_repo_path_if_needed(repo_path: &Path) -> Result<()> {
@@ -4340,6 +4286,7 @@ pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn create_usable_bare_repo(path: &Path) {
@@ -4360,6 +4307,51 @@ mod tests {
             low_water: 0.75,
             eviction_policy: crate::config::EvictionPolicy::Lfu,
         }
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "git -C {} {args:?} failed",
+            repo.display()
+        );
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git -C {} {args:?} failed: {}",
+            repo.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn pkt(payload: &[u8]) -> Vec<u8> {
+        let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn fetch_request_for(want: &str) -> Vec<u8> {
+        let mut request = Vec::new();
+        request.extend_from_slice(&pkt(b"command=fetch\n"));
+        request.extend_from_slice(&pkt(format!("want {want}\n").as_bytes()));
+        request.extend_from_slice(&pkt(b"done\n"));
+        request.extend_from_slice(b"0000");
+        request
     }
 
     #[test]
@@ -4502,6 +4494,66 @@ mod tests {
             false,
             Some(0)
         ));
+    }
+
+    #[tokio::test]
+    async fn pack_cache_base_selection_skips_unrelated_history_without_object_reduction() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let status = Command::new("git").arg("init").arg(&repo).status().unwrap();
+        assert!(status.success());
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "main"]);
+        let main = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+        git(&repo, &["checkout", "--orphan", "unrelated"]);
+        std::fs::remove_file(repo.join("main.txt")).unwrap();
+        std::fs::write(repo.join("unrelated.txt"), "unrelated\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-m", "unrelated"]);
+        let unrelated = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+        let cache = crate::pack_cache::PackCache::new(
+            &tmp.path().join("cache"),
+            crate::config::PackCacheConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            1.0,
+            crate::metrics::MetricsRegistry::new(),
+        );
+        let main_key = cache
+            .key_for_fresh_clone_with_ref_tips(
+                "owner/repo",
+                &fetch_request_for(&main),
+                Some("version=2"),
+                &BTreeMap::from([("refs/heads/main".to_string(), main.clone())]),
+            )
+            .unwrap();
+        let candidate = crate::pack_cache::PackCacheRecentEntry {
+            key: main_key,
+            request_wants: vec![main.clone()],
+            covered_wants: vec![main],
+            request_template: vec![
+                "command=fetch".to_string(),
+                "done".to_string(),
+                "flush".to_string(),
+            ],
+            full_tip: false,
+        };
+
+        let selected =
+            select_pack_cache_base_entry(&repo, &[candidate], std::slice::from_ref(&unrelated))
+                .await
+                .unwrap();
+
+        assert!(
+            selected.is_none(),
+            "unrelated history should fall back to a full pack capture"
+        );
     }
 
     #[tokio::test]
