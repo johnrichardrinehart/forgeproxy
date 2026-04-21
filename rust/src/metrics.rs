@@ -219,6 +219,14 @@ pub struct PackCacheStitchFailureLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheOnDemandCompositeStageLabels {
+    pub protocol: Protocol,
+    pub owner_repo: String,
+    pub stage: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct UploadPackCpuLabels {
     pub protocol: Protocol,
     pub source: String,
@@ -393,10 +401,13 @@ pub struct Metrics {
     pub active_connections: Family<ProtocolLabels, Gauge>,
     pub upload_pack_concurrent: Family<ProtocolLabels, Gauge>,
     pub active_clones: Family<ActiveCloneLabels, Gauge>,
-    pub cache_size_bytes: Gauge,
+    pub cache_apparent_usage_bytes: Gauge,
+    pub cache_physical_usage_bytes: Gauge,
     pub cache_repos_total: Gauge,
-    pub mirror_size_bytes: Family<RepoLabels, Gauge>,
-    pub cache_subtree_size_bytes: Family<CacheSubtreeLabels, Gauge>,
+    pub mirror_apparent_usage_bytes: Family<RepoLabels, Gauge>,
+    pub mirror_physical_usage_bytes: Family<RepoLabels, Gauge>,
+    pub cache_subtree_apparent_usage_bytes: Family<CacheSubtreeLabels, Gauge>,
+    pub cache_subtree_physical_usage_bytes: Family<CacheSubtreeLabels, Gauge>,
 
     // -- hydration --
     pub hydration_skipped: Family<HydrationSkipLabels, Counter>,
@@ -406,12 +417,15 @@ pub struct Metrics {
 
     // -- pack cache --
     pub pack_cache_requests_total: Family<PackCacheRequestLabels, Counter>,
-    pub pack_cache_size_bytes: Gauge,
+    pub pack_cache_apparent_usage_bytes: Gauge,
+    pub pack_cache_physical_usage_bytes: Gauge,
     pub pack_cache_inflight_waits_total: Family<PackCacheInflightWaitLabels, Counter>,
     pub pack_cache_artifact_generation_duration_seconds: Histogram,
     pub pack_cache_stitch_attempts_total: Family<PackCacheStitchLabels, Counter>,
     pub pack_cache_stitch_duration_seconds: Family<PackCacheStitchLabels, Histogram>,
     pub pack_cache_stitch_failures_total: Family<PackCacheStitchFailureLabels, Counter>,
+    pub pack_cache_on_demand_composite_stage_duration_seconds:
+        Family<PackCacheOnDemandCompositeStageLabels, Histogram>,
     pub upload_pack_cpu_seconds_total: Family<UploadPackCpuLabels, Counter>,
 
     // -- bundle URI / manifests --
@@ -607,11 +621,18 @@ impl Metrics {
             active_clones.clone(),
         );
 
-        let cache_size_bytes: Gauge = Gauge::default();
+        let cache_apparent_usage_bytes: Gauge = Gauge::default();
         registry.register(
-            "forgeproxy_cache_size_bytes",
-            "Current local cache disk usage in bytes",
-            cache_size_bytes.clone(),
+            "forgeproxy_cache_apparent_usage_bytes",
+            "Current local repo-cache apparent bytes across unique files",
+            cache_apparent_usage_bytes.clone(),
+        );
+
+        let cache_physical_usage_bytes: Gauge = Gauge::default();
+        registry.register(
+            "forgeproxy_cache_physical_usage_bytes",
+            "Current local repo-cache physically allocated bytes across unique files",
+            cache_physical_usage_bytes.clone(),
         );
 
         let cache_repos_total: Gauge = Gauge::default();
@@ -621,18 +642,32 @@ impl Metrics {
             cache_repos_total.clone(),
         );
 
-        let mirror_size_bytes = Family::<RepoLabels, Gauge>::default();
+        let mirror_apparent_usage_bytes = Family::<RepoLabels, Gauge>::default();
         registry.register(
-            "forgeproxy_mirror_size_bytes",
-            "Current on-disk size in bytes for each mirrored repository",
-            mirror_size_bytes.clone(),
+            "forgeproxy_mirror_apparent_usage_bytes",
+            "Current apparent bytes for each mirrored repository",
+            mirror_apparent_usage_bytes.clone(),
         );
 
-        let cache_subtree_size_bytes = Family::<CacheSubtreeLabels, Gauge>::default();
+        let mirror_physical_usage_bytes = Family::<RepoLabels, Gauge>::default();
         registry.register(
-            "forgeproxy_cache_subtree_size_bytes",
-            "Current on-disk size in bytes for important forgeproxy cache subtrees",
-            cache_subtree_size_bytes.clone(),
+            "forgeproxy_mirror_physical_usage_bytes",
+            "Current physically allocated bytes for each mirrored repository",
+            mirror_physical_usage_bytes.clone(),
+        );
+
+        let cache_subtree_apparent_usage_bytes = Family::<CacheSubtreeLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_cache_subtree_apparent_usage_bytes",
+            "Current apparent bytes for important forgeproxy cache subtrees",
+            cache_subtree_apparent_usage_bytes.clone(),
+        );
+
+        let cache_subtree_physical_usage_bytes = Family::<CacheSubtreeLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_cache_subtree_physical_usage_bytes",
+            "Current physically allocated bytes for important forgeproxy cache subtrees",
+            cache_subtree_physical_usage_bytes.clone(),
         );
 
         let hydration_skipped = Family::<HydrationSkipLabels, Counter>::default();
@@ -656,11 +691,18 @@ impl Metrics {
             pack_cache_requests_total.clone(),
         );
 
-        let pack_cache_size_bytes = Gauge::default();
+        let pack_cache_apparent_usage_bytes = Gauge::default();
         registry.register(
-            "forgeproxy_pack_cache_size_bytes",
-            "Current pack response cache size in bytes",
-            pack_cache_size_bytes.clone(),
+            "forgeproxy_pack_cache_apparent_usage_bytes",
+            "Current pack response cache apparent bytes across unique files",
+            pack_cache_apparent_usage_bytes.clone(),
+        );
+
+        let pack_cache_physical_usage_bytes = Gauge::default();
+        registry.register(
+            "forgeproxy_pack_cache_physical_usage_bytes",
+            "Current pack response cache physically allocated bytes across unique files",
+            pack_cache_physical_usage_bytes.clone(),
         );
 
         let pack_cache_inflight_waits_total =
@@ -702,6 +744,16 @@ impl Metrics {
             "forgeproxy_pack_cache_stitch_failures",
             "Pack response cache proactive stitching failures by repo and reason",
             pack_cache_stitch_failures_total.clone(),
+        );
+
+        let pack_cache_on_demand_composite_stage_duration_seconds =
+            Family::<PackCacheOnDemandCompositeStageLabels, Histogram>::new_with_constructor(
+                || Histogram::new(exponential_buckets(0.001, 2.0, 18)),
+            );
+        registry.register(
+            "forgeproxy_pack_cache_on_demand_composite_stage_duration_seconds",
+            "Request-time pack response cache composite stage latency in seconds",
+            pack_cache_on_demand_composite_stage_duration_seconds.clone(),
         );
 
         let upload_pack_cpu_seconds_total = Family::<UploadPackCpuLabels, Counter>::default();
@@ -765,19 +817,24 @@ impl Metrics {
             active_connections,
             upload_pack_concurrent,
             active_clones,
-            cache_size_bytes,
+            cache_apparent_usage_bytes,
+            cache_physical_usage_bytes,
             cache_repos_total,
-            mirror_size_bytes,
-            cache_subtree_size_bytes,
+            mirror_apparent_usage_bytes,
+            mirror_physical_usage_bytes,
+            cache_subtree_apparent_usage_bytes,
+            cache_subtree_physical_usage_bytes,
             hydration_skipped,
             upstream_fallback,
             pack_cache_requests_total,
-            pack_cache_size_bytes,
+            pack_cache_apparent_usage_bytes,
+            pack_cache_physical_usage_bytes,
             pack_cache_inflight_waits_total,
             pack_cache_artifact_generation_duration_seconds,
             pack_cache_stitch_attempts_total,
             pack_cache_stitch_duration_seconds,
             pack_cache_stitch_failures_total,
+            pack_cache_on_demand_composite_stage_duration_seconds,
             upload_pack_cpu_seconds_total,
             bundle_uri_command_total,
             bundle_presign_total,
@@ -977,11 +1034,19 @@ pub fn set_active_clones(
         .set(value);
 }
 
-pub fn set_cache_size_bytes(metrics: &MetricsRegistry, size_bytes: u64) {
+pub fn set_cache_usage_bytes(
+    metrics: &MetricsRegistry,
+    apparent_usage_bytes: u64,
+    physical_usage_bytes: u64,
+) {
     metrics
         .metrics
-        .cache_size_bytes
-        .set(size_bytes.min(i64::MAX as u64) as i64);
+        .cache_apparent_usage_bytes
+        .set(apparent_usage_bytes.min(i64::MAX as u64) as i64);
+    metrics
+        .metrics
+        .cache_physical_usage_bytes
+        .set(physical_usage_bytes.min(i64::MAX as u64) as i64);
 }
 
 pub fn set_cache_repos_total(metrics: &MetricsRegistry, repo_count: usize) {
@@ -991,26 +1056,51 @@ pub fn set_cache_repos_total(metrics: &MetricsRegistry, repo_count: usize) {
         .set(repo_count.min(i64::MAX as usize) as i64);
 }
 
-pub fn replace_mirror_size_bytes(metrics: &MetricsRegistry, mirror_sizes: &[(String, u64)]) {
-    metrics.metrics.mirror_size_bytes.clear();
-    for (repo, size_bytes) in mirror_sizes {
+pub fn replace_mirror_usage_bytes(
+    metrics: &MetricsRegistry,
+    apparent_sizes: &[(String, u64)],
+    physical_sizes: &[(String, u64)],
+) {
+    metrics.metrics.mirror_apparent_usage_bytes.clear();
+    for (repo, size_bytes) in apparent_sizes {
         metrics
             .metrics
-            .mirror_size_bytes
+            .mirror_apparent_usage_bytes
+            .get_or_create(&RepoLabels { repo: repo.clone() })
+            .set((*size_bytes).min(i64::MAX as u64) as i64);
+    }
+
+    metrics.metrics.mirror_physical_usage_bytes.clear();
+    for (repo, size_bytes) in physical_sizes {
+        metrics
+            .metrics
+            .mirror_physical_usage_bytes
             .get_or_create(&RepoLabels { repo: repo.clone() })
             .set((*size_bytes).min(i64::MAX as u64) as i64);
     }
 }
 
-pub fn replace_cache_subtree_size_bytes(
+pub fn replace_cache_subtree_usage_bytes(
     metrics: &MetricsRegistry,
-    subtree_sizes: &[(String, u64)],
+    apparent_sizes: &[(String, u64)],
+    physical_sizes: &[(String, u64)],
 ) {
-    metrics.metrics.cache_subtree_size_bytes.clear();
-    for (subtree, size_bytes) in subtree_sizes {
+    metrics.metrics.cache_subtree_apparent_usage_bytes.clear();
+    for (subtree, size_bytes) in apparent_sizes {
         metrics
             .metrics
-            .cache_subtree_size_bytes
+            .cache_subtree_apparent_usage_bytes
+            .get_or_create(&CacheSubtreeLabels {
+                subtree: subtree.clone(),
+            })
+            .set((*size_bytes).min(i64::MAX as u64) as i64);
+    }
+
+    metrics.metrics.cache_subtree_physical_usage_bytes.clear();
+    for (subtree, size_bytes) in physical_sizes {
+        metrics
+            .metrics
+            .cache_subtree_physical_usage_bytes
             .get_or_create(&CacheSubtreeLabels {
                 subtree: subtree.clone(),
             })
@@ -1054,11 +1144,19 @@ pub fn inc_pack_cache_request(
         .inc();
 }
 
-pub fn set_pack_cache_size_bytes(metrics: &MetricsRegistry, size_bytes: u64) {
+pub fn set_pack_cache_usage_bytes(
+    metrics: &MetricsRegistry,
+    apparent_usage_bytes: u64,
+    physical_usage_bytes: u64,
+) {
     metrics
         .metrics
-        .pack_cache_size_bytes
-        .set(size_bytes.min(i64::MAX as u64) as i64);
+        .pack_cache_apparent_usage_bytes
+        .set(apparent_usage_bytes.min(i64::MAX as u64) as i64);
+    metrics
+        .metrics
+        .pack_cache_physical_usage_bytes
+        .set(physical_usage_bytes.min(i64::MAX as u64) as i64);
 }
 
 pub fn inc_pack_cache_inflight_wait(metrics: &MetricsRegistry, protocol: Protocol, result: &str) {
@@ -1111,6 +1209,27 @@ pub fn inc_pack_cache_stitch_failure(metrics: &MetricsRegistry, owner_repo: &str
             reason: reason.to_string(),
         })
         .inc();
+}
+
+pub fn observe_pack_cache_on_demand_composite_stage(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    owner_repo: &str,
+    stage: &str,
+    result: &str,
+    elapsed: Duration,
+) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_on_demand_composite_stage_duration_seconds
+        .get_or_create(&PackCacheOnDemandCompositeStageLabels {
+            protocol,
+            owner_repo,
+            stage: stage.to_string(),
+            result: result.to_string(),
+        })
+        .observe(elapsed.as_secs_f64());
 }
 
 pub fn inc_upload_pack_cpu_seconds(
@@ -1295,32 +1414,64 @@ mod tests {
     fn replacing_cache_size_families_removes_stale_series() {
         let metrics = MetricsRegistry::new();
 
-        replace_mirror_size_bytes(
+        replace_mirror_usage_bytes(
             &metrics,
             &[
                 ("acme/widgets".to_string(), 12),
                 ("acme/legacy".to_string(), 7),
             ],
+            &[
+                ("acme/widgets".to_string(), 8),
+                ("acme/legacy".to_string(), 5),
+            ],
         );
-        replace_cache_subtree_size_bytes(
+        replace_cache_subtree_usage_bytes(
             &metrics,
             &[("mirrors".to_string(), 12), ("snapshots".to_string(), 4)],
+            &[("mirrors".to_string(), 8), ("snapshots".to_string(), 3)],
         );
 
         let encoded = encode_metrics(&metrics.registry);
-        assert!(encoded.contains("forgeproxy_mirror_size_bytes{repo=\"acme/widgets\"} 12"));
-        assert!(encoded.contains("forgeproxy_mirror_size_bytes{repo=\"acme/legacy\"} 7"));
-        assert!(encoded.contains("forgeproxy_cache_subtree_size_bytes{subtree=\"mirrors\"} 12"));
-        assert!(encoded.contains("forgeproxy_cache_subtree_size_bytes{subtree=\"snapshots\"} 4"));
+        assert!(
+            encoded.contains("forgeproxy_mirror_apparent_usage_bytes{repo=\"acme/widgets\"} 12")
+        );
+        assert!(encoded.contains("forgeproxy_mirror_physical_usage_bytes{repo=\"acme/legacy\"} 5"));
+        assert!(
+            encoded
+                .contains("forgeproxy_cache_subtree_apparent_usage_bytes{subtree=\"mirrors\"} 12")
+        );
+        assert!(
+            encoded
+                .contains("forgeproxy_cache_subtree_physical_usage_bytes{subtree=\"snapshots\"} 3")
+        );
 
-        replace_mirror_size_bytes(&metrics, &[("acme/widgets".to_string(), 9)]);
-        replace_cache_subtree_size_bytes(&metrics, &[("mirrors".to_string(), 9)]);
+        replace_mirror_usage_bytes(
+            &metrics,
+            &[("acme/widgets".to_string(), 9)],
+            &[("acme/widgets".to_string(), 6)],
+        );
+        replace_cache_subtree_usage_bytes(
+            &metrics,
+            &[("mirrors".to_string(), 9)],
+            &[("mirrors".to_string(), 6)],
+        );
 
         let encoded = encode_metrics(&metrics.registry);
-        assert!(encoded.contains("forgeproxy_mirror_size_bytes{repo=\"acme/widgets\"} 9"));
-        assert!(!encoded.contains("forgeproxy_mirror_size_bytes{repo=\"acme/legacy\"}"));
-        assert!(encoded.contains("forgeproxy_cache_subtree_size_bytes{subtree=\"mirrors\"} 9"));
-        assert!(!encoded.contains("forgeproxy_cache_subtree_size_bytes{subtree=\"snapshots\"}"));
+        assert!(
+            encoded.contains("forgeproxy_mirror_apparent_usage_bytes{repo=\"acme/widgets\"} 9")
+        );
+        assert!(
+            encoded.contains("forgeproxy_mirror_physical_usage_bytes{repo=\"acme/widgets\"} 6")
+        );
+        assert!(!encoded.contains("forgeproxy_mirror_apparent_usage_bytes{repo=\"acme/legacy\"}"));
+        assert!(
+            encoded
+                .contains("forgeproxy_cache_subtree_apparent_usage_bytes{subtree=\"mirrors\"} 9")
+        );
+        assert!(
+            !encoded
+                .contains("forgeproxy_cache_subtree_physical_usage_bytes{subtree=\"snapshots\"}")
+        );
     }
 
     #[test]
@@ -1358,6 +1509,31 @@ mod tests {
             line.starts_with("forgeproxy_bundle_list_request_total{")
                 && line.contains("repo=\"acme/widgets\"")
                 && line.contains("result=\"served\"")
+                && line.ends_with(" 1")
+        }));
+    }
+
+    #[test]
+    fn on_demand_composite_stage_metrics_encode_expected_labels() {
+        let metrics = MetricsRegistry::new();
+
+        observe_pack_cache_on_demand_composite_stage(
+            &metrics,
+            Protocol::Ssh,
+            "acme/widgets.git",
+            "semaphore_wait",
+            "ok",
+            Duration::from_millis(25),
+        );
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(encoded.lines().any(|line| {
+            line.starts_with(
+                "forgeproxy_pack_cache_on_demand_composite_stage_duration_seconds_count{",
+            ) && line.contains("owner_repo=\"acme/widgets\"")
+                && line.contains("protocol=\"ssh\"")
+                && line.contains("result=\"ok\"")
+                && line.contains("stage=\"semaphore_wait\"")
                 && line.ends_with(" 1")
         }));
     }

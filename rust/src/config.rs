@@ -713,6 +713,13 @@ pub struct PackCacheConfig {
     /// before bypassing the cache and running its own local upload-pack.
     #[serde(default = "default_pack_cache_wait_for_inflight_secs")]
     pub wait_for_inflight_secs: u64,
+    /// Maximum request-time composite delta packs that may be built in parallel.
+    ///
+    /// These foreground builds intentionally do not share the background bundle
+    /// generation semaphore, so cache-miss clones do not queue behind proactive
+    /// warming or index preparation.
+    #[serde(default = "default_pack_cache_max_concurrent_request_deltas")]
+    pub max_concurrent_request_deltas: usize,
     /// Do not store responses smaller than this threshold. Small requests do
     /// not justify cache bookkeeping.
     #[serde(default = "default_pack_cache_min_response_bytes")]
@@ -728,6 +735,7 @@ impl Default for PackCacheConfig {
             low_water_mark: default_low_water(),
             eviction_policy: default_eviction_policy(),
             wait_for_inflight_secs: default_pack_cache_wait_for_inflight_secs(),
+            max_concurrent_request_deltas: default_pack_cache_max_concurrent_request_deltas(),
             min_response_bytes: default_pack_cache_min_response_bytes(),
         }
     }
@@ -739,6 +747,10 @@ fn default_pack_cache_max_percent() -> f64 {
 
 fn default_pack_cache_wait_for_inflight_secs() -> u64 {
     120
+}
+
+fn default_pack_cache_max_concurrent_request_deltas() -> usize {
+    1
 }
 
 fn default_pack_cache_min_response_bytes() -> u64 {
@@ -953,6 +965,10 @@ fn validate_config(config: &Config) -> Result<()> {
         "pack_cache water marks must be in range [0.0, 1.0]"
     );
     anyhow::ensure!(
+        config.pack_cache.max_concurrent_request_deltas > 0,
+        "pack_cache.max_concurrent_request_deltas must be greater than 0"
+    );
+    anyhow::ensure!(
         (0.0..=1.0).contains(&config.observability.traces.sample_ratio),
         "observability.traces.sample_ratio must be in range [0.0, 1.0]"
     );
@@ -1018,6 +1034,15 @@ mod tests {
         let config = include_str!("../../config.example.yaml").replace(
             "  metrics:\n    prometheus:\n      enabled: true\n",
             "  metrics:\n    prometheus:\n      enabled: true\n      refresh_interval_secs: 0\n",
+        );
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_pack_cache_request_delta_concurrency() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  max_concurrent_request_deltas: 1\n",
+            "  max_concurrent_request_deltas: 0\n",
         );
         assert!(parse_config_str(&config).is_err());
     }

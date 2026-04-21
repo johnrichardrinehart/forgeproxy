@@ -208,14 +208,19 @@
     {
       "id": 6,
       "type": "stat",
-      "title": "Total Cache Footprint",
+      "title": "Total Cache Usage",
       "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
-          "expr": "sum(forgeproxy_cache_size_bytes{service\\.instance\\.id=~\"$instance\"})",
-          "legendFormat": "",
+          "expr": "sum(forgeproxy_cache_physical_usage_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "physical",
           "refId": "A"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_apparent_usage_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "apparent",
+          "refId": "B"
         }
       ],
       "fieldConfig": {
@@ -520,34 +525,64 @@
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
-          "expr": "sum(forgeproxy_mirror_size_bytes{service\\.instance\\.id=~\"$instance\"})",
-          "legendFormat": "/var/cache/forgeproxy/mirrors",
+          "expr": "sum(forgeproxy_mirror_physical_usage_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "physical /var/cache/forgeproxy/mirrors",
           "refId": "A"
         },
         {
-          "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"snapshots\", service\\.instance\\.id=~\"$instance\"})",
-          "legendFormat": "/var/cache/forgeproxy/snapshots",
+          "expr": "sum(forgeproxy_cache_subtree_physical_usage_bytes{subtree=\"snapshots\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "physical /var/cache/forgeproxy/snapshots",
           "refId": "B"
         },
         {
-          "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"state_generations\", service\\.instance\\.id=~\"$instance\"})",
-          "legendFormat": "/var/cache/forgeproxy/.state/generations",
+          "expr": "sum(forgeproxy_cache_subtree_physical_usage_bytes{subtree=\"state_generations\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "physical /var/cache/forgeproxy/.state/generations",
           "refId": "C"
         },
         {
-          "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"state_delta\", service\\.instance\\.id=~\"$instance\"})",
-          "legendFormat": "/var/cache/forgeproxy/.state/delta",
+          "expr": "sum(forgeproxy_cache_subtree_physical_usage_bytes{subtree=\"state_delta\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "physical /var/cache/forgeproxy/.state/delta",
           "refId": "D"
         },
         {
-          "expr": "sum(forgeproxy_cache_subtree_size_bytes{subtree=\"state_tee\", service\\.instance\\.id=~\"$instance\"})",
-          "legendFormat": "/var/cache/forgeproxy/.state/tee",
+          "expr": "sum(forgeproxy_cache_subtree_physical_usage_bytes{subtree=\"state_tee\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "physical /var/cache/forgeproxy/.state/tee",
           "refId": "E"
         },
         {
-          "expr": "sum(forgeproxy_pack_cache_size_bytes{service\\.instance\\.id=~\"$instance\"})",
-          "legendFormat": "/var/cache/forgeproxy/.state/pack-cache",
+          "expr": "sum(forgeproxy_pack_cache_physical_usage_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "physical /var/cache/forgeproxy/.state/pack-cache",
           "refId": "F"
+        },
+        {
+          "expr": "sum(forgeproxy_mirror_apparent_usage_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "apparent /var/cache/forgeproxy/mirrors",
+          "refId": "G"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_subtree_apparent_usage_bytes{subtree=\"snapshots\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "apparent /var/cache/forgeproxy/snapshots",
+          "refId": "H"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_subtree_apparent_usage_bytes{subtree=\"state_generations\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "apparent /var/cache/forgeproxy/.state/generations",
+          "refId": "I"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_subtree_apparent_usage_bytes{subtree=\"state_delta\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "apparent /var/cache/forgeproxy/.state/delta",
+          "refId": "J"
+        },
+        {
+          "expr": "sum(forgeproxy_cache_subtree_apparent_usage_bytes{subtree=\"state_tee\", service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "apparent /var/cache/forgeproxy/.state/tee",
+          "refId": "K"
+        },
+        {
+          "expr": "sum(forgeproxy_pack_cache_apparent_usage_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "legendFormat": "apparent /var/cache/forgeproxy/.state/pack-cache",
+          "refId": "L"
         }
       ],
       "fieldConfig": {
@@ -572,12 +607,12 @@
     {
       "id": 32,
       "type": "timeseries",
-      "title": "Largest Mirrors",
+      "title": "Largest Mirrors by Physical Usage",
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
-          "expr": "topk(12, forgeproxy_mirror_size_bytes{service\\.instance\\.id=~\"$instance\"})",
+          "expr": "topk(12, forgeproxy_mirror_physical_usage_bytes{service\\.instance\\.id=~\"$instance\"})",
           "legendFormat": "{{repo}}",
           "refId": "A"
         }
@@ -664,19 +699,61 @@
         "legend": { "displayMode": "list", "placement": "bottom" }
       }
     },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "On-Demand Pack Composite Stage Latency",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(forgeproxy_pack_cache_on_demand_composite_stage_duration_seconds_bucket{result=\"ok\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, result) (rate(forgeproxy_pack_cache_on_demand_composite_stage_duration_seconds_bucket{stage=\"total\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "p95 total {{result}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisBorderShow": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*semaphore_wait.*" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      }
+    },
 
     {
       "id": 40,
       "type": "row",
       "title": "Bundle Generation",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
       "collapsed": false
     },
     {
       "id": 41,
       "type": "timeseries",
       "title": "Bundle Generations / min",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -723,7 +800,7 @@
       "id": 42,
       "type": "timeseries",
       "title": "Bundle Generation Duration Percentiles",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -776,14 +853,14 @@
       "id": 50,
       "type": "row",
       "title": "Coordination & Auth",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
       "collapsed": false
     },
     {
       "id": 51,
       "type": "timeseries",
       "title": "Distributed Lock Operations / min",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 42 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 50 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -834,7 +911,7 @@
       "id": 52,
       "type": "timeseries",
       "title": "GHE API Calls / min & Rate Limit",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 42 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 50 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -881,7 +958,7 @@
       "id": 53,
       "type": "timeseries",
       "title": "Auth Cache / min",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 42 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 50 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -925,14 +1002,14 @@
       "id": 60,
       "type": "row",
       "title": "Host Metrics",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 50 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 },
       "collapsed": true,
       "panels": [
         {
           "id": 61,
           "type": "timeseries",
           "title": "CPU Busy %",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -964,7 +1041,7 @@
           "id": 62,
           "type": "timeseries",
           "title": "Memory Breakdown",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -997,7 +1074,7 @@
           "id": 63,
           "type": "timeseries",
           "title": "Disk I/O",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1029,7 +1106,7 @@
           "id": 64,
           "type": "timeseries",
           "title": "Network I/O",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1061,7 +1138,7 @@
           "id": 65,
           "type": "timeseries",
           "title": "I/O Wait %",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1093,7 +1170,7 @@
           "id": 66,
           "type": "timeseries",
           "title": "Disk Queue Depth",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 75 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1125,7 +1202,7 @@
           "id": 67,
           "type": "timeseries",
           "title": "Disk Read Latency",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 83 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1157,7 +1234,7 @@
           "id": 68,
           "type": "timeseries",
           "title": "Major Page Faults / sec",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 75 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 83 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1189,7 +1266,7 @@
           "id": 69,
           "type": "timeseries",
           "title": "Page Cache Size",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 83 },
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 91 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1224,14 +1301,14 @@
       "id": 70,
       "type": "row",
       "title": "Logs",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 59 },
       "collapsed": true,
       "panels": [
         {
           "id": 71,
           "type": "logs",
           "title": "Forgeproxy Logs",
-          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 52 },
+          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 60 },
           "datasource": { "type": "loki", "uid": "$${loki}" },
           "targets": [
             {
@@ -1257,7 +1334,7 @@
       "id": 80,
       "type": "row",
       "title": "Traces",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 60 },
       "collapsed": true,
       "panels": [
         {
@@ -1265,7 +1342,7 @@
           "type": "table",
           "title": "Trace Search",
           "description": "Recent traces from forgeproxy — click a Trace ID to open the trace view",
-          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 53 },
+          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 61 },
           "datasource": { "type": "tempo", "uid": "$${tempo}" },
           "targets": [
             {

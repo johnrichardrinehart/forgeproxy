@@ -63,6 +63,7 @@ pack_cache:
   low_water_mark: 0.75
   eviction_policy: "lru"
   wait_for_inflight_secs: 120
+  max_concurrent_request_deltas: 1
   min_response_bytes: 67108864
 storage:
   local:

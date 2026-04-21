@@ -1648,6 +1648,7 @@ async fn serve_local_upload_pack(
         Some(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
             match try_finish_pack_cache_delta_composite(
                 state,
+                Protocol::Https,
                 &owner_repo,
                 repo_lease.repo_path(),
                 writer,

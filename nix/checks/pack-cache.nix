@@ -442,7 +442,7 @@ pkgs.testers.runNixOSTest {
         client.succeed(
             "git clone https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-miss"
         )
-        wait_for_metric_regex(proxy, r"^forgeproxy_pack_cache_size_bytes [1-9][0-9]*$")
+        wait_for_metric_regex(proxy, r"^forgeproxy_pack_cache_physical_usage_bytes [1-9][0-9]*$")
         client.succeed(
             "git clone https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-hit"
         )
