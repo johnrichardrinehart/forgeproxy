@@ -898,8 +898,9 @@ impl PackCacheWriter {
                 directory_size(&self.root).unwrap_or(0),
             );
             self.release_inflight().await;
-            self.finalize_indexed_promotion(self.key.as_str(), None)
-                .await?;
+            let pack_id = self.key.as_str().to_string();
+            self.spawn_indexed_promotion(pack_id, None);
+            return Ok(());
         } else if let Err(error) = tokio::fs::remove_file(&self.tmp_pack_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -954,8 +955,8 @@ impl PackCacheWriter {
             directory_size(&self.root).unwrap_or(0),
         );
         self.release_inflight().await;
-        self.finalize_indexed_promotion(&format!("{}-delta", self.key.as_str()), Some(base_key))
-            .await?;
+        let pack_id = format!("{}-delta", self.key.as_str());
+        self.spawn_indexed_promotion(pack_id, Some(base_key.clone()));
         Ok(())
     }
 
@@ -1096,8 +1097,29 @@ impl PackCacheWriter {
         Ok(pack_id)
     }
 
+    fn spawn_indexed_promotion(
+        mut self,
+        pack_id: String,
+        composite_base_key: Option<PackCacheKey>,
+    ) {
+        let key = self.key.as_str().to_string();
+        tokio::spawn(async move {
+            if let Err(error) = self
+                .finalize_indexed_promotion(&pack_id, composite_base_key.as_ref())
+                .await
+            {
+                warn!(
+                    key = %key,
+                    pack_id,
+                    error = %error,
+                    "failed to finalize pack cache index after replay-ready promotion"
+                );
+            }
+        });
+    }
+
     async fn finalize_indexed_promotion(
-        &self,
+        &mut self,
         pack_id: &str,
         composite_base_key: Option<&PackCacheKey>,
     ) -> Result<()> {
@@ -1986,6 +2008,16 @@ mod tests {
         response
     }
 
+    async fn wait_for_pack_cache_metadata(root: &std::path::Path, key: &str) -> PackCacheMetadata {
+        for _ in 0..100 {
+            if let Ok(metadata) = super::read_pack_cache_metadata(root, key) {
+                return metadata;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        super::read_pack_cache_metadata(root, key).unwrap()
+    }
+
     fn write_prune_test_entry(
         root: &std::path::Path,
         key: &str,
@@ -2574,8 +2606,7 @@ mod tests {
             .await
             .unwrap();
 
-        let metadata =
-            super::read_pack_cache_metadata(&cache.root, composite_key.as_str()).unwrap();
+        let metadata = wait_for_pack_cache_metadata(&cache.root, composite_key.as_str()).await;
         assert_eq!(metadata.request_wants, vec![want_c.clone()]);
         assert_eq!(
             metadata.covered_wants,
@@ -2996,15 +3027,12 @@ mod tests {
         writer.finish().await.unwrap();
         cache.lookup_by_key(&base_key).await.unwrap().unwrap();
 
-        let metadata = super::read_pack_cache_metadata(
-            &temp
-                .path()
-                .join(crate::cache::layout::STATE_ROOT_DIR)
-                .join(super::PACK_CACHE_DIR),
-            base_key.as_str(),
-        )
-        .unwrap();
-        assert_eq!(metadata.hit_count, 1);
+        let metadata_root = temp
+            .path()
+            .join(crate::cache::layout::STATE_ROOT_DIR)
+            .join(super::PACK_CACHE_DIR);
+        let metadata = wait_for_pack_cache_metadata(&metadata_root, base_key.as_str()).await;
+        assert_eq!(metadata.hit_count, 0);
         assert_eq!(
             metadata.covered_wants,
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
