@@ -5,9 +5,18 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
-use tokio::io::AsyncWriteExt;
-use tracing::{debug, instrument};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{debug, instrument, warn};
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+const S3_SINGLE_PUT_MAX_BYTES: u64 = 5 * GIB;
+const S3_MULTIPART_MIN_PART_SIZE_BYTES: u64 = 5 * MIB;
+const S3_MULTIPART_DEFAULT_PART_SIZE_BYTES: u64 = 64 * MIB;
+const S3_MULTIPART_MAX_PART_SIZE_BYTES: u64 = 5 * GIB;
+const S3_MULTIPART_MAX_PARTS: u64 = 10_000;
 
 // ---------------------------------------------------------------------------
 // Free functions — operate on explicit bucket / key parameters.
@@ -26,6 +35,13 @@ pub async fn upload_bundle(
         .await
         .with_context(|| format!("stat file for upload: {}", file_path.display()))?
         .len();
+    if size_bytes > S3_SINGLE_PUT_MAX_BYTES {
+        upload_bundle_multipart(client, bucket, key, file_path, size_bytes).await?;
+        metrics.metrics.s3_upload_bytes.inc_by(size_bytes);
+        debug!(path = %file_path.display(), size_bytes, "bundle uploaded with S3 multipart upload");
+        return Ok(());
+    }
+
     let body = ByteStream::from_path(file_path)
         .await
         .with_context(|| format!("open file for upload: {}", file_path.display()))?;
@@ -42,6 +58,147 @@ pub async fn upload_bundle(
     metrics.metrics.s3_upload_bytes.inc_by(size_bytes);
     debug!(path = %file_path.display(), "bundle uploaded");
     Ok(())
+}
+
+async fn upload_bundle_multipart(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    file_path: &Path,
+    size_bytes: u64,
+) -> Result<()> {
+    let part_size = multipart_part_size(size_bytes)?;
+    debug!(
+        path = %file_path.display(),
+        size_bytes,
+        part_size,
+        "starting S3 multipart bundle upload"
+    );
+
+    let response = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .context("S3 CreateMultipartUpload")?;
+    let upload_id = response
+        .upload_id()
+        .context("S3 CreateMultipartUpload response did not include upload_id")?
+        .to_string();
+
+    match upload_bundle_multipart_parts(client, bucket, key, file_path, &upload_id, part_size).await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            warn!(
+                bucket,
+                key,
+                %upload_id,
+                error = %error,
+                "aborting failed S3 multipart bundle upload"
+            );
+            if let Err(abort_error) = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await
+            {
+                warn!(
+                    bucket,
+                    key,
+                    %upload_id,
+                    error = %abort_error,
+                    "failed to abort S3 multipart bundle upload"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn upload_bundle_multipart_parts(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    file_path: &Path,
+    upload_id: &str,
+    part_size: u64,
+) -> Result<()> {
+    let buffer_len: usize = part_size
+        .try_into()
+        .context("multipart part size does not fit usize")?;
+    let mut file = tokio::fs::File::open(file_path)
+        .await
+        .with_context(|| format!("open file for multipart upload: {}", file_path.display()))?;
+    let mut completed_parts = Vec::new();
+    let mut part_number = 1;
+
+    loop {
+        let mut buffer = vec![0_u8; buffer_len];
+        let bytes_read = file
+            .read(&mut buffer)
+            .await
+            .with_context(|| format!("read multipart upload part from {}", file_path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        buffer.truncate(bytes_read);
+
+        let response = client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(buffer))
+            .send()
+            .await
+            .with_context(|| format!("S3 UploadPart part_number={part_number}"))?;
+        let e_tag = response
+            .e_tag()
+            .with_context(|| format!("S3 UploadPart part_number={part_number} missing ETag"))?
+            .to_string();
+        completed_parts.push(
+            CompletedPart::builder()
+                .set_e_tag(Some(e_tag))
+                .set_part_number(Some(part_number))
+                .build(),
+        );
+        part_number += 1;
+    }
+
+    anyhow::ensure!(
+        !completed_parts.is_empty(),
+        "cannot complete multipart upload without parts"
+    );
+    let multipart_upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(completed_parts))
+        .build();
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(multipart_upload)
+        .send()
+        .await
+        .context("S3 CompleteMultipartUpload")?;
+    Ok(())
+}
+
+fn multipart_part_size(size_bytes: u64) -> Result<u64> {
+    let minimum_for_part_limit = size_bytes.div_ceil(S3_MULTIPART_MAX_PARTS);
+    let part_size = S3_MULTIPART_DEFAULT_PART_SIZE_BYTES
+        .max(S3_MULTIPART_MIN_PART_SIZE_BYTES)
+        .max(minimum_for_part_limit);
+    anyhow::ensure!(
+        part_size <= S3_MULTIPART_MAX_PART_SIZE_BYTES,
+        "object is too large for S3 multipart upload"
+    );
+    Ok(part_size)
 }
 
 /// Upload an in-memory UTF-8 object to S3.
@@ -220,4 +377,28 @@ pub async fn generate_presigned_url(
     let url = req.uri().to_string();
     debug!(%url, "presigned URL generated");
     Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multipart_part_size_uses_default_for_typical_large_bundle() {
+        let size = S3_SINGLE_PUT_MAX_BYTES + 1;
+
+        assert_eq!(
+            multipart_part_size(size).unwrap(),
+            S3_MULTIPART_DEFAULT_PART_SIZE_BYTES
+        );
+    }
+
+    #[test]
+    fn multipart_part_size_grows_to_stay_under_part_limit() {
+        let size = S3_MULTIPART_DEFAULT_PART_SIZE_BYTES * (S3_MULTIPART_MAX_PARTS + 1);
+        let part_size = multipart_part_size(size).unwrap();
+
+        assert!(size.div_ceil(part_size) <= S3_MULTIPART_MAX_PARTS);
+        assert!(part_size > S3_MULTIPART_DEFAULT_PART_SIZE_BYTES);
+    }
 }
