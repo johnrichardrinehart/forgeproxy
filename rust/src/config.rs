@@ -486,6 +486,12 @@ pub struct CloneConfig {
     /// publish before falling back to proxying upstream.
     #[serde(default = "default_request_wait_for_local_catch_up_secs")]
     pub request_wait_for_local_catch_up_secs: u64,
+    /// Request path: maximum time a client request should wait when a same-repo
+    /// request-time catch-up is actively running. This longer deadline prevents
+    /// a slow-but-useful delta fetch from causing a herd of full upstream
+    /// fallbacks that can saturate disk and starve local hydration.
+    #[serde(default = "default_request_wait_for_active_local_catch_up_secs")]
+    pub request_wait_for_active_local_catch_up_secs: u64,
     /// How often to scan `_tee` for abandoned captures.
     #[serde(default = "default_tee_cleanup_interval_secs")]
     pub tee_cleanup_interval_secs: u64,
@@ -523,6 +529,8 @@ impl Default for CloneConfig {
             prepare_published_generation_indexes: false,
             generation_coalescing_window_secs: 0,
             request_wait_for_local_catch_up_secs: default_request_wait_for_local_catch_up_secs(),
+            request_wait_for_active_local_catch_up_secs:
+                default_request_wait_for_active_local_catch_up_secs(),
             tee_cleanup_interval_secs: default_tee_cleanup_interval_secs(),
             tee_retention_secs: default_tee_retention_secs(),
             ssh_upload_pack_close_grace_secs: default_ssh_upload_pack_close_grace_secs(),
@@ -548,6 +556,10 @@ fn default_lock_wait_timeout() -> u64 {
 
 fn default_request_wait_for_local_catch_up_secs() -> u64 {
     30
+}
+
+fn default_request_wait_for_active_local_catch_up_secs() -> u64 {
+    300
 }
 
 fn default_tee_cleanup_interval_secs() -> u64 {
@@ -1039,7 +1051,11 @@ mod tests {
 
     #[test]
     fn config_example_parses() {
-        parse_config_str(include_str!("../../config.example.yaml")).unwrap();
+        let config = parse_config_str(include_str!("../../config.example.yaml")).unwrap();
+        assert_eq!(
+            config.clone.request_wait_for_active_local_catch_up_secs,
+            300
+        );
     }
 
     #[test]

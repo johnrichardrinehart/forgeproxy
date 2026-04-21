@@ -57,20 +57,21 @@ module "forgeproxy" {
   metrics_scrape_cidrs          = var.metrics_scrape_cidrs
   ec2_key_pair_name             = var.ec2_key_pair_name
 
-  local_cache_max_percent                    = var.local_cache_max_percent
-  eviction_policy                            = var.eviction_policy
-  generation_coalescing_window_secs          = var.generation_coalescing_window_secs
-  max_concurrent_local_upload_packs          = var.max_concurrent_local_upload_packs
-  max_concurrent_local_upload_packs_per_repo = var.max_concurrent_local_upload_packs_per_repo
-  index_pack_threads                         = var.index_pack_threads
-  pack_cache_enabled                         = var.pack_cache_enabled
-  pack_cache_max_percent                     = var.pack_cache_max_percent
-  pack_cache_high_water_mark                 = var.pack_cache_high_water_mark
-  pack_cache_low_water_mark                  = var.pack_cache_low_water_mark
-  pack_cache_eviction_policy                 = var.pack_cache_eviction_policy
-  pack_cache_wait_for_inflight_secs          = var.pack_cache_wait_for_inflight_secs
-  pack_cache_max_concurrent_request_deltas   = var.pack_cache_max_concurrent_request_deltas
-  pack_cache_min_response_bytes              = var.pack_cache_min_response_bytes
+  local_cache_max_percent                     = var.local_cache_max_percent
+  eviction_policy                             = var.eviction_policy
+  generation_coalescing_window_secs           = var.generation_coalescing_window_secs
+  request_wait_for_active_local_catch_up_secs = var.request_wait_for_active_local_catch_up_secs
+  max_concurrent_local_upload_packs           = var.max_concurrent_local_upload_packs
+  max_concurrent_local_upload_packs_per_repo  = var.max_concurrent_local_upload_packs_per_repo
+  index_pack_threads                          = var.index_pack_threads
+  pack_cache_enabled                          = var.pack_cache_enabled
+  pack_cache_max_percent                      = var.pack_cache_max_percent
+  pack_cache_high_water_mark                  = var.pack_cache_high_water_mark
+  pack_cache_low_water_mark                   = var.pack_cache_low_water_mark
+  pack_cache_eviction_policy                  = var.pack_cache_eviction_policy
+  pack_cache_wait_for_inflight_secs           = var.pack_cache_wait_for_inflight_secs
+  pack_cache_max_concurrent_request_deltas    = var.pack_cache_max_concurrent_request_deltas
+  pack_cache_min_response_bytes               = var.pack_cache_min_response_bytes
 
   s3_bundle_prefix     = var.s3_bundle_prefix
   s3_use_fips          = var.s3_use_fips

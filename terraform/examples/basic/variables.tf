@@ -288,6 +288,12 @@ variable "generation_coalescing_window_secs" {
   description = "Seconds lower-priority refreshes may keep serving the current published generation before publishing a newer one."
 }
 
+variable "request_wait_for_active_local_catch_up_secs" {
+  type        = number
+  default     = 300
+  description = "Request path: seconds a client may wait for an active same-repo local catch-up before proxying upstream."
+}
+
 variable "max_concurrent_local_upload_packs_per_repo" {
   type        = number
   default     = 1

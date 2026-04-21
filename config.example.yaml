@@ -45,6 +45,9 @@ clone:
   prepare_published_generation_indexes: false
   generation_coalescing_window_secs: 60
   request_wait_for_local_catch_up_secs: 30
+  # Request path: when a same-repo local catch-up is already running, wait longer
+  # for that work instead of stampeding into more full upstream proxy streams.
+  request_wait_for_active_local_catch_up_secs: 300
   tee_cleanup_interval_secs: 60
   tee_retention_secs: 900
 fetch_schedule:
