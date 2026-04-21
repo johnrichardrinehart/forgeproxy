@@ -118,7 +118,8 @@ struct CloneCompletionStream<S> {
     protocol: Protocol,
     completion: CloneCompletion,
     upload_pack_source: Option<CloneSource>,
-    _active_clone_guard: ActiveCloneGuard,
+    _active_clone_guard: Option<ActiveCloneGuard>,
+    record_completion: bool,
     recorded: bool,
 }
 
@@ -129,7 +130,8 @@ impl<S> CloneCompletionStream<S> {
         protocol: Protocol,
         completion: CloneCompletion,
         upload_pack_source: Option<CloneSource>,
-        active_clone_guard: ActiveCloneGuard,
+        active_clone_guard: Option<ActiveCloneGuard>,
+        record_completion: bool,
     ) -> Self {
         Self {
             inner,
@@ -138,6 +140,7 @@ impl<S> CloneCompletionStream<S> {
             completion,
             upload_pack_source,
             _active_clone_guard: active_clone_guard,
+            record_completion,
             recorded: false,
         }
     }
@@ -147,6 +150,9 @@ impl<S> CloneCompletionStream<S> {
             return;
         }
         self.recorded = true;
+        if !self.record_completion {
+            return;
+        }
         if let Some(source) = self.upload_pack_source.clone() {
             crate::metrics::observe_upload_pack_duration(
                 &self.metrics,
@@ -850,24 +856,26 @@ async fn handle_upload_pack(
                 want_count: _,
                 ..
             } => {
-                return serve_local_upload_pack(
-                    &state,
-                    &owner,
-                    &repo,
-                    *serve_from,
-                    &decoded_body,
-                    FreshClonePackCacheKeyContext {
-                        git_protocol: git_protocol.as_deref(),
-                        advertised_ref_tips: advertised_ref_tips.as_ref(),
-                    },
-                    CloneCompletion {
-                        cache_status: effective_cache_status.clone(),
-                        started_at,
-                        metric_username: metric_username.clone(),
-                        metric_repo: repo_slug.clone(),
-                    },
-                )
-                .await;
+                if expects_local_pack_serve {
+                    return serve_local_upload_pack(
+                        &state,
+                        &owner,
+                        &repo,
+                        *serve_from,
+                        &decoded_body,
+                        FreshClonePackCacheKeyContext {
+                            git_protocol: git_protocol.as_deref(),
+                            advertised_ref_tips: advertised_ref_tips.as_ref(),
+                        },
+                        CloneCompletion {
+                            cache_status: effective_cache_status.clone(),
+                            started_at,
+                            metric_username: metric_username.clone(),
+                            metric_repo: repo_slug.clone(),
+                        },
+                    )
+                    .await;
+                }
             }
             LocalServeDecision::Unavailable {
                 had_local_repo_before_check,
@@ -1553,7 +1561,8 @@ async fn serve_http_pack_cache_hit_response(
         Protocol::Https,
         completion,
         None,
-        active_clone_guard,
+        Some(active_clone_guard),
+        true,
     );
     let body = Body::from_stream(stream);
     Ok((
@@ -1885,7 +1894,8 @@ async fn serve_local_upload_pack(
         Protocol::Https,
         completion,
         Some(CloneSource::Local),
-        active_clone_guard,
+        Some(active_clone_guard),
+        true,
     );
     let body = Body::from_stream(stream);
 
@@ -1999,38 +2009,43 @@ async fn proxy_upload_pack_to_upstream(
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(8);
     let completion_metrics = state.metrics.clone();
-    let active_clone_guard =
-        state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
     let state_for_stream = state.clone();
     let owner = owner.to_string();
     let repo = repo.to_string();
     let owner_repo_for_cache = owner_repo.clone();
     let auth_header = auth_header.map(ToOwned::to_owned);
     let request_phase = request_metadata.request_phase.clone();
+    let records_clone_completion = request_phase.expects_local_pack_serve();
+    let active_clone_guard = records_clone_completion
+        .then(|| state.begin_active_clone(Protocol::Https, completion.cache_status.clone()));
     let ls_refs_request_body = capture_body.clone();
-    let upstream_counter = state_for_stream
-        .metrics
-        .metrics
-        .clone_upstream_bytes
-        .get_or_create(&CloneUpstreamBytesLabels {
-            protocol: Protocol::Https,
-            phase: ClonePhase::UploadPack,
-            username: completion.metric_username.clone(),
-            repo: owner_repo.clone(),
-        })
-        .clone();
-    let downstream_counter = state_for_stream
-        .metrics
-        .metrics
-        .clone_downstream_bytes
-        .get_or_create(&CloneDownstreamBytesLabels {
-            protocol: Protocol::Https,
-            phase: ClonePhase::UploadPack,
-            source: CloneSource::Upstream,
-            username: completion.metric_username.clone(),
-            repo: owner_repo.clone(),
-        })
-        .clone();
+    let upstream_counter = records_clone_completion.then(|| {
+        state_for_stream
+            .metrics
+            .metrics
+            .clone_upstream_bytes
+            .get_or_create(&CloneUpstreamBytesLabels {
+                protocol: Protocol::Https,
+                phase: ClonePhase::UploadPack,
+                username: completion.metric_username.clone(),
+                repo: owner_repo.clone(),
+            })
+            .clone()
+    });
+    let downstream_counter = records_clone_completion.then(|| {
+        state_for_stream
+            .metrics
+            .metrics
+            .clone_downstream_bytes
+            .get_or_create(&CloneDownstreamBytesLabels {
+                protocol: Protocol::Https,
+                phase: ClonePhase::UploadPack,
+                source: CloneSource::Upstream,
+                username: completion.metric_username.clone(),
+                repo: owner_repo.clone(),
+            })
+            .clone()
+    });
     let recent_advertised_refs = state_for_stream
         .recent_advertised_refs(
             &owner_repo,
@@ -2074,7 +2089,9 @@ async fn proxy_upload_pack_to_upstream(
                 match item {
                     Ok(chunk) => {
                         let chunk_len = chunk.len() as u64;
-                        upstream_counter.inc_by(chunk_len);
+                        if let Some(counter) = &upstream_counter {
+                            counter.inc_by(chunk_len);
+                        }
                         let capture_chunk = chunk.clone();
                         let frame_chunk = chunk.clone();
 
@@ -2097,7 +2114,9 @@ async fn proxy_upload_pack_to_upstream(
                             return;
                         }
                         response_frame_tracker.observe(&frame_chunk);
-                        downstream_counter.inc_by(chunk_len);
+                        if let Some(counter) = &downstream_counter {
+                            counter.inc_by(chunk_len);
+                        }
 
                         if let Some(response_buf) = ls_refs_response.as_mut() {
                             response_buf.extend_from_slice(&capture_chunk);
@@ -2125,8 +2144,10 @@ async fn proxy_upload_pack_to_upstream(
                         if let Some(packet_kind) = git_error_packet {
                             let packet = packet_kind.encode(&human_message);
                             let packet_len = packet.len() as u64;
-                            if tx.send(Ok(packet)).await.is_ok() {
-                                downstream_counter.inc_by(packet_len);
+                            if tx.send(Ok(packet)).await.is_ok()
+                                && let Some(counter) = &downstream_counter
+                            {
+                                counter.inc_by(packet_len);
                             }
                         } else {
                             let _ = tx.send(Err(e)).await;
@@ -2188,6 +2209,7 @@ async fn proxy_upload_pack_to_upstream(
         completion,
         Some(CloneSource::Upstream),
         active_clone_guard,
+        records_clone_completion,
     ));
 
     Ok(response_from_upstream_parts(
@@ -2317,6 +2339,7 @@ mod tests {
     use brotli::CompressorWriter;
     use flate2::Compression;
     use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
+    use prometheus_client::encoding::text::encode;
     use std::io::Write;
 
     fn sample_v2_fetch_request() -> Vec<u8> {
@@ -2344,6 +2367,12 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(body).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn encode_registry(registry: &prometheus_client::registry::Registry) -> String {
+        let mut encoded = String::new();
+        encode(&mut encoded, registry).unwrap();
+        encoded
     }
 
     fn deflate_body(body: &[u8]) -> Vec<u8> {
@@ -2376,6 +2405,64 @@ mod tests {
             metadata.want_oids,
             vec!["0123456789abcdef0123456789abcdef01234567".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn clone_completion_stream_skips_non_pack_rpc_metrics() {
+        let metrics = crate::metrics::MetricsRegistry::new();
+        let mut stream = CloneCompletionStream::new(
+            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"0000",
+            ))]),
+            metrics.clone(),
+            Protocol::Https,
+            CloneCompletion {
+                cache_status: CacheStatus::Warm,
+                started_at: Instant::now(),
+                metric_username: "octocat".to_string(),
+                metric_repo: "acme/widgets".to_string(),
+            },
+            Some(CloneSource::Upstream),
+            None,
+            false,
+        );
+
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let encoded = encode_registry(&metrics.registry);
+        assert!(!encoded.contains("forgeproxy_clone_total{"));
+        assert!(!encoded.contains("forgeproxy_clone_summary_total{"));
+        assert!(!encoded.contains("forgeproxy_upload_pack_duration_seconds_count{"));
+    }
+
+    #[tokio::test]
+    async fn clone_completion_stream_records_pack_rpc_metrics() {
+        let metrics = crate::metrics::MetricsRegistry::new();
+        let mut stream = CloneCompletionStream::new(
+            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"PACK",
+            ))]),
+            metrics.clone(),
+            Protocol::Https,
+            CloneCompletion {
+                cache_status: CacheStatus::Warm,
+                started_at: Instant::now(),
+                metric_username: "octocat".to_string(),
+                metric_repo: "acme/widgets".to_string(),
+            },
+            Some(CloneSource::Upstream),
+            None,
+            true,
+        );
+
+        while stream.next().await.is_some() {}
+        drop(stream);
+
+        let encoded = encode_registry(&metrics.registry);
+        assert!(encoded.contains("forgeproxy_clone_total{"));
+        assert!(encoded.contains("forgeproxy_clone_summary_total{"));
+        assert!(encoded.contains("forgeproxy_upload_pack_duration_seconds_count{"));
     }
 
     #[test]
