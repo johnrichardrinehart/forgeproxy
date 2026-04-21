@@ -29,8 +29,8 @@ const PACK_RESPONSE_EXT: &str = "pack-response";
 const COMPOSITE_MANIFEST_EXT: &str = "pack-composite.json";
 const DELTA_PACK_EXT: &str = "delta.pack";
 const METADATA_EXT: &str = "pack-cache-meta.json";
-const COMPOSITE_MANIFEST_VERSION: u32 = 1;
-const PACK_CACHE_METADATA_VERSION: u32 = 2;
+const COMPOSITE_MANIFEST_VERSION: u32 = 2;
+const PACK_CACHE_METADATA_VERSION: u32 = 3;
 const MAX_RECENT_ENTRIES_PER_REPO: usize = 16;
 
 #[derive(Clone)]
@@ -88,6 +88,7 @@ impl PackCacheKey {
 pub struct PackCacheRecentEntry {
     pub key: PackCacheKey,
     pub request_wants: Vec<String>,
+    pub covered_wants: Vec<String>,
     pub request_template: Vec<String>,
     pub full_tip: bool,
 }
@@ -215,11 +216,23 @@ struct PackCacheMetadata {
     key: String,
     owner_repo: String,
     request_wants: Vec<String>,
+    #[serde(default)]
+    covered_wants: Vec<String>,
     request_template: Vec<String>,
     full_tip: bool,
     created_at_unix_secs: u64,
     last_accessed_unix_secs: u64,
     hit_count: u64,
+}
+
+impl PackCacheMetadata {
+    fn covered_wants_or_request_wants(&self) -> Vec<String> {
+        if self.covered_wants.is_empty() {
+            self.request_wants.clone()
+        } else {
+            self.covered_wants.clone()
+        }
+    }
 }
 
 pub enum PackCacheLookup {
@@ -770,6 +783,7 @@ impl PackCache {
             if !cache_entry_artifact_exists(&self.root, &metadata.key) {
                 continue;
             }
+            let covered_wants = metadata.covered_wants_or_request_wants();
             insert_recent_entry(
                 &mut recent,
                 metadata.owner_repo.clone(),
@@ -784,6 +798,7 @@ impl PackCache {
                         }),
                     },
                     request_wants: metadata.request_wants,
+                    covered_wants,
                     request_template: metadata.request_template,
                     full_tip: metadata.full_tip,
                 },
@@ -839,7 +854,7 @@ impl PackCacheWriter {
                         self.final_path.display()
                     )
                 })?;
-            self.record_promotion();
+            self.record_promotion(None);
         } else if let Err(error) = tokio::fs::remove_file(&self.tmp_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -933,7 +948,7 @@ impl PackCacheWriter {
             })?;
 
         self.bytes_written = delta_pack.len() as u64;
-        self.record_promotion();
+        self.record_promotion(Some(base_key));
         self.completed = true;
         crate::metrics::set_pack_cache_size_bytes(
             &self.metrics,
@@ -963,15 +978,17 @@ impl PackCacheWriter {
         self.notify.notify_waiters();
     }
 
-    fn record_promotion(&self) {
+    fn record_promotion(&self, composite_base_key: Option<&PackCacheKey>) {
         crate::metrics::observe_pack_cache_artifact_generation(
             &self.metrics,
             self.started_at.elapsed(),
         );
         if let Some(base) = &self.key.base {
+            let covered_wants = self.covered_wants_for_promotion(base, composite_base_key);
             let entry = PackCacheRecentEntry {
                 key: self.key.clone(),
                 request_wants: base.request_wants.clone(),
+                covered_wants,
                 request_template: base.request_template.clone(),
                 full_tip: base.full_tip,
             };
@@ -1019,6 +1036,28 @@ impl PackCacheWriter {
         );
     }
 
+    fn covered_wants_for_promotion(
+        &self,
+        base: &PackCacheBaseMetadata,
+        composite_base_key: Option<&PackCacheKey>,
+    ) -> Vec<String> {
+        let mut covered = composite_base_key
+            .and_then(|base_key| match read_pack_cache_metadata(&self.root, base_key.as_str()) {
+                Ok(metadata) => Some(metadata.covered_wants_or_request_wants()),
+                Err(error) => {
+                    warn!(
+                        key = %base_key.as_str(),
+                        error = %error,
+                        "failed to read pack cache base metadata while deriving composite coverage"
+                    );
+                    base_key.base_request_wants().map(<[String]>::to_vec)
+                }
+            })
+            .unwrap_or_default();
+        covered.extend(base.request_wants.clone());
+        normalize_oid_list(covered)
+    }
+
     fn write_metadata(&self, entry: &PackCacheRecentEntry) -> Result<()> {
         let now = now_unix_secs();
         let metadata = PackCacheMetadata {
@@ -1026,6 +1065,7 @@ impl PackCacheWriter {
             key: self.key.as_str().to_string(),
             owner_repo: self.key.owner_repo.clone(),
             request_wants: entry.request_wants.clone(),
+            covered_wants: entry.covered_wants.clone(),
             request_template: entry.request_template.clone(),
             full_tip: entry.full_tip,
             created_at_unix_secs: now,
@@ -1102,8 +1142,10 @@ fn pack_cache_key(
 fn insert_recent_entry(
     recent: &mut HashMap<String, Vec<PackCacheRecentEntry>>,
     owner_repo: String,
-    entry: PackCacheRecentEntry,
+    mut entry: PackCacheRecentEntry,
 ) {
+    entry.request_wants = normalize_oid_list(entry.request_wants);
+    entry.covered_wants = normalize_oid_list(entry.covered_wants);
     let entries = recent.entry(owner_repo).or_default();
     entries.retain(|existing| {
         existing.key != entry.key
@@ -1113,6 +1155,12 @@ fn insert_recent_entry(
     });
     entries.insert(0, entry);
     entries.truncate(MAX_RECENT_ENTRIES_PER_REPO);
+}
+
+fn normalize_oid_list(mut oids: Vec<String>) -> Vec<String> {
+    oids.sort();
+    oids.dedup();
+    oids
 }
 
 fn collect_repo_ref_tips(
@@ -1754,6 +1802,7 @@ mod tests {
                 key: key.to_string(),
                 owner_repo: "owner/repo".to_string(),
                 request_wants: Vec::new(),
+                covered_wants: Vec::new(),
                 request_template: Vec::new(),
                 full_tip: false,
                 created_at_unix_secs: last_accessed_unix_secs,
@@ -1923,6 +1972,7 @@ mod tests {
                 key: "composite".to_string(),
                 owner_repo: "owner/repo".to_string(),
                 request_wants: Vec::new(),
+                covered_wants: Vec::new(),
                 request_template: Vec::new(),
                 full_tip: false,
                 created_at_unix_secs: 20,
@@ -2049,6 +2099,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composite_promotion_persists_transitive_covered_wants() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+
+        let want_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let want_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let want_c = "cccccccccccccccccccccccccccccccccccccccc".to_string();
+        let want_d = "dddddddddddddddddddddddddddddddddddddddd".to_string();
+        let base_key = PackCacheKey {
+            digest: "base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec![want_b.clone()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+        let composite_key = PackCacheKey {
+            digest: "composite".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec![want_c.clone()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+        std::fs::write(
+            cache.final_path(&base_key),
+            pack_response(&raw_pack(1, b"base")),
+        )
+        .unwrap();
+        write_pack_cache_metadata(
+            &cache.root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: base_key.as_str().to_string(),
+                owner_repo: "owner/repo".to_string(),
+                request_wants: vec![want_b.clone()],
+                covered_wants: vec![want_a.clone(), want_b.clone()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+                created_at_unix_secs: 10,
+                last_accessed_unix_secs: 10,
+                hit_count: 0,
+            },
+        )
+        .unwrap();
+
+        let lookup = cache
+            .lookup_or_reserve(Protocol::Https, composite_key.clone())
+            .await
+            .unwrap();
+        let super::PackCacheLookup::Generate(writer) = lookup else {
+            panic!("expected cache reservation");
+        };
+        writer
+            .finish_composite(&base_key, &raw_pack(1, b"delta"))
+            .await
+            .unwrap();
+
+        let metadata =
+            super::read_pack_cache_metadata(&cache.root, composite_key.as_str()).unwrap();
+        assert_eq!(metadata.request_wants, vec![want_c.clone()]);
+        assert_eq!(
+            metadata.covered_wants,
+            vec![want_a.clone(), want_b.clone(), want_c.clone()]
+        );
+
+        let future_key = PackCacheKey {
+            digest: "future".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec![want_d],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+        let recent = cache.lookup_recent_compatible_key(&future_key).unwrap();
+        assert_eq!(recent.key.as_str(), composite_key.as_str());
+        assert_eq!(recent.request_wants, vec![want_c.clone()]);
+        assert_eq!(recent.covered_wants, vec![want_a, want_b, want_c]);
+    }
+
+    #[tokio::test]
     async fn full_read_lease_survives_unlink_after_open() {
         let temp = tempfile::tempdir().unwrap();
         let cache = PackCache::new(
@@ -2138,6 +2300,7 @@ mod tests {
                 key: base_key.as_str().to_string(),
                 owner_repo: "owner/repo".to_string(),
                 request_wants: Vec::new(),
+                covered_wants: Vec::new(),
                 request_template: Vec::new(),
                 full_tip: false,
                 created_at_unix_secs: 10,
@@ -2153,6 +2316,7 @@ mod tests {
                 key: composite_key.as_str().to_string(),
                 owner_repo: "owner/repo".to_string(),
                 request_wants: Vec::new(),
+                covered_wants: Vec::new(),
                 request_template: Vec::new(),
                 full_tip: false,
                 created_at_unix_secs: 20,
@@ -2281,6 +2445,7 @@ mod tests {
                 key: base_key.as_str().to_string(),
                 owner_repo: "owner/repo".to_string(),
                 request_wants: Vec::new(),
+                covered_wants: Vec::new(),
                 request_template: Vec::new(),
                 full_tip: false,
                 created_at_unix_secs: 10,
@@ -2296,6 +2461,7 @@ mod tests {
                 key: composite_key.as_str().to_string(),
                 owner_repo: "owner/repo".to_string(),
                 request_wants: Vec::new(),
+                covered_wants: Vec::new(),
                 request_template: Vec::new(),
                 full_tip: false,
                 created_at_unix_secs: 20,
@@ -2478,6 +2644,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metadata.hit_count, 1);
+        assert_eq!(
+            metadata.covered_wants,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
 
         let reloaded = PackCache::new(temp.path(), config, 1.0, MetricsRegistry::new());
         reloaded.ensure_ready().await.unwrap();
@@ -2500,6 +2670,10 @@ mod tests {
         assert_eq!(recent.key.as_str(), "persisted-base");
         assert_eq!(
             recent.request_wants,
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
+        assert_eq!(
+            recent.covered_wants,
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         );
         assert!(!recent.full_tip);

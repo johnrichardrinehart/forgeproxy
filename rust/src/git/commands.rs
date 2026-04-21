@@ -761,6 +761,84 @@ pub async fn git_missing_objects(repo_path: &Path, oids: &[String]) -> Result<Ve
     Ok(missing)
 }
 
+/// Return true when every revision in `candidate_ancestors` is reachable from
+/// at least one revision in `descendants`.
+#[instrument(fields(repo = %repo_path.display(), candidate_ancestors = candidate_ancestors.len(), descendants = descendants.len()))]
+pub async fn git_revisions_reachable_from_any(
+    repo_path: &Path,
+    candidate_ancestors: &[String],
+    descendants: &[String],
+) -> Result<bool> {
+    if candidate_ancestors.is_empty() {
+        return Ok(true);
+    }
+    if descendants.is_empty() {
+        return Ok(false);
+    }
+
+    let mut input = Vec::new();
+    for oid in candidate_ancestors {
+        input.extend_from_slice(oid.as_bytes());
+        input.push(b'\n');
+    }
+    for oid in descendants {
+        input.push(b'^');
+        input.extend_from_slice(oid.as_bytes());
+        input.push(b'\n');
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(repo_path)
+        .arg("rev-list")
+        .arg("--stdin")
+        .arg("--max-count=1");
+
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    debug!("spawning git rev-list reachability check");
+
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn git rev-list reachability check")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to capture git rev-list stdin")?;
+    let stdin_writer = tokio::spawn(async move {
+        stdin
+            .write_all(&input)
+            .await
+            .context("failed to write revisions to git rev-list")?;
+        stdin
+            .shutdown()
+            .await
+            .context("failed to close git rev-list stdin")?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to wait on git rev-list reachability check")?;
+    stdin_writer
+        .await
+        .context("git rev-list stdin writer task join failed")??;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git rev-list reachability check failed (status {}): {}",
+            output.status,
+            stderr.trim(),
+        );
+    }
+
+    Ok(output.stdout.iter().all(|byte| byte.is_ascii_whitespace()))
+}
+
 #[cfg(test)]
 fn git_cat_file_missing_object(status: &std::process::ExitStatus, stderr: &str) -> bool {
     status.code() == Some(1)
@@ -1345,6 +1423,155 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
         .unwrap();
 
         assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_revisions_reachable_from_any_detects_non_linear_boundaries() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let repo_path = tempdir.path();
+
+        assert_git_success(StdCommand::new("git").arg("init").arg(repo_path));
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("switch")
+                .arg("-c")
+                .arg("main"),
+        );
+
+        std::fs::write(repo_path.join("base.txt"), "base\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("base"),
+        );
+        let main_v1 = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("switch")
+                .arg("-c")
+                .arg("feature"),
+        );
+        std::fs::write(repo_path.join("feature.txt"), "feature\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("feature"),
+        );
+        let feature_v1 = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("switch")
+                .arg("main"),
+        );
+        std::fs::write(repo_path.join("main.txt"), "main\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("main"),
+        );
+        let main_v2 = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(repo_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+
+        assert!(
+            git_revisions_reachable_from_any(
+                repo_path,
+                std::slice::from_ref(&main_v1),
+                std::slice::from_ref(&main_v2),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !git_revisions_reachable_from_any(
+                repo_path,
+                std::slice::from_ref(&feature_v1),
+                std::slice::from_ref(&main_v2),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !git_revisions_reachable_from_any(repo_path, &[main_v1, feature_v1], &[main_v2])
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

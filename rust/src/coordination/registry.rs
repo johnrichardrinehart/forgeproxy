@@ -1833,6 +1833,19 @@ async fn warm_pack_cache_for_generation(
     if new_request_wants == prev_entry.request_wants {
         return Ok(());
     }
+    let base_covered_by_new_wants = crate::git::commands::git_revisions_reachable_from_any(
+        published_path,
+        &prev_entry.covered_wants,
+        &new_request_wants,
+    )
+    .await
+    .map_err(|error| PackCacheStitchFailure::new("base_reachability", error))?;
+    if !base_covered_by_new_wants {
+        return Err(PackCacheStitchFailure::new(
+            "incompatible_base",
+            anyhow::anyhow!("previous pack cache base is not reachable from new wants"),
+        ));
+    }
 
     let writer = match state
         .pack_cache
@@ -1853,7 +1866,7 @@ async fn warm_pack_cache_for_generation(
     let delta_pack = match build_pack_cache_delta(
         state,
         published_path,
-        &prev_entry.request_wants,
+        &prev_entry.covered_wants,
         &new_request_wants,
     )
     .await
@@ -1925,11 +1938,37 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
             reason: "same_tips",
         });
     }
+    let base_covered_by_new_wants = match crate::git::commands::git_revisions_reachable_from_any(
+        repo_path,
+        &prev_entry.covered_wants,
+        &new_request_wants,
+    )
+    .await
+    {
+        Ok(reachable) => reachable,
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                error = %error,
+                "failed to verify pack cache composite base reachability"
+            );
+            return Err(PackCacheCompositeMiss {
+                writer: Some(writer),
+                reason: "base_reachability",
+            });
+        }
+    };
+    if !base_covered_by_new_wants {
+        return Err(PackCacheCompositeMiss {
+            writer: Some(writer),
+            reason: "incompatible_base",
+        });
+    }
 
     let delta_pack = match build_pack_cache_delta(
         state,
         repo_path,
-        &prev_entry.request_wants,
+        &prev_entry.covered_wants,
         &new_request_wants,
     )
     .await
