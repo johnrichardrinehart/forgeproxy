@@ -5,7 +5,6 @@ use sha1::{Digest, Sha1};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-#[cfg(test)]
 use std::path::PathBuf;
 
 const MAX_PKT_LINE_LEN: usize = 65520;
@@ -183,8 +182,20 @@ where
     stream_packfile_response_from_open_files(pack_infos, emit)
 }
 
+#[cfg(test)]
 pub(crate) fn stream_packfile_response_from_open_files<F>(
+    pack_infos: Vec<OpenedPack>,
+    emit: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> io::Result<()>,
+{
+    stream_packfile_response_from_open_files_with_trailer(pack_infos, None, emit)
+}
+
+pub(crate) fn stream_packfile_response_from_open_files_with_trailer<F>(
     mut pack_infos: Vec<OpenedPack>,
+    synthetic_trailer_sha1: Option<[u8; SHA1_TRAILER_LEN]>,
     mut emit: F,
 ) -> Result<()>
 where
@@ -196,7 +207,7 @@ where
     );
 
     emit(encode_data_pkt(b"packfile\n")).context("emit packfile section")?;
-    if pack_infos.len() == 1 {
+    if pack_infos.len() == 1 && synthetic_trailer_sha1.is_none() {
         pack_infos[0].stream_original_pack(&mut emit)?;
         emit(encode_control_pkt(0)?).context("emit packfile flush")?;
         return Ok(());
@@ -211,7 +222,7 @@ where
         "pack object count overflow"
     );
 
-    let mut streamer = PackStreamer::new(first_header, total_count as u32);
+    let mut streamer = PackStreamer::new(first_header, total_count as u32, synthetic_trailer_sha1);
     streamer.emit_rewritten_header(&mut emit)?;
     for pack in &mut pack_infos {
         streamer.stream_pack_body(pack, &mut emit)?;
@@ -219,6 +230,41 @@ where
     streamer.finish(&mut emit)?;
     emit(encode_control_pkt(0)?).context("emit packfile flush")?;
     Ok(())
+}
+
+pub(crate) fn synthetic_pack_trailer_from_paths(
+    pack_paths: &[PathBuf],
+) -> Result<[u8; SHA1_TRAILER_LEN]> {
+    let mut pack_infos = pack_paths
+        .iter()
+        .map(|path| OpenedPack::from_path(path))
+        .collect::<Result<Vec<_>>>()?;
+    synthetic_pack_trailer_from_open_files(&mut pack_infos)
+}
+
+fn synthetic_pack_trailer_from_open_files(
+    pack_infos: &mut [OpenedPack],
+) -> Result<[u8; SHA1_TRAILER_LEN]> {
+    ensure!(
+        !pack_infos.is_empty(),
+        "cannot compute synthetic trailer without packs"
+    );
+
+    let first_header = pack_infos[0].header;
+    let total_count = pack_infos
+        .iter()
+        .fold(0u64, |total, info| total + u64::from(info.count));
+    ensure!(
+        total_count <= u64::from(u32::MAX),
+        "pack object count overflow"
+    );
+
+    let mut streamer = PackStreamer::new(first_header, total_count as u32, None);
+    streamer.hash_rewritten_header();
+    for pack in pack_infos {
+        streamer.hash_pack_body(pack)?;
+    }
+    streamer.finalize_trailer()
 }
 
 #[cfg(test)]
@@ -291,15 +337,35 @@ fn pack_header(pack: &[u8], name: &str) -> Result<(u32, u32)> {
 struct PackStreamer {
     version: u32,
     total_count: u32,
-    sha1: Sha1,
+    sha1: Option<Sha1>,
+    synthetic_trailer_sha1: Option<[u8; SHA1_TRAILER_LEN]>,
 }
 
 impl PackStreamer {
-    fn new(first_header: [u8; PACK_HEADER_LEN], total_count: u32) -> Self {
+    fn new(
+        first_header: [u8; PACK_HEADER_LEN],
+        total_count: u32,
+        synthetic_trailer_sha1: Option<[u8; SHA1_TRAILER_LEN]>,
+    ) -> Self {
         Self {
             version: pack_header_version(&first_header, "pack").unwrap_or(2),
             total_count,
-            sha1: Sha1::new(),
+            sha1: synthetic_trailer_sha1.is_none().then(Sha1::new),
+            synthetic_trailer_sha1,
+        }
+    }
+
+    fn rewritten_header(&self) -> [u8; PACK_HEADER_LEN] {
+        let mut rewritten = [0u8; PACK_HEADER_LEN];
+        rewritten[..4].copy_from_slice(b"PACK");
+        rewritten[4..8].copy_from_slice(&self.version.to_be_bytes());
+        rewritten[8..12].copy_from_slice(&self.total_count.to_be_bytes());
+        rewritten
+    }
+
+    fn update_sha1(&mut self, bytes: &[u8]) {
+        if let Some(sha1) = self.sha1.as_mut() {
+            sha1.update(bytes);
         }
     }
 
@@ -307,12 +373,14 @@ impl PackStreamer {
     where
         F: FnMut(Vec<u8>) -> io::Result<()>,
     {
-        let mut rewritten = Vec::with_capacity(PACK_HEADER_LEN);
-        rewritten.extend_from_slice(b"PACK");
-        rewritten.extend_from_slice(&self.version.to_be_bytes());
-        rewritten.extend_from_slice(&self.total_count.to_be_bytes());
-        self.sha1.update(&rewritten);
+        let rewritten = self.rewritten_header();
+        self.update_sha1(&rewritten);
         self.emit_sideband1(&rewritten, emit)
+    }
+
+    fn hash_rewritten_header(&mut self) {
+        let rewritten = self.rewritten_header();
+        self.update_sha1(&rewritten);
     }
 
     fn stream_pack_body<F>(&mut self, info: &mut OpenedPack, emit: &mut F) -> Result<()>
@@ -343,8 +411,42 @@ impl PackStreamer {
             let emit_len = trailer_window.len() - SHA1_TRAILER_LEN;
             let emit_bytes = trailer_window[..emit_len].to_vec();
             trailer_window.drain(..emit_len);
-            self.sha1.update(&emit_bytes);
+            self.update_sha1(&emit_bytes);
             self.emit_sideband1(&emit_bytes, emit)?;
+        }
+        ensure!(
+            trailer_window.len() == SHA1_TRAILER_LEN,
+            "pack trailer was incomplete for {}",
+            info.name
+        );
+        Ok(())
+    }
+
+    fn hash_pack_body(&mut self, info: &mut OpenedPack) -> Result<()> {
+        ensure!(
+            info.version == self.version,
+            "pack version {} does not match base pack version {}",
+            info.version,
+            self.version
+        );
+
+        let mut reader = BufReader::new(&mut info.file);
+        let mut trailer_window = Vec::with_capacity(SHA1_TRAILER_LEN);
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buf)
+                .with_context(|| format!("read pack body {}", info.name))?;
+            if read == 0 {
+                break;
+            }
+            trailer_window.extend_from_slice(&buf[..read]);
+            if trailer_window.len() <= SHA1_TRAILER_LEN {
+                continue;
+            }
+            let hash_len = trailer_window.len() - SHA1_TRAILER_LEN;
+            self.update_sha1(&trailer_window[..hash_len]);
+            trailer_window.drain(..hash_len);
         }
         ensure!(
             trailer_window.len() == SHA1_TRAILER_LEN,
@@ -358,9 +460,20 @@ impl PackStreamer {
     where
         F: FnMut(Vec<u8>) -> io::Result<()>,
     {
-        let trailer = self.sha1.clone().finalize();
+        let trailer = self.finalize_trailer()?;
         self.emit_sideband1(&trailer, emit)?;
         Ok(())
+    }
+
+    fn finalize_trailer(&mut self) -> Result<[u8; SHA1_TRAILER_LEN]> {
+        if let Some(trailer) = self.synthetic_trailer_sha1 {
+            return Ok(trailer);
+        }
+        let sha1 = self
+            .sha1
+            .take()
+            .context("cannot finalize synthetic pack trailer twice")?;
+        Ok(sha1.finalize().into())
     }
 
     fn emit_sideband1<F>(&mut self, bytes: &[u8], emit: &mut F) -> Result<()>
@@ -500,5 +613,34 @@ mod tests {
                 .any(|w| w == b"packfile\n")
         );
         assert!(streamed.ends_with(b"0000"));
+    }
+
+    #[test]
+    fn streams_composite_response_with_persisted_synthetic_trailer() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_pack = raw_pack(1, b"base");
+        let delta_pack = raw_pack(2, b"delta");
+        let base_path = temp.path().join("base.pack");
+        let delta_path = temp.path().join("delta.pack");
+        std::fs::write(&base_path, &base_pack).unwrap();
+        std::fs::write(&delta_path, &delta_pack).unwrap();
+        let trailer =
+            synthetic_pack_trailer_from_paths(&[base_path.clone(), delta_path.clone()]).unwrap();
+
+        let packs = [base_path, delta_path]
+            .iter()
+            .map(|path| OpenedPack::from_path(path))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let mut streamed = Vec::new();
+        stream_packfile_response_from_open_files_with_trailer(packs, Some(trailer), |chunk| {
+            streamed.extend_from_slice(&chunk);
+            Ok(())
+        })
+        .unwrap();
+
+        let raw = extract_raw_pack(&streamed).unwrap();
+        assert_eq!(&raw[raw.len() - SHA1_TRAILER_LEN..], trailer.as_slice());
+        assert_eq!(raw, stitch_raw_packs(&base_pack, &delta_pack).unwrap());
     }
 }
