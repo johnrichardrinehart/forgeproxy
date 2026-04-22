@@ -482,6 +482,11 @@ pub struct CloneConfig {
     /// the current published generation instead of publishing another one.
     #[serde(default)]
     pub generation_coalescing_window_secs: u64,
+    /// Request path: coarse maximum time a client request may spend waiting on
+    /// forgeproxy-local work before it proxies upstream. Zero disables the
+    /// coarse budget.
+    #[serde(default)]
+    pub global_short_circuit_upstream_secs: u64,
     /// Maximum time a client request should wait for a local mirror catch-up
     /// publish before falling back to proxying upstream.
     #[serde(default = "default_request_wait_for_local_catch_up_secs")]
@@ -492,6 +497,21 @@ pub struct CloneConfig {
     /// fallbacks that can saturate disk and starve local hydration.
     #[serde(default = "default_request_wait_for_active_local_catch_up_secs")]
     pub request_wait_for_active_local_catch_up_secs: u64,
+    /// Request path: maximum time the client waits for request-triggered S3
+    /// restore work before proxying upstream. The restore continues in the
+    /// background. Zero disables this stage-specific budget.
+    #[serde(default)]
+    pub request_time_s3_restore_secs: u64,
+    /// Request path: maximum time the client waits for request-triggered
+    /// generation publication before proxying upstream. Publication continues
+    /// in the background. Zero disables this stage-specific budget.
+    #[serde(default)]
+    pub generation_publish_secs: u64,
+    /// Request path: maximum time the client waits for the first byte from a
+    /// local git upload-pack subprocess before proxying upstream. Zero disables
+    /// this stage-specific budget.
+    #[serde(default)]
+    pub local_upload_pack_first_byte_secs: u64,
     /// How often to scan `_tee` for abandoned captures.
     #[serde(default = "default_tee_cleanup_interval_secs")]
     pub tee_cleanup_interval_secs: u64,
@@ -528,9 +548,13 @@ impl Default for CloneConfig {
             hydration_mode: HydrationMode::default(),
             prepare_published_generation_indexes: false,
             generation_coalescing_window_secs: 0,
+            global_short_circuit_upstream_secs: 0,
             request_wait_for_local_catch_up_secs: default_request_wait_for_local_catch_up_secs(),
             request_wait_for_active_local_catch_up_secs:
                 default_request_wait_for_active_local_catch_up_secs(),
+            request_time_s3_restore_secs: 0,
+            generation_publish_secs: 0,
+            local_upload_pack_first_byte_secs: 0,
             tee_cleanup_interval_secs: default_tee_cleanup_interval_secs(),
             tee_retention_secs: default_tee_retention_secs(),
             ssh_upload_pack_close_grace_secs: default_ssh_upload_pack_close_grace_secs(),
@@ -744,6 +768,16 @@ pub struct PackCacheConfig {
     /// before bypassing the cache and running its own local upload-pack.
     #[serde(default = "default_pack_cache_wait_for_inflight_secs")]
     pub wait_for_inflight_secs: u64,
+    /// Request path: maximum time a client waits for an on-demand pack-cache
+    /// composite attempt before proxying upstream. The composite work continues
+    /// in the background. Zero disables this stage-specific budget.
+    #[serde(default)]
+    pub on_demand_composite_total_secs: u64,
+    /// Request path: maximum time a client waits for request-time delta
+    /// pack-objects during on-demand composite construction. The composite work
+    /// continues in the background. Zero disables this stage-specific budget.
+    #[serde(default)]
+    pub request_delta_pack_secs: u64,
     /// Maximum request-time composite delta packs that may be built in parallel.
     ///
     /// These foreground builds intentionally do not share the background bundle
@@ -766,6 +800,8 @@ impl Default for PackCacheConfig {
             low_water_mark: default_low_water(),
             eviction_policy: default_eviction_policy(),
             wait_for_inflight_secs: default_pack_cache_wait_for_inflight_secs(),
+            on_demand_composite_total_secs: 0,
+            request_delta_pack_secs: 0,
             max_concurrent_request_deltas: default_pack_cache_max_concurrent_request_deltas(),
             min_response_bytes: default_pack_cache_min_response_bytes(),
         }
