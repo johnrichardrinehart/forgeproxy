@@ -3,8 +3,9 @@
 module "forgeproxy" {
   source = "../../"
 
-  flake_ref       = var.flake_ref
-  closure_variant = var.closure_variant
+  flake_ref                 = var.flake_ref
+  closure_variant           = var.closure_variant
+  disallow_local_nix_builds = var.disallow_local_nix_builds
 
   aws_region  = var.aws_region
   aws_profile = var.aws_profile

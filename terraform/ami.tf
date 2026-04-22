@@ -127,9 +127,21 @@ resource "null_resource" "build_forgeproxy_ami" {
       # Build the NixOS image (only reached when AMI doesn't exist yet).
       # Use --no-link to avoid races on the shared ./result symlink when
       # multiple AMI builds run concurrently.
-      OUT_PATH=$(nix build --tarball-ttl 0 --no-link --print-out-paths \
+      DISALLOW_LOCAL_NIX_BUILDS="${var.disallow_local_nix_builds}"
+      NIX_BUILD_FLAGS="${var.disallow_local_nix_builds ? "--max-jobs 0 " : ""}--tarball-ttl 0 --no-link --print-out-paths"
+      OUT_PATH=$(nix build $NIX_BUILD_FLAGS \
         '${var.flake_ref}#nixosConfigurations.${local.forgeproxy_config}.config.system.build.images.amazon' \
-        | tail -n1)
+        | tail -n1) || {
+        echo "ERROR: nix build failed for forgeproxy (${local.forgeproxy_config})." >&2
+        if [[ "$DISALLOW_LOCAL_NIX_BUILDS" == "true" ]]; then
+          echo "  disallow_local_nix_builds is true, so Nix is disallowed from building anything locally (--max-jobs 0)." >&2
+          echo "  Set disallow_local_nix_builds = false to allow this host to build locally." >&2
+        else
+          echo "  disallow_local_nix_builds is false, so Nix may build locally." >&2
+          echo "  This setting only controls whether Nix may build anything locally; see the Nix error above." >&2
+        fi
+        exit 1
+      }
 
       # Upload only if this exact image isn't already in the bucket.
       # Uses aggressive retry/timeout settings for large uploads over
@@ -264,9 +276,21 @@ resource "null_resource" "build_valkey_ami" {
       # Build the NixOS image (only reached when AMI doesn't exist yet).
       # Use --no-link to avoid races on the shared ./result symlink when
       # multiple AMI builds run concurrently.
-      OUT_PATH=$(nix build --tarball-ttl 0 --no-link --print-out-paths \
+      DISALLOW_LOCAL_NIX_BUILDS="${var.disallow_local_nix_builds}"
+      NIX_BUILD_FLAGS="${var.disallow_local_nix_builds ? "--max-jobs 0 " : ""}--tarball-ttl 0 --no-link --print-out-paths"
+      OUT_PATH=$(nix build $NIX_BUILD_FLAGS \
         '${var.flake_ref}#nixosConfigurations.${local.valkey_config}.config.system.build.images.amazon' \
-        | tail -n1)
+        | tail -n1) || {
+        echo "ERROR: nix build failed for valkey (${local.valkey_config})." >&2
+        if [[ "$DISALLOW_LOCAL_NIX_BUILDS" == "true" ]]; then
+          echo "  disallow_local_nix_builds is true, so Nix is disallowed from building anything locally (--max-jobs 0)." >&2
+          echo "  Set disallow_local_nix_builds = false to allow this host to build locally." >&2
+        else
+          echo "  disallow_local_nix_builds is false, so Nix may build locally." >&2
+          echo "  This setting only controls whether Nix may build anything locally; see the Nix error above." >&2
+        fi
+        exit 1
+      }
 
       # Upload only if this exact image isn't already in the bucket.
       # Uses aggressive retry/timeout settings for large uploads over
@@ -403,9 +427,21 @@ resource "null_resource" "build_ghe_key_lookup_ami" {
       # Build the NixOS image (only reached when AMI doesn't exist yet).
       # Use --no-link to avoid races on the shared ./result symlink when
       # multiple AMI builds run concurrently.
-      OUT_PATH=$(nix build --tarball-ttl 0 --no-link --print-out-paths \
+      DISALLOW_LOCAL_NIX_BUILDS="${var.disallow_local_nix_builds}"
+      NIX_BUILD_FLAGS="${var.disallow_local_nix_builds ? "--max-jobs 0 " : ""}--tarball-ttl 0 --no-link --print-out-paths"
+      OUT_PATH=$(nix build $NIX_BUILD_FLAGS \
         '${var.flake_ref}#nixosConfigurations."${local.ghe_key_lookup_config}".config.system.build.images.amazon' \
-        | tail -n1)
+        | tail -n1) || {
+        echo "ERROR: nix build failed for ghe-key-lookup (${local.ghe_key_lookup_config})." >&2
+        if [[ "$DISALLOW_LOCAL_NIX_BUILDS" == "true" ]]; then
+          echo "  disallow_local_nix_builds is true, so Nix is disallowed from building anything locally (--max-jobs 0)." >&2
+          echo "  Set disallow_local_nix_builds = false to allow this host to build locally." >&2
+        else
+          echo "  disallow_local_nix_builds is false, so Nix may build locally." >&2
+          echo "  This setting only controls whether Nix may build anything locally; see the Nix error above." >&2
+        fi
+        exit 1
+      }
 
       # Upload only if this exact image isn't already in the bucket.
       if ! aws s3api head-object --bucket "${aws_s3_bucket.ami_staging.id}" --key "$S3_KEY" 2>/dev/null; then

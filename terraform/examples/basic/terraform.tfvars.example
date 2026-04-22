@@ -14,6 +14,7 @@ force_destroy      = false
 # name_prefix              = "forgeproxy"
 # flake_ref                = "github:johnrichardrinehart/forgeproxy"
 # closure_variant          = "hardened" # or "dev"
+# disallow_local_nix_builds = false
 # forgeproxy_instance_type = "t3.large"
 # forgeproxy_count         = 1
 # forgeproxy_root_volume_iops = 3000

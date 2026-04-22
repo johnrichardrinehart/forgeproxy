@@ -7,6 +7,8 @@ name_prefix = "forgeproxy"
 
 # Closure variant: "hardened" (default) or "dev"
 closure_variant = "hardened"
+# Set true to disallow Nix from building anything locally.
+# disallow_local_nix_builds = false
 
 # Upstream forge configuration
 upstream_hostname  = "ghe.example.com"
