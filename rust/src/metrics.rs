@@ -117,6 +117,14 @@ pub struct UploadPackDurationLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UploadPackFirstByteLabels {
+    pub protocol: Protocol,
+    pub source: String,
+    pub cache_status: CacheStatus,
+    pub repo: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ProtocolLabels {
     pub protocol: Protocol,
 }
@@ -208,6 +216,25 @@ pub struct PackCacheInflightWaitLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheKeyBypassLabels {
+    pub protocol: Protocol,
+    pub owner_repo: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheRecentEntriesLabels {
+    pub owner_repo: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheWarmingSkipLabels {
+    pub owner_repo: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PackCacheStitchLabels {
     pub owner_repo: String,
 }
@@ -223,6 +250,13 @@ pub struct PackCacheOnDemandCompositeStageLabels {
     pub protocol: Protocol,
     pub owner_repo: String,
     pub stage: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheOnDemandCompositeDetailLabels {
+    pub protocol: Protocol,
+    pub owner_repo: String,
     pub result: String,
 }
 
@@ -369,6 +403,7 @@ pub struct Metrics {
     pub clone_summary_total: Family<CloneSummaryLabels, Counter>,
     pub clone_duration_seconds: Family<CloneDurationLabels, Histogram>,
     pub upload_pack_duration_seconds: Family<UploadPackDurationLabels, Histogram>,
+    pub upload_pack_first_byte_seconds: Family<UploadPackFirstByteLabels, Histogram>,
     pub clone_upstream_bytes: Family<CloneUpstreamBytesLabels, Counter>,
     pub clone_downstream_bytes: Family<CloneDownstreamBytesLabels, Counter>,
 
@@ -425,12 +460,21 @@ pub struct Metrics {
     pub pack_cache_apparent_usage_bytes: Gauge,
     pub pack_cache_physical_usage_bytes: Gauge,
     pub pack_cache_inflight_waits_total: Family<PackCacheInflightWaitLabels, Counter>,
+    pub pack_cache_key_bypasses_total: Family<PackCacheKeyBypassLabels, Counter>,
+    pub pack_cache_recent_entries: Family<PackCacheRecentEntriesLabels, Gauge>,
+    pub pack_cache_warming_skips_total: Family<PackCacheWarmingSkipLabels, Counter>,
     pub pack_cache_artifact_generation_duration_seconds: Histogram,
     pub pack_cache_stitch_attempts_total: Family<PackCacheStitchLabels, Counter>,
     pub pack_cache_stitch_duration_seconds: Family<PackCacheStitchLabels, Histogram>,
     pub pack_cache_stitch_failures_total: Family<PackCacheStitchFailureLabels, Counter>,
     pub pack_cache_on_demand_composite_stage_duration_seconds:
         Family<PackCacheOnDemandCompositeStageLabels, Histogram>,
+    pub pack_cache_on_demand_composite_candidate_count:
+        Family<PackCacheOnDemandCompositeDetailLabels, Histogram>,
+    pub pack_cache_on_demand_composite_delta_objects:
+        Family<PackCacheOnDemandCompositeDetailLabels, Histogram>,
+    pub pack_cache_on_demand_composite_delta_bytes:
+        Family<PackCacheOnDemandCompositeDetailLabels, Histogram>,
     pub upload_pack_cpu_seconds_total: Family<UploadPackCpuLabels, Counter>,
 
     // -- bundle URI / manifests --
@@ -477,6 +521,16 @@ impl Metrics {
             "forgeproxy_upload_pack_duration_seconds",
             "Upload-pack latency in seconds by protocol and source",
             upload_pack_duration_seconds.clone(),
+        );
+
+        let upload_pack_first_byte_seconds =
+            Family::<UploadPackFirstByteLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.001, 2.0, 19))
+            });
+        registry.register(
+            "forgeproxy_upload_pack_first_byte_seconds",
+            "Upload-pack latency to first downstream byte in seconds by protocol, source, cache status, and repo",
+            upload_pack_first_byte_seconds.clone(),
         );
 
         let clone_upstream_bytes = Family::<CloneUpstreamBytesLabels, Counter>::default();
@@ -719,6 +773,28 @@ impl Metrics {
             pack_cache_inflight_waits_total.clone(),
         );
 
+        let pack_cache_key_bypasses_total = Family::<PackCacheKeyBypassLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_key_bypasses",
+            "Pack response cache key bypasses by protocol, repo, and reason",
+            pack_cache_key_bypasses_total.clone(),
+        );
+
+        let pack_cache_recent_entries = Family::<PackCacheRecentEntriesLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_pack_cache_recent_entries",
+            "Recent pack response cache entries retained for warming and on-demand composites by repo and kind",
+            pack_cache_recent_entries.clone(),
+        );
+
+        let pack_cache_warming_skips_total =
+            Family::<PackCacheWarmingSkipLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_warming_skips",
+            "Pack response cache proactive warming skips by repo and reason",
+            pack_cache_warming_skips_total.clone(),
+        );
+
         let pack_cache_artifact_generation_duration_seconds =
             Histogram::new(exponential_buckets(0.1, 2.0, 16));
         registry.register(
@@ -760,6 +836,36 @@ impl Metrics {
             "forgeproxy_pack_cache_on_demand_composite_stage_duration_seconds",
             "Request-time pack response cache composite stage latency in seconds",
             pack_cache_on_demand_composite_stage_duration_seconds.clone(),
+        );
+
+        let pack_cache_on_demand_composite_candidate_count =
+            Family::<PackCacheOnDemandCompositeDetailLabels, Histogram>::new_with_constructor(
+                || Histogram::new(exponential_buckets(1.0, 2.0, 10)),
+            );
+        registry.register(
+            "forgeproxy_pack_cache_on_demand_composite_candidate_count",
+            "Request-time pack response cache composite base candidates by result",
+            pack_cache_on_demand_composite_candidate_count.clone(),
+        );
+
+        let pack_cache_on_demand_composite_delta_objects =
+            Family::<PackCacheOnDemandCompositeDetailLabels, Histogram>::new_with_constructor(
+                || Histogram::new(exponential_buckets(1.0, 2.0, 24)),
+            );
+        registry.register(
+            "forgeproxy_pack_cache_on_demand_composite_delta_objects",
+            "Request-time pack response cache composite missing object counts by result",
+            pack_cache_on_demand_composite_delta_objects.clone(),
+        );
+
+        let pack_cache_on_demand_composite_delta_bytes =
+            Family::<PackCacheOnDemandCompositeDetailLabels, Histogram>::new_with_constructor(
+                || Histogram::new(exponential_buckets(1024.0, 2.0, 24)),
+            );
+        registry.register(
+            "forgeproxy_pack_cache_on_demand_composite_delta_bytes",
+            "Request-time pack response cache composite delta pack bytes by result",
+            pack_cache_on_demand_composite_delta_bytes.clone(),
         );
 
         let upload_pack_cpu_seconds_total = Family::<UploadPackCpuLabels, Counter>::default();
@@ -809,6 +915,7 @@ impl Metrics {
             clone_summary_total,
             clone_duration_seconds,
             upload_pack_duration_seconds,
+            upload_pack_first_byte_seconds,
             clone_upstream_bytes,
             clone_downstream_bytes,
             bundle_generation_total,
@@ -843,11 +950,17 @@ impl Metrics {
             pack_cache_apparent_usage_bytes,
             pack_cache_physical_usage_bytes,
             pack_cache_inflight_waits_total,
+            pack_cache_key_bypasses_total,
+            pack_cache_recent_entries,
+            pack_cache_warming_skips_total,
             pack_cache_artifact_generation_duration_seconds,
             pack_cache_stitch_attempts_total,
             pack_cache_stitch_duration_seconds,
             pack_cache_stitch_failures_total,
             pack_cache_on_demand_composite_stage_duration_seconds,
+            pack_cache_on_demand_composite_candidate_count,
+            pack_cache_on_demand_composite_delta_objects,
+            pack_cache_on_demand_composite_delta_bytes,
             upload_pack_cpu_seconds_total,
             bundle_uri_command_total,
             bundle_presign_total,
@@ -972,6 +1085,26 @@ pub fn observe_upload_pack_duration(
         .get_or_create(&UploadPackDurationLabels {
             protocol,
             source,
+            repo: repo.to_string(),
+        })
+        .observe(elapsed.as_secs_f64());
+}
+
+pub fn observe_upload_pack_first_byte(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    source: &str,
+    cache_status: CacheStatus,
+    repo: &str,
+    elapsed: Duration,
+) {
+    metrics
+        .metrics
+        .upload_pack_first_byte_seconds
+        .get_or_create(&UploadPackFirstByteLabels {
+            protocol,
+            source: source.to_string(),
+            cache_status,
             repo: repo.to_string(),
         })
         .observe(elapsed.as_secs_f64());
@@ -1184,6 +1317,62 @@ pub fn inc_pack_cache_inflight_wait(metrics: &MetricsRegistry, protocol: Protoco
         .inc();
 }
 
+pub fn inc_pack_cache_key_bypass(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    owner_repo: &str,
+    reason: &str,
+) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_key_bypasses_total
+        .get_or_create(&PackCacheKeyBypassLabels {
+            protocol,
+            owner_repo,
+            reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn replace_pack_cache_recent_entries(
+    metrics: &MetricsRegistry,
+    entries: &[(String, usize, usize)],
+) {
+    metrics.metrics.pack_cache_recent_entries.clear();
+    for (owner_repo, total, full_tip) in entries {
+        let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+        metrics
+            .metrics
+            .pack_cache_recent_entries
+            .get_or_create(&PackCacheRecentEntriesLabels {
+                owner_repo: owner_repo.clone(),
+                kind: "all".to_string(),
+            })
+            .set((*total).min(i64::MAX as usize) as i64);
+        metrics
+            .metrics
+            .pack_cache_recent_entries
+            .get_or_create(&PackCacheRecentEntriesLabels {
+                owner_repo,
+                kind: "full_tip".to_string(),
+            })
+            .set((*full_tip).min(i64::MAX as usize) as i64);
+    }
+}
+
+pub fn inc_pack_cache_warming_skip(metrics: &MetricsRegistry, owner_repo: &str, reason: &str) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_warming_skips_total
+        .get_or_create(&PackCacheWarmingSkipLabels {
+            owner_repo,
+            reason: reason.to_string(),
+        })
+        .inc();
+}
+
 pub fn observe_pack_cache_artifact_generation(metrics: &MetricsRegistry, elapsed: Duration) {
     metrics
         .metrics
@@ -1244,6 +1433,63 @@ pub fn observe_pack_cache_on_demand_composite_stage(
             result: result.to_string(),
         })
         .observe(elapsed.as_secs_f64());
+}
+
+pub fn observe_pack_cache_on_demand_composite_candidate_count(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    owner_repo: &str,
+    result: &str,
+    count: usize,
+) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_on_demand_composite_candidate_count
+        .get_or_create(&PackCacheOnDemandCompositeDetailLabels {
+            protocol,
+            owner_repo,
+            result: result.to_string(),
+        })
+        .observe(count as f64);
+}
+
+pub fn observe_pack_cache_on_demand_composite_delta_objects(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    owner_repo: &str,
+    result: &str,
+    count: usize,
+) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_on_demand_composite_delta_objects
+        .get_or_create(&PackCacheOnDemandCompositeDetailLabels {
+            protocol,
+            owner_repo,
+            result: result.to_string(),
+        })
+        .observe(count as f64);
+}
+
+pub fn observe_pack_cache_on_demand_composite_delta_bytes(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    owner_repo: &str,
+    result: &str,
+    bytes: usize,
+) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_on_demand_composite_delta_bytes
+        .get_or_create(&PackCacheOnDemandCompositeDetailLabels {
+            protocol,
+            owner_repo,
+            result: result.to_string(),
+        })
+        .observe(bytes as f64);
 }
 
 pub fn inc_upload_pack_cpu_seconds(
@@ -1509,6 +1755,14 @@ mod tests {
             "acme/widgets",
             Duration::from_millis(250),
         );
+        observe_upload_pack_first_byte(
+            &metrics,
+            Protocol::Https,
+            "local_upload_pack",
+            CacheStatus::Warm,
+            "acme/widgets",
+            Duration::from_millis(125),
+        );
         inc_bundle_uri_advertisement(&metrics, "acme/widgets", "injected");
         inc_bundle_list_request(&metrics, "acme/widgets", "served");
         inc_hydration_skipped(&metrics, HydrationSkipReason::SemaphoreSaturated);
@@ -1520,6 +1774,13 @@ mod tests {
             line.starts_with("forgeproxy_upload_pack_duration_seconds_sum{")
                 && line.contains("repo=\"acme/widgets\"")
                 && line.contains(" 0.25")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_upload_pack_first_byte_seconds_sum{")
+                && line.contains("cache_status=\"warm\"")
+                && line.contains("repo=\"acme/widgets\"")
+                && line.contains("source=\"local_upload_pack\"")
+                && line.contains(" 0.125")
         }));
         assert!(encoded.lines().any(
             |line| line.starts_with("forgeproxy_hydration_skipped_total{") && line.ends_with(" 1")
@@ -1555,6 +1816,27 @@ mod tests {
             "ok",
             Duration::from_millis(25),
         );
+        observe_pack_cache_on_demand_composite_candidate_count(
+            &metrics,
+            Protocol::Ssh,
+            "acme/widgets.git",
+            "ok",
+            3,
+        );
+        observe_pack_cache_on_demand_composite_delta_objects(
+            &metrics,
+            Protocol::Ssh,
+            "acme/widgets.git",
+            "composite",
+            42,
+        );
+        observe_pack_cache_on_demand_composite_delta_bytes(
+            &metrics,
+            Protocol::Ssh,
+            "acme/widgets.git",
+            "composite",
+            1024,
+        );
 
         let encoded = encode_metrics(&metrics.registry);
         assert!(encoded.lines().any(|line| {
@@ -1565,6 +1847,60 @@ mod tests {
                 && line.contains("result=\"ok\"")
                 && line.contains("stage=\"semaphore_wait\"")
                 && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_on_demand_composite_candidate_count_count{")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.contains("result=\"ok\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_on_demand_composite_delta_objects_sum{")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.contains("result=\"composite\"")
+                && (line.ends_with(" 42") || line.ends_with(" 42.0"))
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_on_demand_composite_delta_bytes_sum{")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.contains("result=\"composite\"")
+                && (line.ends_with(" 1024") || line.ends_with(" 1024.0"))
+        }));
+    }
+
+    #[test]
+    fn pack_cache_diagnostic_metrics_encode_expected_labels() {
+        let metrics = MetricsRegistry::new();
+
+        inc_pack_cache_key_bypass(&metrics, Protocol::Https, "acme/widgets.git", "filtered");
+        inc_pack_cache_warming_skip(&metrics, "acme/widgets.git", "no_recent_full_tip");
+        replace_pack_cache_recent_entries(&metrics, &[("acme/widgets.git".to_string(), 4, 2)]);
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_key_bypasses_total{")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.contains("protocol=\"https\"")
+                && line.contains("reason=\"filtered\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_warming_skips_total{")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.contains("reason=\"no_recent_full_tip\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_recent_entries{")
+                && line.contains("kind=\"all\"")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.ends_with(" 4")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_recent_entries{")
+                && line.contains("kind=\"full_tip\"")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.ends_with(" 2")
         }));
     }
 
