@@ -156,7 +156,7 @@ async fn acquire_local_repo_upload_pack_permit(
             .or_insert_with(|| {
                 std::sync::Arc::new(tokio::sync::Semaphore::new(
                     state
-                        .config
+                        .config()
                         .clone
                         .max_concurrent_local_upload_packs_per_repo,
                 ))
@@ -280,8 +280,8 @@ impl UpstreamHydrationTracker {
                     info!(
                         repo = %owner_repo,
                         protocol = protocol_name,
-                        host_limit = state.config.clone.max_concurrent_tee_captures,
-                        per_repo_host_limit = state.config.clone.max_concurrent_tee_captures_per_repo_per_instance,
+                        host_limit = state.config().clone.max_concurrent_tee_captures,
+                        per_repo_host_limit = state.config().clone.max_concurrent_tee_captures_per_repo_per_instance,
                         "skipping tee hydration because the tee capture semaphore is saturated"
                     );
                     None

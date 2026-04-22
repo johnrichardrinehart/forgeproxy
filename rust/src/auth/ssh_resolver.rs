@@ -21,7 +21,7 @@ pub async fn resolve_user_by_fingerprint(
     // 2. Self-throttle if approaching the upstream rate limit.
     state
         .rate_limit
-        .wait_if_needed(state.config.upstream.api_rate_limit_buffer)
+        .wait_if_needed(state.config().upstream.api_rate_limit_buffer)
         .await;
 
     // 3. Delegate to the forge backend.
@@ -36,7 +36,7 @@ pub async fn resolve_user_by_fingerprint(
             &state.valkey,
             &cache_key,
             username,
-            state.config.auth.ssh_cache_ttl,
+            state.config().auth.ssh_cache_ttl,
         )
         .await?;
     } else {
@@ -64,7 +64,7 @@ pub async fn check_ssh_repo_access(
     // Self-throttle if approaching the upstream rate limit.
     state
         .rate_limit
-        .wait_if_needed(state.config.upstream.api_rate_limit_buffer)
+        .wait_if_needed(state.config().upstream.api_rate_limit_buffer)
         .await;
 
     // Delegate to the forge backend.
@@ -85,7 +85,7 @@ pub async fn check_ssh_repo_access(
         &state.valkey,
         &cache_key,
         perm_str,
-        state.config.auth.ssh_cache_ttl,
+        state.config().auth.ssh_cache_ttl,
     )
     .await?;
 

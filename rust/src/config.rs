@@ -79,9 +79,11 @@ impl fmt::Display for BackendType {
 // Top-level config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub config_reload: ConfigReloadConfig,
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub backend_type: BackendType,
@@ -110,10 +112,39 @@ pub struct Config {
 }
 
 // ---------------------------------------------------------------------------
+// Config reload
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigReloadConfig {
+    /// Periodically re-read the config file and publish compatible changes to
+    /// request handlers without restarting the process.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum delay, in seconds, before a changed on-disk config is observed.
+    #[serde(default = "default_config_reload_interval_secs")]
+    pub interval_secs: u64,
+}
+
+impl Default for ConfigReloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            interval_secs: default_config_reload_interval_secs(),
+        }
+    }
+}
+
+fn default_config_reload_interval_secs() -> u64 {
+    60
+}
+
+// ---------------------------------------------------------------------------
 // Pre-warm
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrewarmConfig {
     /// Restore/publish selected repositories during startup before `/readyz`
@@ -146,7 +177,7 @@ fn default_prewarm_max_concurrent() -> usize {
 // Observability
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     #[serde(default)]
@@ -157,14 +188,14 @@ pub struct ObservabilityConfig {
     pub traces: TraceConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     #[serde(default)]
     pub prometheus: PrometheusConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrometheusConfig {
     #[serde(default = "default_true")]
@@ -182,14 +213,14 @@ impl Default for PrometheusConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogSignalConfig {
     #[serde(default)]
     pub journald: JournaldLogConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JournaldLogConfig {
     #[serde(default = "default_true")]
@@ -204,7 +235,7 @@ impl Default for JournaldLogConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TraceConfig {
     #[serde(default)]
@@ -238,7 +269,7 @@ fn default_metrics_refresh_interval_secs() -> u64 {
 // Logging
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
@@ -261,7 +292,7 @@ fn default_log_level() -> String {
 // Upstream
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     /// Hostname of the upstream forge (e.g. `ghe.corp.example.com`).
@@ -330,7 +361,7 @@ fn default_log_secret_unmask_chars() -> usize {
 // Upstream credentials
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamCredentials {
     /// Default credential mode used when no per-org override is present.
@@ -352,7 +383,7 @@ fn default_credential_mode() -> CredentialMode {
     CredentialMode::Pat
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrgCredential {
     pub mode: CredentialMode,
@@ -364,7 +395,7 @@ pub struct OrgCredential {
 // Proxy
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// Socket address for the SSH listener (e.g. `0.0.0.0:2222`).
@@ -377,7 +408,7 @@ pub struct ProxyConfig {
 // Valkey / Redis
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValkeyConfig {
     /// Connection string (e.g. `rediss://valkey.local:6380`).
@@ -404,7 +435,7 @@ fn default_valkey_auth_env() -> String {
 // Auth cache TTLs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Positive SSH auth cache TTL in seconds.
@@ -452,7 +483,7 @@ fn default_webhook_secret_env() -> String {
 // Clone behaviour
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloneConfig {
     /// TTL (seconds) of the distributed per-repo hydration semaphore lease in
@@ -677,7 +708,7 @@ fn default_index_pack_threads() -> usize {
 // Adaptive fetch schedule
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FetchScheduleConfig {
     /// Default interval (seconds) between background re-fetches.
@@ -733,7 +764,7 @@ fn default_rolling_window() -> u64 {
 // Bundle generation
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleConfig {
     /// Minimum number of clones a repo must have received before bundles are
@@ -777,7 +808,7 @@ pub struct BundleExecutionPolicy {
 // Pack response cache
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackCacheConfig {
     /// Enable replay caching of local upload-pack responses for safe fresh
@@ -922,14 +953,14 @@ fn default_pack_threads(available_parallelism: usize, max_concurrent_generations
 // Storage (local + S3)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub local: LocalStorageConfig,
     pub s3: S3StorageConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalStorageConfig {
     /// Root directory for bare repos and bundles.
@@ -967,7 +998,7 @@ fn default_eviction_policy() -> EvictionPolicy {
     EvictionPolicy::Lru
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct S3StorageConfig {
     pub bucket: String,
@@ -996,7 +1027,7 @@ fn default_presigned_url_ttl() -> u64 {
 // Per-repo overrides
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoOverride {
     /// Override fetch interval (seconds) for this repo.
@@ -1009,7 +1040,7 @@ pub struct RepoOverride {
 // Loader
 // ---------------------------------------------------------------------------
 
-fn parse_config_str(contents: &str) -> Result<Config> {
+pub(crate) fn parse_config_str(contents: &str) -> Result<Config> {
     let config: Config = serde_yml::from_str(contents)?;
     validate_config(&config)?;
     Ok(config)
@@ -1022,6 +1053,18 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
     parse_config_str(&contents)
         .with_context(|| format!("failed to parse config file: {}", path.display()))
+}
+
+/// Load and validate a [`Config`] while also returning the exact file contents
+/// that produced it. The reload loop keeps this content fingerprint so
+/// metadata-only filesystem changes do not churn the live config handle.
+pub fn load_config_with_contents<P: AsRef<Path>>(path: P) -> Result<(Config, String)> {
+    let path = path.as_ref();
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+    let config = parse_config_str(&contents)
+        .with_context(|| format!("failed to parse config file: {}", path.display()))?;
+    Ok((config, contents))
 }
 
 /// Basic sanity checks that cannot be expressed purely with serde.
@@ -1091,6 +1134,10 @@ fn validate_config(config: &Config) -> Result<()> {
             > 0,
         "observability.metrics.prometheus.refresh_interval_secs must be greater than 0"
     );
+    anyhow::ensure!(
+        config.config_reload.interval_secs > 0,
+        "config_reload.interval_secs must be greater than 0"
+    );
     Ok(())
 }
 
@@ -1131,6 +1178,17 @@ mod tests {
             config.clone.request_wait_for_active_local_catch_up_secs,
             300
         );
+        assert!(config.config_reload.enabled);
+        assert_eq!(config.config_reload.interval_secs, 60);
+    }
+
+    #[test]
+    fn rejects_non_positive_config_reload_interval() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "config_reload:\n  enabled: true\n  interval_secs: 60\n",
+            "config_reload:\n  enabled: true\n  interval_secs: 0\n",
+        );
+        assert!(parse_config_str(&config).is_err());
     }
 
     #[test]

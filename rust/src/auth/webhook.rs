@@ -24,7 +24,8 @@ pub async fn handle_webhook_payload(
     body: &Bytes,
 ) -> anyhow::Result<Response> {
     // 1. Verify signature.
-    let secret = crate::credentials::keyring::resolve_secret(&state.config.auth.webhook_secret_env)
+    let config = state.config();
+    let secret = crate::credentials::keyring::resolve_secret(&config.auth.webhook_secret_env)
         .await
         .ok_or_else(|| anyhow::anyhow!("webhook secret not found in keyring or env"))?;
 

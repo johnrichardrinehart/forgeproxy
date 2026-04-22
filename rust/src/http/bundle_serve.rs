@@ -127,6 +127,7 @@ pub async fn bundle_list_body(
     }
 
     let presigned_ttl_secs = 60u64; // short-lived; clients fetch immediately
+    let config = state.config();
     let mut body = String::with_capacity(512);
     writeln!(body, "[bundle]")?;
     writeln!(body, "\tversion = 1")?;
@@ -136,7 +137,7 @@ pub async fn bundle_list_body(
     for entry in &manifest.entries {
         let presigned_url = crate::storage::s3::generate_presigned_url(
             &state.s3_client,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &entry.bundle_s3_key,
             presigned_ttl_secs,
         )
@@ -177,6 +178,7 @@ pub async fn bundle_uri_command_response(
     }
 
     let mut body = Vec::new();
+    let config = state.config();
     let mut lines = vec![
         "bundle.version=1\n".to_string(),
         "bundle.mode=all\n".to_string(),
@@ -185,7 +187,7 @@ pub async fn bundle_uri_command_response(
     for entry in &manifest.entries {
         let presigned_url = crate::storage::s3::generate_presigned_url(
             &state.s3_client,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &entry.bundle_s3_key,
             60,
         )

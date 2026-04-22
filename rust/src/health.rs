@@ -260,8 +260,8 @@ fn aggregate_status(checks: &HealthChecks) -> HealthStatus {
 pub async fn health_handler(State(state): State<HealthState>) -> impl IntoResponse {
     let (valkey, ghe, disk) = tokio::join!(
         check_valkey(&state.valkey),
-        check_ghe(&state.http_client, &state.config),
-        check_disk(&state.config),
+        check_ghe(&state.http_client, state.config.as_ref()),
+        check_disk(state.config.as_ref()),
     );
 
     let checks = HealthChecks { valkey, ghe, disk };

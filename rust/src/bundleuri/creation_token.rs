@@ -15,18 +15,19 @@ const COUNTER_LOCK_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Atomically allocate the next creation token for a repository.
 pub async fn next_creation_token(state: &crate::AppState, owner_repo: &str) -> Result<u64> {
+    let config = state.config();
     let lock_key = format!("forgeproxy:lock:bundle-counter:{owner_repo}");
-    let ttl_secs = state.config.bundles.bundle_lock_ttl;
+    let ttl_secs = config.bundles.bundle_lock_ttl;
 
     let lease = acquire_counter_lock(state, &lock_key, ttl_secs, owner_repo).await?;
     let counter_key =
-        crate::bundleuri::bundle_counter_s3_key(&state.config.storage.s3.prefix, owner_repo);
+        crate::bundleuri::bundle_counter_s3_key(&config.storage.s3.prefix, owner_repo);
 
     let result = async {
         let current = crate::storage::s3::download_text_if_exists(
             &state.s3_client,
             &state.metrics,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &counter_key,
         )
         .await?
@@ -40,7 +41,7 @@ pub async fn next_creation_token(state: &crate::AppState, owner_repo: &str) -> R
             .max(CREATION_TOKEN_STEP);
         crate::storage::s3::upload_text(
             &state.s3_client,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &counter_key,
             &format!("{next}\n"),
         )

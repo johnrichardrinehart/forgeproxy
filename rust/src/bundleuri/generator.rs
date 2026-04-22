@@ -288,7 +288,8 @@ pub async fn get_refs(repo_path: &Path) -> Result<HashMap<String, String>> {
 }
 
 fn create_bundle_tempdir(state: &crate::AppState, context: &str) -> Result<tempfile::TempDir> {
-    let cache_root = Path::new(&state.config.storage.local.path);
+    let config = state.config();
+    let cache_root = Path::new(&config.storage.local.path);
     let tmp_root = crate::cache::layout::state_bundle_tmp_root(cache_root);
 
     std::fs::create_dir_all(&tmp_root)
