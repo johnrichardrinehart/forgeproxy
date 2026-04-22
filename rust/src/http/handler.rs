@@ -57,6 +57,10 @@ use crate::metrics::{
 };
 use crate::observability::GitRequestObservation;
 
+// Capacity for large proxied pack response streams. Production profiles justify
+// extra read-ahead while keeping bounded backpressure between producer and body.
+const UPSTREAM_PACK_PROXY_CHANNEL_CAPACITY: usize = 256;
+
 struct LeasedReaderStream<S> {
     inner: S,
     lease: Option<LocalServeRepoLease>,
@@ -2007,7 +2011,8 @@ async fn proxy_upload_pack_to_upstream(
     let status = upstream_resp.status();
     let forwarded_headers = collect_forwarded_response_headers(upstream_resp.headers());
 
-    let (tx, rx) = mpsc::channel::<Result<Bytes, reqwest::Error>>(8);
+    let (tx, rx) =
+        mpsc::channel::<Result<Bytes, reqwest::Error>>(UPSTREAM_PACK_PROXY_CHANNEL_CAPACITY);
     let completion_metrics = state.metrics.clone();
     let state_for_stream = state.clone();
     let owner = owner.to_string();

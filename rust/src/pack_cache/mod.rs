@@ -30,6 +30,9 @@ const PACK_ENTRY_MANIFEST_VERSION: u32 = 1;
 const PACK_CACHE_METADATA_VERSION: u32 = 4;
 const MAX_RECENT_ENTRIES_PER_REPO: usize = 16;
 const METADATA_HIT_UPDATE_INTERVAL_SECS: u64 = 60;
+// Capacity for large pack-cache response streams. Production profiles justify
+// extra read-ahead while keeping bounded backpressure between producer and body.
+const PACK_CACHE_STREAM_CHANNEL_CAPACITY: usize = 256;
 const PACKSTORE_DIR: &str = "packstore";
 const PACKSTORE_OBJECTS_DIR: &str = "objects";
 const PACKSTORE_PACK_DIR: &str = "pack";
@@ -145,7 +148,8 @@ impl PackCacheReadLease {
                 packs,
                 synthetic_trailer_sha1,
             } => {
-                let (sender, receiver) = tokio::sync::mpsc::channel(8);
+                let (sender, receiver) =
+                    tokio::sync::mpsc::channel(PACK_CACHE_STREAM_CHANNEL_CAPACITY);
                 tokio::task::spawn_blocking(move || {
                     let result = stitch::stream_packfile_response_from_open_files_with_trailer(
                         packs,
