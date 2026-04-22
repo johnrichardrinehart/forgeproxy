@@ -1881,6 +1881,17 @@ fn spawn_pack_cache_warming(
     }
     let prev_entries = state.pack_cache.lookup_recent_full_tip_keys(&owner_repo);
     if prev_entries.is_empty() {
+        crate::metrics::inc_pack_cache_warming_skip(
+            &state.metrics,
+            &owner_repo,
+            "no_recent_full_tip",
+        );
+        debug!(
+            repo = %owner_repo,
+            source,
+            path = %published_path.display(),
+            "skipping pack cache stitching because no recent full-tip entry is available"
+        );
         return;
     }
 
@@ -2097,6 +2108,18 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
     let candidate_started_at = Instant::now();
     let candidates = state.pack_cache.lookup_recent_compatible_keys(writer.key());
     if candidates.is_empty() {
+        crate::metrics::observe_pack_cache_on_demand_composite_candidate_count(
+            &state.metrics,
+            protocol.clone(),
+            owner_repo,
+            "no_base",
+            0,
+        );
+        debug!(
+            repo = %owner_repo,
+            key = %writer.key().as_str(),
+            "cannot build on-demand pack cache composite because no compatible recent base exists"
+        );
         observe_on_demand_composite_stage(
             state,
             protocol.clone(),
@@ -2118,6 +2141,13 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
             reason: "no_base",
         });
     }
+    crate::metrics::observe_pack_cache_on_demand_composite_candidate_count(
+        &state.metrics,
+        protocol.clone(),
+        owner_repo,
+        "ok",
+        candidates.len(),
+    );
     observe_on_demand_composite_stage(
         state,
         protocol.clone(),
@@ -2150,6 +2180,13 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
     .await
     {
         Ok(Some(selection)) => {
+            crate::metrics::observe_pack_cache_on_demand_composite_delta_objects(
+                &state.metrics,
+                protocol.clone(),
+                owner_repo,
+                "selected",
+                selection.missing_objects.len(),
+            );
             observe_on_demand_composite_stage(
                 state,
                 protocol.clone(),
@@ -2161,6 +2198,13 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
             selection
         }
         Ok(None) => {
+            crate::metrics::observe_pack_cache_on_demand_composite_delta_objects(
+                &state.metrics,
+                protocol.clone(),
+                owner_repo,
+                "no_usable_base",
+                0,
+            );
             observe_on_demand_composite_stage(
                 state,
                 protocol.clone(),
@@ -2207,6 +2251,20 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
         }
     };
     if selected_base.missing_objects.is_empty() {
+        crate::metrics::observe_pack_cache_on_demand_composite_delta_objects(
+            &state.metrics,
+            protocol.clone(),
+            owner_repo,
+            "alias",
+            0,
+        );
+        crate::metrics::observe_pack_cache_on_demand_composite_delta_bytes(
+            &state.metrics,
+            protocol.clone(),
+            owner_repo,
+            "alias",
+            0,
+        );
         let alias_key = writer.key().clone();
         let finish_started_at = Instant::now();
         writer
@@ -2343,6 +2401,20 @@ pub(crate) async fn try_finish_pack_cache_delta_composite(
     };
 
     let composite_key = writer.key().clone();
+    crate::metrics::observe_pack_cache_on_demand_composite_delta_objects(
+        &state.metrics,
+        protocol.clone(),
+        owner_repo,
+        "composite",
+        selected_base.missing_objects.len(),
+    );
+    crate::metrics::observe_pack_cache_on_demand_composite_delta_bytes(
+        &state.metrics,
+        protocol.clone(),
+        owner_repo,
+        "composite",
+        delta_build.pack.len(),
+    );
     let finish_started_at = Instant::now();
     writer
         .finish_composite(&selected_base.entry.key, &delta_build.pack)

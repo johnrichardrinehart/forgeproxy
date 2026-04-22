@@ -917,6 +917,7 @@ impl PackCache {
             );
         }
 
+        record_recent_entries_metric(&self.metrics, &recent);
         *self.recent_pack_cache_keys.lock().unwrap() = recent;
         Ok(())
     }
@@ -1113,10 +1114,9 @@ impl PackCacheWriter {
                     "failed to prune pack cache after artifact promotion"
                 );
             }
-            retain_existing_recent_entries(
-                &self.root,
-                &mut self.recent_pack_cache_keys.lock().unwrap(),
-            );
+            let mut recent = self.recent_pack_cache_keys.lock().unwrap();
+            retain_existing_recent_entries(&self.root, &mut recent);
+            record_recent_entries_metric(&self.metrics, &recent);
             self.record_pack_cache_usage_metric();
         }
         debug!(
@@ -1399,6 +1399,23 @@ fn insert_recent_entry(
     });
     entries.insert(0, entry);
     entries.truncate(MAX_RECENT_ENTRIES_PER_REPO);
+}
+
+fn record_recent_entries_metric(
+    metrics: &crate::metrics::MetricsRegistry,
+    recent: &HashMap<String, Vec<PackCacheRecentEntry>>,
+) {
+    let counts = recent
+        .iter()
+        .map(|(owner_repo, entries)| {
+            (
+                owner_repo.clone(),
+                entries.len(),
+                entries.iter().filter(|entry| entry.full_tip).count(),
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::metrics::replace_pack_cache_recent_entries(metrics, &counts);
 }
 
 fn normalize_oid_list(mut oids: Vec<String>) -> Vec<String> {
