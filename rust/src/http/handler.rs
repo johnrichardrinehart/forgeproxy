@@ -1122,6 +1122,14 @@ async fn handle_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     }
 
+    if !state.is_prewarm_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "forgeproxy repository pre-warm is not complete\n",
+        )
+            .into_response();
+    }
+
     let health_state = crate::health::HealthState {
         config: Arc::clone(&state.config),
         valkey: state.valkey.clone(),

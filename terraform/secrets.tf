@@ -54,6 +54,9 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     pack_cache_request_delta_pack_secs          = var.pack_cache_request_delta_pack_secs
     pack_cache_max_concurrent_request_deltas    = var.pack_cache_max_concurrent_request_deltas
     pack_cache_min_response_bytes               = var.pack_cache_min_response_bytes
+    prewarm_enabled                             = var.prewarm_enabled
+    prewarm_repos                               = var.prewarm_repos
+    prewarm_max_concurrent                      = var.prewarm_max_concurrent
     bundle_pack_threads                         = var.bundle_pack_threads
     bundle_max_incremental_bundles              = var.bundle_max_incremental_bundles
     metrics_enabled                             = var.metrics_enabled

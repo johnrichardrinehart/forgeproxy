@@ -80,6 +80,9 @@ module "forgeproxy" {
   pack_cache_request_delta_pack_secs          = var.pack_cache_request_delta_pack_secs
   pack_cache_max_concurrent_request_deltas    = var.pack_cache_max_concurrent_request_deltas
   pack_cache_min_response_bytes               = var.pack_cache_min_response_bytes
+  prewarm_enabled                             = var.prewarm_enabled
+  prewarm_repos                               = var.prewarm_repos
+  prewarm_max_concurrent                      = var.prewarm_max_concurrent
 
   s3_bundle_prefix     = var.s3_bundle_prefix
   s3_use_fips          = var.s3_use_fips

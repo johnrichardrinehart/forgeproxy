@@ -98,6 +98,8 @@ pub struct Config {
     pub bundles: BundleConfig,
     #[serde(default)]
     pub pack_cache: PackCacheConfig,
+    #[serde(default)]
+    pub prewarm: PrewarmConfig,
     pub storage: StorageConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -105,6 +107,39 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub repo_overrides: HashMap<String, RepoOverride>,
+}
+
+// ---------------------------------------------------------------------------
+// Pre-warm
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrewarmConfig {
+    /// Restore/publish selected repositories during startup before `/readyz`
+    /// reports ready.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Canonical `owner/repo` repository names to pre-warm on this instance.
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// Maximum repositories to pre-warm concurrently.
+    #[serde(default = "default_prewarm_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+impl Default for PrewarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repos: Vec::new(),
+            max_concurrent: default_prewarm_max_concurrent(),
+        }
+    }
+}
+
+fn default_prewarm_max_concurrent() -> usize {
+    2
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1073,10 @@ fn validate_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.pack_cache.max_concurrent_request_deltas > 0,
         "pack_cache.max_concurrent_request_deltas must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.prewarm.max_concurrent > 0,
+        "prewarm.max_concurrent must be greater than 0"
     );
     anyhow::ensure!(
         (0.0..=1.0).contains(&config.observability.traces.sample_ratio),

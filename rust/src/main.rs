@@ -30,6 +30,7 @@ use fred::clients::Pool;
 use fred::interfaces::ClientLike;
 use fred::interfaces::KeysInterface;
 use fred::types::config::{Config as FredConfig, ReconnectPolicy, ServerConfig, TlsConnector};
+use futures::StreamExt;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
@@ -184,6 +185,7 @@ pub struct AppState {
     pub active_ssh_warm_clones: Arc<AtomicI64>,
     pub active_ssh_cold_clones: Arc<AtomicI64>,
     pub draining: Arc<AtomicBool>,
+    pub prewarm_ready: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -232,6 +234,14 @@ impl AppState {
 
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_prewarm_ready(&self) {
+        self.prewarm_ready.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_prewarm_ready(&self) -> bool {
+        self.prewarm_ready.load(Ordering::SeqCst)
     }
 
     pub fn refresh_live_metrics(&self) {
@@ -959,6 +969,15 @@ async fn main() -> Result<()> {
     let telemetry_buffer = cache::telemetry::TelemetryBuffer::new();
 
     // ---- Spawn services ----
+    let prewarm_handle = tokio::spawn({
+        let s = state.clone();
+        async move {
+            if let Err(e) = run_startup_prewarm(s).await {
+                tracing::error!(error = %e, "repository pre-warm failed; readiness remains closed");
+            }
+        }
+    });
+
     let telemetry_handle = tokio::spawn({
         let s = Arc::new(state.clone());
         let buf = telemetry_buffer.clone();
@@ -1033,6 +1052,7 @@ async fn main() -> Result<()> {
         tee_cleanup_handle.abort_handle(),
         metrics_refresh_handle.abort_handle(),
         heartbeat_handle.abort_handle(),
+        prewarm_handle.abort_handle(),
         telemetry_handle.abort_handle(),
     ];
     let abort_handles = abort_handles.to_vec();
@@ -1203,6 +1223,7 @@ async fn build_app_state(
         active_ssh_warm_clones: Arc::new(AtomicI64::new(0)),
         active_ssh_cold_clones: Arc::new(AtomicI64::new(0)),
         draining: Arc::new(AtomicBool::new(false)),
+        prewarm_ready: Arc::new(AtomicBool::new(!config.prewarm.enabled)),
     };
     state.refresh_live_metrics();
     Ok(state)
@@ -1223,5 +1244,83 @@ async fn run_metrics_refresh_loop(state: AppState) -> Result<()> {
     loop {
         ticker.tick().await;
         state.refresh_live_metrics();
+    }
+}
+
+async fn run_startup_prewarm(state: AppState) -> Result<()> {
+    if !state.config.prewarm.enabled {
+        state.mark_prewarm_ready();
+        return Ok(());
+    }
+
+    let repos = state
+        .config
+        .prewarm
+        .repos
+        .iter()
+        .map(|repo| crate::repo_identity::canonicalize_owner_repo(repo))
+        .collect::<Vec<_>>();
+    let max_concurrent = state.config.prewarm.max_concurrent;
+    tracing::info!(
+        repo_count = repos.len(),
+        max_concurrent,
+        "starting repository pre-warm before readiness"
+    );
+
+    if repos.is_empty() {
+        state.mark_prewarm_ready();
+        tracing::info!("repository pre-warm complete; no repos configured");
+        return Ok(());
+    }
+
+    let results = futures::stream::iter(repos.into_iter().map(|owner_repo| {
+        let state = state.clone();
+        async move {
+            let started_at = Instant::now();
+            let warmed =
+                crate::coordination::registry::prewarm_repo_from_s3(&state, &owner_repo).await;
+            (owner_repo, started_at.elapsed(), warmed)
+        }
+    }))
+    .buffer_unordered(max_concurrent)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut failures = Vec::new();
+    for (owner_repo, elapsed, warmed) in results {
+        match warmed {
+            Ok(true) => {
+                tracing::info!(
+                    repo = %owner_repo,
+                    elapsed_ms = elapsed.as_millis(),
+                    "repository pre-warm completed"
+                );
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    repo = %owner_repo,
+                    elapsed_ms = elapsed.as_millis(),
+                    "repository pre-warm did not find local or S3 state"
+                );
+                failures.push(format!("{owner_repo}: unavailable"));
+            }
+            Err(error) => {
+                tracing::error!(
+                    repo = %owner_repo,
+                    elapsed_ms = elapsed.as_millis(),
+                    error = %error,
+                    "repository pre-warm failed"
+                );
+                failures.push(format!("{owner_repo}: {error}"));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        state.mark_prewarm_ready();
+        tracing::info!("repository pre-warm complete; readiness gate opened");
+        Ok(())
+    } else {
+        anyhow::bail!("repository pre-warm failed: {}", failures.join("; "))
     }
 }
