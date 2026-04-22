@@ -95,6 +95,8 @@ org_creds = [
 # OpenTelemetry configuration (optional)
 metrics_enabled = true
 metrics_refresh_interval_secs = 60
+config_reload_enabled = true
+config_reload_interval_secs = 60
 prepare_published_generation_indexes = false
 global_short_circuit_upstream_secs = 0
 request_wait_for_local_catch_up_secs = 30

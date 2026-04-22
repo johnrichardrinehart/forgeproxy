@@ -641,6 +641,23 @@ variable "org_creds" {
   description = "List of organization credentials configurations"
 }
 
+variable "config_reload_enabled" {
+  type        = bool
+  default     = true
+  description = "Periodically hot reload compatible forgeproxy config.yaml changes from the rendered service secret."
+}
+
+variable "config_reload_interval_secs" {
+  type        = number
+  default     = 60
+  description = "Maximum delay in seconds before forgeproxy observes a compatible rendered config.yaml change."
+
+  validation {
+    condition     = var.config_reload_interval_secs > 0
+    error_message = "config_reload_interval_secs must be greater than 0"
+  }
+}
+
 variable "metrics_enabled" {
   type        = bool
   default     = true

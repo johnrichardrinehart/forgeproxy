@@ -1,3 +1,7 @@
+config_reload:
+  enabled: ${config_reload_enabled}
+  interval_secs: ${config_reload_interval_secs}
+
 upstream:
   hostname: "${upstream_hostname}"
   api_url: "${upstream_api_url}"
