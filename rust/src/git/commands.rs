@@ -7,7 +7,9 @@
 //!
 //! All functions are fully `async` and use the Tokio process runtime.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
 
@@ -29,6 +31,39 @@ pub struct FetchResult {
     /// otherwise 0).
     pub bytes_received: u64,
 }
+
+/// Result of a selected-ref fetch that may have skipped refs which vanished
+/// between advertisement and fetch time.
+#[derive(Debug, Clone)]
+pub struct SelectedFetchResult {
+    pub fetch_result: FetchResult,
+    pub fetched_refspecs: Vec<String>,
+    pub missing_remote_refspecs: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct GitFetchError {
+    status: std::process::ExitStatus,
+    stderr: String,
+}
+
+impl GitFetchError {
+    pub fn stderr(&self) -> &str {
+        &self.stderr
+    }
+}
+
+impl fmt::Display for GitFetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "git fetch failed (status {}): {}",
+            self.status, self.stderr
+        )
+    }
+}
+
+impl Error for GitFetchError {}
 
 const FETCH_REFSPECS_STDIN_THRESHOLD: usize = 100;
 
@@ -492,11 +527,11 @@ pub async fn git_fetch_refspecs_with_context(
     };
 
     if !status.success() {
-        bail!(
-            "git fetch failed (status {}): {}",
+        return Err(GitFetchError {
             status,
-            stderr_buf.trim()
-        );
+            stderr: stderr_buf.trim().to_string(),
+        }
+        .into());
     }
     if let Some(result) = stdin_writer_result {
         result??;
@@ -519,6 +554,89 @@ pub async fn git_fetch_refspecs_with_context(
     })
 }
 
+/// Run a selected-ref fetch and retry after dropping refs that disappeared
+/// from the remote between advertisement and fetch time.
+pub async fn git_fetch_refspecs_allow_missing_remote_refs_with_context(
+    repo_path: &Path,
+    remote_url: &str,
+    env_vars: &[(String, String)],
+    refspecs: &[String],
+    prune: bool,
+    fetch_priority: Option<&str>,
+) -> Result<SelectedFetchResult> {
+    if refspecs.is_empty() {
+        bail!("git fetch requires at least one refspec");
+    }
+
+    let mut pending_refspecs = refspecs.to_vec();
+    let mut missing_remote_refspecs = Vec::new();
+
+    loop {
+        match git_fetch_refspecs_with_context(
+            repo_path,
+            remote_url,
+            env_vars,
+            &pending_refspecs,
+            prune,
+            fetch_priority,
+        )
+        .await
+        {
+            Ok(fetch_result) => {
+                return Ok(SelectedFetchResult {
+                    fetch_result,
+                    fetched_refspecs: pending_refspecs,
+                    missing_remote_refspecs,
+                });
+            }
+            Err(error) => {
+                let missing_remote_refs = {
+                    let Some(fetch_error) = error.downcast_ref::<GitFetchError>() else {
+                        return Err(error);
+                    };
+                    missing_remote_refs_from_fetch_stderr(fetch_error.stderr())
+                };
+                if missing_remote_refs.is_empty() {
+                    return Err(error);
+                }
+
+                let before_len = pending_refspecs.len();
+                let mut next_refspecs = Vec::with_capacity(before_len);
+                for refspec in pending_refspecs {
+                    if missing_remote_refs.contains(refspec_source_ref(&refspec)) {
+                        missing_remote_refspecs.push(refspec);
+                    } else {
+                        next_refspecs.push(refspec);
+                    }
+                }
+
+                if next_refspecs.len() == before_len {
+                    return Err(error);
+                }
+                if next_refspecs.is_empty() {
+                    return Ok(SelectedFetchResult {
+                        fetch_result: FetchResult {
+                            refs_updated: 0,
+                            bytes_received: 0,
+                        },
+                        fetched_refspecs: Vec::new(),
+                        missing_remote_refspecs,
+                    });
+                }
+
+                info!(
+                    repo = %repo_path.display(),
+                    missing_remote_refspecs = missing_remote_refspecs.len(),
+                    remaining_refspecs = next_refspecs.len(),
+                    fetch_priority = fetch_priority.unwrap_or("unspecified"),
+                    "retrying selected git fetch after dropping refs that disappeared from the remote"
+                );
+                pending_refspecs = next_refspecs;
+            }
+        }
+    }
+}
+
 fn should_feed_fetch_refspecs_on_stdin(refspecs: &[String]) -> bool {
     refspecs.len() > FETCH_REFSPECS_STDIN_THRESHOLD
 }
@@ -530,6 +648,25 @@ fn encode_fetch_refspecs_stdin(refspecs: &[String]) -> Vec<u8> {
         input.push(b'\n');
     }
     input
+}
+
+fn refspec_source_ref(refspec: &str) -> &str {
+    let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+    refspec
+        .split_once(':')
+        .map(|(source, _)| source)
+        .unwrap_or(refspec)
+}
+
+fn missing_remote_refs_from_fetch_stderr(stderr: &str) -> BTreeSet<&str> {
+    stderr
+        .lines()
+        .filter_map(|line| {
+            line.split_once("couldn't find remote ref ")
+                .map(|(_, remote_ref)| remote_ref.trim())
+        })
+        .filter(|remote_ref| !remote_ref.is_empty())
+        .collect()
 }
 
 pub fn redact_url_secret(url: &str, unmask_chars: usize) -> String {
@@ -1474,6 +1611,23 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
     }
 
     #[test]
+    fn missing_remote_ref_parser_extracts_refnames_from_git_fetch_stderr() {
+        let stderr = "\
+fatal: couldn't find remote ref refs/heads/foo/locks-master-web-infra
+fatal: something else
+fatal: couldn't find remote ref refs/tags/tmp-lock
+";
+
+        assert_eq!(
+            missing_remote_refs_from_fetch_stderr(stderr),
+            BTreeSet::from([
+                "refs/heads/foo/locks-master-web-infra",
+                "refs/tags/tmp-lock"
+            ])
+        );
+    }
+
+    #[test]
     fn bundle_create_tmpdir_env_uses_output_parent() {
         let tmpdir_key = std::ffi::OsStr::new("TMPDIR");
         let output = Path::new("/cache/.state/bundle-tmp/work/repo.bundle");
@@ -2195,6 +2349,116 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
         assert_eq!(refs.lines().count(), refspecs.len());
         assert!(refs.contains("refs/heads/branch-000"));
         assert!(refs.contains("refs/heads/branch-100"));
+    }
+
+    #[tokio::test]
+    async fn selected_fetch_retries_after_dropping_missing_remote_refs() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let work_path = tempdir.path().join("work");
+        let remote_path = tempdir.path().join("remote.git");
+        let cache_path = tempdir.path().join("cache.git");
+
+        assert_git_success(StdCommand::new("git").arg("init").arg(&work_path));
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User"),
+        );
+
+        std::fs::write(work_path.join("file.txt"), "hello\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("add")
+                .arg("file.txt"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("initial"),
+        );
+
+        let default_branch = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("symbolic-ref")
+                .arg("--short")
+                .arg("HEAD"),
+        )
+        .trim()
+        .to_string();
+        let default_branch_ref = format!("refs/heads/{default_branch}");
+
+        git_init_bare(&remote_path).await.unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("push")
+                .arg(remote_path.to_str().unwrap())
+                .arg(format!("HEAD:{default_branch_ref}")),
+        );
+        git_init_bare(&cache_path).await.unwrap();
+
+        let main_refspec = format!("+{default_branch_ref}:{default_branch_ref}");
+        let vanished_refspec =
+            "+refs/heads/foo/locks-vanished:refs/heads/foo/locks-vanished".to_string();
+        let result = timeout(
+            Duration::from_secs(10),
+            git_fetch_refspecs_allow_missing_remote_refs_with_context(
+                &cache_path,
+                remote_path.to_str().unwrap(),
+                &[],
+                &[main_refspec.clone(), vanished_refspec.clone()],
+                false,
+                Some("test"),
+            ),
+        )
+        .await
+        .expect("selected fetch timed out")
+        .unwrap();
+
+        assert_eq!(result.fetched_refspecs, vec![main_refspec]);
+        assert_eq!(result.missing_remote_refspecs, vec![vanished_refspec]);
+        assert!(result.fetch_result.refs_updated <= 1);
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&cache_path)
+                .arg("rev-parse")
+                .arg("--verify")
+                .arg(default_branch_ref),
+        );
+        assert!(
+            !StdCommand::new("git")
+                .arg("-C")
+                .arg(&cache_path)
+                .arg("rev-parse")
+                .arg("--verify")
+                .arg("refs/heads/foo/locks-vanished")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[tokio::test]
