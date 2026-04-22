@@ -4469,6 +4469,14 @@ async fn ensure_repo_available_locally_detailed(
     Ok(availability)
 }
 
+pub async fn prewarm_repo_from_s3(state: &crate::AppState, owner_repo: &str) -> Result<bool> {
+    Ok(
+        ensure_repo_available_locally_detailed(state, owner_repo, true)
+            .await?
+            .available,
+    )
+}
+
 async fn classify_local_wants_satisfaction_inner(
     state: &crate::AppState,
     owner_repo: &str,

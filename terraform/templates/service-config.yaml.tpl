@@ -63,6 +63,11 @@ pack_cache:
   max_concurrent_request_deltas: ${pack_cache_max_concurrent_request_deltas}
   min_response_bytes: ${pack_cache_min_response_bytes}
 
+prewarm:
+  enabled: ${prewarm_enabled}
+  repos: ${jsonencode(prewarm_repos)}
+  max_concurrent: ${prewarm_max_concurrent}
+
 storage:
   local:
     path: "/var/cache/forgeproxy"

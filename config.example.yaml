@@ -82,6 +82,10 @@ pack_cache:
   request_delta_pack_secs: 0
   max_concurrent_request_deltas: 1
   min_response_bytes: 67108864
+prewarm:
+  enabled: false
+  repos: []
+  max_concurrent: 2
 storage:
   local:
     path: "/var/cache/forgeproxy"
