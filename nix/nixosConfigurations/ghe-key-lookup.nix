@@ -1,6 +1,10 @@
-{ self, ... }:
+{
+  self,
+  inputs,
+  system ? "x86_64-linux",
+}:
 
-self.nixosConfigurations.ghe-key-lookup-hardened.extendModules {
+(import ./ghe-key-lookup-hardened.nix { inherit self inputs system; }).extendModules {
   modules = [
     self.nixosModules.dev
     self.nixosModules.dev-tools

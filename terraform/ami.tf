@@ -1,9 +1,40 @@
-# ── Map closure_variant to nixosConfiguration names ───────────────────────────
+# ── Resolve instance architectures ──────────────────────────────────────────
+data "aws_ec2_instance_type" "forgeproxy" {
+  instance_type = var.forgeproxy_instance_type
+}
+
+data "aws_ec2_instance_type" "valkey" {
+  instance_type = var.valkey_instance_type
+}
+
+data "aws_ec2_instance_type" "ghe_key_lookup" {
+  count         = var.enable_ghe_key_lookup ? 1 : 0
+  instance_type = var.ghe_key_lookup_instance_type
+}
+
+# ── Map closure_variant and instance architecture to nixosConfiguration names ─
 locals {
-  forgeproxy_config     = var.closure_variant == "dev" ? "forgeproxy" : "forgeproxy-hardened"
-  valkey_config         = var.closure_variant == "dev" ? "valkey" : "valkey-hardened"
-  ghe_key_lookup_config = var.closure_variant == "dev" ? "ghe-key-lookup" : "ghe-key-lookup-hardened"
-  variant_suffix        = var.closure_variant == "dev" ? "" : "-hardened"
+  # EC2 reports "x86_64" or "arm64"; map to the Nix system and AMI arch strings.
+  # supported_architectures is a list; all instance types have exactly one entry.
+  forgeproxy_ec2_arch     = data.aws_ec2_instance_type.forgeproxy.supported_architectures[0]
+  valkey_ec2_arch         = data.aws_ec2_instance_type.valkey.supported_architectures[0]
+  ghe_key_lookup_ec2_arch = var.enable_ghe_key_lookup ? data.aws_ec2_instance_type.ghe_key_lookup[0].supported_architectures[0] : "x86_64"
+
+  # AMI architecture strings accepted by ec2 register-image
+  forgeproxy_ami_arch     = local.forgeproxy_ec2_arch == "arm64" ? "arm64" : "x86_64"
+  valkey_ami_arch         = local.valkey_ec2_arch == "arm64" ? "arm64" : "x86_64"
+  ghe_key_lookup_ami_arch = local.ghe_key_lookup_ec2_arch == "arm64" ? "arm64" : "x86_64"
+
+  # Nix system strings used to select nixosConfigurations
+  forgeproxy_nix_system     = local.forgeproxy_ec2_arch == "arm64" ? "aarch64-linux" : "x86_64-linux"
+  valkey_nix_system         = local.valkey_ec2_arch == "arm64" ? "aarch64-linux" : "x86_64-linux"
+  ghe_key_lookup_nix_system = local.ghe_key_lookup_ec2_arch == "arm64" ? "aarch64-linux" : "x86_64-linux"
+
+  variant_suffix = var.closure_variant == "dev" ? "" : "-hardened"
+
+  forgeproxy_config     = var.closure_variant == "dev" ? "forgeproxy-${local.forgeproxy_nix_system}" : "forgeproxy-hardened-${local.forgeproxy_nix_system}"
+  valkey_config         = var.closure_variant == "dev" ? "valkey-${local.valkey_nix_system}" : "valkey-hardened-${local.valkey_nix_system}"
+  ghe_key_lookup_config = var.closure_variant == "dev" ? "ghe-key-lookup-${local.ghe_key_lookup_nix_system}" : "ghe-key-lookup-hardened-${local.ghe_key_lookup_nix_system}"
 
   # ── Values derived from the Nix configuration (single source of truth) ──
   valkey_tls_enable = data.external.nix_config.result.valkey_tls_enable == "true"
@@ -60,8 +91,9 @@ data "external" "nix_config" {
 # ── Build forgeproxy AMI ──────────────────────────────────────────────────
 resource "null_resource" "build_forgeproxy_ami" {
   triggers = {
-    image_hash  = data.external.forgeproxy_image_hash.result.hash
-    name_prefix = var.name_prefix
+    image_hash   = data.external.forgeproxy_image_hash.result.hash
+    name_prefix  = var.name_prefix
+    architecture = local.forgeproxy_ami_arch
   }
 
   provisioner "local-exec" {
@@ -162,7 +194,7 @@ resource "null_resource" "build_forgeproxy_ami" {
       aws ec2 register-image \
         --name "$AMI_NAME" \
         --description "forgeproxy NixOS AMI (Terraform-managed)" \
-        --architecture x86_64 \
+        --architecture ${local.forgeproxy_ami_arch} \
         --root-device-name /dev/xvda \
         --virtualization-type hvm \
         --boot-mode uefi \
@@ -196,8 +228,9 @@ data "aws_ami" "forgeproxy" {
 # ── Build valkey AMI ────────────────────────────────────────────────────────
 resource "null_resource" "build_valkey_ami" {
   triggers = {
-    image_hash  = data.external.valkey_image_hash.result.hash
-    name_prefix = var.name_prefix
+    image_hash   = data.external.valkey_image_hash.result.hash
+    name_prefix  = var.name_prefix
+    architecture = local.valkey_ami_arch
   }
 
   provisioner "local-exec" {
@@ -298,7 +331,7 @@ resource "null_resource" "build_valkey_ami" {
       aws ec2 register-image \
         --name "$AMI_NAME" \
         --description "valkey NixOS AMI (Terraform-managed)" \
-        --architecture x86_64 \
+        --architecture ${local.valkey_ami_arch} \
         --root-device-name /dev/xvda \
         --virtualization-type hvm \
         --boot-mode uefi \
@@ -334,8 +367,9 @@ resource "null_resource" "build_ghe_key_lookup_ami" {
   count = var.enable_ghe_key_lookup ? 1 : 0
 
   triggers = {
-    image_hash  = data.external.ghe_key_lookup_image_hash.result.hash
-    name_prefix = var.name_prefix
+    image_hash   = data.external.ghe_key_lookup_image_hash.result.hash
+    name_prefix  = var.name_prefix
+    architecture = local.ghe_key_lookup_ami_arch
   }
 
   provisioner "local-exec" {
@@ -431,7 +465,7 @@ resource "null_resource" "build_ghe_key_lookup_ami" {
       aws ec2 register-image \
         --name "$AMI_NAME" \
         --description "ghe-key-lookup NixOS AMI (Terraform-managed)" \
-        --architecture x86_64 \
+        --architecture ${local.ghe_key_lookup_ami_arch} \
         --root-device-name /dev/xvda \
         --virtualization-type hvm \
         --boot-mode uefi \
