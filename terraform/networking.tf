@@ -326,7 +326,7 @@ resource "aws_lb_target_group" "https" {
     interval            = 30
     port                = "443"
     protocol            = "HTTPS"
-    path                = "/healthz"
+    path                = "/readyz"
     matcher             = "200-299"
   }
 
@@ -351,7 +351,7 @@ resource "aws_lb_target_group" "ssh" {
     interval            = 30
     port                = "443"
     protocol            = "HTTPS"
-    path                = "/healthz"
+    path                = "/readyz"
     matcher             = "200-299"
   }
 

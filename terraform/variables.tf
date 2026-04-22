@@ -536,6 +536,29 @@ variable "pack_cache_min_response_bytes" {
   description = "Minimum upload-pack response size to store in the pack response cache."
 }
 
+variable "prewarm_enabled" {
+  type        = bool
+  default     = false
+  description = "Gate /readyz on startup pre-warming of configured repositories."
+}
+
+variable "prewarm_repos" {
+  type        = list(string)
+  default     = []
+  description = "Canonical owner/repo repositories to restore or verify locally before /readyz reports ready."
+}
+
+variable "prewarm_max_concurrent" {
+  type        = number
+  default     = 2
+  description = "Maximum repositories to pre-warm concurrently during startup."
+
+  validation {
+    condition     = var.prewarm_max_concurrent > 0
+    error_message = "prewarm_max_concurrent must be greater than 0."
+  }
+}
+
 variable "eviction_policy" {
   type        = string
   default     = "lfu"
