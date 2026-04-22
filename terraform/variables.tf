@@ -15,6 +15,12 @@ variable "flake_ref" {
   description = "Nix flake reference for building AMIs (e.g., github:owner/repo, path:./local)"
 }
 
+variable "disallow_local_nix_builds" {
+  type        = bool
+  default     = false
+  description = "Disallow nix build from building anything locally. Set to true to pass --max-jobs 0."
+}
+
 variable "aws_region" {
   type        = string
   default     = "us-east-1"
