@@ -181,16 +181,28 @@ in
   };
 
   systemd.services.forgeproxy = {
-    serviceConfig.ExecStartPre = lib.mkAfter [
-      (pkgs.writeShellScript "forgeproxy-materialize-keyring-secrets" ''
-        set -euo pipefail
+    serviceConfig = {
+      ExecStartPre = lib.mkAfter [
+        (pkgs.writeShellScript "forgeproxy-materialize-keyring-secrets" ''
+          set -euo pipefail
 
-        CA_ID=$(keyctl search @u user FORGEPROXY_VALKEY_CA 2>/dev/null || true)
-        if [ -n "$CA_ID" ]; then
-          keyctl pipe "$CA_ID" > /run/forgeproxy/valkey-ca.pem
-        fi
-      '')
-    ];
+          CA_ID=$(keyctl search @u user FORGEPROXY_VALKEY_CA 2>/dev/null || true)
+          if [ -n "$CA_ID" ]; then
+            keyctl pipe "$CA_ID" > /run/forgeproxy/valkey-ca.pem
+          fi
+        '')
+      ];
+      ExecReload = lib.mkAfter [
+        (pkgs.writeShellScript "forgeproxy-materialize-keyring-secrets" ''
+          set -euo pipefail
+
+          CA_ID=$(keyctl search @u user FORGEPROXY_VALKEY_CA 2>/dev/null || true)
+          if [ -n "$CA_ID" ]; then
+            keyctl pipe "$CA_ID" > /run/forgeproxy/valkey-ca.pem
+          fi
+        '')
+      ];
+    };
   };
 
   services.forgeproxy-nginx-runtime = lib.mkDefault {
