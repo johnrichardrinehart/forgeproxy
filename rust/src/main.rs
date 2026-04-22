@@ -1277,8 +1277,7 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
         let state = state.clone();
         async move {
             let started_at = Instant::now();
-            let warmed =
-                crate::coordination::registry::prewarm_repo_from_s3(&state, &owner_repo).await;
+            let warmed = crate::coordination::registry::prewarm_repo(&state, &owner_repo).await;
             (owner_repo, started_at.elapsed(), warmed)
         }
     }))
@@ -1289,20 +1288,12 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
     let mut failures = Vec::new();
     for (owner_repo, elapsed, warmed) in results {
         match warmed {
-            Ok(true) => {
+            Ok(()) => {
                 tracing::info!(
                     repo = %owner_repo,
                     elapsed_ms = elapsed.as_millis(),
                     "repository pre-warm completed"
                 );
-            }
-            Ok(false) => {
-                tracing::warn!(
-                    repo = %owner_repo,
-                    elapsed_ms = elapsed.as_millis(),
-                    "repository pre-warm did not find local or S3 state"
-                );
-                failures.push(format!("{owner_repo}: unavailable"));
             }
             Err(error) => {
                 tracing::error!(
