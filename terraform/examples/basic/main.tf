@@ -60,6 +60,8 @@ module "forgeproxy" {
 
   local_cache_max_percent                     = var.local_cache_max_percent
   eviction_policy                             = var.eviction_policy
+  config_reload_enabled                       = var.config_reload_enabled
+  config_reload_interval_secs                 = var.config_reload_interval_secs
   generation_coalescing_window_secs           = var.generation_coalescing_window_secs
   global_short_circuit_upstream_secs          = var.global_short_circuit_upstream_secs
   request_wait_for_local_catch_up_secs        = var.request_wait_for_local_catch_up_secs
