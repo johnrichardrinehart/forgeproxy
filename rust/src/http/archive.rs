@@ -196,15 +196,16 @@ pub async fn handle_archive(
         &sha,
         &ext,
     );
+    let config = state.config();
     let s3_key = archive_s3_key(
-        &state.config.storage.s3.prefix,
+        &config.storage.s3.prefix,
         &owner,
         &repo,
         &ref_name,
         &sha,
         &ext,
     );
-    let bucket = &state.config.storage.s3.bucket;
+    let bucket = &config.storage.s3.bucket;
 
     // ---------- 1. Local disk hit ----------
     if local_path.exists() {
@@ -231,7 +232,10 @@ pub async fn handle_archive(
 
     let upstream_url = format!(
         "https://{}/{}/{}/archive/{}",
-        state.config.upstream.hostname, owner, repo, rest,
+        state.config().upstream.hostname,
+        owner,
+        repo,
+        rest,
     );
 
     debug!(%upstream_url, "proxying archive request to upstream forge");

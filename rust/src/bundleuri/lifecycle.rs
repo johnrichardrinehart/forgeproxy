@@ -428,7 +428,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
     let clone_count: Option<i64> = HashesInterface::hget(&state.valkey, &repo_key, "clone_count")
         .await
         .unwrap_or(None);
-    let min_clones = state.config.bundles.min_clone_count_for_bundles;
+    let min_clones = state.config().bundles.min_clone_count_for_bundles;
     if (clone_count.unwrap_or(0) as u64) < min_clones {
         debug!(
             repo = %owner_repo,
@@ -443,7 +443,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
 
     // 4. Attempt to acquire the distributed fetch/bundle lock.
     let lock_key = format!("forgeproxy:lock:bundle:{owner_repo}");
-    let lock_ttl = state.config.bundles.bundle_lock_ttl;
+    let lock_ttl = state.config().bundles.bundle_lock_ttl;
     let node_id = crate::coordination::node::node_id();
     let Some(lock_lease) = crate::coordination::locks::acquire_lock_lease(
         &state.valkey,
@@ -549,7 +549,7 @@ async fn process_repo(state: &AppState, owner_repo: &str) -> Result<RepoTickOutc
                         "incremental bundle generated"
                     );
 
-                    let filtered_bundle = if state.config.bundles.generate_filtered_bundles {
+                    let filtered_bundle = if state.config().bundles.generate_filtered_bundles {
                         match crate::bundleuri::generator::generate_filtered_bundle(
                             state,
                             &staged_repo_path,
@@ -683,8 +683,8 @@ async fn resolve_bundle_fetch_auth(
     owner_repo: &str,
 ) -> Result<BundleFetchAuthContext> {
     let (owner, _) = crate::ssh::upstream::split_owner_repo(owner_repo)?;
-    let credential =
-        bundle_fetch_credential(owner, state.config.upstream_credentials.orgs.get(owner))?;
+    let config = state.config();
+    let credential = bundle_fetch_credential(owner, config.upstream_credentials.orgs.get(owner))?;
     let key_name = match credential {
         BundleFetchCredential::Pat(key_name) | BundleFetchCredential::SshKey(key_name) => key_name,
     };
@@ -721,7 +721,7 @@ async fn resolve_bundle_fetch_auth(
             ));
 
             Ok(BundleFetchAuthContext {
-                remote_url: format!("git@{}:{}.git", state.config.upstream.hostname, owner_repo),
+                remote_url: format!("git@{}:{}.git", config.upstream.hostname, owner_repo),
                 env_vars,
                 ssh_agent: Some(ssh_agent),
             })
@@ -730,7 +730,7 @@ async fn resolve_bundle_fetch_auth(
 }
 
 fn authenticated_git_base_url(state: &AppState, userinfo: &str) -> String {
-    let base = state.config.upstream.git_url_base();
+    let base = state.config().upstream.git_url_base();
     if let Ok(mut parsed) = url::Url::parse(&base) {
         if let Some((username, password)) = userinfo.split_once(':') {
             let _ = parsed.set_username(username);
@@ -774,18 +774,18 @@ fn bundle_fetch_credential<'a>(
 fn effective_interval(state: &AppState, owner_repo: &str, schedule_secs: u64) -> u64 {
     // Check for a per-repo override.
     let canonical_owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
-    if let Some(override_cfg) = state
-        .config
+    let config = state.config();
+    if let Some(override_cfg) = config
         .repo_overrides
         .get(owner_repo)
-        .or_else(|| state.config.repo_overrides.get(&canonical_owner_repo))
+        .or_else(|| config.repo_overrides.get(&canonical_owner_repo))
         && let Some(interval) = override_cfg.fetch_interval
     {
         return interval;
     }
 
     if schedule_secs == 0 {
-        return state.config.fetch_schedule.default_interval;
+        return config.fetch_schedule.default_interval;
     }
 
     schedule_secs
@@ -825,11 +825,12 @@ pub async fn update_fetch_schedule(
         .await?
         .unwrap_or_default();
 
-    let delta_threshold_cfg = state.config.fetch_schedule.delta_threshold;
-    let default_interval = state.config.fetch_schedule.default_interval;
-    let backoff_factor = state.config.fetch_schedule.backoff_factor;
-    let max_interval_cfg = state.config.fetch_schedule.max_interval;
-    let rolling_window = state.config.fetch_schedule.rolling_window;
+    let config = state.config();
+    let delta_threshold_cfg = config.fetch_schedule.delta_threshold;
+    let default_interval = config.fetch_schedule.default_interval;
+    let backoff_factor = config.fetch_schedule.backoff_factor;
+    let max_interval_cfg = config.fetch_schedule.max_interval;
+    let rolling_window = config.fetch_schedule.rolling_window;
 
     // Compute EMA of the delta bytes using the rolling window.
     let effective_interval = if current.current_interval == 0 {

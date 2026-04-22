@@ -430,14 +430,14 @@ pub async fn try_acquire_clone_hydration_permits(
     owner_repo: &str,
 ) -> Result<std::result::Result<CloneHydrationPermits, CloneHydrationPermitFailure>> {
     let owner_repo = normalize_owner_repo(owner_repo);
-    if state.config.clone.max_concurrent_upstream_clones == 0
+    if state.config().clone.max_concurrent_upstream_clones == 0
         || state
-            .config
+            .config()
             .clone
             .max_concurrent_upstream_clones_per_repo_per_instance
             == 0
         || state
-            .config
+            .config()
             .clone
             .max_concurrent_upstream_clones_per_repo_across_instances
             == 0
@@ -466,10 +466,10 @@ pub async fn try_acquire_clone_hydration_permits(
         &distributed_permit_key,
         &state.node_id,
         state
-            .config
+            .config()
             .clone
             .max_concurrent_upstream_clones_per_repo_across_instances,
-        state.config.clone.lock_ttl,
+        state.config().clone.lock_ttl,
         Some(&state.metrics),
     )
     .await?
@@ -489,14 +489,14 @@ pub async fn acquire_clone_hydration_permits(
     owner_repo: &str,
 ) -> Result<Option<CloneHydrationPermits>> {
     let owner_repo = normalize_owner_repo(owner_repo);
-    if state.config.clone.max_concurrent_upstream_clones == 0
+    if state.config().clone.max_concurrent_upstream_clones == 0
         || state
-            .config
+            .config()
             .clone
             .max_concurrent_upstream_clones_per_repo_per_instance
             == 0
         || state
-            .config
+            .config()
             .clone
             .max_concurrent_upstream_clones_per_repo_across_instances
             == 0
@@ -517,10 +517,10 @@ pub async fn acquire_clone_hydration_permits(
         &distributed_permit_key,
         &state.node_id,
         state
-            .config
+            .config()
             .clone
             .max_concurrent_upstream_clones_per_repo_across_instances,
-        state.config.clone.lock_ttl,
+        state.config().clone.lock_ttl,
         Some(&state.metrics),
     )
     .await?
@@ -559,8 +559,8 @@ async fn acquire_fetch_permits(
                 info!(
                     repo = %owner_repo,
                     ?priority,
-                    reserved_request_time_fetches = state.config.clone.reserved_request_time_upstream_fetches,
-                    max_concurrent_fetches = state.config.clone.max_concurrent_upstream_fetches,
+                    reserved_request_time_fetches = state.config().clone.reserved_request_time_upstream_fetches,
+                    max_concurrent_fetches = state.config().clone.max_concurrent_upstream_fetches,
                     "skipping lower-priority upstream fetch because all fetch slots are reserved for request-time catch-up"
                 );
                 return Ok(None);
@@ -600,7 +600,7 @@ async fn acquire_local_repo_tee_capture_permit(
             .or_insert_with(|| {
                 std::sync::Arc::new(tokio::sync::Semaphore::new(
                     state
-                        .config
+                        .config()
                         .clone
                         .max_concurrent_tee_captures_per_repo_per_instance,
                 ))
@@ -706,7 +706,7 @@ async fn try_acquire_local_repo_clone_permit(
             .or_insert_with(|| {
                 std::sync::Arc::new(tokio::sync::Semaphore::new(
                     state
-                        .config
+                        .config()
                         .clone
                         .max_concurrent_upstream_clones_per_repo_per_instance,
                 ))
@@ -732,7 +732,7 @@ async fn acquire_local_repo_clone_permit_waiting(
             .or_insert_with(|| {
                 std::sync::Arc::new(tokio::sync::Semaphore::new(
                     state
-                        .config
+                        .config()
                         .clone
                         .max_concurrent_upstream_clones_per_repo_per_instance,
                 ))
@@ -1335,9 +1335,9 @@ async fn try_ensure_repo_cloned_inner(
                     );
                     info!(
                         repo = %owner_repo,
-                        per_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_per_instance,
-                        cross_instance_limit = state.config.clone.max_concurrent_upstream_clones_per_repo_across_instances,
-                        lease_ttl_secs = state.config.clone.lock_ttl,
+                        per_instance_limit = state.config().clone.max_concurrent_upstream_clones_per_repo_per_instance,
+                        cross_instance_limit = state.config().clone.max_concurrent_upstream_clones_per_repo_across_instances,
+                        lease_ttl_secs = state.config().clone.lock_ttl,
                         "skipping initial upstream clone because the repo clone semaphore is saturated"
                     );
                     return Ok((tee_outcome, initial_clone_path));
@@ -1560,13 +1560,13 @@ fn clone_url(
     } else {
         format!(
             "{}/{owner}/{repo_clean}.git",
-            state.config.upstream.git_url_base(),
+            state.config().upstream.git_url_base(),
         )
     }
 }
 
 fn authenticated_git_base_url(state: &crate::AppState, userinfo: &str) -> String {
-    let base = state.config.upstream.git_url_base();
+    let base = state.config().upstream.git_url_base();
     if let Ok(mut parsed) = url::Url::parse(&base) {
         if let Some((username, password)) = userinfo.split_once(':') {
             let _ = parsed.set_username(username);
@@ -1583,7 +1583,7 @@ fn authenticated_git_base_url(state: &crate::AppState, userinfo: &str) -> String
 fn redacted_clone_url(state: &crate::AppState, clone_url: &str) -> String {
     crate::git::commands::redact_url_secret(
         clone_url,
-        state.config.upstream.log_secret_unmask_chars,
+        state.config().upstream.log_secret_unmask_chars,
     )
 }
 
@@ -1723,7 +1723,7 @@ fn spawn_published_generation_index_preparation(
     published_lease: PublishedGenerationLease,
     source: String,
 ) {
-    if !state.config.clone.prepare_published_generation_indexes {
+    if !state.config().clone.prepare_published_generation_indexes {
         return;
     }
 
@@ -1799,13 +1799,13 @@ fn try_acquire_idle_local_upload_pack_gate(
     owner_repo: &str,
     source: &str,
 ) -> Option<OwnedSemaphorePermit> {
-    let permit_count = match u32::try_from(state.config.clone.max_concurrent_local_upload_packs) {
+    let permit_count = match u32::try_from(state.config().clone.max_concurrent_local_upload_packs) {
         Ok(permit_count) => permit_count,
         Err(_) => {
             warn!(
                 repo = %owner_repo,
                 source,
-                max_concurrent_local_upload_packs = state.config.clone.max_concurrent_local_upload_packs,
+                max_concurrent_local_upload_packs = state.config().clone.max_concurrent_local_upload_packs,
                 "skipping background bitmap/MIDX preparation because upload-pack semaphore size exceeds git maintenance gate capacity"
             );
             return None;
@@ -2738,7 +2738,7 @@ async fn publish_repo_mirror_generation_inner(
             repo = %owner_repo,
             source,
             generation = %current_target.display(),
-            window_secs = state.config.clone.generation_coalescing_window_secs,
+            window_secs = state.config().clone.generation_coalescing_window_secs,
             "reusing current published generation inside coalescing window"
         );
         return Ok(current_target);
@@ -2884,7 +2884,7 @@ fn coalescable_generation_target(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<Option<PathBuf>> {
-    let window_secs = state.config.clone.generation_coalescing_window_secs;
+    let window_secs = state.config().clone.generation_coalescing_window_secs;
     if window_secs == 0 {
         return Ok(None);
     }
@@ -2918,7 +2918,7 @@ async fn fetch_delta_into_repo_mirror(
     request_refspecs: Option<&[String]>,
     priority: FetchPriority,
 ) -> Result<DeltaMirrorFetchResult> {
-    if state.config.clone.max_concurrent_upstream_fetches == 0 {
+    if state.config().clone.max_concurrent_upstream_fetches == 0 {
         bail!("upstream fetch semaphore is disabled");
     }
 
@@ -3112,10 +3112,11 @@ async fn restore_repo_from_s3_into_path(
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for S3 hydration")?;
     let bundle_path = tmp_dir.path().join("hydrate.bundle");
     let bundle_download_started_at = Instant::now();
+    let config = state.config();
     crate::storage::s3::download_to_path(
         &state.s3_client,
         &state.metrics,
-        &state.config.storage.s3.bucket,
+        &config.storage.s3.bucket,
         &metadata.bundle_s3_key,
         &bundle_path,
     )
@@ -3205,21 +3206,18 @@ async fn list_published_bundle_metadata(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<Vec<crate::bundleuri::PublishedBundleMetadata>> {
-    let prefix =
-        crate::bundleuri::bundle_metadata_s3_prefix(&state.config.storage.s3.prefix, owner_repo);
-    let keys = crate::storage::s3::list_object_keys(
-        &state.s3_client,
-        &state.config.storage.s3.bucket,
-        &prefix,
-    )
-    .await?;
+    let config = state.config();
+    let prefix = crate::bundleuri::bundle_metadata_s3_prefix(&config.storage.s3.prefix, owner_repo);
+    let keys =
+        crate::storage::s3::list_object_keys(&state.s3_client, &config.storage.s3.bucket, &prefix)
+            .await?;
 
     let mut metadata = Vec::new();
     for key in keys.into_iter().filter(|key| key.ends_with(".json")) {
         let Some(metadata_json) = crate::storage::s3::download_text_if_exists(
             &state.s3_client,
             &state.metrics,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &key,
         )
         .await?
@@ -3254,12 +3252,13 @@ pub(crate) async fn load_repo_bundle_manifest(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<Option<crate::bundleuri::BundleManifest>> {
+    let config = state.config();
     let manifest_key =
-        crate::bundleuri::repo_bundle_manifest_s3_key(&state.config.storage.s3.prefix, owner_repo);
+        crate::bundleuri::repo_bundle_manifest_s3_key(&config.storage.s3.prefix, owner_repo);
     let Some(manifest_json) = crate::storage::s3::download_text_if_exists(
         &state.s3_client,
         &state.metrics,
-        &state.config.storage.s3.bucket,
+        &config.storage.s3.bucket,
         &manifest_key,
     )
     .await?
@@ -3288,14 +3287,14 @@ async fn publish_repo_bundle_manifest(
             &state.valkey,
             &lock_key,
             &node_id,
-            state.config.bundles.bundle_lock_ttl,
+            state.config().bundles.bundle_lock_ttl,
             Some(&state.metrics),
         )
         .await?
         {
             break lease;
         }
-        if started_at.elapsed() > Duration::from_secs(state.config.clone.lock_wait_timeout) {
+        if started_at.elapsed() > Duration::from_secs(state.config().clone.lock_wait_timeout) {
             anyhow::bail!("timed out waiting for repo bundle manifest lock for {owner_repo}");
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -3356,18 +3355,19 @@ async fn publish_repo_bundle_manifest_locked(
     }
     let pruned_entries = prune_incremental_manifest_entries(
         &mut manifest.entries,
-        state.config.bundles.max_incremental_bundles,
+        state.config().bundles.max_incremental_bundles,
     );
     manifest.entries.sort_by_key(|entry| entry.creation_token);
     manifest.updated_at_unix_secs = chrono::Utc::now().timestamp();
 
+    let config = state.config();
     let manifest_key =
-        crate::bundleuri::repo_bundle_manifest_s3_key(&state.config.storage.s3.prefix, owner_repo);
+        crate::bundleuri::repo_bundle_manifest_s3_key(&config.storage.s3.prefix, owner_repo);
     let manifest_json =
         serde_json::to_string_pretty(&manifest).context("serialize repo bundle manifest")?;
     crate::storage::s3::upload_text(
         &state.s3_client,
-        &state.config.storage.s3.bucket,
+        &config.storage.s3.bucket,
         &manifest_key,
         &manifest_json,
     )
@@ -3414,6 +3414,7 @@ pub(crate) async fn publish_bundle_artifacts(
     filtered_bundle: Option<&crate::bundleuri::generator::BundleResult>,
 ) -> Result<crate::bundleuri::PublishedBundleMetadata> {
     let now = chrono::Utc::now().timestamp();
+    let config = state.config();
     let current_refs = crate::bundleuri::generator::get_refs(repo_path).await?;
     let existing_manifest = load_repo_bundle_manifest(state, owner_repo).await?;
     let existing_base = existing_manifest.as_ref().and_then(|manifest| {
@@ -3426,7 +3427,7 @@ pub(crate) async fn publish_bundle_artifacts(
     let mut manifest_entries = Vec::new();
     let current_base_s3_key = if let Some(base_entry) = existing_base {
         let incremental_s3_key = crate::bundleuri::repo_bundle_object_s3_key(
-            &state.config.storage.s3.prefix,
+            &config.storage.s3.prefix,
             owner_repo,
             bundle.creation_token,
             crate::bundleuri::BundleKind::Incremental,
@@ -3434,7 +3435,7 @@ pub(crate) async fn publish_bundle_artifacts(
         crate::storage::s3::upload_bundle(
             &state.s3_client,
             &state.metrics,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &incremental_s3_key,
             &bundle.bundle_path,
         )
@@ -3452,7 +3453,7 @@ pub(crate) async fn publish_bundle_artifacts(
         base_entry.bundle_s3_key.clone()
     } else {
         let base_s3_key = crate::bundleuri::repo_bundle_object_s3_key(
-            &state.config.storage.s3.prefix,
+            &config.storage.s3.prefix,
             owner_repo,
             bundle.creation_token,
             crate::bundleuri::BundleKind::Base,
@@ -3460,7 +3461,7 @@ pub(crate) async fn publish_bundle_artifacts(
         crate::storage::s3::upload_bundle(
             &state.s3_client,
             &state.metrics,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &base_s3_key,
             &bundle.bundle_path,
         )
@@ -3480,7 +3481,7 @@ pub(crate) async fn publish_bundle_artifacts(
 
     let filtered_bundle_s3_key = if let Some(filtered_bundle) = filtered_bundle {
         let filtered_s3_key = crate::bundleuri::repo_bundle_object_s3_key(
-            &state.config.storage.s3.prefix,
+            &config.storage.s3.prefix,
             owner_repo,
             filtered_bundle.creation_token,
             crate::bundleuri::BundleKind::Filtered,
@@ -3488,7 +3489,7 @@ pub(crate) async fn publish_bundle_artifacts(
         crate::storage::s3::upload_bundle(
             &state.s3_client,
             &state.metrics,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &filtered_s3_key,
             &filtered_bundle.bundle_path,
         )
@@ -3513,7 +3514,7 @@ pub(crate) async fn publish_bundle_artifacts(
     for pruned_entry in pruned_entries {
         if let Err(error) = crate::storage::s3::delete_object_if_exists(
             &state.s3_client,
-            &state.config.storage.s3.bucket,
+            &config.storage.s3.bucket,
             &pruned_entry.bundle_s3_key,
         )
         .await
@@ -3552,7 +3553,7 @@ pub(crate) async fn publish_bundle_artifacts(
         service_machine_id: state.runtime_resource_attributes.service_machine_id.clone(),
     };
     let metadata_key = crate::bundleuri::bundle_metadata_s3_key(
-        &state.config.storage.s3.prefix,
+        &config.storage.s3.prefix,
         owner_repo,
         &state.bundle_publisher_id,
     );
@@ -3560,7 +3561,7 @@ pub(crate) async fn publish_bundle_artifacts(
         serde_json::to_string_pretty(&metadata).context("serialize published bundle metadata")?;
     crate::storage::s3::upload_text(
         &state.s3_client,
-        &state.config.storage.s3.bucket,
+        &config.storage.s3.bucket,
         &metadata_key,
         &metadata_json,
     )
@@ -3756,7 +3757,7 @@ async fn hydrate_repo_from_tee_capture(
         destination = %repo_path.display(),
         "tee hydration index-pack finished"
     );
-    if state.config.clone.hydration_mode == crate::config::HydrationMode::PublishFromCapture {
+    if state.config().clone.hydration_mode == crate::config::HydrationMode::PublishFromCapture {
         let materialize_refs_started_at = Instant::now();
         info!(
             repo = %owner_repo,
@@ -4490,13 +4491,13 @@ pub async fn prewarm_repo(state: &crate::AppState, owner_repo: &str) -> Result<(
 }
 
 async fn prewarm_clone_auth_header(state: &crate::AppState, owner: &str) -> Option<String> {
-    let token_key = state
-        .config
+    let config = state.config();
+    let token_key = config
         .upstream_credentials
         .orgs
         .get(owner)
         .map(|oc| oc.keyring_key_name.as_str())
-        .unwrap_or(&state.config.upstream.admin_token_env);
+        .unwrap_or(&config.upstream.admin_token_env);
     let token = crate::credentials::keyring::resolve_secret(token_key).await?;
     (!token.is_empty()).then(|| format!("Bearer {token}"))
 }
@@ -4767,10 +4768,10 @@ pub async fn wait_for_local_catch_up(
     budget: Option<RequestBudget>,
 ) -> Result<LocalServeDecision> {
     let quick_timeout =
-        Duration::from_secs(state.config.clone.request_wait_for_local_catch_up_secs);
+        Duration::from_secs(state.config().clone.request_wait_for_local_catch_up_secs);
     let active_timeout = Duration::from_secs(
         state
-            .config
+            .config()
             .clone
             .request_wait_for_active_local_catch_up_secs,
     );
@@ -4850,13 +4851,13 @@ pub async fn wait_for_local_catch_up(
     if should_start_refresh && !has_published_repo && !has_repo_mirror {
         timeout = min_timeout(
             timeout,
-            duration_from_secs(state.config.clone.request_time_s3_restore_secs),
+            duration_from_secs(state.config().clone.request_time_s3_restore_secs),
         );
     }
     if should_start_refresh && has_repo_mirror {
         timeout = min_timeout(
             timeout,
-            duration_from_secs(state.config.clone.generation_publish_secs),
+            duration_from_secs(state.config().clone.generation_publish_secs),
         );
     }
     let Some(timeout) = timeout else {

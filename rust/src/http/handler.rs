@@ -545,7 +545,7 @@ async fn handle_info_refs(
     .await;
     let client_fingerprint = http_git_client_fingerprint(&headers, &metric_username, &owner, &repo);
     let observation = GitRequestObservation::new(
-        &state.config,
+        state.config().as_ref(),
         &owner,
         &repo,
         &metric_username,
@@ -561,7 +561,7 @@ async fn handle_info_refs(
     // Proxy the info/refs request to the upstream forge.
     let upstream_url = format!(
         "{}/{}/{}/info/refs?service=git-upload-pack",
-        state.config.upstream.git_url_base(),
+        state.config().upstream.git_url_base(),
         owner,
         repo,
     );
@@ -692,7 +692,7 @@ async fn handle_upload_pack(
 ) -> Result<Response, AppError> {
     let _active_connection = state.begin_active_connection(Protocol::Https);
     let started_at = Instant::now();
-    let short_circuit_budget = RequestBudget::from_config(&state.config, started_at);
+    let short_circuit_budget = RequestBudget::from_config(state.config().as_ref(), started_at);
     // 1. Validate path segments.
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
@@ -742,7 +742,7 @@ async fn handle_upload_pack(
         .unwrap_or_else(|| format!("http-{}", Uuid::new_v4().simple()));
     let request_phase = request_metadata.request_phase.to_string();
     let observation = GitRequestObservation::new(
-        &state.config,
+        state.config().as_ref(),
         &owner,
         &repo,
         &metric_username,
@@ -1103,7 +1103,7 @@ async fn handle_webhook(
 /// `GET /healthz`
 async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let health_state = crate::health::HealthState {
-        config: Arc::clone(&state.config),
+        config: state.config(),
         valkey: state.valkey.clone(),
         http_client: state.http_client.clone(),
     };
@@ -1131,7 +1131,7 @@ async fn handle_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 
     let health_state = crate::health::HealthState {
-        config: Arc::clone(&state.config),
+        config: state.config(),
         valkey: state.valkey.clone(),
         http_client: state.http_client.clone(),
     };
@@ -1529,7 +1529,7 @@ async fn proxy_info_refs_to_upstream(
 ) -> Result<Response, AppError> {
     let upstream_url = format!(
         "{}/{}/{}/info/refs?service={service}",
-        state.config.upstream.git_url_base(),
+        state.config().upstream.git_url_base(),
         owner,
         repo,
     );
@@ -1786,10 +1786,10 @@ async fn serve_local_upload_pack(
             let composite_timeout = budget.and_then(|budget| {
                 budget.stage_timeout(crate::short_circuit::min_timeout(
                     crate::short_circuit::duration_from_secs(
-                        state.config.pack_cache.on_demand_composite_total_secs,
+                        state.config().pack_cache.on_demand_composite_total_secs,
                     ),
                     crate::short_circuit::duration_from_secs(
-                        state.config.pack_cache.request_delta_pack_secs,
+                        state.config().pack_cache.request_delta_pack_secs,
                     ),
                 ))
             });
@@ -2100,7 +2100,7 @@ async fn serve_local_upload_pack(
     let Some(stream) = await_first_local_upload_pack_chunk(
         stream,
         budget.and_then(|budget| {
-            budget.stage_timeout_secs(state.config.clone.local_upload_pack_first_byte_secs)
+            budget.stage_timeout_secs(state.config().clone.local_upload_pack_first_byte_secs)
         }),
     )
     .await
@@ -2174,7 +2174,7 @@ async fn proxy_upload_pack_to_upstream(
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
     let upstream_url = format!(
         "{}/{}/{}/git-upload-pack",
-        state.config.upstream.git_url_base(),
+        state.config().upstream.git_url_base(),
         owner,
         repo,
     );
@@ -2213,9 +2213,10 @@ async fn proxy_upload_pack_to_upstream(
             )
             .await
             .map_err(AppError::Internal)?;
+            let config = state.config();
             let upstream_host = crate::git::commands::redact_url_secret(
-                &state.config.upstream.git_url_base(),
-                state.config.upstream.log_secret_unmask_chars,
+                &config.upstream.git_url_base(),
+                config.upstream.log_secret_unmask_chars,
             );
             error!(
                 repo = %owner_repo,
@@ -2376,8 +2377,8 @@ async fn proxy_upload_pack_to_upstream(
                     Err(e) => {
                         hydration.handle_stream_error().await;
                         let upstream_host = crate::git::commands::redact_url_secret(
-                            &state_for_stream.config.upstream.git_url_base(),
-                            state_for_stream.config.upstream.log_secret_unmask_chars,
+                            &state_for_stream.config().upstream.git_url_base(),
+                            state_for_stream.config().upstream.log_secret_unmask_chars,
                         );
                         let error_message = e.to_string();
                         let git_error_packet =
@@ -2490,7 +2491,7 @@ async fn proxy_receive_pack_to_upstream(
 ) -> Result<Response, AppError> {
     let upstream_url = format!(
         "{}/{}/{}/git-receive-pack",
-        state.config.upstream.git_url_base(),
+        state.config().upstream.git_url_base(),
         owner,
         repo,
     );

@@ -141,8 +141,9 @@ pub async fn flush_to_s3(state: &AppState, buffer: &TelemetryBuffer) -> Result<(
 }
 
 async fn flush_inner(state: &AppState, new_events: &[EvictionEvent]) -> Result<()> {
-    let s3_key = telemetry_s3_key(&state.config.storage.s3.prefix);
-    let bucket = &state.config.storage.s3.bucket;
+    let config = state.config();
+    let s3_key = telemetry_s3_key(&config.storage.s3.prefix);
+    let bucket = &config.storage.s3.bucket;
     let now = chrono::Utc::now().timestamp();
     let cutoff = now - RETENTION_SECS;
 
