@@ -549,6 +549,7 @@ async fn replay_ssh_pack_cache_hit(
         state.begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
 
     let mut stream = hit.into_stream();
+    let mut observed_first_byte = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if send_channel_response_data(
@@ -567,6 +568,17 @@ async fn replay_ssh_pack_cache_hit(
                 "client disconnected during SSH pack cache replay"
             );
             break;
+        }
+        if !observed_first_byte && !chunk.is_empty() {
+            observed_first_byte = true;
+            crate::metrics::observe_upload_pack_first_byte(
+                &state.metrics,
+                Protocol::Ssh,
+                "pack_cache",
+                completion.cache_status.clone(),
+                &completion.metric_repo,
+                completion.started_at.elapsed(),
+            );
         }
         total_bytes += chunk.len() as u64;
         downstream_counter.inc_by(chunk.len() as u64);
@@ -742,6 +754,12 @@ async fn serve_local_upload_pack_once(
                     "bypass",
                     reason,
                 );
+                crate::metrics::inc_pack_cache_key_bypass(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    owner_repo,
+                    reason,
+                );
             }
         }
     }
@@ -825,6 +843,7 @@ async fn serve_local_upload_pack_once(
         state.begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
     let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
     let mut disconnected = false;
+    let mut observed_first_byte = false;
     loop {
         match stdout.read(&mut stdout_buf).await {
             Ok(0) => break,
@@ -863,6 +882,17 @@ async fn serve_local_upload_pack_once(
                     }
                     disconnected = true;
                     break;
+                }
+                if !observed_first_byte && read > 0 {
+                    observed_first_byte = true;
+                    crate::metrics::observe_upload_pack_first_byte(
+                        &state.metrics,
+                        Protocol::Ssh,
+                        "local_upload_pack",
+                        completion.cache_status.clone(),
+                        &completion.metric_repo,
+                        completion.started_at.elapsed(),
+                    );
                 }
                 total_bytes += read as u64;
                 downstream_counter.inc_by(read as u64);
@@ -1900,6 +1930,7 @@ impl Handler for SshSession {
                                 let mut total_bytes: u64 = 0;
                                 let mut stream_writer = stream_channel.make_writer();
                                 let clone_started = clone_started;
+                                let mut observed_first_byte = false;
                                 let downstream_counter = state_for_stream
                                     .metrics
                                     .metrics
@@ -1936,6 +1967,17 @@ impl Handler for SshSession {
                                                 );
                                                 disconnected = true;
                                                 break;
+                                            }
+                                            if !observed_first_byte && read > 0 {
+                                                observed_first_byte = true;
+                                                crate::metrics::observe_upload_pack_first_byte(
+                                                    &state_for_stream.metrics,
+                                                    Protocol::Ssh,
+                                                    "local_upload_pack",
+                                                    CacheStatus::Hot,
+                                                    &repo_for_stream,
+                                                    clone_started.elapsed(),
+                                                );
                                             }
                                             total_bytes += read as u64;
                                             downstream_counter.inc_by(read as u64);
@@ -2561,6 +2603,7 @@ async fn proxy_upstream_upload_pack(
             } else {
                 None
             };
+            let mut observed_first_byte = false;
             while let Some(chunk_result) =
                 std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await
             {
@@ -2590,6 +2633,22 @@ async fn proxy_upstream_upload_pack(
                             }
                             had_error = true;
                             break;
+                        }
+                        if !observed_first_byte
+                            && request_kind == V2RequestKind::Fetch
+                            && !chunk.is_empty()
+                            && let (Some(cache_status), Some(started_at)) =
+                                (fetch_cache_status.clone(), fetch_started_at)
+                        {
+                            observed_first_byte = true;
+                            crate::metrics::observe_upload_pack_first_byte(
+                                &state.metrics,
+                                Protocol::Ssh,
+                                "upstream",
+                                cache_status,
+                                &owner_repo,
+                                started_at.elapsed(),
+                            );
                         }
                         total_bytes += chunk_len;
                         downstream_counter.inc_by(chunk_len);

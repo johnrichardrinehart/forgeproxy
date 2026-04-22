@@ -116,6 +116,80 @@ where
     }
 }
 
+struct FirstByteMetricStream<S> {
+    inner: S,
+    context: FirstByteMetricContext,
+    record: bool,
+    observed: bool,
+}
+
+#[derive(Clone)]
+struct FirstByteMetricContext {
+    metrics: crate::metrics::MetricsRegistry,
+    protocol: Protocol,
+    source: &'static str,
+    cache_status: CacheStatus,
+    repo: String,
+    started_at: Instant,
+}
+
+impl<S> FirstByteMetricStream<S> {
+    fn new(inner: S, context: FirstByteMetricContext, record: bool) -> Self {
+        Self {
+            inner,
+            context,
+            record,
+            observed: false,
+        }
+    }
+}
+
+impl FirstByteMetricContext {
+    fn new(
+        metrics: crate::metrics::MetricsRegistry,
+        protocol: Protocol,
+        source: &'static str,
+        cache_status: CacheStatus,
+        repo: String,
+        started_at: Instant,
+    ) -> Self {
+        Self {
+            metrics,
+            protocol,
+            source,
+            cache_status,
+            repo,
+            started_at,
+        }
+    }
+}
+
+impl<S, E> Stream for FirstByteMetricStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let poll = Pin::new(&mut self.inner).poll_next(cx);
+        if self.record
+            && !self.observed
+            && matches!(&poll, Poll::Ready(Some(Ok(bytes))) if !bytes.is_empty())
+        {
+            self.observed = true;
+            crate::metrics::observe_upload_pack_first_byte(
+                &self.context.metrics,
+                self.context.protocol.clone(),
+                self.context.source,
+                self.context.cache_status.clone(),
+                &self.context.repo,
+                self.context.started_at.elapsed(),
+            );
+        }
+        poll
+    }
+}
+
 struct CloneCompletionStream<S> {
     inner: S,
     metrics: crate::metrics::MetricsRegistry,
@@ -1559,8 +1633,20 @@ async fn serve_http_pack_cache_hit_response(
         .clone();
     let active_clone_guard =
         state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
+    let first_byte_stream = FirstByteMetricStream::new(
+        source_stream,
+        FirstByteMetricContext::new(
+            state.metrics.clone(),
+            Protocol::Https,
+            "pack_cache",
+            completion.cache_status.clone(),
+            completion.metric_repo.clone(),
+            completion.started_at,
+        ),
+        true,
+    );
     let stream = CloneCompletionStream::new(
-        CountingBytesStream::new(source_stream, downstream_counter),
+        CountingBytesStream::new(first_byte_stream, downstream_counter),
         state.metrics.clone(),
         Protocol::Https,
         completion,
@@ -1629,6 +1715,12 @@ async fn serve_local_upload_pack(
                     &state.metrics,
                     Protocol::Https,
                     "bypass",
+                    reason,
+                );
+                crate::metrics::inc_pack_cache_key_bypass(
+                    &state.metrics,
+                    Protocol::Https,
+                    &owner_repo,
                     reason,
                 );
             }
@@ -1893,7 +1985,21 @@ async fn serve_local_upload_pack(
         ))
     };
     let stream = CloneCompletionStream::new(
-        CountingBytesStream::new(stream, downstream_counter),
+        CountingBytesStream::new(
+            FirstByteMetricStream::new(
+                stream,
+                FirstByteMetricContext::new(
+                    state.metrics.clone(),
+                    Protocol::Https,
+                    "local_upload_pack",
+                    completion.cache_status.clone(),
+                    completion.metric_repo.clone(),
+                    completion.started_at,
+                ),
+                true,
+            ),
+            downstream_counter,
+        ),
         state.metrics.clone(),
         Protocol::Https,
         completion,
@@ -2207,8 +2313,20 @@ async fn proxy_upload_pack_to_upstream(
         .instrument(tracing::Span::current()),
     );
 
-    let body = Body::from_stream(CloneCompletionStream::new(
+    let first_byte_stream = FirstByteMetricStream::new(
         ReceiverStream::new(rx),
+        FirstByteMetricContext::new(
+            state.metrics.clone(),
+            Protocol::Https,
+            "upstream",
+            completion.cache_status.clone(),
+            completion.metric_repo.clone(),
+            completion.started_at,
+        ),
+        records_clone_completion,
+    );
+    let body = Body::from_stream(CloneCompletionStream::new(
+        first_byte_stream,
         completion_metrics,
         Protocol::Https,
         completion,
@@ -2468,6 +2586,39 @@ mod tests {
         assert!(encoded.contains("forgeproxy_clone_total{"));
         assert!(encoded.contains("forgeproxy_clone_summary_total{"));
         assert!(encoded.contains("forgeproxy_upload_pack_duration_seconds_count{"));
+    }
+
+    #[tokio::test]
+    async fn first_byte_metric_stream_records_only_first_nonempty_chunk() {
+        let metrics = crate::metrics::MetricsRegistry::new();
+        let mut stream = FirstByteMetricStream::new(
+            futures::stream::iter(vec![
+                Ok::<Bytes, std::io::Error>(Bytes::new()),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b"PACK")),
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b"more")),
+            ]),
+            FirstByteMetricContext::new(
+                metrics.clone(),
+                Protocol::Https,
+                "pack_cache",
+                CacheStatus::Warm,
+                "acme/widgets".to_string(),
+                Instant::now(),
+            ),
+            true,
+        );
+
+        while stream.next().await.is_some() {}
+
+        let encoded = encode_registry(&metrics.registry);
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_upload_pack_first_byte_seconds_count{")
+                && line.contains("cache_status=\"warm\"")
+                && line.contains("protocol=\"https\"")
+                && line.contains("repo=\"acme/widgets\"")
+                && line.contains("source=\"pack_cache\"")
+                && line.ends_with(" 1")
+        }));
     }
 
     #[test]

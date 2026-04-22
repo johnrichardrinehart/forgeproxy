@@ -30,6 +30,9 @@ This branch adds:
   - duration of successful upload-pack handling
   - `source="local"` for local `git upload-pack`
   - `source="upstream"` for proxied upstream pack streams
+- `forgeproxy_upload_pack_first_byte_seconds{protocol,source,cache_status,repo}`
+  - latency to the first downstream upload-pack byte
+  - `source="local_upload_pack"`, `source="pack_cache"`, or `source="upstream"`
 - `forgeproxy_upload_pack_concurrent{protocol}`
   - currently running local `git upload-pack` subprocesses
   - this is intentionally local-process concurrency, not total clone requests
@@ -51,6 +54,9 @@ Existing metrics that remain useful for the same investigation:
 The forgeproxy dashboard now includes:
 
 - local upload-pack subprocess concurrency in the Clone Operations row
+- upload-pack first-byte percentiles by source and cache status
+- pack-cache bypass, warming-skip, recent-entry, and composite-candidate
+  diagnostics in the Cache & Storage row
 - host I/O wait percentage
 - disk queue depth from `system.disk.weighted_io_time`
 - disk read latency from `system.disk.operation_time / system.disk.operations`
