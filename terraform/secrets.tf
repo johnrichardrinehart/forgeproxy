@@ -19,6 +19,8 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
   secret_id = aws_secretsmanager_secret.forgeproxy_config.id
 
   secret_string = templatefile("${path.module}/templates/service-config.yaml.tpl", {
+    config_reload_enabled                       = var.config_reload_enabled
+    config_reload_interval_secs                 = var.config_reload_interval_secs
     upstream_hostname                           = var.upstream_hostname
     upstream_api_url                            = var.upstream_api_url
     upstream_git_url_base                       = coalesce(var.upstream_git_url_base, "https://${var.upstream_hostname}")
