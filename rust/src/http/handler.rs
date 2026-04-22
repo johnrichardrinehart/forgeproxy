@@ -56,6 +56,7 @@ use crate::metrics::{
     CloneUpstreamBytesLabels, Protocol,
 };
 use crate::observability::GitRequestObservation;
+use crate::short_circuit::RequestBudget;
 
 // Capacity for large proxied pack response streams. Production profiles justify
 // extra read-ahead while keeping bounded backpressure between producer and body.
@@ -161,6 +162,22 @@ impl FirstByteMetricContext {
             repo,
             started_at,
         }
+    }
+}
+
+async fn await_first_local_upload_pack_chunk(
+    mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+    timeout: Option<std::time::Duration>,
+) -> Option<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
+    let Some(timeout) = timeout else {
+        return Some(stream);
+    };
+    match tokio::time::timeout(timeout, stream.next()).await {
+        Ok(Some(first)) => Some(Box::pin(
+            futures::stream::once(async move { first }).chain(stream),
+        )),
+        Ok(None) => Some(Box::pin(futures::stream::empty())),
+        Err(_) => None,
     }
 }
 
@@ -675,6 +692,7 @@ async fn handle_upload_pack(
 ) -> Result<Response, AppError> {
     let _active_connection = state.begin_active_connection(Protocol::Https);
     let started_at = Instant::now();
+    let short_circuit_budget = RequestBudget::from_config(&state.config, started_at);
     // 1. Validate path segments.
     validate_path_segment(&owner, "owner")?;
     validate_path_segment(&repo, "repo")?;
@@ -873,6 +891,7 @@ async fn handle_upload_pack(
         advertised_refs.as_ref(),
         "http",
         local_authz_confirmed,
+        Some(short_circuit_budget),
     )
     .await;
     let effective_cache_status = if local_authz_confirmed {
@@ -934,8 +953,8 @@ async fn handle_upload_pack(
                 want_count: _,
                 ..
             } => {
-                if expects_local_pack_serve {
-                    return serve_local_upload_pack(
+                if expects_local_pack_serve
+                    && let Some(response) = serve_local_upload_pack(
                         &state,
                         &owner,
                         &repo,
@@ -951,8 +970,11 @@ async fn handle_upload_pack(
                             metric_username: metric_username.clone(),
                             metric_repo: repo_slug.clone(),
                         },
+                        Some(short_circuit_budget),
                     )
-                    .await;
+                    .await?
+                {
+                    return Ok(response);
                 }
             }
             LocalServeDecision::Unavailable {
@@ -1668,6 +1690,7 @@ struct FreshClonePackCacheKeyContext<'a> {
     advertised_ref_tips: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_local_upload_pack(
     state: &AppState,
     owner: &str,
@@ -1676,7 +1699,8 @@ async fn serve_local_upload_pack(
     request_body: &[u8],
     pack_cache_key_context: FreshClonePackCacheKeyContext<'_>,
     completion: CloneCompletion,
-) -> Result<Response, AppError> {
+    budget: Option<RequestBudget>,
+) -> Result<Option<Response>, AppError> {
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
     let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease(
         state,
@@ -1731,7 +1755,7 @@ async fn serve_local_upload_pack(
     match pack_cache_lookup.take() {
         Some(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
             match serve_http_pack_cache_hit_response(state, hit, completion.clone()).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => return Ok(Some(response)),
                 Err(error) => {
                     warn!(
                         error = %error,
@@ -1751,18 +1775,99 @@ async fn serve_local_upload_pack(
 
     let pack_cache_writer = match pack_cache_lookup {
         Some(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
-            match try_finish_pack_cache_delta_composite(
-                state,
-                Protocol::Https,
-                &owner_repo,
-                repo_lease.repo_path(),
-                writer,
-            )
-            .await
-            {
+            let composite_timeout = budget.and_then(|budget| {
+                budget.stage_timeout(crate::short_circuit::min_timeout(
+                    crate::short_circuit::duration_from_secs(
+                        state.config.pack_cache.on_demand_composite_total_secs,
+                    ),
+                    crate::short_circuit::duration_from_secs(
+                        state.config.pack_cache.request_delta_pack_secs,
+                    ),
+                ))
+            });
+            let composite_result = if let Some(timeout) = composite_timeout {
+                let state_for_task = state.clone();
+                let metrics = state.metrics.clone();
+                let owner_repo_for_task = owner_repo.clone();
+                let serve_from_for_task = serve_from;
+                let mut handle = tokio::spawn(async move {
+                    let background_lease =
+                        match crate::coordination::registry::acquire_local_serve_repo_lease(
+                            &state_for_task,
+                            &owner_repo_for_task,
+                            serve_from_for_task,
+                        )
+                        .await
+                        {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                warn!(
+                                    repo = %owner_repo_for_task,
+                                    error = %error,
+                                    "failed to reacquire repo lease for background pack cache composite"
+                                );
+                                writer.abort().await;
+                                return Err(
+                                    crate::coordination::registry::PackCacheCompositeMiss {
+                                        writer: None,
+                                        reason: "lease_failed",
+                                    },
+                                );
+                            }
+                        };
+                    try_finish_pack_cache_delta_composite(
+                        &state_for_task,
+                        Protocol::Https,
+                        &owner_repo_for_task,
+                        background_lease.repo_path(),
+                        writer,
+                    )
+                    .await
+                });
+                tokio::select! {
+                    result = &mut handle => match result {
+                        Ok(result) => result,
+                        Err(error) => {
+                            warn!(repo = %owner_repo, error = %error, "on-demand pack cache composite task failed");
+                            Err(crate::coordination::registry::PackCacheCompositeMiss {
+                                writer: None,
+                                reason: "task_failed",
+                            })
+                        }
+                    },
+                    _ = tokio::time::sleep(timeout) => {
+                        warn!(
+                            repo = %owner_repo,
+                            timeout_secs = timeout.as_secs_f64(),
+                            "short-circuiting to upstream while on-demand pack cache composite continues in the background"
+                        );
+                        crate::metrics::inc_upstream_fallback(
+                            &metrics,
+                            Protocol::Https,
+                            "short_circuit_pack_cache_composite",
+                        );
+                        crate::metrics::inc_short_circuit_upstream(
+                            &metrics,
+                            Protocol::Https,
+                            "pack_cache_composite",
+                        );
+                        return Ok(None);
+                    }
+                }
+            } else {
+                try_finish_pack_cache_delta_composite(
+                    state,
+                    Protocol::Https,
+                    &owner_repo,
+                    repo_lease.repo_path(),
+                    writer,
+                )
+                .await
+            };
+            match composite_result {
                 Ok(hit) => {
                     match serve_http_pack_cache_hit_response(state, hit, completion.clone()).await {
-                        Ok(response) => return Ok(response),
+                        Ok(response) => return Ok(Some(response)),
                         Err(error) => {
                             warn!(
                                 error = %error,
@@ -1984,6 +2089,30 @@ async fn serve_local_upload_pack(
             repo_lease,
         ))
     };
+    let Some(stream) = await_first_local_upload_pack_chunk(
+        stream,
+        budget.and_then(|budget| {
+            budget.stage_timeout_secs(state.config.clone.local_upload_pack_first_byte_secs)
+        }),
+    )
+    .await
+    else {
+        warn!(
+            repo = %owner_repo,
+            "short-circuiting to upstream before local upload-pack produced a first byte"
+        );
+        crate::metrics::inc_upstream_fallback(
+            &state.metrics,
+            Protocol::Https,
+            "short_circuit_local_upload_pack_first_byte",
+        );
+        crate::metrics::inc_short_circuit_upstream(
+            &state.metrics,
+            Protocol::Https,
+            "local_upload_pack_first_byte",
+        );
+        return Ok(None);
+    };
     let stream = CloneCompletionStream::new(
         CountingBytesStream::new(
             FirstByteMetricStream::new(
@@ -2009,12 +2138,14 @@ async fn serve_local_upload_pack(
     );
     let body = Body::from_stream(stream);
 
-    Ok((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
-        body,
-    )
-        .into_response())
+    Ok(Some(
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/x-git-upload-pack-result")],
+            body,
+        )
+            .into_response(),
+    ))
 }
 
 /// Proxy a `git-upload-pack` POST to the upstream forge and stream the response.
@@ -2464,6 +2595,7 @@ mod tests {
     use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
     use prometheus_client::encoding::text::encode;
     use std::io::Write;
+    use std::time::Duration;
 
     fn sample_v2_fetch_request() -> Vec<u8> {
         let mut body = Vec::new();
@@ -2512,6 +2644,34 @@ mod tests {
             encoder.flush().unwrap();
         }
         encoded
+    }
+
+    #[tokio::test]
+    async fn await_first_local_upload_pack_chunk_times_out_pending_stream() {
+        let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            Box::pin(futures::stream::pending());
+
+        let stream =
+            await_first_local_upload_pack_chunk(stream, Some(Duration::from_millis(1))).await;
+
+        assert!(stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn await_first_local_upload_pack_chunk_preserves_first_chunk() {
+        let first = Bytes::from_static(b"pack");
+        let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            Box::pin(futures::stream::once({
+                let first = first.clone();
+                async move { Ok(first) }
+            }));
+
+        let mut stream = await_first_local_upload_pack_chunk(stream, Some(Duration::from_secs(1)))
+            .await
+            .expect("stream should produce first chunk before timeout");
+
+        assert_eq!(stream.next().await.unwrap().unwrap(), first);
+        assert!(stream.next().await.is_none());
     }
 
     fn assert_decoded_fetch(headers: HeaderMap, encoded: Vec<u8>) {

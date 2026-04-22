@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, TryAcquireError};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::short_circuit::{RequestBudget, duration_from_secs, min_timeout};
+
 /// Metadata about a cached repository.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoInfo {
@@ -4721,13 +4723,16 @@ async fn try_publish_mirror_generation_for_satisfied_wants(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn wait_for_local_catch_up(
     state: &crate::AppState,
+    protocol: crate::metrics::Protocol,
     owner: &str,
     repo: &str,
     auth_header: Option<&str>,
     wants: &[String],
     request_refspecs: Option<Vec<String>>,
+    budget: Option<RequestBudget>,
 ) -> Result<LocalServeDecision> {
     let quick_timeout =
         Duration::from_secs(state.config.clone.request_wait_for_local_catch_up_secs);
@@ -4801,10 +4806,29 @@ pub async fn wait_for_local_catch_up(
         None
     };
     let using_active_wait = catch_up.is_some();
-    let timeout = if using_active_wait {
+    let base_timeout = if using_active_wait {
         quick_timeout.max(active_timeout)
     } else {
         quick_timeout
+    };
+    let mut timeout = Some(base_timeout);
+    if let Some(budget) = budget {
+        timeout = min_timeout(timeout, budget.remaining());
+    }
+    if should_start_refresh && !has_published_repo && !has_repo_mirror {
+        timeout = min_timeout(
+            timeout,
+            duration_from_secs(state.config.clone.request_time_s3_restore_secs),
+        );
+    }
+    if should_start_refresh && has_repo_mirror {
+        timeout = min_timeout(
+            timeout,
+            duration_from_secs(state.config.clone.generation_publish_secs),
+        );
+    }
+    let Some(timeout) = timeout else {
+        return Ok(initial_decision);
     };
     if timeout.is_zero() {
         return Ok(initial_decision);
@@ -4913,9 +4937,11 @@ pub async fn wait_for_local_catch_up(
         "local published-generation catch-up timed out; falling back to upstream proxy"
     );
     crate::metrics::inc_request_time_catch_up(&state.metrics, "timeout");
+    crate::metrics::inc_short_circuit_upstream(&state.metrics, protocol, "local_catch_up");
     Ok(last_decision)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_local_fetch_serveability(
     state: &crate::AppState,
     owner_repo: &str,
@@ -4924,7 +4950,12 @@ pub async fn resolve_local_fetch_serveability(
     advertised_refs: Option<&RequestAdvertisedRefs>,
     protocol_label: &'static str,
     allow_request_time_local_catch_up: bool,
+    budget: Option<RequestBudget>,
 ) -> LocalServeDecision {
+    let protocol = match protocol_label {
+        "ssh" => crate::metrics::Protocol::Ssh,
+        _ => crate::metrics::Protocol::Https,
+    };
     let want_sample = wants
         .iter()
         .take(5)
@@ -5007,7 +5038,18 @@ pub async fn resolve_local_fetch_serveability(
         return initial_local_decision;
     };
 
-    match wait_for_local_catch_up(state, owner, repo, auth_header, wants, request_refspecs).await {
+    match wait_for_local_catch_up(
+        state,
+        protocol,
+        owner,
+        repo,
+        auth_header,
+        wants,
+        request_refspecs,
+        budget,
+    )
+    .await
+    {
         Ok(decision) => decision,
         Err(error) => {
             warn!(

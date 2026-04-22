@@ -38,7 +38,12 @@ auth:
 clone:
   prepare_published_generation_indexes: ${prepare_published_generation_indexes}
   generation_coalescing_window_secs: ${generation_coalescing_window_secs}
+  global_short_circuit_upstream_secs: ${global_short_circuit_upstream_secs}
+  request_wait_for_local_catch_up_secs: ${request_wait_for_local_catch_up_secs}
   request_wait_for_active_local_catch_up_secs: ${request_wait_for_active_local_catch_up_secs}
+  request_time_s3_restore_secs: ${request_time_s3_restore_secs}
+  generation_publish_secs: ${generation_publish_secs}
+  local_upload_pack_first_byte_secs: ${local_upload_pack_first_byte_secs}
   # Request path: every local disk serve acquires these before spawning git upload-pack.
   # Higher values improve parallel clone/fetch throughput but allow more concurrent pack-objects CPU.
   max_concurrent_local_upload_packs: ${max_concurrent_local_upload_packs}
@@ -53,6 +58,8 @@ pack_cache:
   low_water_mark: ${pack_cache_low_water_mark}
   eviction_policy: "${pack_cache_eviction_policy}"
   wait_for_inflight_secs: ${pack_cache_wait_for_inflight_secs}
+  on_demand_composite_total_secs: ${pack_cache_on_demand_composite_total_secs}
+  request_delta_pack_secs: ${pack_cache_request_delta_pack_secs}
   max_concurrent_request_deltas: ${pack_cache_max_concurrent_request_deltas}
   min_response_bytes: ${pack_cache_min_response_bytes}
 

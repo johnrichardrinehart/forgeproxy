@@ -15,6 +15,7 @@ mod observability;
 pub(crate) mod pack_cache;
 mod repo_identity;
 mod runtime_resource;
+mod short_circuit;
 mod ssh;
 mod storage;
 mod tee_hydration;
