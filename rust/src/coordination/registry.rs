@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::git::commands::git_fetch_refspecs_allow_missing_remote_refs_with_context;
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use fred::interfaces::{ClientLike, HashesInterface, KeysInterface};
@@ -2867,7 +2868,7 @@ async fn fetch_delta_into_repo_mirror(
         let Some(fetch_permits) = acquire_fetch_permits(state, owner_repo, priority).await? else {
             bail!("no upstream fetch slots are available for {priority:?} delta fetch");
         };
-        let fetch_result =
+        let (fetch_result, selected_fetched_refspecs) =
             if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
                 if priority == FetchPriority::RequestTime {
                     crate::metrics::inc_request_time_catch_up(&state.metrics, "selected_fetch");
@@ -2878,7 +2879,7 @@ async fn fetch_delta_into_repo_mirror(
                     refspec_count = refspecs.len(),
                     "request-time catch-up is fetching only refs needed for the current wants"
                 );
-                crate::git::commands::git_fetch_refspecs_with_context(
+                let selected_fetch = git_fetch_refspecs_allow_missing_remote_refs_with_context(
                     &delta_repo_path,
                     clone_url,
                     &[],
@@ -2886,18 +2887,35 @@ async fn fetch_delta_into_repo_mirror(
                     false,
                     Some(priority.as_label()),
                 )
-                .await?
+                .await?;
+                if !selected_fetch.missing_remote_refspecs.is_empty() {
+                    info!(
+                        repo = %owner_repo,
+                        fetch_priority = priority.as_label(),
+                        requested_refspecs = refspecs.len(),
+                        fetched_refspecs = selected_fetch.fetched_refspecs.len(),
+                        missing_remote_refspecs = selected_fetch.missing_remote_refspecs.len(),
+                        "selected request-time catch-up skipped refs that disappeared from the remote"
+                    );
+                }
+                if selected_fetch.fetched_refspecs.is_empty() {
+                    bail!(
+                        "all selected request-time catch-up refs disappeared from the remote before fetch"
+                    );
+                }
+                (selected_fetch.fetch_result, Some(selected_fetch.fetched_refspecs))
             } else {
                 if priority == FetchPriority::RequestTime {
                     crate::metrics::inc_request_time_catch_up(&state.metrics, "full_fetch");
                 }
-                crate::git::commands::git_fetch_with_context(
+                let fetch_result = crate::git::commands::git_fetch_with_context(
                     &delta_repo_path,
                     clone_url,
                     &[],
                     Some(priority.as_label()),
                 )
-                .await?
+                .await?;
+                (fetch_result, None)
             };
         drop(fetch_permits);
         {
@@ -2905,7 +2923,7 @@ async fn fetch_delta_into_repo_mirror(
             // delta workspace until a new published generation is ready.
             let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
             let delta_remote = delta_repo_path.to_string_lossy().to_string();
-            if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
+            if let Some(refspecs) = selected_fetched_refspecs.as_deref() {
                 crate::git::commands::git_fetch_refspecs_with_context(
                     &mirror_path,
                     &delta_remote,
@@ -4537,7 +4555,23 @@ async fn try_start_request_time_catch_up(
                 auth_header.as_deref(),
                 request_refspecs.as_deref(),
             )
-            .await
+            .await?;
+
+            if request_refspecs.as_ref().is_some_and(|refspecs| !refspecs.is_empty()) {
+                let post_fetch_decision = classify_local_wants_satisfaction_without_request_restore(
+                    &state,
+                    &owner_repo,
+                    &wants,
+                )
+                .await?;
+                if !matches!(post_fetch_decision, LocalServeDecision::SatisfiesWants { .. }) {
+                    bail!(
+                        "selected request-time catch-up completed but local repo still cannot satisfy all requested wants"
+                    );
+                }
+            }
+
+            Ok(())
         }
         .await;
         if result.is_err() {
