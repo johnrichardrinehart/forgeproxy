@@ -294,10 +294,40 @@ variable "generation_coalescing_window_secs" {
   description = "Seconds lower-priority refreshes may keep serving the current published generation before publishing a newer one."
 }
 
+variable "global_short_circuit_upstream_secs" {
+  type        = number
+  default     = 0
+  description = "Coarse request-path seconds budget before forgeproxy proxies upstream while local work continues in the background. Zero disables the global budget."
+}
+
+variable "request_wait_for_local_catch_up_secs" {
+  type        = number
+  default     = 30
+  description = "Request path: seconds a client may wait for quick local catch-up before proxying upstream."
+}
+
 variable "request_wait_for_active_local_catch_up_secs" {
   type        = number
   default     = 300
   description = "Request path: seconds a client may wait for an active same-repo local catch-up before proxying upstream."
+}
+
+variable "request_time_s3_restore_secs" {
+  type        = number
+  default     = 0
+  description = "Request path: seconds a client may wait for request-triggered S3 restore before proxying upstream. Zero disables this stage budget."
+}
+
+variable "generation_publish_secs" {
+  type        = number
+  default     = 0
+  description = "Request path: seconds a client may wait for request-triggered generation publication before proxying upstream. Zero disables this stage budget."
+}
+
+variable "local_upload_pack_first_byte_secs" {
+  type        = number
+  default     = 0
+  description = "Request path: seconds a client may wait for first byte from local git upload-pack before proxying upstream. Zero disables this stage budget."
 }
 
 variable "max_concurrent_local_upload_packs_per_repo" {
@@ -366,6 +396,18 @@ variable "pack_cache_wait_for_inflight_secs" {
   type        = number
   default     = 120
   description = "Seconds a same-key clone waits for an in-flight cached pack artifact."
+}
+
+variable "pack_cache_on_demand_composite_total_secs" {
+  type        = number
+  default     = 0
+  description = "Request path: seconds a client may wait for on-demand pack-cache composite generation before proxying upstream. Zero disables this stage budget."
+}
+
+variable "pack_cache_request_delta_pack_secs" {
+  type        = number
+  default     = 0
+  description = "Request path: seconds a client may wait for request-time delta pack generation during on-demand composite construction. Zero disables this stage budget."
 }
 
 variable "pack_cache_max_concurrent_request_deltas" {

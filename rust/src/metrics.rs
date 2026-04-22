@@ -203,6 +203,12 @@ pub struct UpstreamFallbackLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ShortCircuitUpstreamLabels {
+    pub protocol: Protocol,
+    pub stage: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PackCacheRequestLabels {
     pub protocol: Protocol,
     pub result: String,
@@ -454,6 +460,7 @@ pub struct Metrics {
 
     // -- upstream fallback --
     pub upstream_fallback: Family<UpstreamFallbackLabels, Counter>,
+    pub short_circuit_upstream_total: Family<ShortCircuitUpstreamLabels, Counter>,
 
     // -- pack cache --
     pub pack_cache_requests_total: Family<PackCacheRequestLabels, Counter>,
@@ -744,6 +751,13 @@ impl Metrics {
             upstream_fallback.clone(),
         );
 
+        let short_circuit_upstream_total = Family::<ShortCircuitUpstreamLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_short_circuit_upstream",
+            "Requests handed off to upstream because a forgeproxy request-path timing budget expired",
+            short_circuit_upstream_total.clone(),
+        );
+
         let pack_cache_requests_total = Family::<PackCacheRequestLabels, Counter>::default();
         registry.register(
             "forgeproxy_pack_cache_requests",
@@ -946,6 +960,7 @@ impl Metrics {
             cache_subtree_physical_usage_bytes,
             hydration_skipped,
             upstream_fallback,
+            short_circuit_upstream_total,
             pack_cache_requests_total,
             pack_cache_apparent_usage_bytes,
             pack_cache_physical_usage_bytes,
@@ -1270,6 +1285,17 @@ pub fn inc_upstream_fallback(metrics: &MetricsRegistry, protocol: Protocol, reas
         .get_or_create(&UpstreamFallbackLabels {
             protocol,
             reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_short_circuit_upstream(metrics: &MetricsRegistry, protocol: Protocol, stage: &str) {
+    metrics
+        .metrics
+        .short_circuit_upstream_total
+        .get_or_create(&ShortCircuitUpstreamLabels {
+            protocol,
+            stage: stage.to_string(),
         })
         .inc();
 }
@@ -1767,6 +1793,7 @@ mod tests {
         inc_bundle_list_request(&metrics, "acme/widgets", "served");
         inc_hydration_skipped(&metrics, HydrationSkipReason::SemaphoreSaturated);
         inc_request_time_catch_up(&metrics, "selected_fetch");
+        inc_short_circuit_upstream(&metrics, Protocol::Https, "local_catch_up");
 
         let encoded = encode_metrics(&metrics.registry);
         assert!(encoded.contains("# HELP forgeproxy_upload_pack_duration_seconds"));
@@ -1788,6 +1815,12 @@ mod tests {
         assert!(encoded.lines().any(|line| {
             line.starts_with("forgeproxy_request_time_catch_up_total{")
                 && line.contains("result=\"selected_fetch\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_short_circuit_upstream_total{")
+                && line.contains("protocol=\"https\"")
+                && line.contains("stage=\"local_catch_up\"")
                 && line.ends_with(" 1")
         }));
         assert!(encoded.lines().any(|line| {

@@ -709,6 +709,11 @@
           "expr": "sum by (result) (rate(forgeproxy_generation_coalescing_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
           "legendFormat": "Generation coalescing {{result}}",
           "refId": "F"
+        },
+        {
+          "expr": "sum by (protocol, stage) (rate(forgeproxy_short_circuit_upstream_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Short-circuit {{protocol}} {{stage}}",
+          "refId": "G"
         }
       ],
       "fieldConfig": {
