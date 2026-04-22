@@ -4469,12 +4469,36 @@ async fn ensure_repo_available_locally_detailed(
     Ok(availability)
 }
 
-pub async fn prewarm_repo_from_s3(state: &crate::AppState, owner_repo: &str) -> Result<bool> {
-    Ok(
-        ensure_repo_available_locally_detailed(state, owner_repo, true)
-            .await?
-            .available,
-    )
+pub async fn prewarm_repo(state: &crate::AppState, owner_repo: &str) -> Result<()> {
+    if ensure_repo_available_locally_detailed(state, owner_repo, true)
+        .await?
+        .available
+    {
+        return Ok(());
+    }
+
+    let Some((owner, repo)) = owner_repo.split_once('/') else {
+        anyhow::bail!("invalid prewarm repository slug: {owner_repo}");
+    };
+    let auth_header = prewarm_clone_auth_header(state, owner).await;
+    info!(
+        repo = %owner_repo,
+        has_auth_header = auth_header.is_some(),
+        "pre-warm did not find local or S3 state; falling back to upstream clone"
+    );
+    ensure_repo_cloned_from_upstream(state, owner, repo, auth_header.as_deref()).await
+}
+
+async fn prewarm_clone_auth_header(state: &crate::AppState, owner: &str) -> Option<String> {
+    let token_key = state
+        .config
+        .upstream_credentials
+        .orgs
+        .get(owner)
+        .map(|oc| oc.keyring_key_name.as_str())
+        .unwrap_or(&state.config.upstream.admin_token_env);
+    let token = crate::credentials::keyring::resolve_secret(token_key).await?;
+    (!token.is_empty()).then(|| format!("Bearer {token}"))
 }
 
 async fn classify_local_wants_satisfaction_inner(
