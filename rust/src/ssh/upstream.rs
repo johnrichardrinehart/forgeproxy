@@ -46,7 +46,7 @@ use crate::metrics::{ClonePhase, CloneUpstreamBytesLabels, Protocol};
         %owner_repo,
         username = %metric_username,
         git_protocol = git_protocol.unwrap_or(""),
-        forge_backend = %state.config.backend_type.as_label(),
+        forge_backend = %state.config().backend_type.as_label(),
         authenticated
     )
 )]
@@ -59,14 +59,14 @@ pub async fn fetch_ref_advertisement(
 ) -> Result<Vec<u8>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =
-        resolve_upstream_url_and_creds(&state.config, owner, repo, authenticated).await?;
+        resolve_upstream_url_and_creds(state.config().as_ref(), owner, repo, authenticated).await?;
 
-    match credential_mode(&state.config, owner) {
+    match credential_mode(state.config().as_ref(), owner) {
         CredentialMode::Pat => {
             let url = format!("{clone_url}/info/refs?service=git-upload-pack");
             let redacted_url = crate::git::commands::redact_url_secret(
                 &url,
-                state.config.upstream.log_secret_unmask_chars,
+                state.config().upstream.log_secret_unmask_chars,
             );
             debug!(url = %redacted_url, "fetching ref advertisement via HTTP GET");
 
@@ -140,7 +140,7 @@ pub async fn fetch_ref_advertisement(
         %owner_repo,
         username = %metric_username,
         git_protocol = git_protocol.unwrap_or(""),
-        forge_backend = %state.config.backend_type.as_label(),
+        forge_backend = %state.config().backend_type.as_label(),
         input_bytes = want_have.len(),
         authenticated
     )
@@ -155,14 +155,14 @@ pub async fn post_upload_pack_stream(
 ) -> Result<impl Stream<Item = reqwest::Result<bytes::Bytes>>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =
-        resolve_upstream_url_and_creds(&state.config, owner, repo, authenticated).await?;
+        resolve_upstream_url_and_creds(state.config().as_ref(), owner, repo, authenticated).await?;
 
-    match credential_mode(&state.config, owner) {
+    match credential_mode(state.config().as_ref(), owner) {
         CredentialMode::Pat => {
             let url = format!("{clone_url}/git-upload-pack");
             let redacted_url = crate::git::commands::redact_url_secret(
                 &url,
-                state.config.upstream.log_secret_unmask_chars,
+                state.config().upstream.log_secret_unmask_chars,
             );
             debug!(
                 url = %redacted_url,

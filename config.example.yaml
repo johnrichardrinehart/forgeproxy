@@ -1,3 +1,6 @@
+config_reload:
+  enabled: true
+  interval_secs: 60
 upstream:
   hostname: "ghe.internal.example.com"
   api_url: "https://ghe.internal.example.com/api/v3"

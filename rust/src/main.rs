@@ -20,8 +20,9 @@ mod ssh;
 mod storage;
 mod tee_hydration;
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -103,7 +104,7 @@ enum Command {
 /// Global state shared across all request handlers and background tasks.
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
+    pub config: ConfigHandle,
     pub valkey: Pool,
     pub s3_client: aws_sdk_s3::Client,
     pub metrics: MetricsRegistry,
@@ -189,6 +190,30 @@ pub struct AppState {
 }
 
 #[derive(Clone)]
+pub struct ConfigHandle {
+    current: Arc<RwLock<Arc<Config>>>,
+}
+
+impl ConfigHandle {
+    pub fn new(config: Arc<Config>) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(config)),
+        }
+    }
+
+    pub fn load(&self) -> Arc<Config> {
+        self.current
+            .read()
+            .expect("live config lock poisoned")
+            .clone()
+    }
+
+    pub fn store(&self, config: Arc<Config>) {
+        *self.current.write().expect("live config lock poisoned") = config;
+    }
+}
+
+#[derive(Clone)]
 pub struct RecentAdvertisedRefs {
     pub captured_at: Instant,
     pub session_id: String,
@@ -196,6 +221,10 @@ pub struct RecentAdvertisedRefs {
 }
 
 impl AppState {
+    pub fn config(&self) -> Arc<Config> {
+        self.config.load()
+    }
+
     pub fn begin_active_connection(&self, protocol: Protocol) -> ActiveConnectionGuard {
         let counter = match protocol {
             Protocol::Https => Arc::clone(&self.active_https_connections),
@@ -666,7 +695,7 @@ async fn run_http_server(state: AppState, mut shutdown_rx: watch::Receiver<bool>
     let app = http::handler::create_router(Arc::new(state.clone()));
 
     let listen_addr: std::net::SocketAddr = state
-        .config
+        .config()
         .proxy
         .http_listen
         .parse()
@@ -717,6 +746,247 @@ async fn run_bundle_lifecycle(state: AppState) -> Result<()> {
 async fn run_node_heartbeat(state: AppState) -> Result<()> {
     coordination::node::run_heartbeat(state.valkey.clone(), state.node_id.clone()).await;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigReloadOutcome {
+    Unchanged,
+    Reloaded,
+    Rejected,
+}
+
+fn ensure_same<T: PartialEq + std::fmt::Debug>(
+    current: &T,
+    next: &T,
+    field: &'static str,
+) -> Result<()> {
+    anyhow::ensure!(
+        current == next,
+        "{field} cannot be hot reloaded; restart forgeproxy to apply this change"
+    );
+    Ok(())
+}
+
+fn ensure_reload_compatible(current: &Config, next: &Config) -> Result<()> {
+    ensure_same(&current.backend_type, &next.backend_type, "backend_type")?;
+    ensure_same(&current.upstream, &next.upstream, "upstream")?;
+    ensure_same(&current.proxy, &next.proxy, "proxy")?;
+    ensure_same(&current.valkey, &next.valkey, "valkey")?;
+    ensure_same(&current.storage.local, &next.storage.local, "storage.local")?;
+    ensure_same(
+        &current.storage.s3.region,
+        &next.storage.s3.region,
+        "storage.s3.region",
+    )?;
+    ensure_same(
+        &current.storage.s3.endpoint,
+        &next.storage.s3.endpoint,
+        "storage.s3.endpoint",
+    )?;
+    ensure_same(
+        &current.storage.s3.use_fips,
+        &next.storage.s3.use_fips,
+        "storage.s3.use_fips",
+    )?;
+    ensure_same(
+        &current.clone.max_concurrent_upstream_clones,
+        &next.clone.max_concurrent_upstream_clones,
+        "clone.max_concurrent_upstream_clones",
+    )?;
+    ensure_same(
+        &current.clone.max_concurrent_upstream_fetches,
+        &next.clone.max_concurrent_upstream_fetches,
+        "clone.max_concurrent_upstream_fetches",
+    )?;
+    ensure_same(
+        &current.clone.reserved_request_time_upstream_fetches,
+        &next.clone.reserved_request_time_upstream_fetches,
+        "clone.reserved_request_time_upstream_fetches",
+    )?;
+    ensure_same(
+        &current.clone.max_concurrent_tee_captures,
+        &next.clone.max_concurrent_tee_captures,
+        "clone.max_concurrent_tee_captures",
+    )?;
+    ensure_same(
+        &current
+            .clone
+            .max_concurrent_tee_captures_per_repo_per_instance,
+        &next.clone.max_concurrent_tee_captures_per_repo_per_instance,
+        "clone.max_concurrent_tee_captures_per_repo_per_instance",
+    )?;
+    ensure_same(
+        &current
+            .clone
+            .max_concurrent_upstream_clones_per_repo_across_instances,
+        &next
+            .clone
+            .max_concurrent_upstream_clones_per_repo_across_instances,
+        "clone.max_concurrent_upstream_clones_per_repo_across_instances",
+    )?;
+    ensure_same(
+        &current
+            .clone
+            .max_concurrent_upstream_clones_per_repo_per_instance,
+        &next
+            .clone
+            .max_concurrent_upstream_clones_per_repo_per_instance,
+        "clone.max_concurrent_upstream_clones_per_repo_per_instance",
+    )?;
+    ensure_same(
+        &current.clone.max_concurrent_local_upload_packs,
+        &next.clone.max_concurrent_local_upload_packs,
+        "clone.max_concurrent_local_upload_packs",
+    )?;
+    ensure_same(
+        &current.clone.max_concurrent_local_upload_packs_per_repo,
+        &next.clone.max_concurrent_local_upload_packs_per_repo,
+        "clone.max_concurrent_local_upload_packs_per_repo",
+    )?;
+    ensure_same(
+        &current.clone.index_pack_threads,
+        &next.clone.index_pack_threads,
+        "clone.index_pack_threads",
+    )?;
+    ensure_same(
+        &current.clone.tee_cleanup_interval_secs,
+        &next.clone.tee_cleanup_interval_secs,
+        "clone.tee_cleanup_interval_secs",
+    )?;
+    ensure_same(
+        &current.clone.tee_retention_secs,
+        &next.clone.tee_retention_secs,
+        "clone.tee_retention_secs",
+    )?;
+    ensure_same(
+        &current.bundles.max_concurrent_generations,
+        &next.bundles.max_concurrent_generations,
+        "bundles.max_concurrent_generations",
+    )?;
+    ensure_same(
+        &current.bundles.pack_threads,
+        &next.bundles.pack_threads,
+        "bundles.pack_threads",
+    )?;
+    ensure_same(
+        &current.pack_cache.enabled,
+        &next.pack_cache.enabled,
+        "pack_cache.enabled",
+    )?;
+    ensure_same(
+        &current.pack_cache.max_percent,
+        &next.pack_cache.max_percent,
+        "pack_cache.max_percent",
+    )?;
+    ensure_same(
+        &current.pack_cache.high_water_mark,
+        &next.pack_cache.high_water_mark,
+        "pack_cache.high_water_mark",
+    )?;
+    ensure_same(
+        &current.pack_cache.low_water_mark,
+        &next.pack_cache.low_water_mark,
+        "pack_cache.low_water_mark",
+    )?;
+    ensure_same(
+        &current.pack_cache.eviction_policy,
+        &next.pack_cache.eviction_policy,
+        "pack_cache.eviction_policy",
+    )?;
+    ensure_same(
+        &current.pack_cache.wait_for_inflight_secs,
+        &next.pack_cache.wait_for_inflight_secs,
+        "pack_cache.wait_for_inflight_secs",
+    )?;
+    ensure_same(
+        &current.pack_cache.max_concurrent_request_deltas,
+        &next.pack_cache.max_concurrent_request_deltas,
+        "pack_cache.max_concurrent_request_deltas",
+    )?;
+    ensure_same(
+        &current.pack_cache.min_response_bytes,
+        &next.pack_cache.min_response_bytes,
+        "pack_cache.min_response_bytes",
+    )?;
+    ensure_same(&current.prewarm, &next.prewarm, "prewarm")?;
+    ensure_same(
+        &current.observability.logs,
+        &next.observability.logs,
+        "observability.logs",
+    )?;
+    ensure_same(
+        &current.observability.traces,
+        &next.observability.traces,
+        "observability.traces",
+    )?;
+    ensure_same(&current.logging, &next.logging, "logging")?;
+    Ok(())
+}
+
+fn reload_config_once(
+    config_path: &Path,
+    state: &AppState,
+    last_seen_contents: &mut String,
+) -> Result<ConfigReloadOutcome> {
+    let (next_config, next_contents) = config::load_config_with_contents(config_path)?;
+    if next_contents == *last_seen_contents {
+        return Ok(ConfigReloadOutcome::Unchanged);
+    }
+
+    let current = state.config();
+    match ensure_reload_compatible(current.as_ref(), &next_config) {
+        Ok(()) => {
+            state.config.store(Arc::new(next_config));
+            *last_seen_contents = next_contents;
+            Ok(ConfigReloadOutcome::Reloaded)
+        }
+        Err(error) => {
+            *last_seen_contents = next_contents;
+            tracing::warn!(
+                config_path = %config_path.display(),
+                error = %error,
+                "config file changed but cannot be hot reloaded"
+            );
+            Ok(ConfigReloadOutcome::Rejected)
+        }
+    }
+}
+
+async fn run_config_reload_loop(
+    config_path: PathBuf,
+    state: AppState,
+    mut last_seen_contents: String,
+) -> Result<()> {
+    loop {
+        let current = state.config();
+        let interval = Duration::from_secs(current.config_reload.interval_secs);
+        let enabled = current.config_reload.enabled;
+        drop(current);
+
+        tokio::time::sleep(interval).await;
+        if !enabled {
+            continue;
+        }
+
+        match reload_config_once(&config_path, &state, &mut last_seen_contents) {
+            Ok(ConfigReloadOutcome::Reloaded) => {
+                let current = state.config();
+                tracing::info!(
+                    config_path = %config_path.display(),
+                    reload_interval_secs = current.config_reload.interval_secs,
+                    "hot reloaded config file"
+                );
+            }
+            Ok(ConfigReloadOutcome::Rejected | ConfigReloadOutcome::Unchanged) => {}
+            Err(error) => {
+                tracing::warn!(
+                    config_path = %config_path.display(),
+                    error = %error,
+                    "failed to hot reload config file; keeping previous config"
+                );
+            }
+        }
+    }
 }
 
 fn validate_config_file(path: &str) -> Result<()> {
@@ -876,7 +1146,9 @@ async fn main() -> Result<()> {
     }
 
     // ---- Config ----
-    let config = Arc::new(config::load_config(&cli.config)?);
+    let config_path = PathBuf::from(&cli.config);
+    let (loaded_config, config_contents) = config::load_config_with_contents(&config_path)?;
+    let config = Arc::new(loaded_config);
     let runtime_resource_detection =
         crate::runtime_resource::load_or_detect_runtime_resource_attributes(
             std::path::Path::new(&cli.runtime_resource_file),
@@ -1015,8 +1287,9 @@ async fn main() -> Result<()> {
 
     let tee_cleanup_handle = tokio::spawn({
         let base_path = state.cache_manager.base_path.clone();
-        let interval = std::time::Duration::from_secs(state.config.clone.tee_cleanup_interval_secs);
-        let retention = std::time::Duration::from_secs(state.config.clone.tee_retention_secs);
+        let interval =
+            std::time::Duration::from_secs(state.config().clone.tee_cleanup_interval_secs);
+        let retention = std::time::Duration::from_secs(state.config().clone.tee_retention_secs);
         async move {
             if let Err(e) =
                 crate::tee_hydration::run_tee_cleanup_loop(base_path, interval, retention).await
@@ -1031,6 +1304,16 @@ async fn main() -> Result<()> {
         async move {
             if let Err(e) = run_metrics_refresh_loop(s).await {
                 tracing::error!(error = %e, "cache metrics refresh loop failed");
+            }
+        }
+    });
+
+    let config_reload_handle = tokio::spawn({
+        let s = state.clone();
+        let path = config_path.clone();
+        async move {
+            if let Err(e) = run_config_reload_loop(path, s, config_contents).await {
+                tracing::error!(error = %e, "config reload loop failed");
             }
         }
     });
@@ -1051,6 +1334,7 @@ async fn main() -> Result<()> {
         bundle_handle.abort_handle(),
         tee_cleanup_handle.abort_handle(),
         metrics_refresh_handle.abort_handle(),
+        config_reload_handle.abort_handle(),
         heartbeat_handle.abort_handle(),
         prewarm_handle.abort_handle(),
         telemetry_handle.abort_handle(),
@@ -1062,6 +1346,7 @@ async fn main() -> Result<()> {
         bundle_handle,
         tee_cleanup_handle,
         metrics_refresh_handle,
+        config_reload_handle,
         heartbeat_handle,
         telemetry_handle
     );
@@ -1095,6 +1380,7 @@ async fn main() -> Result<()> {
                 &mut http_handle,
                 &mut ssh_handle,
                 &mut bundle_handle,
+                &mut config_reload_handle,
                 &mut heartbeat_handle,
                 &mut telemetry_handle
             );
@@ -1174,7 +1460,7 @@ async fn build_app_state(
     pack_cache.ensure_ready().await?;
 
     let state = AppState {
-        config: Arc::clone(&config),
+        config: ConfigHandle::new(Arc::clone(&config)),
         valkey,
         s3_client: s3,
         metrics,
@@ -1230,37 +1516,34 @@ async fn build_app_state(
 }
 
 async fn run_metrics_refresh_loop(state: AppState) -> Result<()> {
-    let refresh_interval = Duration::from_secs(
-        state
-            .config
-            .observability
-            .metrics
-            .prometheus
-            .refresh_interval_secs,
-    );
-    let mut ticker = tokio::time::interval(refresh_interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
     loop {
-        ticker.tick().await;
+        let refresh_interval = Duration::from_secs(
+            state
+                .config()
+                .observability
+                .metrics
+                .prometheus
+                .refresh_interval_secs,
+        );
+        tokio::time::sleep(refresh_interval).await;
         state.refresh_live_metrics();
     }
 }
 
 async fn run_startup_prewarm(state: AppState) -> Result<()> {
-    if !state.config.prewarm.enabled {
+    let config = state.config();
+    if !config.prewarm.enabled {
         state.mark_prewarm_ready();
         return Ok(());
     }
 
-    let repos = state
-        .config
+    let repos = config
         .prewarm
         .repos
         .iter()
         .map(|repo| crate::repo_identity::canonicalize_owner_repo(repo))
         .collect::<Vec<_>>();
-    let max_concurrent = state.config.prewarm.max_concurrent;
+    let max_concurrent = config.prewarm.max_concurrent;
     tracing::info!(
         repo_count = repos.len(),
         max_concurrent,
@@ -1313,5 +1596,40 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("repository pre-warm failed: {}", failures.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example_config() -> Config {
+        crate::config::parse_config_str(include_str!("../../config.example.yaml")).unwrap()
+    }
+
+    #[test]
+    fn reload_compatibility_accepts_request_path_knob_changes() {
+        let current = example_config();
+        let mut next = current.clone();
+        next.auth.http_cache_ttl = current.auth.http_cache_ttl + 1;
+        next.clone.global_short_circuit_upstream_secs =
+            current.clone.global_short_circuit_upstream_secs + 5;
+        next.upstream_credentials
+            .orgs
+            .get_mut("acme-corp")
+            .unwrap()
+            .keyring_key_name = "pat-acme-next".to_string();
+
+        ensure_reload_compatible(&current, &next).unwrap();
+    }
+
+    #[test]
+    fn reload_compatibility_rejects_startup_resource_changes() {
+        let current = example_config();
+        let mut next = current.clone();
+        next.proxy.http_listen = "127.0.0.1:18080".to_string();
+
+        let error = ensure_reload_compatible(&current, &next).unwrap_err();
+        assert!(error.to_string().contains("proxy cannot be hot reloaded"));
     }
 }

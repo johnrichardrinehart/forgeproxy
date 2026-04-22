@@ -75,9 +75,9 @@ pub async fn validate_http_auth(
 
     // 4. Cache the result.
     let ttl = if perm.has_read() {
-        state.config.auth.http_cache_ttl
+        state.config().auth.http_cache_ttl
     } else {
-        state.config.auth.negative_cache_ttl
+        state.config().auth.negative_cache_ttl
     };
     let perm_str = perm.as_str();
     cache::set_cached_auth(&state.valkey, &cache_key, perm_str, ttl)
@@ -130,7 +130,7 @@ async fn resolve_http_user(
     }
 
     let remaining = state.rate_limit.remaining();
-    if remaining < state.config.upstream.api_rate_limit_buffer as u64 && remaining != u64::MAX {
+    if remaining < state.config().upstream.api_rate_limit_buffer as u64 && remaining != u64::MAX {
         debug!(
             remaining,
             "skipping current-user resolution because upstream API rate limit is low"
@@ -149,7 +149,7 @@ async fn resolve_http_user(
                 &state.valkey,
                 &cache_key,
                 &username,
-                state.config.auth.http_cache_ttl,
+                state.config().auth.http_cache_ttl,
             )
             .await
             .ok();

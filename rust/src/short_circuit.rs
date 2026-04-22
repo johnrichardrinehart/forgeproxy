@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -10,7 +9,7 @@ pub struct RequestBudget {
 }
 
 impl RequestBudget {
-    pub fn from_config(config: &Arc<Config>, started_at: Instant) -> Self {
+    pub fn from_config(config: &Config, started_at: Instant) -> Self {
         Self {
             started_at,
             global: duration_from_secs(config.clone.global_short_circuit_upstream_secs),

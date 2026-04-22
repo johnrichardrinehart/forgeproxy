@@ -99,10 +99,10 @@ pub async fn start_ssh_server(
     state: Arc<AppState>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let listen_addr: SocketAddr = state.config.proxy.ssh_listen.parse().with_context(|| {
+    let listen_addr: SocketAddr = state.config().proxy.ssh_listen.parse().with_context(|| {
         format!(
             "invalid SSH listen address: {:?}",
-            state.config.proxy.ssh_listen
+            state.config().proxy.ssh_listen
         )
     })?;
 

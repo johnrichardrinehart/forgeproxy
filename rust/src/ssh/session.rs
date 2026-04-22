@@ -57,7 +57,7 @@ fn ssh_git_request_observation(
     let (owner, repo) =
         super::upstream::split_owner_repo(owner_repo).unwrap_or((owner_repo, "<unknown>"));
     GitRequestObservation::new(
-        &state.config,
+        state.config().as_ref(),
         owner,
         repo,
         username.unwrap_or("anonymous"),
@@ -594,7 +594,7 @@ async fn replay_ssh_pack_cache_hit(
             replay.channel_id,
             0,
             total_bytes,
-            Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
+            Duration::from_secs(state.config().clone.ssh_upload_pack_close_grace_secs),
         )
         .await;
     }
@@ -695,8 +695,10 @@ async fn serve_local_upload_pack_once(
             Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
                 let composite_timeout = budget.and_then(|budget| {
                     budget.stage_timeout(min_timeout(
-                        duration_from_secs(state.config.pack_cache.on_demand_composite_total_secs),
-                        duration_from_secs(state.config.pack_cache.request_delta_pack_secs),
+                        duration_from_secs(
+                            state.config().pack_cache.on_demand_composite_total_secs,
+                        ),
+                        duration_from_secs(state.config().pack_cache.request_delta_pack_secs),
                     ))
                 });
                 let composite_result = if let Some(timeout) = composite_timeout {
@@ -1069,7 +1071,7 @@ async fn serve_local_upload_pack_once(
             channel_id,
             exit_status,
             total_bytes,
-            Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
+            Duration::from_secs(state.config().clone.ssh_upload_pack_close_grace_secs),
         )
         .await;
     }
@@ -1989,7 +1991,7 @@ impl Handler for SshSession {
                             let state_for_stream = Arc::clone(&self.state);
                             let stream_channel = channel;
                             let close_grace_secs =
-                                self.state.config.clone.ssh_upload_pack_close_grace_secs;
+                                self.state.config().clone.ssh_upload_pack_close_grace_secs;
                             let metric_username = crate::metrics::clone_metric_username(
                                 self.username.as_deref(),
                                 true,
@@ -2216,7 +2218,8 @@ impl Handler for SshSession {
                     let handle = session.handle();
                     let repo_bg = repo.clone();
                     let git_protocol = self.git_protocol.clone();
-                    let close_grace_secs = self.state.config.clone.ssh_upload_pack_close_grace_secs;
+                    let close_grace_secs =
+                        self.state.config().clone.ssh_upload_pack_close_grace_secs;
                     let stream_channel = self.channels.get(&channel_id).cloned();
                     let metric_username =
                         crate::metrics::clone_metric_username(self.username.as_deref(), true);
@@ -2470,7 +2473,7 @@ async fn proxy_upstream_upload_pack(
             None
         };
         let short_circuit_budget = fetch_started_at
-            .map(|started_at| RequestBudget::from_config(&state.config, started_at));
+            .map(|started_at| RequestBudget::from_config(state.config().as_ref(), started_at));
         let local_decision = crate::coordination::registry::resolve_local_fetch_serveability(
             &state,
             &owner_repo,
@@ -2613,7 +2616,7 @@ async fn proxy_upstream_upload_pack(
                         channel_id,
                         1,
                         0,
-                        Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
+                        Duration::from_secs(state.config().clone.ssh_upload_pack_close_grace_secs),
                     )
                     .await;
                 }
@@ -2767,7 +2770,7 @@ async fn proxy_upstream_upload_pack(
                         channel_id,
                         1,
                         total_bytes,
-                        Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
+                        Duration::from_secs(state.config().clone.ssh_upload_pack_close_grace_secs),
                     )
                     .await;
                 }
@@ -2805,7 +2808,7 @@ async fn proxy_upstream_upload_pack(
                         channel_id,
                         0,
                         total_bytes,
-                        Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
+                        Duration::from_secs(state.config().clone.ssh_upload_pack_close_grace_secs),
                     )
                     .await;
                 }
@@ -2858,7 +2861,7 @@ async fn proxy_upstream_upload_pack(
                     channel_id,
                     1,
                     0,
-                    Duration::from_secs(state.config.clone.ssh_upload_pack_close_grace_secs),
+                    Duration::from_secs(state.config().clone.ssh_upload_pack_close_grace_secs),
                 )
                 .await;
             }
@@ -2881,13 +2884,13 @@ async fn proxy_upstream_upload_pack(
 /// Returns `None` if the token cannot be resolved.
 async fn build_clone_auth_header_for_repo(state: &AppState, owner_repo: &str) -> Option<String> {
     let (owner, _) = super::upstream::split_owner_repo(owner_repo).ok()?;
-    let token_key = state
-        .config
+    let config = state.config();
+    let token_key = config
         .upstream_credentials
         .orgs
         .get(owner)
         .map(|oc| oc.keyring_key_name.as_str())
-        .unwrap_or(&state.config.upstream.admin_token_env);
+        .unwrap_or(&config.upstream.admin_token_env);
 
     let token = crate::credentials::keyring::resolve_secret(token_key).await?;
     if token.is_empty() {
