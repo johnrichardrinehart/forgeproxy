@@ -227,6 +227,7 @@ The resulting rollout behavior is:
 - Listener cutover moves all production traffic to a single slot at a time, avoiding mixed `git_revision` values from `/healthz`.
 - After listener cutover, Terraform performs a bounded HTTPS soak against `/readyz` and `/healthz` through each configured client-facing hostname before scaling the old slot down.
 - If that soak never stabilizes before `forgeproxy_cutover_timeout_secs`, `terraform apply` fails and the old slot is left running instead of being terminated.
+- If a launch-template change would replace instances in the currently live slot because `forgeproxy_active_slot` was not flipped, the prepare helper now fails fast instead of attempting an in-place turnover on the production slot.
 
 Two helper entrypoints back this sequencing:
 - `terraform/scripts/forgeproxy-rollout-prepare.sh` scales and waits for the target slot.
