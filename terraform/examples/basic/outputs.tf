@@ -3,6 +3,11 @@ output "nlb_dns_name" {
   description = "DNS name of the Network Load Balancer for use with your DNS provider, such as MarkMonitor, Infoblox, Route 53, Google Cloud DNS, Azure DNS, etc."
 }
 
+output "nlb_zone_id" {
+  value       = module.forgeproxy.nlb_zone_id
+  description = "Hosted zone ID of the Network Load Balancer for DNS alias records."
+}
+
 output "nlb_eip" {
   value       = module.forgeproxy.nlb_eip
   description = "Elastic IP address of the Network Load Balancer"
