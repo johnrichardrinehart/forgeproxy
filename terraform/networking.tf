@@ -55,6 +55,16 @@ check "forgeproxy_ssh_host_key_inputs_consistent" {
   }
 }
 
+check "forgeproxy_cutover_soak_window_sufficient" {
+  assert {
+    condition = (
+      var.forgeproxy_cutover_timeout_secs >=
+      var.forgeproxy_cutover_check_interval_secs * var.forgeproxy_cutover_required_consecutive_successes
+    )
+    error_message = "forgeproxy_cutover_timeout_secs must be at least forgeproxy_cutover_check_interval_secs * forgeproxy_cutover_required_consecutive_successes."
+  }
+}
+
 # A public subnet is only required when the NLB is internet-facing; an
 # internal NLB can be placed in the private subnet.
 check "public_subnet_required_for_external_nlb" {

@@ -111,6 +111,39 @@ variable "forgeproxy_active_slot" {
   }
 }
 
+variable "forgeproxy_cutover_check_interval_secs" {
+  type        = number
+  default     = 15
+  description = "Seconds between post-cutover HTTPS soak probes before the previously active forgeproxy slot is scaled down."
+
+  validation {
+    condition     = var.forgeproxy_cutover_check_interval_secs >= 1
+    error_message = "forgeproxy_cutover_check_interval_secs must be at least 1."
+  }
+}
+
+variable "forgeproxy_cutover_required_consecutive_successes" {
+  type        = number
+  default     = 8
+  description = "Number of consecutive successful post-cutover HTTPS soak probes required before the previously active forgeproxy slot is scaled down."
+
+  validation {
+    condition     = var.forgeproxy_cutover_required_consecutive_successes >= 1
+    error_message = "forgeproxy_cutover_required_consecutive_successes must be at least 1."
+  }
+}
+
+variable "forgeproxy_cutover_timeout_secs" {
+  type        = number
+  default     = 600
+  description = "Maximum seconds to keep probing the public forgeproxy HTTPS endpoints after listener cutover before failing the rollout cleanup step."
+
+  validation {
+    condition     = var.forgeproxy_cutover_timeout_secs >= 1
+    error_message = "forgeproxy_cutover_timeout_secs must be at least 1."
+  }
+}
+
 variable "forgeproxy_ssh_host_key_secret_arn" {
   type        = string
   default     = null

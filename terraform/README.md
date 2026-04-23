@@ -51,6 +51,11 @@ vim terraform.tfvars  # Edit with your values
 - Set `aws_profile` when your Terraform AWS provider uses a named profile (for example SSO).
 - The module uses this only when `AWS_PROFILE` is not already set in the shell running Terraform.
 
+**Optional post-cutover soak controls:**
+- `forgeproxy_cutover_check_interval_secs` controls how often the cleanup helper probes the client-facing HTTPS endpoint after listener cutover.
+- `forgeproxy_cutover_required_consecutive_successes` controls how many consecutive successful soak rounds are required before the old slot is scaled down.
+- `forgeproxy_cutover_timeout_secs` bounds how long cleanup will keep trying before the apply fails and leaves the old slot intact.
+
 ### 2. Initialize Terraform
 
 ```bash
@@ -220,11 +225,12 @@ The resulting rollout behavior is:
 - The inactive slot launches and warms on the updated launch template while the active slot remains registered with the production listeners.
 - The NLB health checks gate cutover on `/readyz`, so warm-up must finish before the new slot can receive production traffic.
 - Listener cutover moves all production traffic to a single slot at a time, avoiding mixed `git_revision` values from `/healthz`.
-- The previously active slot is only scaled down after listener cutover.
+- After listener cutover, Terraform performs a bounded HTTPS soak against `/readyz` and `/healthz` through each configured client-facing hostname before scaling the old slot down.
+- If that soak never stabilizes before `forgeproxy_cutover_timeout_secs`, `terraform apply` fails and the old slot is left running instead of being terminated.
 
 Two helper entrypoints back this sequencing:
 - `terraform/scripts/forgeproxy-rollout-prepare.sh` scales and waits for the target slot.
-- `terraform/scripts/forgeproxy-rollout-cleanup.sh` scales the inactive slot down after cutover.
+- `terraform/scripts/forgeproxy-rollout-cleanup.sh` soaks the cutover through the live NLB and only then scales the inactive slot down.
 
 Those helpers are also exposed as flake packages so they can be run with Nix-managed dependencies:
 
