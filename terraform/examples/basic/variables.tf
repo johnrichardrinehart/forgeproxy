@@ -96,6 +96,24 @@ variable "forgeproxy_active_slot" {
   }
 }
 
+variable "forgeproxy_cutover_check_interval_secs" {
+  type        = number
+  default     = 15
+  description = "Seconds between post-cutover HTTPS soak probes before the previously active forgeproxy slot is scaled down."
+}
+
+variable "forgeproxy_cutover_required_consecutive_successes" {
+  type        = number
+  default     = 8
+  description = "Number of consecutive successful post-cutover HTTPS soak probes required before the previously active forgeproxy slot is scaled down."
+}
+
+variable "forgeproxy_cutover_timeout_secs" {
+  type        = number
+  default     = 600
+  description = "Maximum seconds to keep probing the public forgeproxy HTTPS endpoints after listener cutover before failing the rollout cleanup step."
+}
+
 variable "forgeproxy_ssh_host_key_secret_arn" {
   type        = string
   default     = null

@@ -220,8 +220,13 @@ resource "null_resource" "forgeproxy_rollout_cleanup" {
     green_launch_template_version = tostring(
       aws_launch_template.forgeproxy["green"].latest_version
     )
-    listener_https_arn = aws_lb_listener.https.arn
-    listener_ssh_arn   = aws_lb_listener.ssh.arn
+    listener_https_arn                  = aws_lb_listener.https.arn
+    listener_ssh_arn                    = aws_lb_listener.ssh.arn
+    nlb_dns_name                        = aws_lb.nlb.dns_name
+    client_facing_hostnames             = join(",", local.configured_proxy_hostnames)
+    cutover_check_interval_secs         = tostring(var.forgeproxy_cutover_check_interval_secs)
+    cutover_required_consecutive_checks = tostring(var.forgeproxy_cutover_required_consecutive_successes)
+    cutover_timeout_secs                = tostring(var.forgeproxy_cutover_timeout_secs)
   }
 
   depends_on = [
@@ -233,11 +238,16 @@ resource "null_resource" "forgeproxy_rollout_cleanup" {
   provisioner "local-exec" {
     command = "${path.module}/scripts/forgeproxy-rollout-cleanup.sh"
     environment = {
-      AWS_REGION           = var.aws_region
-      AWS_PROFILE_FALLBACK = var.aws_profile
-      ACTIVE_SLOT          = var.forgeproxy_active_slot
-      BLUE_ASG_NAME        = aws_autoscaling_group.forgeproxy["blue"].name
-      GREEN_ASG_NAME       = aws_autoscaling_group.forgeproxy["green"].name
+      AWS_REGION                             = var.aws_region
+      AWS_PROFILE_FALLBACK                   = var.aws_profile
+      ACTIVE_SLOT                            = var.forgeproxy_active_slot
+      BLUE_ASG_NAME                          = aws_autoscaling_group.forgeproxy["blue"].name
+      GREEN_ASG_NAME                         = aws_autoscaling_group.forgeproxy["green"].name
+      NLB_DNS_NAME                           = aws_lb.nlb.dns_name
+      CLIENT_FACING_HOSTNAMES                = join(",", local.configured_proxy_hostnames)
+      CUTOVER_CHECK_INTERVAL_SECONDS         = tostring(var.forgeproxy_cutover_check_interval_secs)
+      CUTOVER_REQUIRED_CONSECUTIVE_SUCCESSES = tostring(var.forgeproxy_cutover_required_consecutive_successes)
+      CUTOVER_TIMEOUT_SECONDS                = tostring(var.forgeproxy_cutover_timeout_secs)
     }
     interpreter = ["/usr/bin/env", "bash"]
   }
