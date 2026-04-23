@@ -1572,6 +1572,22 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
         async move {
             let started_at = Instant::now();
             let warmed = crate::coordination::registry::prewarm_repo(&state, &owner_repo).await;
+            if warmed.is_ok()
+                && state.pack_cache.enabled()
+                && let Err(error) =
+                    crate::coordination::registry::warm_current_published_generation_pack_cache(
+                        &state,
+                        &owner_repo,
+                        "startup prewarm",
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    repo = %owner_repo,
+                    error = %error,
+                    "startup pre-warm could not run pack-cache warming"
+                );
+            }
             (owner_repo, started_at.elapsed(), warmed)
         }
     }))
