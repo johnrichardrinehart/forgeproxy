@@ -1116,7 +1116,7 @@ async fn try_ensure_repo_cloned_inner(
                 repo = %owner_repo,
                 mirror = %mirror_path.display(),
                 published = %published_repo_path.display(),
-                "updating existing repo through a delta workspace backed by the local mirror"
+                "updating existing repo from local tee convergence or an upstream delta workspace"
             );
             if let Some(permits) = clone_hydration_permits.take() {
                 release_clone_hydration_permits(state, permits).await?;
@@ -1131,6 +1131,84 @@ async fn try_ensure_repo_cloned_inner(
                 info.hydrating_since_ts = hydrate_started_at;
                 info.bootstrap_bundle_pending = false;
                 set_repo_info(&state.valkey, &owner_repo, &info).await?;
+            }
+
+            if let Some(capture_dir) = tee_capture_dir.as_ref() {
+                info!(
+                    repo = %owner_repo,
+                    capture_dir = %capture_dir.display(),
+                    mirror = %mirror_path.display(),
+                    published = %published_repo_path.display(),
+                    "attempting tee capture convergence against the existing local mirror"
+                );
+                match repair_existing_repo_mirror_from_tee_capture(
+                    state,
+                    &owner_repo,
+                    &mirror_path,
+                    &clone_url,
+                    capture_dir,
+                )
+                .await
+                {
+                    Ok(Some(repair)) => {
+                        if should_update_hydration_state_for_delta_fetch(delta_fetch_priority) {
+                            let mut info = get_repo_info(&state.valkey, &owner_repo)
+                                .await?
+                                .unwrap_or_default();
+                            info.status = "ready".to_string();
+                            info.node_ids = node_id.clone();
+                            info.hydrating_node_id.clear();
+                            info.hydrating_since_ts = 0;
+                            info.bootstrap_bundle_pending = false;
+                            set_repo_info(&state.valkey, &owner_repo, &info).await?;
+                        } else {
+                            info!(
+                                repo = %owner_repo,
+                                fetch_priority = delta_fetch_priority.as_label(),
+                                "request-time catch-up published without mutating hydration ownership state"
+                            );
+                        }
+                        crate::coordination::pubsub::publish_ready(
+                            &state.valkey,
+                            &owner_repo,
+                            &node_id,
+                        )
+                        .await?;
+                        info!(
+                            repo = %owner_repo,
+                            mirror = %mirror_path.display(),
+                            published = %repair.published_repo_path.display(),
+                            tee_outcome = match repair.tee_outcome {
+                                TeeHydrationOutcome::HydratedWithFollowOnFetch => "follow_on_fetch",
+                                TeeHydrationOutcome::PublishedFromCapture => "published_from_capture",
+                                TeeHydrationOutcome::NotHydrated => "not_hydrated",
+                            },
+                            "tee capture convergence repaired the local mirror and published a fresh generation"
+                        );
+                        publish_bootstrap_bundle_best_effort(
+                            state,
+                            &owner_repo,
+                            &repair.published_repo_path,
+                        )
+                        .await;
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    Ok(None) => {
+                        info!(
+                            repo = %owner_repo,
+                            capture_dir = %capture_dir.display(),
+                            "tee capture convergence did not produce a repairable repo; falling back to upstream delta fetch"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            repo = %owner_repo,
+                            capture_dir = %capture_dir.display(),
+                            error = %error,
+                            "tee capture convergence could not repair the existing mirror; falling back to upstream delta fetch"
+                        );
+                    }
+                }
             }
 
             let delta_fetch =
@@ -1247,7 +1325,7 @@ async fn try_ensure_repo_cloned_inner(
                 ensure_bare_head_ref(&mirror_path)
                     .await
                     .with_context(|| format!("failed to set bare HEAD after S3 restore for {owner_repo}"))?;
-                quick_check_ready_repo(state, &owner_repo, &mirror_path, "S3 restore", None)
+                quick_check_ready_repo(&mirror_path, "S3 restore", None)
                     .await
                     .with_context(|| {
                         format!("S3-restored repo quick verification failed for {owner_repo}")
@@ -1363,13 +1441,7 @@ async fn try_ensure_repo_cloned_inner(
                         "failed to set bare HEAD after temporary upstream clone for {owner_repo}"
                     )
                 })?;
-                quick_check_ready_repo(
-                    state,
-                    &owner_repo,
-                    &temp_clone_path,
-                    "temporary upstream clone",
-                    None,
-                )
+                quick_check_ready_repo(&temp_clone_path, "temporary upstream clone", None)
                 .await
                 .with_context(|| {
                     format!(
@@ -1428,8 +1500,6 @@ async fn try_ensure_repo_cloned_inner(
             .await
             .with_context(|| format!("failed to set bare HEAD after hydration for {owner_repo}"))?;
         quick_check_ready_repo(
-            state,
-            &owner_repo,
             &mirror_path,
             match tee_outcome {
                 TeeHydrationOutcome::HydratedWithFollowOnFetch => "tee hydration",
@@ -2996,7 +3066,7 @@ async fn publish_repo_mirror_generation_inner(
             staged = %staged_repo_path.display(),
             "performing quick staged-generation verification before publish"
         );
-        quick_check_ready_repo(state, owner_repo, &staged_repo_path, source, None).await?;
+        quick_check_ready_repo(&staged_repo_path, source, None).await?;
         info!(
             repo = %owner_repo,
             source,
@@ -3033,7 +3103,6 @@ async fn publish_repo_mirror_generation_inner(
             source.to_string(),
         );
         spawn_generation_deep_validation(
-            state.clone(),
             owner_repo.to_string(),
             published_path.clone(),
             source.to_string(),
@@ -3236,14 +3305,7 @@ async fn fetch_delta_into_repo_mirror(
                 path = %mirror_path.display(),
                 "starting quick mirror verification before publishing a generation"
             );
-            quick_check_ready_repo(
-                state,
-                owner_repo,
-                &mirror_path,
-                "delta workspace integration",
-                None,
-            )
-            .await?;
+            quick_check_ready_repo(&mirror_path, "delta workspace integration", None).await?;
             info!(
                 repo = %owner_repo,
                 source = "delta workspace integration",
@@ -3984,7 +4046,9 @@ async fn hydrate_repo_from_tee_capture(
             );
             let direct_publish_ready = async {
                 ensure_bare_head_ref(repo_path).await?;
-                check_ready_repo(state, owner_repo, repo_path, "tee capture publish").await?;
+                quick_check_ready_repo(repo_path, "tee capture publish", Some(&captured_wants))
+                    .await?;
+                check_ready_repo(owner_repo, repo_path, "tee capture publish").await?;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -4065,13 +4129,8 @@ async fn hydrate_repo_from_tee_capture(
     }
 }
 
-async fn check_ready_repo(
-    state: &crate::AppState,
-    owner_repo: &str,
-    repo_path: &Path,
-    source: &str,
-) -> Result<()> {
-    if !state.cache_manager.has_repo_at(repo_path) {
+async fn check_ready_repo(owner_repo: &str, repo_path: &Path, source: &str) -> Result<()> {
+    if !crate::cache::manager::is_usable_bare_repo(repo_path) {
         bail!("repo is missing required bare-repo refs after {source}");
     }
 
@@ -4085,13 +4144,11 @@ async fn check_ready_repo(
 }
 
 async fn quick_check_ready_repo(
-    state: &crate::AppState,
-    _owner_repo: &str,
     repo_path: &Path,
     source: &str,
     wants: Option<&[String]>,
 ) -> Result<()> {
-    if !state.cache_manager.has_repo_at(repo_path) {
+    if !crate::cache::manager::is_usable_bare_repo(repo_path) {
         bail!("repo is missing required bare-repo refs after {source}");
     }
 
@@ -4116,12 +4173,128 @@ async fn quick_check_ready_repo(
     Ok(())
 }
 
-fn spawn_generation_deep_validation(
-    state: crate::AppState,
-    owner_repo: String,
-    generation_path: PathBuf,
-    source: String,
-) {
+async fn integrate_hydrated_repo_into_mirror(
+    mirror_path: &Path,
+    hydrated_repo_path: &Path,
+    wants: &[String],
+    fetch_priority: &'static str,
+) -> Result<()> {
+    let source_remote = hydrated_repo_path.to_string_lossy().to_string();
+    let public_refspecs = crate::git::commands::git_for_each_ref(hydrated_repo_path)
+        .await?
+        .into_keys()
+        .filter(|refname| !refname.starts_with("refs/forgeproxy/"))
+        .map(|refname| format!("+{refname}:{refname}"))
+        .collect::<Vec<_>>();
+
+    let seeded_wants = seed_temp_want_refs(hydrated_repo_path, wants).await?;
+    let mirrored_seeded_wants = if wants.is_empty() {
+        None
+    } else {
+        Some(mirror_path.join("refs/forgeproxy/tee-wants"))
+    };
+
+    let mut refspecs = public_refspecs;
+    if seeded_wants.is_some() {
+        refspecs.push("+refs/forgeproxy/tee-wants/*:refs/forgeproxy/tee-wants/*".to_string());
+    }
+
+    let fetch_result = crate::git::commands::git_fetch_refspecs_with_context(
+        mirror_path,
+        &source_remote,
+        &[],
+        &refspecs,
+        false,
+        Some(fetch_priority),
+    )
+    .await;
+    let cleanup_result = async {
+        cleanup_temp_want_refs(seeded_wants.as_deref()).await?;
+        cleanup_temp_want_refs(mirrored_seeded_wants.as_deref()).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    fetch_result?;
+    cleanup_result?;
+    ensure_bare_head_ref(mirror_path).await?;
+    quick_check_ready_repo(
+        mirror_path,
+        "tee capture convergence integration",
+        Some(wants),
+    )
+    .await
+}
+
+struct TeeMirrorRepairResult {
+    tee_outcome: TeeHydrationOutcome,
+    published_repo_path: PathBuf,
+}
+
+async fn repair_existing_repo_mirror_from_tee_capture(
+    state: &crate::AppState,
+    owner_repo: &str,
+    mirror_path: &Path,
+    clone_url: &str,
+    capture_dir: &Path,
+) -> Result<Option<TeeMirrorRepairResult>> {
+    let captured_fetch_metadata =
+        crate::tee_hydration::extract_captured_fetch_metadata(capture_dir).await?;
+    let captured_wants = captured_fetch_metadata.want_oids;
+    let hydrated_repo_path = state.cache_manager.create_delta_repo_path(owner_repo)?;
+
+    let result = async {
+        let tee_outcome = hydrate_repo_from_tee_capture(
+            state,
+            owner_repo,
+            &hydrated_repo_path,
+            clone_url,
+            capture_dir,
+            true,
+        )
+        .await?;
+        if tee_outcome == TeeHydrationOutcome::NotHydrated {
+            return Ok(None);
+        }
+
+        let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+        integrate_hydrated_repo_into_mirror(
+            mirror_path,
+            &hydrated_repo_path,
+            &captured_wants,
+            FetchPriority::TeeConvergence.as_label(),
+        )
+        .await?;
+        let _published_generation_path = publish_repo_mirror_generation_inner(
+            state,
+            owner_repo,
+            "tee capture convergence",
+            true,
+        )
+        .await?;
+
+        Ok(Some(TeeMirrorRepairResult {
+            tee_outcome,
+            published_repo_path: state.cache_manager.repo_path(owner_repo),
+        }))
+    }
+    .await;
+
+    if hydrated_repo_path.exists() {
+        tokio::fs::remove_dir_all(&hydrated_repo_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to remove tee convergence workspace at {}",
+                    hydrated_repo_path.display()
+                )
+            })?;
+    }
+
+    result
+}
+
+fn spawn_generation_deep_validation(owner_repo: String, generation_path: PathBuf, source: String) {
     tokio::spawn(async move {
         let validation_started_at = Instant::now();
         info!(
@@ -4130,7 +4303,7 @@ fn spawn_generation_deep_validation(
             path = %generation_path.display(),
             "starting background deep validation for published generation"
         );
-        match check_ready_repo(&state, &owner_repo, &generation_path, &source).await {
+        match check_ready_repo(&owner_repo, &generation_path, &source).await {
             Ok(()) => {
                 info!(
                     repo = %owner_repo,
@@ -4234,7 +4407,7 @@ fn spawn_mirror_deep_validation(
             snapshot = %snapshot_path.display(),
             "starting background deep validation for mirror snapshot"
         );
-        match check_ready_repo(&state, &owner_repo, &snapshot_path, &source).await {
+        match check_ready_repo(&owner_repo, &snapshot_path, &source).await {
             Ok(()) => {
                 info!(
                     repo = %owner_repo,
@@ -4602,17 +4775,11 @@ async fn ensure_repo_available_locally_detailed(
                 ensure_bare_head_ref(&mirror_path).await.with_context(|| {
                     format!("failed to set bare HEAD after S3 restore for {owner_repo}")
                 })?;
-                quick_check_ready_repo(
-                    state,
-                    owner_repo,
-                    &mirror_path,
-                    "S3 restore for request",
-                    None,
-                )
-                .await
-                .with_context(|| {
-                    format!("S3-restored repo quick verification failed for {owner_repo}")
-                })?;
+                quick_check_ready_repo(&mirror_path, "S3 restore for request", None)
+                    .await
+                    .with_context(|| {
+                        format!("S3-restored repo quick verification failed for {owner_repo}")
+                    })?;
                 publish_repo_mirror_generation(state, owner_repo, "S3 restore for request").await?;
 
                 let mut info = get_repo_info(&state.valkey, owner_repo)
@@ -4927,14 +5094,7 @@ async fn try_publish_mirror_generation_for_satisfied_wants(
         wants = wants.len(),
         "request-time mirror fast path can satisfy all wants; publishing without upstream fetch"
     );
-    quick_check_ready_repo(
-        state,
-        owner_repo,
-        &mirror_path,
-        "request-time mirror fast path",
-        Some(wants),
-    )
-    .await?;
+    quick_check_ready_repo(&mirror_path, "request-time mirror fast path", Some(wants)).await?;
     let published_path = publish_repo_mirror_generation_inner(
         state,
         owner_repo,
@@ -5540,6 +5700,124 @@ mod tests {
         assert_eq!(FetchPriority::RequestTime.as_label(), "request_time");
         assert_eq!(FetchPriority::Background.as_label(), "background");
         assert_eq!(FetchPriority::TeeConvergence.as_label(), "tee_convergence");
+    }
+
+    #[tokio::test]
+    async fn quick_check_ready_repo_rejects_missing_wants() {
+        let tmp = tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let init_status = Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(&worktree)
+            .status()
+            .unwrap();
+        assert!(init_status.success());
+        git(&worktree, &["config", "user.email", "test@example.com"]);
+        git(&worktree, &["config", "user.name", "Test User"]);
+        std::fs::write(worktree.join("README.md"), "base\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-m", "base"]);
+
+        let repo = tmp.path().join("repo.git");
+        let clone_status = Command::new("git")
+            .arg("clone")
+            .arg("--bare")
+            .arg(&worktree)
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(clone_status.success());
+
+        let error = quick_check_ready_repo(
+            &repo,
+            "tee capture publish",
+            Some(&["0123456789abcdef0123456789abcdef01234567".to_string()]),
+        )
+        .await
+        .expect_err("missing wants should block tee direct publish");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing 1 wanted objects after tee capture publish"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn integrate_hydrated_repo_into_mirror_repairs_missing_wants() {
+        let tmp = tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let init_status = Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(&worktree)
+            .status()
+            .unwrap();
+        assert!(init_status.success());
+        git(&worktree, &["config", "user.email", "test@example.com"]);
+        git(&worktree, &["config", "user.name", "Test User"]);
+
+        std::fs::write(worktree.join("README.md"), "base\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-m", "base"]);
+
+        let mirror_path = tmp.path().join("mirror.git");
+        let mirror_clone = Command::new("git")
+            .arg("clone")
+            .arg("--bare")
+            .arg(&worktree)
+            .arg(&mirror_path)
+            .status()
+            .unwrap();
+        assert!(mirror_clone.success());
+
+        std::fs::write(worktree.join("README.md"), "base\nfollow-up\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-m", "follow-up"]);
+        let wanted = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+
+        let hydrated_repo_path = tmp.path().join("hydrated.git");
+        let hydrated_clone = Command::new("git")
+            .arg("clone")
+            .arg("--bare")
+            .arg(&worktree)
+            .arg(&hydrated_repo_path)
+            .status()
+            .unwrap();
+        assert!(hydrated_clone.success());
+
+        let missing_before =
+            crate::git::commands::git_missing_objects(&mirror_path, std::slice::from_ref(&wanted))
+                .await
+                .unwrap();
+        assert_eq!(missing_before, vec![wanted.clone()]);
+
+        integrate_hydrated_repo_into_mirror(
+            &mirror_path,
+            &hydrated_repo_path,
+            std::slice::from_ref(&wanted),
+            FetchPriority::TeeConvergence.as_label(),
+        )
+        .await
+        .unwrap();
+
+        let missing_after =
+            crate::git::commands::git_missing_objects(&mirror_path, std::slice::from_ref(&wanted))
+                .await
+                .unwrap();
+        assert!(missing_after.is_empty());
+        assert_eq!(
+            git_stdout(&mirror_path, &["rev-parse", "refs/heads/main"]),
+            wanted
+        );
+        assert!(
+            !mirror_path.join("refs/forgeproxy/tee-wants").exists(),
+            "mirror should not retain temporary want refs after tee repair"
+        );
     }
 
     #[test]
