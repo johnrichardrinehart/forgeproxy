@@ -80,7 +80,6 @@ impl fmt::Display for BackendType {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub config_reload: ConfigReloadConfig,
@@ -127,7 +126,6 @@ impl Config {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConfigReloadConfig {
     /// Periodically re-read the config file and publish compatible changes to
     /// request handlers without restarting the process.
@@ -156,7 +154,6 @@ fn default_config_reload_interval_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PrewarmConfig {
     /// Best-effort initialize selected repositories during startup before
     /// `/readyz` reports ready.
@@ -198,7 +195,6 @@ fn default_prewarm_force_open_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ObservabilityConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -209,14 +205,12 @@ pub struct ObservabilityConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     #[serde(default)]
     pub prometheus: PrometheusConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PrometheusConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -234,14 +228,12 @@ impl Default for PrometheusConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LogSignalConfig {
     #[serde(default)]
     pub journald: JournaldLogConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct JournaldLogConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -256,7 +248,6 @@ impl Default for JournaldLogConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TraceConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -290,7 +281,6 @@ fn default_metrics_refresh_interval_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -313,7 +303,6 @@ fn default_log_level() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     /// Hostname of the upstream forge (e.g. `ghe.corp.example.com`).
     pub hostname: String,
@@ -382,7 +371,6 @@ fn default_log_secret_unmask_chars() -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpstreamCredentials {
     /// Default credential mode used when no per-org override is present.
     #[serde(default = "default_credential_mode")]
@@ -404,7 +392,6 @@ fn default_credential_mode() -> CredentialMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OrgCredential {
     pub mode: CredentialMode,
     /// Key name stored in the Linux kernel keyring (`linux-keyutils`).
@@ -416,7 +403,6 @@ pub struct OrgCredential {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// Socket address for the SSH listener (e.g. `0.0.0.0:2222`).
     pub ssh_listen: String,
@@ -429,7 +415,6 @@ pub struct ProxyConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ValkeyConfig {
     /// Connection string (e.g. `rediss://valkey.local:6380`).
     pub endpoint: String,
@@ -456,7 +441,6 @@ fn default_valkey_auth_env() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Positive SSH auth cache TTL in seconds.
     #[serde(default = "default_ssh_cache_ttl")]
@@ -504,7 +488,6 @@ fn default_webhook_secret_env() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CloneConfig {
     /// TTL (seconds) of the distributed per-repo hydration semaphore lease in
     /// Valkey.
@@ -729,7 +712,6 @@ fn default_index_pack_threads() -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FetchScheduleConfig {
     /// Default interval (seconds) between background re-fetches.
     #[serde(default = "default_fetch_interval")]
@@ -785,7 +767,6 @@ fn default_rolling_window() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BundleConfig {
     /// Minimum number of clones a repo must have received before bundles are
     /// generated for it.
@@ -829,7 +810,6 @@ pub struct BundleExecutionPolicy {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PackCacheConfig {
     /// Enable replay caching of local upload-pack responses for safe fresh
     /// clone requests.
@@ -988,14 +968,12 @@ fn default_pack_threads(available_parallelism: usize, max_concurrent_generations
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub local: LocalStorageConfig,
     pub s3: S3StorageConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LocalStorageConfig {
     /// Root directory for bare repos and bundles.
     pub path: String,
@@ -1033,7 +1011,6 @@ fn default_eviction_policy() -> EvictionPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct S3StorageConfig {
     pub bucket: String,
     #[serde(default = "default_s3_prefix")]
@@ -1062,7 +1039,6 @@ fn default_presigned_url_ttl() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RepoOverride {
     /// Override fetch interval (seconds) for this repo.
     pub fetch_interval: Option<u64>,
@@ -1074,9 +1050,287 @@ pub struct RepoOverride {
 // Loader
 // ---------------------------------------------------------------------------
 
-pub(crate) fn parse_config_str(contents: &str) -> Result<Config> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSchemaNode {
+    Root,
+    ConfigReload,
+    Upstream,
+    UpstreamCredentials,
+    OrgCredential,
+    Proxy,
+    Valkey,
+    Auth,
+    Clone,
+    FetchSchedule,
+    Bundles,
+    PackCache,
+    Prewarm,
+    Storage,
+    LocalStorage,
+    S3Storage,
+    Observability,
+    Metrics,
+    Prometheus,
+    LogSignal,
+    Journald,
+    Trace,
+    Logging,
+    RepoOverride,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSchemaChild {
+    None,
+    Object(ConfigSchemaNode),
+    DynamicObjectValues(ConfigSchemaNode),
+}
+
+fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
+    match node {
+        ConfigSchemaNode::Root => &[
+            "config_reload",
+            "upstream",
+            "backend_type",
+            "upstream_credentials",
+            "proxy",
+            "valkey",
+            "auth",
+            "clone",
+            "fetch_schedule",
+            "bundles",
+            "pack_cache",
+            "prewarm",
+            "storage",
+            "observability",
+            "logging",
+            "delegated_repositories",
+            "repo_overrides",
+        ],
+        ConfigSchemaNode::ConfigReload => &["enabled", "interval_secs"],
+        ConfigSchemaNode::Upstream => &[
+            "hostname",
+            "api_url",
+            "git_url_base",
+            "admin_token_env",
+            "api_rate_limit_buffer",
+            "log_secret_unmask_chars",
+            "key_lookup_url",
+        ],
+        ConfigSchemaNode::UpstreamCredentials => &["default_mode", "orgs"],
+        ConfigSchemaNode::OrgCredential => &["mode", "keyring_key_name"],
+        ConfigSchemaNode::Proxy => &["ssh_listen", "http_listen"],
+        ConfigSchemaNode::Valkey => &["endpoint", "tls", "ca_cert_file", "auth_token_env"],
+        ConfigSchemaNode::Auth => &[
+            "ssh_cache_ttl",
+            "http_cache_ttl",
+            "negative_cache_ttl",
+            "webhook_secret_env",
+        ],
+        ConfigSchemaNode::Clone => &[
+            "lock_ttl",
+            "lock_wait_timeout",
+            "max_concurrent_upstream_clones",
+            "max_concurrent_upstream_fetches",
+            "reserved_request_time_upstream_fetches",
+            "max_concurrent_tee_captures",
+            "max_concurrent_tee_captures_per_repo_per_instance",
+            "max_concurrent_upstream_clones_per_repo_across_instances",
+            "max_concurrent_upstream_clones_per_repo_per_instance",
+            "max_concurrent_local_upload_packs",
+            "max_concurrent_local_upload_packs_per_repo",
+            "index_pack_threads",
+            "hydration_mode",
+            "prepare_published_generation_indexes",
+            "generation_coalescing_window_secs",
+            "global_short_circuit_upstream_secs",
+            "request_wait_for_local_catch_up_secs",
+            "request_wait_for_active_local_catch_up_secs",
+            "request_time_s3_restore_secs",
+            "generation_publish_secs",
+            "local_upload_pack_first_byte_secs",
+            "tee_cleanup_interval_secs",
+            "tee_retention_secs",
+            "ssh_upload_pack_close_grace_secs",
+        ],
+        ConfigSchemaNode::FetchSchedule => &[
+            "default_interval",
+            "delta_threshold",
+            "backoff_factor",
+            "max_interval",
+            "rolling_window",
+        ],
+        ConfigSchemaNode::Bundles => &[
+            "min_clone_count_for_bundles",
+            "bundle_lock_ttl",
+            "max_concurrent_generations",
+            "pack_threads",
+            "generate_filtered_bundles",
+            "max_incremental_bundles",
+        ],
+        ConfigSchemaNode::PackCache => &[
+            "enabled",
+            "max_percent",
+            "high_water_mark",
+            "low_water_mark",
+            "eviction_policy",
+            "wait_for_inflight_secs",
+            "on_demand_composite_total_secs",
+            "request_delta_pack_secs",
+            "max_concurrent_request_deltas",
+            "max_concurrent_background_warmings",
+            "min_response_bytes",
+        ],
+        ConfigSchemaNode::Prewarm => &["enabled", "repos", "max_concurrent", "force_open_secs"],
+        ConfigSchemaNode::Storage => &["local", "s3"],
+        ConfigSchemaNode::LocalStorage => &[
+            "path",
+            "max_percent",
+            "high_water_mark",
+            "low_water_mark",
+            "eviction_policy",
+        ],
+        ConfigSchemaNode::S3Storage => &[
+            "bucket",
+            "prefix",
+            "region",
+            "endpoint",
+            "use_fips",
+            "presigned_url_ttl",
+        ],
+        ConfigSchemaNode::Observability => &["metrics", "logs", "traces"],
+        ConfigSchemaNode::Metrics => &["prometheus"],
+        ConfigSchemaNode::Prometheus => &["enabled", "refresh_interval_secs"],
+        ConfigSchemaNode::LogSignal => &["journald"],
+        ConfigSchemaNode::Journald => &["enabled"],
+        ConfigSchemaNode::Trace => &["enabled", "sample_ratio"],
+        ConfigSchemaNode::Logging => &["level"],
+        ConfigSchemaNode::RepoOverride => &["fetch_interval", "disable_bundles"],
+    }
+}
+
+fn schema_child(node: ConfigSchemaNode, key: &str) -> ConfigSchemaChild {
+    match (node, key) {
+        (ConfigSchemaNode::Root, "config_reload") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::ConfigReload)
+        }
+        (ConfigSchemaNode::Root, "upstream") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::Upstream)
+        }
+        (ConfigSchemaNode::Root, "upstream_credentials") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::UpstreamCredentials)
+        }
+        (ConfigSchemaNode::Root, "proxy") => ConfigSchemaChild::Object(ConfigSchemaNode::Proxy),
+        (ConfigSchemaNode::Root, "valkey") => ConfigSchemaChild::Object(ConfigSchemaNode::Valkey),
+        (ConfigSchemaNode::Root, "auth") => ConfigSchemaChild::Object(ConfigSchemaNode::Auth),
+        (ConfigSchemaNode::Root, "clone") => ConfigSchemaChild::Object(ConfigSchemaNode::Clone),
+        (ConfigSchemaNode::Root, "fetch_schedule") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::FetchSchedule)
+        }
+        (ConfigSchemaNode::Root, "bundles") => ConfigSchemaChild::Object(ConfigSchemaNode::Bundles),
+        (ConfigSchemaNode::Root, "pack_cache") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::PackCache)
+        }
+        (ConfigSchemaNode::Root, "prewarm") => ConfigSchemaChild::Object(ConfigSchemaNode::Prewarm),
+        (ConfigSchemaNode::Root, "storage") => ConfigSchemaChild::Object(ConfigSchemaNode::Storage),
+        (ConfigSchemaNode::Root, "observability") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::Observability)
+        }
+        (ConfigSchemaNode::Root, "logging") => ConfigSchemaChild::Object(ConfigSchemaNode::Logging),
+        (ConfigSchemaNode::Root, "repo_overrides") => {
+            ConfigSchemaChild::DynamicObjectValues(ConfigSchemaNode::RepoOverride)
+        }
+        (ConfigSchemaNode::UpstreamCredentials, "orgs") => {
+            ConfigSchemaChild::DynamicObjectValues(ConfigSchemaNode::OrgCredential)
+        }
+        (ConfigSchemaNode::Storage, "local") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::LocalStorage)
+        }
+        (ConfigSchemaNode::Storage, "s3") => ConfigSchemaChild::Object(ConfigSchemaNode::S3Storage),
+        (ConfigSchemaNode::Observability, "metrics") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::Metrics)
+        }
+        (ConfigSchemaNode::Observability, "logs") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::LogSignal)
+        }
+        (ConfigSchemaNode::Observability, "traces") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::Trace)
+        }
+        (ConfigSchemaNode::Metrics, "prometheus") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::Prometheus)
+        }
+        (ConfigSchemaNode::LogSignal, "journald") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::Journald)
+        }
+        _ => ConfigSchemaChild::None,
+    }
+}
+
+fn collect_unknown_config_fields(value: &serde_yml::Value) -> Vec<String> {
+    fn visit_object(
+        value: &serde_yml::Value,
+        node: ConfigSchemaNode,
+        path: &mut Vec<String>,
+        warnings: &mut Vec<String>,
+    ) {
+        let serde_yml::Value::Mapping(mapping) = value else {
+            return;
+        };
+
+        let allowed = schema_allowed_fields(node);
+        for (raw_key, child_value) in mapping {
+            let Some(key) = raw_key.as_str() else {
+                continue;
+            };
+            path.push(key.to_string());
+
+            if !allowed.contains(&key) {
+                warnings.push(format!("unknown config field `{}`", path.join(".")));
+                path.pop();
+                continue;
+            }
+
+            match schema_child(node, key) {
+                ConfigSchemaChild::None => {}
+                ConfigSchemaChild::Object(child_node) => {
+                    visit_object(child_value, child_node, path, warnings);
+                }
+                ConfigSchemaChild::DynamicObjectValues(child_node) => {
+                    if let serde_yml::Value::Mapping(entries) = child_value {
+                        for (raw_entry_key, entry_value) in entries {
+                            let Some(entry_key) = raw_entry_key.as_str() else {
+                                continue;
+                            };
+                            path.push(entry_key.to_string());
+                            visit_object(entry_value, child_node, path, warnings);
+                            path.pop();
+                        }
+                    }
+                }
+            }
+
+            path.pop();
+        }
+    }
+
+    let mut warnings = Vec::new();
+    let mut path = Vec::new();
+    visit_object(value, ConfigSchemaNode::Root, &mut path, &mut warnings);
+    warnings
+}
+
+pub(crate) fn parse_config_str_with_warnings(contents: &str) -> Result<(Config, Vec<String>)> {
+    let config_value: serde_yml::Value = serde_yml::from_str(contents)?;
+    let warnings = collect_unknown_config_fields(&config_value);
     let config: Config = serde_yml::from_str(contents)?;
     validate_config(&config)?;
+    Ok((config, warnings))
+}
+
+pub(crate) fn parse_config_str(contents: &str) -> Result<Config> {
+    let (config, warnings) = parse_config_str_with_warnings(contents)?;
+    for warning in warnings {
+        eprintln!("forgeproxy: warning: {warning}");
+    }
     Ok(config)
 }
 
@@ -1194,7 +1448,7 @@ fn validate_config(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendType, BundleConfig, parse_config_str};
+    use super::{BackendType, BundleConfig, parse_config_str, parse_config_str_with_warnings};
 
     #[test]
     fn bundle_execution_policy_defaults_single_core() {
@@ -1302,12 +1556,29 @@ mod tests {
     }
 
     #[test]
+    fn warns_on_extra_legacy_local_max_bytes_field() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "    max_percent: 0.80\n",
+            "    max_percent: 0.80\n    max_bytes: 536870912000\n",
+        );
+        let (_parsed, warnings) = parse_config_str_with_warnings(&config).unwrap();
+        assert_eq!(
+            warnings,
+            vec!["unknown config field `storage.local.max_bytes`".to_string()]
+        );
+    }
+
+    #[test]
     fn rejects_legacy_pack_cache_ttl() {
         let config = include_str!("../../config.example.yaml").replace(
             "  wait_for_inflight_secs: 120\n",
             "  ttl_secs: 900\n  wait_for_inflight_secs: 120\n",
         );
-        assert!(parse_config_str(&config).is_err());
+        let (_parsed, warnings) = parse_config_str_with_warnings(&config).unwrap();
+        assert_eq!(
+            warnings,
+            vec!["unknown config field `pack_cache.ttl_secs`".to_string()]
+        );
     }
 
     #[test]
@@ -1316,7 +1587,11 @@ mod tests {
             "  metrics:\n    prometheus:\n      enabled: true\n",
             "  metrics:\n    prometheus:\n      enabled: true\n    otlp:\n      enabled: true\n      endpoint: \"https://ingest.metrics.foo.dev/vm/insert/0/opentelemetry/api/v1/push\"\n      protocol: \"http/protobuf\"\n      export_interval_secs: 60\n      auth:\n        basic:\n          username: \"foo\"\n          password: \"bar\"\n",
         );
-        assert!(parse_config_str(&config).is_err());
+        let (_parsed, warnings) = parse_config_str_with_warnings(&config).unwrap();
+        assert_eq!(
+            warnings,
+            vec!["unknown config field `observability.metrics.otlp`".to_string()]
+        );
     }
 
     #[test]
@@ -1325,7 +1600,11 @@ mod tests {
             "  traces:\n    enabled: false\n    sample_ratio: 1.0\n",
             "  traces:\n    enabled: false\n    sample_ratio: 1.0\n  exporters:\n    otlp:\n      metrics:\n        enabled: true\n        endpoint: \"https://ingest.metrics.foo.dev/vm/insert/0/opentelemetry/api/v1/push\"\n        protocol: \"http/protobuf\"\n        export_interval_secs: 60\n        auth:\n          basic:\n            username: \"foo\"\n            password: \"bar\"\n",
         );
-        assert!(parse_config_str(&config).is_err());
+        let (_parsed, warnings) = parse_config_str_with_warnings(&config).unwrap();
+        assert_eq!(
+            warnings,
+            vec!["unknown config field `observability.exporters`".to_string()]
+        );
     }
 
     #[test]
@@ -1345,7 +1624,35 @@ mod tests {
                 "max_concurrent_upstream_fetches",
                 "max_concurrent_ghe_fetches",
             );
-        assert!(parse_config_str(&config).is_err());
+        let (parsed, warnings) = parse_config_str_with_warnings(&config).unwrap();
+        assert_eq!(
+            warnings,
+            vec![
+                "unknown config field `clone.max_concurrent_ghe_clones`".to_string(),
+                "unknown config field `clone.max_concurrent_ghe_fetches`".to_string(),
+            ]
+        );
+        assert_eq!(
+            parsed.clone.max_concurrent_upstream_clones,
+            super::default_max_concurrent_upstream_clones()
+        );
+        assert_eq!(
+            parsed.clone.max_concurrent_upstream_fetches,
+            super::default_max_concurrent_upstream_fetches()
+        );
+    }
+
+    #[test]
+    fn warns_on_forward_compatible_unknown_fields() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "prewarm:\n  enabled: false\n  repos: []\n  max_concurrent: 2\n",
+            "prewarm:\n  enabled: false\n  repos: []\n  max_concurrent: 2\n  future_mode: \"best_effort\"\n",
+        );
+        let (_parsed, warnings) = parse_config_str_with_warnings(&config).unwrap();
+        assert_eq!(
+            warnings,
+            vec!["unknown config field `prewarm.future_mode`".to_string()]
+        );
     }
 
     #[test]
