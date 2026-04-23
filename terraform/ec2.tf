@@ -197,14 +197,21 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
   provisioner "local-exec" {
     command = "${path.module}/scripts/forgeproxy-rollout-prepare.sh"
     environment = {
-      AWS_REGION              = var.aws_region
-      AWS_PROFILE_FALLBACK    = var.aws_profile
-      ACTIVE_SLOT             = var.forgeproxy_active_slot
-      DESIRED_COUNT           = tostring(var.forgeproxy_count)
-      BLUE_ASG_NAME           = aws_autoscaling_group.forgeproxy["blue"].name
-      GREEN_ASG_NAME          = aws_autoscaling_group.forgeproxy["green"].name
-      ACTIVE_HTTPS_TARGET_ARN = aws_lb_target_group.https[var.forgeproxy_active_slot].arn
-      ACTIVE_SSH_TARGET_ARN   = aws_lb_target_group.ssh[var.forgeproxy_active_slot].arn
+      AWS_REGION                   = var.aws_region
+      AWS_PROFILE_FALLBACK         = var.aws_profile
+      ACTIVE_SLOT                  = var.forgeproxy_active_slot
+      DESIRED_COUNT                = tostring(var.forgeproxy_count)
+      BLUE_ASG_NAME                = aws_autoscaling_group.forgeproxy["blue"].name
+      GREEN_ASG_NAME               = aws_autoscaling_group.forgeproxy["green"].name
+      ACTIVE_HTTPS_TARGET_ARN      = aws_lb_target_group.https[var.forgeproxy_active_slot].arn
+      ACTIVE_SSH_TARGET_ARN        = aws_lb_target_group.ssh[var.forgeproxy_active_slot].arn
+      BLUE_HTTPS_TARGET_ARN        = aws_lb_target_group.https["blue"].arn
+      GREEN_HTTPS_TARGET_ARN       = aws_lb_target_group.https["green"].arn
+      NLB_ARN                      = aws_lb.nlb.arn
+      BLUE_LAUNCH_TEMPLATE_VERSION = tostring(aws_launch_template.forgeproxy["blue"].latest_version)
+      GREEN_LAUNCH_TEMPLATE_VERSION = tostring(
+        aws_launch_template.forgeproxy["green"].latest_version
+      )
     }
     interpreter = ["/usr/bin/env", "bash"]
   }
