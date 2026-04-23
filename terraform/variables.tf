@@ -100,6 +100,17 @@ variable "forgeproxy_count" {
   }
 }
 
+variable "forgeproxy_health_check_grace_period_secs" {
+  type        = number
+  default     = 1800
+  description = "Seconds an Auto Scaling Group should ignore ELB/NLB health-check failures after launching a forgeproxy instance before considering it for replacement."
+
+  validation {
+    condition     = var.forgeproxy_health_check_grace_period_secs >= 0
+    error_message = "forgeproxy_health_check_grace_period_secs must be greater than or equal to 0."
+  }
+}
+
 variable "forgeproxy_active_slot" {
   type        = string
   default     = null
