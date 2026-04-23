@@ -88,14 +88,23 @@ pub async fn fetch_ref_advertisement(
                 .await
                 .context("failed to read ref advertisement body")?;
 
-            let stripped = strip_http_service_line(&body).to_vec();
-            let (stripped, bundle_uri_result) =
-                crate::http::protocolv2::inject_bundle_uri_with_result(&stripped, "");
-            crate::metrics::inc_bundle_uri_advertisement(
-                &state.metrics,
-                owner_repo,
-                bundle_uri_result.as_metric_label(),
-            );
+            let stripped = strip_http_service_line(&body);
+            let stripped = if state.config().repository_is_delegated(owner_repo) {
+                info!(
+                    %owner_repo,
+                    "repository is delegated to upstream; forwarding SSH ref advertisement without bundle-uri injection"
+                );
+                stripped.to_vec()
+            } else {
+                let (stripped, bundle_uri_result) =
+                    crate::http::protocolv2::inject_bundle_uri_with_result(stripped, "");
+                crate::metrics::inc_bundle_uri_advertisement(
+                    &state.metrics,
+                    owner_repo,
+                    bundle_uri_result.as_metric_label(),
+                );
+                stripped
+            };
 
             state
                 .metrics

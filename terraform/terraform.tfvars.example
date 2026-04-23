@@ -104,6 +104,7 @@ request_wait_for_active_local_catch_up_secs = 300
 request_time_s3_restore_secs = 0
 generation_publish_secs = 0
 local_upload_pack_first_byte_secs = 0
+delegated_repositories = []
 pack_cache_on_demand_composite_total_secs = 0
 pack_cache_request_delta_pack_secs = 0
 prewarm_enabled = false

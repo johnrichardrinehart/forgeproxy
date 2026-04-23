@@ -165,6 +165,11 @@ impl FirstByteMetricContext {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HttpUpstreamProxyBehavior {
+    capture_for_hydration: bool,
+}
+
 async fn await_first_local_upload_pack_chunk(
     mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     timeout: Option<std::time::Duration>,
@@ -537,6 +542,15 @@ async fn handle_info_refs(
             .into_response());
     }
 
+    let repo_slug = crate::repo_identity::canonical_owner_repo(&owner, &repo);
+    if state.config().repository_is_delegated(&repo_slug) {
+        info!(
+            repo = %repo_slug,
+            "repository is delegated to upstream; proxying info/refs without bundle-uri injection"
+        );
+        return proxy_info_refs_to_upstream(&state, &owner, &repo, &service, &headers).await;
+    }
+
     let auth_header = extract_optional_auth_header(&headers);
     let metric_username = crate::auth::http_validator::metric_username_for_http_request(
         &state,
@@ -600,7 +614,6 @@ async fn handle_info_refs(
 
     let (modified_body, bundle_uri_result) =
         crate::http::protocolv2::inject_bundle_uri_with_result(&upstream_bytes, &bundle_list_url);
-    let repo_slug = crate::repo_identity::canonical_owner_repo(&owner, &repo);
     let bundle_uri_result_label = bundle_uri_result.as_metric_label();
     crate::metrics::inc_bundle_uri_advertisement(
         &state.metrics,
@@ -716,6 +729,38 @@ async fn handle_upload_pack(
         git_protocol.as_deref(),
     )
     .unwrap_or_default();
+    let client_fingerprint = http_git_client_fingerprint(&headers, &metric_username, &owner, &repo);
+    let repository_delegated = state.config().repository_is_delegated(&repo_slug);
+    if repository_delegated {
+        info!(
+            repo = %repo_slug,
+            "repository is delegated to upstream; proxying upload-pack without cache or hydration"
+        );
+        let response = proxy_upload_pack_to_upstream(
+            &state,
+            &owner,
+            &repo,
+            auth_header.as_deref(),
+            body,
+            decoded_body,
+            CloneCompletion {
+                cache_status: CacheStatus::Cold,
+                started_at,
+                metric_username,
+                metric_repo: repo_slug,
+            },
+            &headers,
+            request_metadata,
+            format!("http-{}", Uuid::new_v4().simple()),
+            client_fingerprint,
+            HttpUpstreamProxyBehavior {
+                capture_for_hydration: false,
+            },
+        )
+        .await?;
+
+        return Ok(response);
+    }
     let wants = request_metadata.want_oids.clone();
     let want_sample = wants
         .iter()
@@ -726,7 +771,6 @@ async fn handle_upload_pack(
     let local_http_access =
         local_http_clone_access(&state, auth_header.as_deref(), &owner, &repo).await;
     let local_authz_confirmed = local_http_access == LocalHttpAccess::Confirmed;
-    let client_fingerprint = http_git_client_fingerprint(&headers, &metric_username, &owner, &repo);
     let recent_advertised_refs = state
         .recent_advertised_refs(&repo_slug, &client_fingerprint)
         .await;
@@ -1037,6 +1081,9 @@ async fn handle_upload_pack(
         request_metadata,
         git_session_id,
         client_fingerprint,
+        HttpUpstreamProxyBehavior {
+            capture_for_hydration: true,
+        },
     )
     .await?;
 
@@ -2170,6 +2217,7 @@ async fn proxy_upload_pack_to_upstream(
     request_metadata: crate::tee_hydration::CapturedFetchMetadata,
     git_session_id: String,
     client_fingerprint: String,
+    behavior: HttpUpstreamProxyBehavior,
 ) -> Result<Response, AppError> {
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
     let upstream_url = format!(
@@ -2178,28 +2226,36 @@ async fn proxy_upload_pack_to_upstream(
         owner,
         repo,
     );
-    let upstream_clone_permits =
-        match crate::coordination::registry::try_acquire_clone_hydration_permits(state, &owner_repo)
+    let upstream_clone_permits = if behavior.capture_for_hydration {
+        Some(
+            match crate::coordination::registry::try_acquire_clone_hydration_permits(
+                state,
+                &owner_repo,
+            )
             .await
             .map_err(AppError::Internal)?
-        {
-            Ok(permits) => permits,
-            Err(reason) => {
-                warn!(
-                    repo = %owner_repo,
-                    reason = reason.as_metric_reason(),
-                    "upstream upload-pack proxy is saturated; asking nginx to fall back to upstream"
-                );
-                crate::metrics::inc_upstream_fallback(
-                    &state.metrics,
-                    Protocol::Https,
-                    reason.as_metric_reason(),
-                );
-                return Err(AppError::UpstreamFallback(
-                    "Upstream clone capacity is saturated. Please retry later.\n".to_string(),
-                ));
-            }
-        };
+            {
+                Ok(permits) => permits,
+                Err(reason) => {
+                    warn!(
+                        repo = %owner_repo,
+                        reason = reason.as_metric_reason(),
+                        "upstream upload-pack proxy is saturated; asking nginx to fall back to upstream"
+                    );
+                    crate::metrics::inc_upstream_fallback(
+                        &state.metrics,
+                        Protocol::Https,
+                        reason.as_metric_reason(),
+                    );
+                    return Err(AppError::UpstreamFallback(
+                        "Upstream clone capacity is saturated. Please retry later.\n".to_string(),
+                    ));
+                }
+            },
+        )
+    } else {
+        None
+    };
 
     let req =
         apply_forwarded_request_headers(state.http_client.post(&upstream_url), request_headers);
@@ -2207,12 +2263,11 @@ async fn proxy_upload_pack_to_upstream(
     let upstream_resp = match req.body(body).send().await {
         Ok(response) => response,
         Err(error) => {
-            crate::coordination::registry::release_clone_hydration_permits(
-                state,
-                upstream_clone_permits,
-            )
-            .await
-            .map_err(AppError::Internal)?;
+            if let Some(permits) = upstream_clone_permits {
+                crate::coordination::registry::release_clone_hydration_permits(state, permits)
+                    .await
+                    .map_err(AppError::Internal)?;
+            }
             let config = state.config();
             let upstream_host = crate::git::commands::redact_url_secret(
                 &config.upstream.git_url_base(),
@@ -2245,12 +2300,11 @@ async fn proxy_upload_pack_to_upstream(
             want_sample,
             "cannot satisfy HTTP upload-pack request from local disk and upstream upload-pack failed"
         );
-        crate::coordination::registry::release_clone_hydration_permits(
-            state,
-            upstream_clone_permits,
-        )
-        .await
-        .map_err(AppError::Internal)?;
+        if let Some(permits) = upstream_clone_permits {
+            crate::coordination::registry::release_clone_hydration_permits(state, permits)
+                .await
+                .map_err(AppError::Internal)?;
+        }
         return forward_upstream_response(upstream_resp).await;
     }
 
@@ -2313,7 +2367,7 @@ async fn proxy_upload_pack_to_upstream(
         .map(|recent| recent.advertised_refs.clone());
     tokio::spawn(
         async move {
-            let mut upstream_clone_permits = Some(upstream_clone_permits);
+            let mut upstream_clone_permits = upstream_clone_permits;
             let mut stream = upstream_resp.bytes_stream();
             let mut ls_refs_response =
                 if request_phase == crate::tee_hydration::UploadPackRequestPhase::V2LsRefs {
@@ -2330,7 +2384,8 @@ async fn proxy_upload_pack_to_upstream(
                 UpstreamHydrationRequest {
                     advertised_refs: advertised_refs.as_ref(),
                     request_body: &capture_body,
-                    enable_hydration: request_phase.expects_local_pack_serve(),
+                    enable_hydration: request_phase.expects_local_pack_serve()
+                        && upstream_clone_permits.is_some(),
                 },
             )
             .await;
