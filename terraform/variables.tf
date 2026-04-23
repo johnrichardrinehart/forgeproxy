@@ -102,12 +102,12 @@ variable "forgeproxy_count" {
 
 variable "forgeproxy_active_slot" {
   type        = string
-  default     = "blue"
-  description = "Blue/green deployment slot that should receive production traffic after apply. Flip this value on each rollout when the forgeproxy launch template changes so Terraform can stage the new revision on the standby slot before cutover."
+  default     = null
+  description = "Optional blue/green deployment slot override that should receive production traffic after apply. Leave null to alternate automatically from the currently live slot."
 
   validation {
-    condition     = contains(["blue", "green"], var.forgeproxy_active_slot)
-    error_message = "forgeproxy_active_slot must be either 'blue' or 'green'."
+    condition     = var.forgeproxy_active_slot == null || contains(["blue", "green"], var.forgeproxy_active_slot)
+    error_message = "forgeproxy_active_slot must be null, 'blue', or 'green'."
   }
 }
 
