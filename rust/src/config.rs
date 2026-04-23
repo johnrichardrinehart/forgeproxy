@@ -158,8 +158,8 @@ fn default_config_reload_interval_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrewarmConfig {
-    /// Restore/publish selected repositories during startup before `/readyz`
-    /// reports ready.
+    /// Best-effort initialize selected repositories during startup before
+    /// `/readyz` reports ready.
     #[serde(default)]
     pub enabled: bool,
     /// Canonical `owner/repo` repository names to pre-warm on this instance.
