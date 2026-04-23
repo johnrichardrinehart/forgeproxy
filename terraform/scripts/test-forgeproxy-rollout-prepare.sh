@@ -188,7 +188,7 @@ run_expect_success() {
 }
 
 run_expect_fail "stale_same_slot"
-grep -q "Flip forgeproxy_active_slot to the opposite color" "${tmpdir}/stale_same_slot.err"
+grep -q "Leave forgeproxy_active_slot unset for automatic alternation" "${tmpdir}/stale_same_slot.err"
 
 run_expect_success "bootstrap_unattached"
 grep -q "skipping health wait during bootstrap" "${tmpdir}/bootstrap_unattached.out"

@@ -104,7 +104,7 @@ enforce_blue_green_slot_flip() {
 Refusing rollout: forgeproxy_active_slot is still '${active_slot}', but the currently live slot is running launch template version ${version} while Terraform wants ${active_launch_template_version}.
 
 This would replace instances in the live slot instead of staging the new revision on the standby slot first.
-Flip forgeproxy_active_slot to the opposite color for this apply, then rerun terraform apply.
+Leave forgeproxy_active_slot unset for automatic alternation, or set it to the opposite color for this apply, then rerun terraform apply.
 EOF
       exit 1
     fi
