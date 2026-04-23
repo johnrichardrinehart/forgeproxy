@@ -511,6 +511,17 @@ variable "prewarm_max_concurrent" {
   }
 }
 
+variable "prewarm_force_open_secs" {
+  type        = number
+  default     = 1500
+  description = "Maximum seconds startup pre-warm may hold /readyz closed before readiness force-opens and /healthz reports degraded warm-up state."
+
+  validation {
+    condition     = var.prewarm_force_open_secs > 0
+    error_message = "prewarm_force_open_secs must be greater than 0."
+  }
+}
+
 variable "eviction_policy" {
   type        = string
   default     = "lfu"
