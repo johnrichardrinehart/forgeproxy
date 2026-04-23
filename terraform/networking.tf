@@ -310,9 +310,11 @@ resource "aws_lb" "nlb" {
   }
 }
 
-# ── Target Group: HTTPS (port 443) ──────────────────────────────────────────
+# ── Target Groups: forgeproxy HTTPS (port 443) ──────────────────────────────
 resource "aws_lb_target_group" "https" {
-  name        = "${var.name_prefix}-https-tg"
+  for_each = toset(["blue", "green"])
+
+  name        = "${var.name_prefix}-${each.key}-https-tg"
   port        = 443
   protocol    = local.https_target_group_protocol
   vpc_id      = local.vpc_id
@@ -331,13 +333,15 @@ resource "aws_lb_target_group" "https" {
   }
 
   tags = {
-    Name = "${var.name_prefix}-https-tg"
+    Name = "${var.name_prefix}-${each.key}-https-tg"
   }
 }
 
-# ── Target Group: SSH Git (port 2222) ───────────────────────────────────────
+# ── Target Groups: forgeproxy SSH Git (port 2222) ───────────────────────────
 resource "aws_lb_target_group" "ssh" {
-  name        = "${var.name_prefix}-ssh-tg"
+  for_each = toset(["blue", "green"])
+
+  name        = "${var.name_prefix}-${each.key}-ssh-tg"
   port        = 2222
   protocol    = "TCP"
   vpc_id      = local.vpc_id
@@ -356,7 +360,7 @@ resource "aws_lb_target_group" "ssh" {
   }
 
   tags = {
-    Name = "${var.name_prefix}-ssh-tg"
+    Name = "${var.name_prefix}-${each.key}-ssh-tg"
   }
 }
 
@@ -369,9 +373,22 @@ resource "aws_lb_listener" "https" {
   ssl_policy        = var.nlb_tls_ssl_policy
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.https.arn
+    type = "forward"
+
+    forward {
+      target_group {
+        arn    = aws_lb_target_group.https["blue"].arn
+        weight = var.forgeproxy_active_slot == "blue" ? 100 : 0
+      }
+
+      target_group {
+        arn    = aws_lb_target_group.https["green"].arn
+        weight = var.forgeproxy_active_slot == "green" ? 100 : 0
+      }
+    }
   }
+
+  depends_on = [null_resource.forgeproxy_rollout_prepare]
 }
 
 resource "aws_lb_listener_certificate" "https_sni" {
@@ -387,7 +404,20 @@ resource "aws_lb_listener" "ssh" {
   port              = var.nlb_ssh_listen_port
   protocol          = "TCP"
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.ssh.arn
+    type = "forward"
+
+    forward {
+      target_group {
+        arn    = aws_lb_target_group.ssh["blue"].arn
+        weight = var.forgeproxy_active_slot == "blue" ? 100 : 0
+      }
+
+      target_group {
+        arn    = aws_lb_target_group.ssh["green"].arn
+        weight = var.forgeproxy_active_slot == "green" ? 100 : 0
+      }
+    }
   }
+
+  depends_on = [null_resource.forgeproxy_rollout_prepare]
 }

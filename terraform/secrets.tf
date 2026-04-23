@@ -74,6 +74,13 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     ghe_key_lookup_enabled                        = local.ghe_key_lookup_enabled
     ghe_key_lookup_url                            = local.ghe_key_lookup_enabled ? "http://${aws_lb.ghe_key_lookup[0].dns_name}:${local.ghe_key_lookup_listen_port}" : ""
   })
+
+  lifecycle {
+    # Forgeproxy instances and launch templates consume this version directly.
+    # Replacing the secret version must publish the new value before Terraform
+    # tries to destroy legacy instance/attachment edges still present in state.
+    create_before_destroy = true
+  }
 }
 
 resource "aws_secretsmanager_secret" "forgeproxy_otel_collector_config" {
