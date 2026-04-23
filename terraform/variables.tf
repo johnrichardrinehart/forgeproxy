@@ -103,7 +103,7 @@ variable "forgeproxy_count" {
 variable "forgeproxy_active_slot" {
   type        = string
   default     = "blue"
-  description = "Blue/green deployment slot that should receive production traffic after apply. Flip this value on each rollout to avoid mixed revisions behind the load balancer."
+  description = "Blue/green deployment slot that should receive production traffic after apply. Flip this value on each rollout when the forgeproxy launch template changes so Terraform can stage the new revision on the standby slot before cutover."
 
   validation {
     condition     = contains(["blue", "green"], var.forgeproxy_active_slot)
