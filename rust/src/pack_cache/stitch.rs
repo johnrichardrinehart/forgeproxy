@@ -10,7 +10,8 @@ use std::path::PathBuf;
 const MAX_PKT_LINE_LEN: usize = 65520;
 const PKT_HEADER_LEN: usize = 4;
 const SIDEBAND_PREFIX_LEN: usize = 1;
-const MAX_SIDEBAND_PACK_CHUNK: usize = MAX_PKT_LINE_LEN - PKT_HEADER_LEN - SIDEBAND_PREFIX_LEN;
+pub(crate) const MAX_SIDEBAND_PACK_CHUNK: usize =
+    MAX_PKT_LINE_LEN - PKT_HEADER_LEN - SIDEBAND_PREFIX_LEN;
 const SHA1_TRAILER_LEN: usize = 20;
 const PACK_HEADER_LEN: usize = 12;
 
@@ -297,15 +298,27 @@ fn encode_data_pkt(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+pub(crate) fn packfile_section_pkt() -> Vec<u8> {
+    encode_data_pkt(b"packfile\n")
+}
+
+pub(crate) fn flush_pkt() -> Vec<u8> {
+    b"0000".to_vec()
+}
+
+pub(crate) fn encode_sideband1_pkt(payload: &[u8]) -> Vec<u8> {
+    let packet_len = PKT_HEADER_LEN + SIDEBAND_PREFIX_LEN + payload.len();
+    let mut out = Vec::with_capacity(packet_len);
+    out.extend_from_slice(format!("{packet_len:04x}").as_bytes());
+    out.push(1);
+    out.extend_from_slice(payload);
+    out
+}
+
 fn sideband1_chunks(bytes: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
-    bytes.chunks(MAX_SIDEBAND_PACK_CHUNK).map(|chunk| {
-        let packet_len = PKT_HEADER_LEN + SIDEBAND_PREFIX_LEN + chunk.len();
-        let mut out = Vec::with_capacity(packet_len);
-        out.extend_from_slice(format!("{packet_len:04x}").as_bytes());
-        out.push(1);
-        out.extend_from_slice(chunk);
-        out
-    })
+    bytes
+        .chunks(MAX_SIDEBAND_PACK_CHUNK)
+        .map(encode_sideband1_pkt)
 }
 
 fn emit_sideband1<F>(bytes: &[u8], emit: &mut F) -> Result<()>
