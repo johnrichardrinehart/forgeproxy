@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ const S3_MULTIPART_MIN_PART_SIZE_BYTES: u64 = 5 * MIB;
 const S3_MULTIPART_DEFAULT_PART_SIZE_BYTES: u64 = 64 * MIB;
 const S3_MULTIPART_MAX_PART_SIZE_BYTES: u64 = 5 * GIB;
 const S3_MULTIPART_MAX_PARTS: u64 = 10_000;
+const S3_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 
 // ---------------------------------------------------------------------------
 // Free functions — operate on explicit bucket / key parameters.
@@ -42,18 +44,21 @@ pub async fn upload_bundle(
         return Ok(());
     }
 
-    let body = ByteStream::from_path(file_path)
-        .await
-        .with_context(|| format!("open file for upload: {}", file_path.display()))?;
-
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(body)
-        .send()
-        .await
-        .context("S3 PutObject")?;
+    retry_s3_operation("PutObject", bucket, key, || async {
+        let body = ByteStream::from_path(file_path)
+            .await
+            .with_context(|| format!("open file for upload: {}", file_path.display()))?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(body)
+            .send()
+            .await
+            .context("S3 PutObject")?;
+        Ok(())
+    })
+    .await?;
 
     metrics.metrics.s3_upload_bytes.inc_by(size_bytes);
     debug!(path = %file_path.display(), "bundle uploaded");
@@ -145,16 +150,19 @@ async fn upload_bundle_multipart_parts(
             break;
         }
 
-        let response = client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(ByteStream::from(buffer[..bytes_read].to_vec()))
-            .send()
-            .await
-            .with_context(|| format!("S3 UploadPart part_number={part_number}"))?;
+        let response = retry_s3_operation("UploadPart", bucket, key, || async {
+            client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(buffer[..bytes_read].to_vec()))
+                .send()
+                .await
+                .with_context(|| format!("S3 UploadPart part_number={part_number}"))
+        })
+        .await?;
         let e_tag = response
             .e_tag()
             .with_context(|| format!("S3 UploadPart part_number={part_number} missing ETag"))?
@@ -220,14 +228,18 @@ fn multipart_part_size(size_bytes: u64) -> Result<u64> {
 /// Upload an in-memory UTF-8 object to S3.
 #[instrument(skip(client), fields(%bucket, %key, size_bytes = contents.len()))]
 pub async fn upload_text(client: &Client, bucket: &str, key: &str, contents: &str) -> Result<()> {
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(contents.as_bytes().to_vec()))
-        .send()
-        .await
-        .context("S3 PutObject")?;
+    retry_s3_operation("PutObject", bucket, key, || async {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(contents.as_bytes().to_vec()))
+            .send()
+            .await
+            .context("S3 PutObject")?;
+        Ok(())
+    })
+    .await?;
 
     debug!(bytes = contents.len(), "S3 text object uploaded");
     Ok(())
@@ -236,13 +248,17 @@ pub async fn upload_text(client: &Client, bucket: &str, key: &str, contents: &st
 /// Delete an S3 object if present.
 #[instrument(skip(client), fields(%bucket, %key))]
 pub async fn delete_object_if_exists(client: &Client, bucket: &str, key: &str) -> Result<()> {
-    client
-        .delete_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .context("S3 DeleteObject")?;
+    retry_s3_operation("DeleteObject", bucket, key, || async {
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .context("S3 DeleteObject")?;
+        Ok(())
+    })
+    .await?;
     debug!("S3 object deleted");
     Ok(())
 }
@@ -263,25 +279,29 @@ pub async fn download_to_path(
             .with_context(|| format!("create parent directories for {}", file_path.display()))?;
     }
 
-    let response = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-        .context("S3 GetObject")?;
+    let total_bytes = retry_s3_operation("GetObject", bucket, key, || async {
+        let response = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .context("S3 GetObject")?;
 
-    let mut file = tokio::fs::File::create(file_path)
-        .await
-        .with_context(|| format!("create downloaded object at {}", file_path.display()))?;
+        let mut file = tokio::fs::File::create(file_path)
+            .await
+            .with_context(|| format!("create downloaded object at {}", file_path.display()))?;
 
-    let mut reader = response.body.into_async_read();
-    let total_bytes = tokio::io::copy(&mut reader, &mut file)
-        .await
-        .context("stream S3 object body to disk")?;
-    file.flush()
-        .await
-        .with_context(|| format!("flush downloaded object to {}", file_path.display()))?;
+        let mut reader = response.body.into_async_read();
+        let total_bytes = tokio::io::copy(&mut reader, &mut file)
+            .await
+            .context("stream S3 object body to disk")?;
+        file.flush()
+            .await
+            .with_context(|| format!("flush downloaded object to {}", file_path.display()))?;
+        Ok(total_bytes)
+    })
+    .await?;
 
     metrics.metrics.s3_download_bytes.inc_by(total_bytes);
     debug!(path = %file_path.display(), bytes = total_bytes, "S3 object downloaded");
@@ -297,25 +317,33 @@ pub async fn download_bytes_if_exists(
     bucket: &str,
     key: &str,
 ) -> Result<Option<Vec<u8>>> {
-    let response = match client.get_object().bucket(bucket).key(key).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            if let Some(service_error) = error.as_service_error()
-                && (service_error.code() == Some("NoSuchKey")
-                    || service_error.code() == Some("NotFound"))
-            {
-                return Ok(None);
+    let maybe_bytes = retry_s3_operation("GetObject", bucket, key, || async {
+        let response = match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(service_error) = error.as_service_error()
+                    && (service_error.code() == Some("NoSuchKey")
+                        || service_error.code() == Some("NotFound"))
+                {
+                    return Ok(None);
+                }
+                return Err(error).context("S3 GetObject");
             }
-            return Err(error).context("S3 GetObject");
-        }
-    };
+        };
 
-    let bytes = response
-        .body
-        .collect()
-        .await
-        .context("read S3 object body")?
-        .into_bytes();
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .context("read S3 object body")?
+            .into_bytes();
+        Ok(Some(bytes))
+    })
+    .await?;
+
+    let Some(bytes) = maybe_bytes else {
+        return Ok(None);
+    };
 
     metrics.metrics.s3_download_bytes.inc_by(bytes.len() as u64);
     debug!(bytes = bytes.len(), "S3 object downloaded into memory");
@@ -346,12 +374,15 @@ pub async fn list_object_keys(client: &Client, bucket: &str, prefix: &str) -> Re
     let mut keys = Vec::new();
 
     loop {
-        let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
-        if let Some(token) = continuation_token.as_deref() {
-            request = request.continuation_token(token);
-        }
-
-        let response = request.send().await.context("S3 ListObjectsV2")?;
+        let request_continuation_token = continuation_token.clone();
+        let response = retry_s3_operation("ListObjectsV2", bucket, prefix, || async {
+            let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+            if let Some(token) = request_continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            request.send().await.context("S3 ListObjectsV2")
+        })
+        .await?;
 
         for object in response.contents() {
             if let Some(key) = object.key() {
@@ -395,9 +426,72 @@ pub async fn generate_presigned_url(
     Ok(url)
 }
 
+async fn retry_s3_operation<T, F, Fut>(
+    operation: &'static str,
+    bucket: &str,
+    object: &str,
+    mut action: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    retry_s3_operation_with_delays(operation, bucket, object, &S3_RETRY_DELAYS, &mut action).await
+}
+
+async fn retry_s3_operation_with_delays<T, F, Fut>(
+    operation: &'static str,
+    bucket: &str,
+    object: &str,
+    retry_delays: &[Duration],
+    action: &mut F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let total_attempts = retry_delays.len() + 1;
+    for attempt in 1..=total_attempts {
+        match action().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let error_chain = format!("{error:#}");
+                if let Some(delay) = retry_delays.get(attempt - 1) {
+                    warn!(
+                        operation,
+                        bucket,
+                        object,
+                        attempt,
+                        total_attempts,
+                        delay_ms = delay.as_millis(),
+                        error = %error_chain,
+                        "S3 operation failed; retrying"
+                    );
+                    tokio::time::sleep(*delay).await;
+                    continue;
+                }
+                warn!(
+                    operation,
+                    bucket,
+                    object,
+                    attempt,
+                    total_attempts,
+                    error = %error_chain,
+                    "S3 operation failed; no retries remaining"
+                );
+                return Err(error);
+            }
+        }
+    }
+
+    unreachable!("retry loop must return success or failure")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -440,5 +534,60 @@ mod tests {
 
         let eof_len = read_multipart_part(&mut reader, &mut buffer).await.unwrap();
         assert_eq!(eof_len, 0);
+    }
+
+    #[tokio::test]
+    async fn retry_s3_operation_retries_until_success() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let value = retry_s3_operation_with_delays(
+            "GetObject",
+            "bucket",
+            "key",
+            &[Duration::ZERO, Duration::ZERO],
+            &mut {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempt < 3 {
+                            anyhow::bail!("transient failure on attempt {attempt}");
+                        }
+                        Ok(attempt)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_s3_operation_stops_after_final_failure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let error = retry_s3_operation_with_delays::<(), _, _>(
+            "GetObject",
+            "bucket",
+            "key",
+            &[Duration::ZERO, Duration::ZERO],
+            &mut {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        anyhow::bail!("persistent failure on attempt {attempt}");
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(error.to_string(), "persistent failure on attempt 3");
     }
 }
