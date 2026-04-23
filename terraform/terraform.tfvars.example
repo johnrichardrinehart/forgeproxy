@@ -114,6 +114,7 @@ pack_cache_max_concurrent_background_warmings = 1
 prewarm_enabled = false
 prewarm_repos = []
 prewarm_max_concurrent = 2
+prewarm_force_open_secs = 1500
 bundle_pack_threads = 4
 logs_enabled = true
 traces_enabled = false
