@@ -3,6 +3,11 @@ output "nlb_dns_name" {
   description = "DNS name of the Network Load Balancer for use when configuring your DNS provider, such as MarkMonitor, Infoblox, Route 53, Google Cloud DNS, Azure DNS, etc."
 }
 
+output "nlb_zone_id" {
+  value       = aws_lb.nlb.zone_id
+  description = "Hosted zone ID of the Network Load Balancer for DNS alias records."
+}
+
 output "nlb_eip" {
   value       = var.nlb_internal ? null : aws_eip.nlb[0].public_ip
   description = "Elastic IP address of the Network Load Balancer (only set if nlb_internal=false)"
