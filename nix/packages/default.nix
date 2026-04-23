@@ -16,6 +16,8 @@
     ghe-key-lookup
     ghe-key-lookup-oci
     forgeproxy-cache-report
+    forgeproxy-rollout-prepare
+    forgeproxy-rollout-cleanup
     ;
 }
 // {

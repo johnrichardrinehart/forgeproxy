@@ -9,8 +9,15 @@ output "nlb_eip" {
 }
 
 output "forgeproxy_instance_ids" {
-  value       = aws_instance.forgeproxy[*].id
-  description = "List of forgeproxy instance IDs"
+  value = sort(
+    var.forgeproxy_active_slot == "blue" ? data.aws_instances.forgeproxy_blue.ids : data.aws_instances.forgeproxy_green.ids
+  )
+  description = "List of current forgeproxy instance IDs in the active deployment slot"
+}
+
+output "forgeproxy_active_slot" {
+  value       = var.forgeproxy_active_slot
+  description = "Blue/green deployment slot currently receiving production traffic"
 }
 
 output "valkey_instance_id" {

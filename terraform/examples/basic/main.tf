@@ -22,6 +22,7 @@ module "forgeproxy" {
 
   forgeproxy_instance_type               = var.forgeproxy_instance_type
   forgeproxy_count                       = var.forgeproxy_count
+  forgeproxy_active_slot                 = var.forgeproxy_active_slot
   forgeproxy_root_volume_gb              = var.forgeproxy_root_volume_gb
   forgeproxy_root_volume_iops            = var.forgeproxy_root_volume_iops
   forgeproxy_root_volume_throughput_mbps = var.forgeproxy_root_volume_throughput_mbps

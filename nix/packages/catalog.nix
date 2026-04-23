@@ -37,6 +37,14 @@ rec {
   ghe-key-lookup = final.callPackage ./ghe-key-lookup { };
   ghe-key-lookup-oci = final.callPackage ./ghe-key-lookup/oci.nix { };
   forgeproxy-cache-report = final.callPackage ./forgeproxy-cache-report { };
+  forgeproxy-rollout-prepare = final.callPackage ./rollout-script {
+    scriptName = "forgeproxy-rollout-prepare";
+    scriptPath = ../../terraform/scripts/forgeproxy-rollout-prepare.sh;
+  };
+  forgeproxy-rollout-cleanup = final.callPackage ./rollout-script {
+    scriptName = "forgeproxy-rollout-cleanup";
+    scriptPath = ../../terraform/scripts/forgeproxy-rollout-cleanup.sh;
+  };
 
   valkey-stock-jemalloc-no-tests = valkey-stock-jemalloc.overrideAttrs (_: {
     doCheck = false;

@@ -2,7 +2,7 @@
 
 This directory contains Terraform infrastructure-as-code for a fully dynamic, runtime-configured deployment of forgeproxy with:
 - Network Load Balancer for multi-instance support (TLS termination with SNI on 443, TCP on 2222)
-- Scalable forgeproxy instances (count-based)
+- Scalable forgeproxy instances managed by a launch template and Auto Scaling Group
 - Valkey instance for distributed caching
 - Optional ghe-key-lookup sidecar fleet (AMI + internal NLB + runtime config via Secrets Manager)
 - Automatic NixOS AMI building and registration
@@ -69,8 +69,8 @@ This will:
 3. Create security groups and NLB
 4. Generate internal TLS materials for backend services
 5. Create all AWS Secrets Manager secrets
-6. Launch Valkey and forgeproxy instances
-7. Attach instances to NLB target groups
+6. Launch Valkey and the forgeproxy Auto Scaling Group
+7. Wait for `/readyz` health checks before the NLB sends traffic to new forgeproxy instances
 
 ### 4. Apply the configuration
 
@@ -118,7 +118,7 @@ terraform output nlb_eip
 curl -k https://$(terraform output -raw nlb_eip)/healthz
 
 # SSH to instance via SSM
-aws ssm start-session --target $(terraform output -raw forgeproxy_instance_ids | jq -r '.[0]')
+aws ssm start-session --target $(terraform output -json forgeproxy_instance_ids | jq -r '.[0]')
 
 # Check logs
 sudo journalctl -u forgeproxy -f
@@ -205,10 +205,33 @@ Proper `depends_on` ordering ensures:
 2. S3 bucket → AMI build
 3. AMI build → TLS cert request (needs Valkey private IP)
 4. TLS resources → Secrets Manager secrets
-5. Secrets → EC2 instances
-6. EC2 instances → NLB attachments
+5. Secrets → forgeproxy launch template
+6. Launch template + target groups → forgeproxy Auto Scaling Group
+7. Auto Scaling Group waits for NLB health checks before an update is considered complete
 
 No manual steps required.
+
+### 6. Readiness-gated blue/green forgeproxy rollouts
+`terraform apply` now performs forgeproxy replacements as an infrastructure-level blue/green rollout: two Auto Scaling Groups, two sets of NLB target groups, listener cutover, then old-slot scale-down.
+
+This module intentionally does not use AWS CodeDeploy for this path. CodeDeploy is AWS's managed blue/green controller for EC2 deployments, but this repo deploys immutable AMIs via Terraform launch templates rather than an AppSpec-driven application revision with the CodeDeploy agent. Keeping the rollout at the ASG/NLB layer matches the existing deployment model, keeps the entire operation inside `terraform apply`, and still avoids mixed revisions behind the load balancer.
+
+The resulting rollout behavior is:
+- The inactive slot launches and warms on the updated launch template while the active slot remains registered with the production listeners.
+- The NLB health checks gate cutover on `/readyz`, so warm-up must finish before the new slot can receive production traffic.
+- Listener cutover moves all production traffic to a single slot at a time, avoiding mixed `git_revision` values from `/healthz`.
+- The previously active slot is only scaled down after listener cutover.
+
+Two helper entrypoints back this sequencing:
+- `terraform/scripts/forgeproxy-rollout-prepare.sh` scales and waits for the target slot.
+- `terraform/scripts/forgeproxy-rollout-cleanup.sh` scales the inactive slot down after cutover.
+
+Those helpers are also exposed as flake packages so they can be run with Nix-managed dependencies:
+
+```bash
+nix run .#forgeproxy-rollout-prepare
+nix run .#forgeproxy-rollout-cleanup
+```
 
 ## Operational Changes
 
