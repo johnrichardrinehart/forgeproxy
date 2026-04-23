@@ -2951,10 +2951,10 @@ async fn publish_repo_mirror_generation_inner(
             source,
             mirror = %mirror_path.display(),
             staged = %staged_repo_path.display(),
-            snapshot_mode = "git-clone-local",
+            snapshot_mode = "hardlink-with-git-clone-fallback",
             "materializing staged generation from mirror"
         );
-        crate::git::commands::git_clone_bare_local(&mirror_path, &staged_repo_path)
+        crate::git::commands::git_snapshot_bare_local(&mirror_path, &staged_repo_path)
             .await
             .with_context(|| {
                 format!(

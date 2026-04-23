@@ -16,7 +16,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -176,6 +176,144 @@ pub async fn git_clone_bare_local(source: &Path, dest: &Path) -> Result<()> {
 
     debug!("git clone --bare --local succeeded");
     Ok(())
+}
+
+/// Snapshot a local bare repo by copying mutable metadata and hard-linking
+/// object payloads when possible, falling back to `git clone --bare --local`.
+#[instrument(fields(source = %source.display(), dest = %dest.display()))]
+pub async fn git_snapshot_bare_local(source: &Path, dest: &Path) -> Result<()> {
+    let source = source.to_path_buf();
+    let dest = dest.to_path_buf();
+    let snapshot_result = tokio::task::spawn_blocking({
+        let source = source.clone();
+        let dest = dest.clone();
+        move || hardlink_bare_repo_snapshot(&source, &dest)
+    })
+    .await
+    .context("bare repo hardlink snapshot task join failed")?;
+
+    match snapshot_result {
+        Ok(()) => {
+            debug!("bare repo hardlink snapshot succeeded");
+            Ok(())
+        }
+        Err(error) => {
+            warn!(
+                source = %source.display(),
+                dest = %dest.display(),
+                error = %error,
+                "bare repo hardlink snapshot failed; falling back to git clone --bare --local"
+            );
+            if dest.exists() {
+                tokio::fs::remove_dir_all(&dest).await.with_context(|| {
+                    format!("remove partial bare repo snapshot {}", dest.display())
+                })?;
+            }
+            git_clone_bare_local(&source, &dest).await
+        }
+    }
+}
+
+fn hardlink_bare_repo_snapshot(source: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        bail!("destination already exists: {}", dest.display());
+    }
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("create bare repo snapshot {}", dest.display()))?;
+    snapshot_bare_repo_dir(source, dest, source, false)
+}
+
+fn snapshot_bare_repo_dir(
+    source: &Path,
+    dest: &Path,
+    root: &Path,
+    under_objects: bool,
+) -> Result<()> {
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("read bare repo {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("read bare repo entry {}", source.display()))?;
+        let source_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat bare repo entry {}", source_path.display()))?;
+        let relative = source_path.strip_prefix(root).unwrap_or(&source_path);
+        if skip_snapshot_path(relative) {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&dest_path).with_context(|| {
+                format!("create bare repo snapshot dir {}", dest_path.display())
+            })?;
+            snapshot_bare_repo_dir(
+                &source_path,
+                &dest_path,
+                root,
+                under_objects || relative == Path::new("objects"),
+            )?;
+        } else if file_type.is_file() {
+            if should_hardlink_bare_object_file(relative, under_objects) {
+                std::fs::hard_link(&source_path, &dest_path).with_context(|| {
+                    format!(
+                        "hard-link bare repo object {} to {}",
+                        source_path.display(),
+                        dest_path.display()
+                    )
+                })?;
+            } else {
+                std::fs::copy(&source_path, &dest_path).with_context(|| {
+                    format!(
+                        "copy bare repo metadata {} to {}",
+                        source_path.display(),
+                        dest_path.display()
+                    )
+                })?;
+            }
+        } else {
+            bail!(
+                "unsupported bare repo entry type: {}",
+                source_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn skip_snapshot_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".lock") || name.starts_with("tmp_"))
+}
+
+fn should_hardlink_bare_object_file(path: &Path, under_objects: bool) -> bool {
+    if !under_objects {
+        return false;
+    }
+    let mut components = path.components();
+    if components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        != Some("objects")
+    {
+        return false;
+    }
+    let Some(first) = components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+    else {
+        return false;
+    };
+
+    if first.len() == 2 && first.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return true;
+    }
+    first == "pack"
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "pack" | "idx" | "bitmap" | "rev"))
 }
 
 /// Run `git clone --bare --shared <source> <dest>` for a local bare repo.
@@ -1586,6 +1724,233 @@ remote: Total 42 (delta 10), reused 40 (delta 8), pack-reused 0
     #[test]
     fn parse_bytes_received_missing() {
         assert_eq!(parse_bytes_received("nothing here"), 0);
+    }
+
+    #[tokio::test]
+    async fn hardlink_snapshot_bare_local_preserves_refs_and_objects() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let work_path = tempdir.path().join("work");
+        let source_path = tempdir.path().join("source.git");
+        let snapshot_path = tempdir.path().join("snapshot.git");
+
+        assert_git_success(StdCommand::new("git").arg("init").arg(&work_path));
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User"),
+        );
+        std::fs::write(work_path.join("file.txt"), "hello\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("initial"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("clone")
+                .arg("--bare")
+                .arg(&work_path)
+                .arg(&source_path),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&source_path)
+                .arg("repack")
+                .arg("-ad"),
+        );
+
+        git_snapshot_bare_local(&source_path, &snapshot_path)
+            .await
+            .unwrap();
+
+        let source_head = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&source_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        );
+        let snapshot_head = git_stdout(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&snapshot_path)
+                .arg("rev-parse")
+                .arg("HEAD"),
+        );
+        assert_eq!(source_head, snapshot_head);
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&snapshot_path)
+                .arg("fsck")
+                .arg("--no-progress"),
+        );
+    }
+
+    #[tokio::test]
+    async fn hardlink_snapshot_bare_local_supports_smart_clone() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let work_path = tempdir.path().join("work");
+        let source_path = tempdir.path().join("source.git");
+        let snapshot_path = tempdir.path().join("snapshot.git");
+        let clone_path = tempdir.path().join("clone");
+
+        assert_git_success(StdCommand::new("git").arg("init").arg(&work_path));
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.email")
+                .arg("test@example.com"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("config")
+                .arg("user.name")
+                .arg("Test User"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("checkout")
+                .arg("-b")
+                .arg("main"),
+        );
+
+        std::fs::write(work_path.join("README.md"), "hello\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("add")
+                .arg("."),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("main"),
+        );
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("checkout")
+                .arg("-b")
+                .arg("side"),
+        );
+        std::fs::write(work_path.join("side.txt"), "side\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("add")
+                .arg("side.txt"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("side"),
+        );
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("checkout")
+                .arg("--orphan")
+                .arg("unrelated"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("rm")
+                .arg("-rf")
+                .arg("."),
+        );
+        std::fs::write(work_path.join("unrelated.txt"), "unrelated\n").unwrap();
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("add")
+                .arg("unrelated.txt"),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&work_path)
+                .arg("commit")
+                .arg("-m")
+                .arg("unrelated"),
+        );
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("clone")
+                .arg("--bare")
+                .arg(&work_path)
+                .arg(&source_path),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&source_path)
+                .arg("repack")
+                .arg("-ad"),
+        );
+
+        git_snapshot_bare_local(&source_path, &snapshot_path)
+            .await
+            .unwrap();
+
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("clone")
+                .arg("--no-local")
+                .arg(format!("file://{}", snapshot_path.display()))
+                .arg(&clone_path),
+        );
+        assert_git_success(
+            StdCommand::new("git")
+                .arg("-C")
+                .arg(&clone_path)
+                .arg("fsck")
+                .arg("--no-progress"),
+        );
     }
 
     #[test]
