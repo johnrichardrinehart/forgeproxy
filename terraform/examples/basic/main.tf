@@ -69,6 +69,7 @@ module "forgeproxy" {
   request_time_s3_restore_secs                = var.request_time_s3_restore_secs
   generation_publish_secs                     = var.generation_publish_secs
   local_upload_pack_first_byte_secs           = var.local_upload_pack_first_byte_secs
+  delegated_repositories                      = var.delegated_repositories
   max_concurrent_local_upload_packs           = var.max_concurrent_local_upload_packs
   max_concurrent_local_upload_packs_per_repo  = var.max_concurrent_local_upload_packs_per_repo
   index_pack_threads                          = var.index_pack_threads

@@ -1558,6 +1558,8 @@ impl Handler for SshSession {
                             authenticated,
                             "upstream proxy: request complete"
                         );
+                        let capture_for_hydration = request_kind == V2RequestKind::Fetch
+                            && !state.config().repository_is_delegated(&owner_repo);
                         proxy_upstream_upload_pack(
                             UpstreamUploadPackContext {
                                 state: Arc::clone(&state),
@@ -1579,7 +1581,7 @@ impl Handler for SshSession {
                             UpstreamUploadPackBehavior {
                                 warn_on_disconnect: true,
                                 should_close_channel: request_kind == V2RequestKind::Fetch,
-                                capture_for_hydration: request_kind == V2RequestKind::Fetch,
+                                capture_for_hydration,
                             },
                         )
                         .await;
@@ -1621,6 +1623,8 @@ impl Handler for SshSession {
             .make_span("ssh_upload_pack", "post-upload-pack");
             tokio::spawn(
                 async move {
+                    let capture_for_hydration = request_kind == V2RequestKind::Fetch
+                        && !state.config().repository_is_delegated(&owner_repo);
                     proxy_upstream_upload_pack(
                         UpstreamUploadPackContext {
                             state,
@@ -1642,7 +1646,7 @@ impl Handler for SshSession {
                         UpstreamUploadPackBehavior {
                             warn_on_disconnect: true,
                             should_close_channel: request_kind == V2RequestKind::Fetch,
-                            capture_for_hydration: request_kind == V2RequestKind::Fetch,
+                            capture_for_hydration,
                         },
                     )
                     .await;
@@ -1697,6 +1701,8 @@ impl Handler for SshSession {
             .make_span("ssh_upload_pack", "channel-eof");
             tokio::spawn(
                 async move {
+                    let capture_for_hydration =
+                        !state.config().repository_is_delegated(&owner_repo);
                     proxy_upstream_upload_pack(
                         UpstreamUploadPackContext {
                             state,
@@ -1718,7 +1724,7 @@ impl Handler for SshSession {
                         UpstreamUploadPackBehavior {
                             warn_on_disconnect: false,
                             should_close_channel: true,
-                            capture_for_hydration: true,
+                            capture_for_hydration,
                         },
                     )
                     .await;
@@ -1926,8 +1932,9 @@ impl Handler for SshSession {
 
                 let repo_cached_locally = self.cache_manager.has_repo(&repo);
                 let route_v2_through_upstream = self.git_protocol.as_deref() == Some("version=2");
+                let repository_delegated = self.state.config().repository_is_delegated(&repo);
 
-                if repo_cached_locally && !route_v2_through_upstream {
+                if repo_cached_locally && !route_v2_through_upstream && !repository_delegated {
                     let clone_started = Instant::now();
                     // ── Serve from local cache via bidirectional upload-pack ──
                     let Some(channel) = self.channels.get(&channel_id).cloned() else {
@@ -2167,7 +2174,13 @@ impl Handler for SshSession {
                         }
                     }
                 } else {
-                    if route_v2_through_upstream {
+                    if repository_delegated {
+                        info!(
+                            repo = %repo,
+                            has_local_repo = repo_cached_locally,
+                            "repository is delegated to upstream; proxying SSH upload-pack upstream"
+                        );
+                    } else if route_v2_through_upstream {
                         info!(
                             repo = %repo,
                             has_local_repo = repo_cached_locally,
@@ -2347,7 +2360,8 @@ async fn proxy_upstream_upload_pack(
     let _output_guard = output_lock.lock().await;
     let mut fetch_started_at = None;
     let mut fetch_cache_status = None;
-    if request_kind == V2RequestKind::BundleUri {
+    let repository_delegated = state.config().repository_is_delegated(&owner_repo);
+    if request_kind == V2RequestKind::BundleUri && !repository_delegated {
         let response = if authenticated {
             match crate::http::bundle_serve::bundle_uri_command_response(&state, &owner_repo).await
             {
@@ -2403,180 +2417,190 @@ async fn proxy_upstream_upload_pack(
         let advertised_ref_tips = advertised_refs
             .as_ref()
             .and_then(crate::coordination::registry::advertised_ref_tips);
-        if authenticated
-            && let Some(ref_tips) = advertised_ref_tips.as_ref()
-            && let Ok(key) = state.pack_cache.key_for_fresh_clone_with_ref_tips(
+        if repository_delegated {
+            fetch_cache_status = Some(CacheStatus::Cold);
+            info!(
+                repo = %owner_repo,
+                wants = wants.len(),
+                want_sample,
+                "repository is delegated to upstream; skipping SSH pack-cache and local serveability checks"
+            );
+        } else {
+            if authenticated
+                && let Some(ref_tips) = advertised_ref_tips.as_ref()
+                && let Ok(key) = state.pack_cache.key_for_fresh_clone_with_ref_tips(
+                    &owner_repo,
+                    &want_have,
+                    git_protocol.as_deref(),
+                    ref_tips,
+                )
+            {
+                match state.pack_cache.lookup_by_key(&key).await {
+                    Ok(Some(hit)) => {
+                        crate::metrics::inc_pack_cache_request(
+                            &state.metrics,
+                            Protocol::Ssh,
+                            "hit",
+                            "pre_local_decision",
+                        );
+                        match replay_ssh_pack_cache_hit(
+                            &state,
+                            &owner_repo,
+                            hit,
+                            &CloneCompletion {
+                                cache_status: CacheStatus::Warm,
+                                started_at: fetch_started_at
+                                    .expect("fetch start time must be set for fetch requests"),
+                                metric_username: metric_username.clone(),
+                                metric_repo: owner_repo.clone(),
+                            },
+                            LocalUploadPackReplayContext {
+                                handle: &handle,
+                                channel_states: &channel_states,
+                                channel_id,
+                                stream_channel: stream_channel.as_ref(),
+                                should_close_channel: behavior.should_close_channel,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(_) => return,
+                            Err(error) => {
+                                warn!(
+                                    repo = %owner_repo,
+                                    error = %error,
+                                    "SSH pack cache hit from advertised refs could not be replayed; continuing to local serveability check"
+                                );
+                                crate::metrics::inc_pack_cache_request(
+                                    &state.metrics,
+                                    Protocol::Ssh,
+                                    "bypass",
+                                    "pre_local_artifact_open_failed",
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            repo = %owner_repo,
+                            error = %error,
+                            "SSH pack cache hit lookup from advertised refs failed; continuing to local serveability check"
+                        );
+                    }
+                }
+            }
+            let auth_header = if authenticated {
+                build_clone_auth_header_for_repo(&state, &owner_repo).await
+            } else {
+                None
+            };
+            let short_circuit_budget = fetch_started_at
+                .map(|started_at| RequestBudget::from_config(state.config().as_ref(), started_at));
+            let local_decision = crate::coordination::registry::resolve_local_fetch_serveability(
+                &state,
                 &owner_repo,
-                &want_have,
-                git_protocol.as_deref(),
-                ref_tips,
+                &wants,
+                auth_header.as_deref(),
+                advertised_refs.as_ref(),
+                "ssh",
+                true,
+                short_circuit_budget,
             )
-        {
-            match state.pack_cache.lookup_by_key(&key).await {
-                Ok(Some(hit)) => {
-                    crate::metrics::inc_pack_cache_request(
-                        &state.metrics,
-                        Protocol::Ssh,
-                        "hit",
-                        "pre_local_decision",
+            .await;
+            fetch_cache_status = Some(crate::coordination::registry::clone_cache_status(
+                &local_decision,
+            ));
+            match &local_decision {
+                LocalServeDecision::SatisfiesWants {
+                    serve_from,
+                    restored_from_s3_for_request,
+                    want_count,
+                    ..
+                } => {
+                    info!(
+                        repo = %owner_repo,
+                        serve_from = %serve_from,
+                        wants = *want_count,
+                        want_sample,
+                        restored_from_s3_for_request = *restored_from_s3_for_request,
+                        "serving SSH fetch directly from local disk after want resolution"
                     );
-                    match replay_ssh_pack_cache_hit(
+                    if serve_local_upload_pack_once(
                         &state,
                         &owner_repo,
-                        hit,
-                        &CloneCompletion {
-                            cache_status: CacheStatus::Warm,
+                        *serve_from,
+                        &want_have,
+                        FreshClonePackCacheKeyContext {
+                            git_protocol: git_protocol.as_deref(),
+                            advertised_ref_tips: advertised_ref_tips.as_ref(),
+                        },
+                        CloneCompletion {
+                            cache_status: crate::coordination::registry::clone_cache_status(
+                                &local_decision,
+                            ),
                             started_at: fetch_started_at
                                 .expect("fetch start time must be set for fetch requests"),
                             metric_username: metric_username.clone(),
                             metric_repo: owner_repo.clone(),
                         },
-                        LocalUploadPackReplayContext {
-                            handle: &handle,
-                            channel_states: &channel_states,
+                        LocalUploadPackResponseContext {
+                            handle: handle.clone(),
+                            channel_states: Arc::clone(&channel_states),
                             channel_id,
-                            stream_channel: stream_channel.as_ref(),
+                            stream_channel: stream_channel.clone(),
                             should_close_channel: behavior.should_close_channel,
                         },
+                        short_circuit_budget,
                     )
                     .await
                     {
-                        Ok(_) => return,
-                        Err(error) => {
-                            warn!(
-                                repo = %owner_repo,
-                                error = %error,
-                                "SSH pack cache hit from advertised refs could not be replayed; continuing to local serveability check"
-                            );
-                            crate::metrics::inc_pack_cache_request(
-                                &state.metrics,
-                                Protocol::Ssh,
-                                "bypass",
-                                "pre_local_artifact_open_failed",
-                            );
-                        }
+                        return;
                     }
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(
+                LocalServeDecision::Unavailable {
+                    had_local_repo_before_check,
+                    restored_from_s3_for_request,
+                } => {
+                    info!(
                         repo = %owner_repo,
-                        error = %error,
-                        "SSH pack cache hit lookup from advertised refs failed; continuing to local serveability check"
+                        wants = wants.len(),
+                        want_sample,
+                        had_local_repo_before_check = *had_local_repo_before_check,
+                        restored_from_s3_for_request = *restored_from_s3_for_request,
+                        "cannot serve SSH fetch from local disk; no local published repo or request-time S3 restore is available"
                     );
                 }
-            }
-        }
-        let auth_header = if authenticated {
-            build_clone_auth_header_for_repo(&state, &owner_repo).await
-        } else {
-            None
-        };
-        let short_circuit_budget = fetch_started_at
-            .map(|started_at| RequestBudget::from_config(state.config().as_ref(), started_at));
-        let local_decision = crate::coordination::registry::resolve_local_fetch_serveability(
-            &state,
-            &owner_repo,
-            &wants,
-            auth_header.as_deref(),
-            advertised_refs.as_ref(),
-            "ssh",
-            true,
-            short_circuit_budget,
-        )
-        .await;
-        fetch_cache_status = Some(crate::coordination::registry::clone_cache_status(
-            &local_decision,
-        ));
-        match &local_decision {
-            LocalServeDecision::SatisfiesWants {
-                serve_from,
-                restored_from_s3_for_request,
-                want_count,
-                ..
-            } => {
-                info!(
-                    repo = %owner_repo,
-                    serve_from = %serve_from,
-                    wants = *want_count,
-                    want_sample,
-                    restored_from_s3_for_request = *restored_from_s3_for_request,
-                    "serving SSH fetch directly from local disk after want resolution"
-                );
-                if serve_local_upload_pack_once(
-                    &state,
-                    &owner_repo,
-                    *serve_from,
-                    &want_have,
-                    FreshClonePackCacheKeyContext {
-                        git_protocol: git_protocol.as_deref(),
-                        advertised_ref_tips: advertised_ref_tips.as_ref(),
-                    },
-                    CloneCompletion {
-                        cache_status: crate::coordination::registry::clone_cache_status(
-                            &local_decision,
-                        ),
-                        started_at: fetch_started_at
-                            .expect("fetch start time must be set for fetch requests"),
-                        metric_username: metric_username.clone(),
-                        metric_repo: owner_repo.clone(),
-                    },
-                    LocalUploadPackResponseContext {
-                        handle: handle.clone(),
-                        channel_states: Arc::clone(&channel_states),
-                        channel_id,
-                        stream_channel: stream_channel.clone(),
-                        should_close_channel: behavior.should_close_channel,
-                    },
-                    short_circuit_budget,
-                )
-                .await
-                {
-                    return;
+                LocalServeDecision::MissingWantedObjects {
+                    had_local_repo_before_check,
+                    restored_from_s3_for_request,
+                    want_count,
+                    missing_wants,
+                } => {
+                    let missing_sample = missing_wants
+                        .iter()
+                        .take(5)
+                        .map(|want| want.chars().take(12).collect::<String>())
+                        .collect::<Vec<String>>()
+                        .join(",");
+                    info!(
+                        repo = %owner_repo,
+                        wants = *want_count,
+                        missing_wants = missing_wants.len(),
+                        want_sample,
+                        missing_sample,
+                        had_local_repo_before_check = *had_local_repo_before_check,
+                        restored_from_s3_for_request = *restored_from_s3_for_request,
+                        "local disk can only partially satisfy SSH fetch; proxying upstream for missing objects or completeness"
+                    );
                 }
-            }
-            LocalServeDecision::Unavailable {
-                had_local_repo_before_check,
-                restored_from_s3_for_request,
-            } => {
-                info!(
-                    repo = %owner_repo,
-                    wants = wants.len(),
-                    want_sample,
-                    had_local_repo_before_check = *had_local_repo_before_check,
-                    restored_from_s3_for_request = *restored_from_s3_for_request,
-                    "cannot serve SSH fetch from local disk; no local published repo or request-time S3 restore is available"
-                );
-            }
-            LocalServeDecision::MissingWantedObjects {
-                had_local_repo_before_check,
-                restored_from_s3_for_request,
-                want_count,
-                missing_wants,
-            } => {
-                let missing_sample = missing_wants
-                    .iter()
-                    .take(5)
-                    .map(|want| want.chars().take(12).collect::<String>())
-                    .collect::<Vec<String>>()
-                    .join(",");
-                info!(
-                    repo = %owner_repo,
-                    wants = *want_count,
-                    missing_wants = missing_wants.len(),
-                    want_sample,
-                    missing_sample,
-                    had_local_repo_before_check = *had_local_repo_before_check,
-                    restored_from_s3_for_request = *restored_from_s3_for_request,
-                    "local disk can only partially satisfy SSH fetch; proxying upstream for missing objects or completeness"
-                );
             }
         }
     }
 
     let stream_channel = stream_channel;
     let mut stream_writer = stream_channel.as_ref().map(|channel| channel.make_writer());
-    let mut upstream_clone_permits =
+    let mut upstream_clone_permits = if behavior.capture_for_hydration {
         match crate::coordination::registry::try_acquire_clone_hydration_permits(
             &state,
             &owner_repo,
@@ -2622,7 +2646,10 @@ async fn proxy_upstream_upload_pack(
                 }
                 return;
             }
-        };
+        }
+    } else {
+        None
+    };
     match super::upstream::post_upload_pack_stream(
         &state,
         &owner_repo,
