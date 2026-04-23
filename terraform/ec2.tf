@@ -175,12 +175,12 @@ resource "aws_autoscaling_group" "forgeproxy" {
 
 resource "null_resource" "forgeproxy_rollout_prepare" {
   triggers = {
-    active_slot                  = var.forgeproxy_active_slot
+    active_slot                  = local.forgeproxy_target_slot
     desired_count                = tostring(var.forgeproxy_count)
     blue_asg_name                = aws_autoscaling_group.forgeproxy["blue"].name
     green_asg_name               = aws_autoscaling_group.forgeproxy["green"].name
-    active_https_target_group    = aws_lb_target_group.https[var.forgeproxy_active_slot].arn
-    active_ssh_target_group      = aws_lb_target_group.ssh[var.forgeproxy_active_slot].arn
+    active_https_target_group    = aws_lb_target_group.https[local.forgeproxy_target_slot].arn
+    active_ssh_target_group      = aws_lb_target_group.ssh[local.forgeproxy_target_slot].arn
     blue_launch_template_version = tostring(aws_launch_template.forgeproxy["blue"].latest_version)
     green_launch_template_version = tostring(
       aws_launch_template.forgeproxy["green"].latest_version
@@ -199,12 +199,12 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
     environment = {
       AWS_REGION                   = var.aws_region
       AWS_PROFILE_FALLBACK         = var.aws_profile
-      ACTIVE_SLOT                  = var.forgeproxy_active_slot
+      ACTIVE_SLOT                  = local.forgeproxy_target_slot
       DESIRED_COUNT                = tostring(var.forgeproxy_count)
       BLUE_ASG_NAME                = aws_autoscaling_group.forgeproxy["blue"].name
       GREEN_ASG_NAME               = aws_autoscaling_group.forgeproxy["green"].name
-      ACTIVE_HTTPS_TARGET_ARN      = aws_lb_target_group.https[var.forgeproxy_active_slot].arn
-      ACTIVE_SSH_TARGET_ARN        = aws_lb_target_group.ssh[var.forgeproxy_active_slot].arn
+      ACTIVE_HTTPS_TARGET_ARN      = aws_lb_target_group.https[local.forgeproxy_target_slot].arn
+      ACTIVE_SSH_TARGET_ARN        = aws_lb_target_group.ssh[local.forgeproxy_target_slot].arn
       BLUE_HTTPS_TARGET_ARN        = aws_lb_target_group.https["blue"].arn
       GREEN_HTTPS_TARGET_ARN       = aws_lb_target_group.https["green"].arn
       NLB_ARN                      = aws_lb.nlb.arn
@@ -219,7 +219,7 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
 
 resource "null_resource" "forgeproxy_rollout_cleanup" {
   triggers = {
-    active_slot                  = var.forgeproxy_active_slot
+    active_slot                  = local.forgeproxy_target_slot
     desired_count                = tostring(var.forgeproxy_count)
     blue_asg_name                = aws_autoscaling_group.forgeproxy["blue"].name
     green_asg_name               = aws_autoscaling_group.forgeproxy["green"].name
@@ -247,7 +247,7 @@ resource "null_resource" "forgeproxy_rollout_cleanup" {
     environment = {
       AWS_REGION                             = var.aws_region
       AWS_PROFILE_FALLBACK                   = var.aws_profile
-      ACTIVE_SLOT                            = var.forgeproxy_active_slot
+      ACTIVE_SLOT                            = local.forgeproxy_target_slot
       BLUE_ASG_NAME                          = aws_autoscaling_group.forgeproxy["blue"].name
       GREEN_ASG_NAME                         = aws_autoscaling_group.forgeproxy["green"].name
       NLB_DNS_NAME                           = aws_lb.nlb.dns_name

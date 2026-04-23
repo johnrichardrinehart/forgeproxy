@@ -15,7 +15,7 @@ output "forgeproxy_instance_ids" {
 
 output "forgeproxy_active_slot" {
   value       = module.forgeproxy.forgeproxy_active_slot
-  description = "Blue/green deployment slot currently receiving production traffic"
+  description = "Blue/green deployment slot configured to receive production traffic after apply"
 }
 
 output "valkey_instance_id" {

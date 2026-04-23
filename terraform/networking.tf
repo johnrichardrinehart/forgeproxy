@@ -388,12 +388,12 @@ resource "aws_lb_listener" "https" {
     forward {
       target_group {
         arn    = aws_lb_target_group.https["blue"].arn
-        weight = var.forgeproxy_active_slot == "blue" ? 100 : 0
+        weight = local.forgeproxy_target_slot == "blue" ? 100 : 0
       }
 
       target_group {
         arn    = aws_lb_target_group.https["green"].arn
-        weight = var.forgeproxy_active_slot == "green" ? 100 : 0
+        weight = local.forgeproxy_target_slot == "green" ? 100 : 0
       }
     }
   }
@@ -419,12 +419,12 @@ resource "aws_lb_listener" "ssh" {
     forward {
       target_group {
         arn    = aws_lb_target_group.ssh["blue"].arn
-        weight = var.forgeproxy_active_slot == "blue" ? 100 : 0
+        weight = local.forgeproxy_target_slot == "blue" ? 100 : 0
       }
 
       target_group {
         arn    = aws_lb_target_group.ssh["green"].arn
-        weight = var.forgeproxy_active_slot == "green" ? 100 : 0
+        weight = local.forgeproxy_target_slot == "green" ? 100 : 0
       }
     }
   }
