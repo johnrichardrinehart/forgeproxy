@@ -407,7 +407,7 @@ variable "request_wait_for_local_catch_up_secs" {
 
 variable "request_wait_for_active_local_catch_up_secs" {
   type        = number
-  default     = 300
+  default     = 360
   description = "Request path: seconds a client may wait for an active same-repo local catch-up before proxying upstream."
 }
 

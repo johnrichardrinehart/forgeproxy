@@ -28,7 +28,7 @@ let
         generation_coalescing_window_secs          = 60
         global_short_circuit_upstream_secs         = 0
         request_wait_for_local_catch_up_secs       = 30
-        request_wait_for_active_local_catch_up_secs = 300
+        request_wait_for_active_local_catch_up_secs = 360
         request_time_s3_restore_secs               = 0
         generation_publish_secs                    = 0
         local_upload_pack_first_byte_secs          = 0

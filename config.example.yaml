@@ -52,7 +52,7 @@ clone:
   request_wait_for_local_catch_up_secs: 30
   # Request path: when a same-repo local catch-up is already running, wait longer
   # for that work instead of stampeding into more full upstream proxy streams.
-  request_wait_for_active_local_catch_up_secs: 300
+  request_wait_for_active_local_catch_up_secs: 360
   # Stage-specific request-path budgets. Zero disables each stage-specific budget.
   request_time_s3_restore_secs: 0
   generation_publish_secs: 0
