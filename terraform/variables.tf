@@ -545,6 +545,17 @@ variable "pack_cache_max_concurrent_request_deltas" {
   }
 }
 
+variable "pack_cache_max_concurrent_background_warmings" {
+  type        = number
+  default     = 1
+  description = "Background path: maximum proactive pack-cache warm/composite delta builds per forgeproxy instance."
+
+  validation {
+    condition     = var.pack_cache_max_concurrent_background_warmings > 0
+    error_message = "pack_cache_max_concurrent_background_warmings must be greater than 0."
+  }
+}
+
 variable "pack_cache_min_response_bytes" {
   type        = number
   default     = 67108864 # 64 MiB

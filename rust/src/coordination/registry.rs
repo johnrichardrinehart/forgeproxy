@@ -2257,7 +2257,7 @@ fn semaphore_for_pack_cache_delta(
     priority: PackCacheDeltaPriority,
 ) -> std::sync::Arc<tokio::sync::Semaphore> {
     select_pack_cache_delta_semaphore(
-        &state.bundle_generation_semaphore,
+        &state.pack_cache_warming_semaphore,
         &state.request_pack_delta_semaphore,
         priority,
     )

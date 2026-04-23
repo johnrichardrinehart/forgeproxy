@@ -84,6 +84,7 @@ pack_cache:
   on_demand_composite_total_secs: 0
   request_delta_pack_secs: 0
   max_concurrent_request_deltas: 1
+  max_concurrent_background_warmings: 1
   min_response_bytes: 67108864
 prewarm:
   enabled: false

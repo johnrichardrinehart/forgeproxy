@@ -44,6 +44,7 @@ let
         pack_cache_on_demand_composite_total_secs  = 0
         pack_cache_request_delta_pack_secs         = 0
         pack_cache_max_concurrent_request_deltas   = 1
+        pack_cache_max_concurrent_background_warmings = 1
         pack_cache_min_response_bytes              = 67108864
         prewarm_enabled                            = false
         prewarm_repos                              = []

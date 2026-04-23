@@ -67,6 +67,7 @@ pack_cache:
   on_demand_composite_total_secs: ${pack_cache_on_demand_composite_total_secs}
   request_delta_pack_secs: ${pack_cache_request_delta_pack_secs}
   max_concurrent_request_deltas: ${pack_cache_max_concurrent_request_deltas}
+  max_concurrent_background_warmings: ${pack_cache_max_concurrent_background_warmings}
   min_response_bytes: ${pack_cache_min_response_bytes}
 
 prewarm:

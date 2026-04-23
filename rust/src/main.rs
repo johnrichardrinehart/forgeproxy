@@ -130,6 +130,9 @@ pub struct AppState {
     /// Semaphore limiting CPU-heavy background bundle/MIDX work. Request-time
     /// pack-cache delta generation has its own foreground semaphore.
     pub bundle_generation_semaphore: Arc<Semaphore>,
+    /// Semaphore limiting background pack-cache warming work. This is separate
+    /// from bundle/MIDX generation so both proactive lanes can make progress.
+    pub pack_cache_warming_semaphore: Arc<Semaphore>,
     /// Semaphore limiting request-time pack-cache delta generation. This is
     /// intentionally separate from background bundle generation so foreground
     /// clone misses do not queue behind proactive warming or index preparation.
@@ -904,6 +907,11 @@ fn ensure_reload_compatible(current: &Config, next: &Config) -> Result<()> {
         "pack_cache.max_concurrent_request_deltas",
     )?;
     ensure_same(
+        &current.pack_cache.max_concurrent_background_warmings,
+        &next.pack_cache.max_concurrent_background_warmings,
+        "pack_cache.max_concurrent_background_warmings",
+    )?;
+    ensure_same(
         &current.pack_cache.min_response_bytes,
         &next.pack_cache.min_response_bytes,
         "pack_cache.min_response_bytes",
@@ -1478,6 +1486,9 @@ async fn build_app_state(
         tee_capture_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_tee_captures)),
         bundle_generation_semaphore: Arc::new(Semaphore::new(
             bundle_execution_policy.max_concurrent_generations,
+        )),
+        pack_cache_warming_semaphore: Arc::new(Semaphore::new(
+            config.pack_cache.max_concurrent_background_warmings,
         )),
         request_pack_delta_semaphore: Arc::new(Semaphore::new(
             config.pack_cache.max_concurrent_request_deltas,
