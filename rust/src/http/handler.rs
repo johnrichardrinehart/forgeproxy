@@ -1153,6 +1153,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         config: state.config(),
         valkey: state.valkey.clone(),
         http_client: state.http_client.clone(),
+        prewarm: state.prewarm_status(),
     };
     crate::health::health_handler(axum::extract::State(health_state))
         .await
@@ -1181,6 +1182,7 @@ async fn handle_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         config: state.config(),
         valkey: state.valkey.clone(),
         http_client: state.http_client.clone(),
+        prewarm: state.prewarm_status(),
     };
     crate::health::health_handler(axum::extract::State(health_state))
         .await
