@@ -241,6 +241,25 @@ pub struct PackCacheWarmingSkipLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheWarmingLabels {
+    pub owner_repo: String,
+    pub kind: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheRefTipReadyLabels {
+    pub owner_repo: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheWarmingDurationLabels {
+    pub owner_repo: String,
+    pub kind: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PackCacheStitchLabels {
     pub owner_repo: String,
 }
@@ -470,6 +489,9 @@ pub struct Metrics {
     pub pack_cache_key_bypasses_total: Family<PackCacheKeyBypassLabels, Counter>,
     pub pack_cache_recent_entries: Family<PackCacheRecentEntriesLabels, Gauge>,
     pub pack_cache_warming_skips_total: Family<PackCacheWarmingSkipLabels, Counter>,
+    pub pack_cache_warming_total: Family<PackCacheWarmingLabels, Counter>,
+    pub pack_cache_ref_tip_ready: Family<PackCacheRefTipReadyLabels, Gauge>,
+    pub pack_cache_warming_duration_seconds: Family<PackCacheWarmingDurationLabels, Histogram>,
     pub pack_cache_artifact_generation_duration_seconds: Histogram,
     pub pack_cache_stitch_attempts_total: Family<PackCacheStitchLabels, Counter>,
     pub pack_cache_stitch_duration_seconds: Family<PackCacheStitchLabels, Histogram>,
@@ -808,6 +830,27 @@ impl Metrics {
             "Pack response cache proactive warming skips by repo and reason",
             pack_cache_warming_skips_total.clone(),
         );
+        let pack_cache_warming_total = Family::<PackCacheWarmingLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_warming",
+            "Pack response cache proactive warming attempts by repo, kind, and result",
+            pack_cache_warming_total.clone(),
+        );
+        let pack_cache_ref_tip_ready = Family::<PackCacheRefTipReadyLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_pack_cache_ref_tip_ready",
+            "Whether the current published generation has a directly usable full-tip pack cache entry for its current ref tips",
+            pack_cache_ref_tip_ready.clone(),
+        );
+        let pack_cache_warming_duration_seconds =
+            Family::<PackCacheWarmingDurationLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.1, 2.0, 16))
+            });
+        registry.register(
+            "forgeproxy_pack_cache_warming_duration_seconds",
+            "Pack response cache proactive warming duration by repo, kind, and result",
+            pack_cache_warming_duration_seconds.clone(),
+        );
 
         let pack_cache_artifact_generation_duration_seconds =
             Histogram::new(exponential_buckets(0.1, 2.0, 16));
@@ -968,6 +1011,9 @@ impl Metrics {
             pack_cache_key_bypasses_total,
             pack_cache_recent_entries,
             pack_cache_warming_skips_total,
+            pack_cache_warming_total,
+            pack_cache_ref_tip_ready,
+            pack_cache_warming_duration_seconds,
             pack_cache_artifact_generation_duration_seconds,
             pack_cache_stitch_attempts_total,
             pack_cache_stitch_duration_seconds,
@@ -1397,6 +1443,52 @@ pub fn inc_pack_cache_warming_skip(metrics: &MetricsRegistry, owner_repo: &str, 
             reason: reason.to_string(),
         })
         .inc();
+}
+
+pub fn inc_pack_cache_warming(
+    metrics: &MetricsRegistry,
+    owner_repo: &str,
+    kind: &str,
+    result: &str,
+) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_warming_total
+        .get_or_create(&PackCacheWarmingLabels {
+            owner_repo,
+            kind: kind.to_string(),
+            result: result.to_string(),
+        })
+        .inc();
+}
+
+pub fn set_pack_cache_ref_tip_ready(metrics: &MetricsRegistry, owner_repo: &str, ready: bool) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_ref_tip_ready
+        .get_or_create(&PackCacheRefTipReadyLabels { owner_repo })
+        .set(if ready { 1 } else { 0 });
+}
+
+pub fn observe_pack_cache_warming_duration(
+    metrics: &MetricsRegistry,
+    owner_repo: &str,
+    kind: &str,
+    result: &str,
+    elapsed: Duration,
+) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_warming_duration_seconds
+        .get_or_create(&PackCacheWarmingDurationLabels {
+            owner_repo,
+            kind: kind.to_string(),
+            result: result.to_string(),
+        })
+        .observe(elapsed.as_secs_f64());
 }
 
 pub fn observe_pack_cache_artifact_generation(metrics: &MetricsRegistry, elapsed: Duration) {
@@ -1907,6 +1999,15 @@ mod tests {
 
         inc_pack_cache_key_bypass(&metrics, Protocol::Https, "acme/widgets.git", "filtered");
         inc_pack_cache_warming_skip(&metrics, "acme/widgets.git", "no_recent_full_tip");
+        inc_pack_cache_warming(&metrics, "acme/widgets.git", "base", "ok");
+        set_pack_cache_ref_tip_ready(&metrics, "acme/widgets.git", true);
+        observe_pack_cache_warming_duration(
+            &metrics,
+            "acme/widgets.git",
+            "base",
+            "ok",
+            Duration::from_secs(3),
+        );
         replace_pack_cache_recent_entries(&metrics, &[("acme/widgets.git".to_string(), 4, 2)]);
 
         let encoded = encode_metrics(&metrics.registry);
@@ -1921,6 +2022,25 @@ mod tests {
             line.starts_with("forgeproxy_pack_cache_warming_skips_total{")
                 && line.contains("owner_repo=\"acme/widgets\"")
                 && line.contains("reason=\"no_recent_full_tip\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_warming_total{")
+                && line.contains("kind=\"base\"")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.contains("result=\"ok\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_ref_tip_ready{")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_warming_duration_seconds_count{")
+                && line.contains("kind=\"base\"")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.contains("result=\"ok\"")
                 && line.ends_with(" 1")
         }));
         assert!(encoded.lines().any(|line| {
