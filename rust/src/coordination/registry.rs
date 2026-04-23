@@ -4835,24 +4835,104 @@ async fn ensure_repo_available_locally_detailed(
     Ok(availability)
 }
 
-pub async fn prewarm_repo(state: &crate::AppState, owner_repo: &str) -> Result<()> {
-    if ensure_repo_available_locally_detailed(state, owner_repo, true)
-        .await?
-        .available
-    {
-        return Ok(());
-    }
+#[derive(Debug, Clone, Default)]
+pub struct PrewarmRepoReport {
+    pub initialized_locally: bool,
+    pub issues: Vec<String>,
+}
 
+pub async fn prewarm_repo(state: &crate::AppState, owner_repo: &str) -> PrewarmRepoReport {
     let Some((owner, repo)) = owner_repo.split_once('/') else {
-        anyhow::bail!("invalid prewarm repository slug: {owner_repo}");
+        return PrewarmRepoReport {
+            initialized_locally: false,
+            issues: vec![format!("invalid prewarm repository slug: {owner_repo}")],
+        };
     };
     let auth_header = prewarm_clone_auth_header(state, owner).await;
-    info!(
-        repo = %owner_repo,
-        has_auth_header = auth_header.is_some(),
-        "pre-warm did not find local or S3 state; falling back to upstream clone"
-    );
-    ensure_repo_cloned_from_upstream(state, owner, repo, auth_header.as_deref()).await
+
+    let local_available =
+        match ensure_repo_available_locally_detailed(state, owner_repo, false).await {
+            Ok(availability) => availability.available,
+            Err(error) => {
+                warn!(
+                    repo = %owner_repo,
+                    error = %error,
+                    error_chain = %format!("{error:#}"),
+                    "startup pre-warm could not inspect existing local repo state"
+                );
+                false
+            }
+        };
+    if local_available {
+        return refresh_prewarmed_repo_from_upstream(
+            state,
+            owner_repo,
+            owner,
+            repo,
+            auth_header.as_deref(),
+            "existing local state",
+        )
+        .await;
+    }
+
+    match initialize_repo_from_s3_for_prewarm(state, owner_repo).await {
+        Ok(true) => {
+            return refresh_prewarmed_repo_from_upstream(
+                state,
+                owner_repo,
+                owner,
+                repo,
+                auth_header.as_deref(),
+                "startup S3 restore",
+            )
+            .await;
+        }
+        Ok(false) => {
+            info!(
+                repo = %owner_repo,
+                has_auth_header = auth_header.is_some(),
+                "startup pre-warm did not find an S3 bundle; falling back to upstream clone"
+            );
+        }
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                has_auth_header = auth_header.is_some(),
+                error = %error,
+                error_chain = %format!("{error:#}"),
+                "startup pre-warm could not initialize from S3; falling back to upstream clone"
+            );
+        }
+    }
+
+    match ensure_repo_cloned_from_upstream(state, owner, repo, auth_header.as_deref()).await {
+        Ok(()) => {
+            info!(
+                repo = %owner_repo,
+                has_auth_header = auth_header.is_some(),
+                "startup pre-warm completed with a full upstream clone"
+            );
+            PrewarmRepoReport {
+                initialized_locally: true,
+                issues: Vec::new(),
+            }
+        }
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                has_auth_header = auth_header.is_some(),
+                error = %error,
+                error_chain = %format!("{error:#}"),
+                "startup pre-warm could not clone from upstream; traffic will rely on proxy fallback"
+            );
+            PrewarmRepoReport {
+                initialized_locally: false,
+                issues: vec![format!(
+                    "{owner_repo}: upstream clone failed during startup pre-warm: {error:#}"
+                )],
+            }
+        }
+    }
 }
 
 async fn prewarm_clone_auth_header(state: &crate::AppState, owner: &str) -> Option<String> {
@@ -4865,6 +4945,107 @@ async fn prewarm_clone_auth_header(state: &crate::AppState, owner: &str) -> Opti
         .unwrap_or(&config.upstream.admin_token_env);
     let token = crate::credentials::keyring::resolve_secret(token_key).await?;
     (!token.is_empty()).then(|| format!("Bearer {token}"))
+}
+
+async fn initialize_repo_from_s3_for_prewarm(
+    state: &crate::AppState,
+    owner_repo: &str,
+) -> Result<bool> {
+    let mirror_path = state.cache_manager.ensure_repo_mirror_dir(owner_repo)?;
+    reset_partial_repo_path_if_needed(&mirror_path).await?;
+    let Some(restored_repo_path) =
+        try_restore_repo_from_s3(state, owner_repo, &mirror_path).await?
+    else {
+        return Ok(false);
+    };
+
+    if state.cache_manager.has_repo_mirror(owner_repo) {
+        tokio::fs::remove_dir_all(&restored_repo_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to remove redundant startup S3 restore at {}",
+                    restored_repo_path.display()
+                )
+            })?;
+    } else {
+        promote_initial_repo_clone(&restored_repo_path, &mirror_path).await?;
+    }
+
+    ensure_bare_head_ref(&mirror_path).await.with_context(|| {
+        format!("failed to set bare HEAD after startup S3 restore for {owner_repo}")
+    })?;
+    quick_check_ready_repo(&mirror_path, "startup S3 restore", None)
+        .await
+        .with_context(|| {
+            format!("startup S3 restore quick verification failed for {owner_repo}")
+        })?;
+    let published_generation_path =
+        publish_repo_mirror_generation(state, owner_repo, "startup S3 restore").await?;
+    info!(
+        repo = %owner_repo,
+        mirror = %mirror_path.display(),
+        generation = %published_generation_path.display(),
+        published = %state.cache_manager.repo_path(owner_repo).display(),
+        "startup pre-warm initialized the local repo from S3"
+    );
+    Ok(true)
+}
+
+async fn refresh_prewarmed_repo_from_upstream(
+    state: &crate::AppState,
+    owner_repo: &str,
+    owner: &str,
+    repo: &str,
+    auth_header: Option<&str>,
+    initialized_from: &str,
+) -> PrewarmRepoReport {
+    let repo_clean = crate::repo_identity::canonical_repo_leaf(repo);
+    let clone_url = clone_url(state, owner, repo_clean, auth_header);
+    info!(
+        repo = %owner_repo,
+        initialized_from,
+        "startup pre-warm is fetching from upstream to maximize freshness before first traffic"
+    );
+    match fetch_delta_into_repo_mirror(
+        state,
+        owner_repo,
+        &clone_url,
+        None,
+        FetchPriority::Background,
+    )
+    .await
+    {
+        Ok(fetch_result) => {
+            info!(
+                repo = %owner_repo,
+                initialized_from,
+                refs_updated = fetch_result.fetch_result.refs_updated,
+                bytes_received = fetch_result.fetch_result.bytes_received,
+                published = %fetch_result.published_repo_path.display(),
+                "startup pre-warm upstream refresh completed"
+            );
+            PrewarmRepoReport {
+                initialized_locally: true,
+                issues: Vec::new(),
+            }
+        }
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                initialized_from,
+                error = %error,
+                error_chain = %format!("{error:#}"),
+                "startup pre-warm upstream refresh failed; keeping the current local repo state"
+            );
+            PrewarmRepoReport {
+                initialized_locally: true,
+                issues: vec![format!(
+                    "{owner_repo}: upstream refresh failed during startup pre-warm after {initialized_from}: {error:#}"
+                )],
+            }
+        }
+    }
 }
 
 async fn classify_local_wants_satisfaction_inner(

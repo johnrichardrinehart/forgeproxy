@@ -38,6 +38,7 @@ pub struct HealthChecks {
     pub valkey: CheckResult,
     pub ghe: CheckResult,
     pub disk: CheckResult,
+    pub prewarm: CheckResult,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,6 +76,27 @@ pub struct HealthState {
     pub config: Arc<Config>,
     pub valkey: fred::clients::Pool,
     pub http_client: reqwest::Client,
+    pub prewarm: PrewarmStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PrewarmStatus {
+    pub complete: bool,
+    pub issues: Vec<String>,
+}
+
+impl PrewarmStatus {
+    fn as_check_result(&self) -> CheckResult {
+        if !self.complete {
+            return CheckResult::unhealthy("startup repository pre-warm is still running");
+        }
+
+        if self.issues.is_empty() {
+            CheckResult::healthy()
+        } else {
+            CheckResult::unhealthy(self.issues.join("; "))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +262,7 @@ fn disk_usage(
 // ---------------------------------------------------------------------------
 
 fn aggregate_status(checks: &HealthChecks) -> HealthStatus {
-    let all_ok = checks.valkey.ok && checks.ghe.ok && checks.disk.ok;
+    let all_ok = checks.valkey.ok && checks.ghe.ok && checks.disk.ok && checks.prewarm.ok;
     let any_critical = !checks.valkey.ok || !checks.ghe.ok; // Valkey and upstream auth are required for operation
 
     if all_ok {
@@ -264,7 +286,12 @@ pub async fn health_handler(State(state): State<HealthState>) -> impl IntoRespon
         check_disk(state.config.as_ref()),
     );
 
-    let checks = HealthChecks { valkey, ghe, disk };
+    let checks = HealthChecks {
+        valkey,
+        ghe,
+        disk,
+        prewarm: state.prewarm.as_check_result(),
+    };
     let status = aggregate_status(&checks);
     let body = HealthResponse {
         status,
@@ -399,8 +426,37 @@ mod tests {
             valkey: CheckResult::healthy(),
             ghe: CheckResult::unhealthy("upstream auth failed"),
             disk: CheckResult::healthy(),
+            prewarm: CheckResult::healthy(),
         };
 
         assert_eq!(aggregate_status(&checks), HealthStatus::Unhealthy);
+    }
+
+    #[test]
+    fn incomplete_prewarm_is_degraded() {
+        let checks = HealthChecks {
+            valkey: CheckResult::healthy(),
+            ghe: CheckResult::healthy(),
+            disk: CheckResult::healthy(),
+            prewarm: PrewarmStatus::default().as_check_result(),
+        };
+
+        assert_eq!(aggregate_status(&checks), HealthStatus::Degraded);
+    }
+
+    #[test]
+    fn completed_prewarm_with_issues_is_degraded() {
+        let checks = HealthChecks {
+            valkey: CheckResult::healthy(),
+            ghe: CheckResult::healthy(),
+            disk: CheckResult::healthy(),
+            prewarm: PrewarmStatus {
+                complete: true,
+                issues: vec!["foo/bar: upstream fetch failed".to_string()],
+            }
+            .as_check_result(),
+        };
+
+        assert_eq!(aggregate_status(&checks), HealthStatus::Degraded);
     }
 }

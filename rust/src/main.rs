@@ -190,6 +190,7 @@ pub struct AppState {
     pub active_ssh_cold_clones: Arc<AtomicI64>,
     pub draining: Arc<AtomicBool>,
     pub prewarm_ready: Arc<AtomicBool>,
+    pub prewarm_status: Arc<RwLock<crate::health::PrewarmStatus>>,
 }
 
 #[derive(Clone)]
@@ -272,8 +273,27 @@ impl AppState {
         self.prewarm_ready.store(true, Ordering::SeqCst);
     }
 
+    pub fn finish_prewarm(&self, issues: Vec<String>) {
+        {
+            let mut status = self
+                .prewarm_status
+                .write()
+                .expect("prewarm status lock poisoned");
+            status.complete = true;
+            status.issues = issues;
+        }
+        self.mark_prewarm_ready();
+    }
+
     pub fn is_prewarm_ready(&self) -> bool {
         self.prewarm_ready.load(Ordering::SeqCst)
+    }
+
+    pub fn prewarm_status(&self) -> crate::health::PrewarmStatus {
+        self.prewarm_status
+            .read()
+            .expect("prewarm status lock poisoned")
+            .clone()
     }
 
     pub fn refresh_live_metrics(&self) {
@@ -1253,7 +1273,11 @@ async fn main() -> Result<()> {
         let s = state.clone();
         async move {
             if let Err(e) = run_startup_prewarm(s).await {
-                tracing::error!(error = %e, "repository pre-warm failed; readiness remains closed");
+                tracing::error!(
+                    error = %e,
+                    error_chain = %format!("{e:#}"),
+                    "repository pre-warm failed; readiness remains closed"
+                );
             }
         }
     });
@@ -1521,6 +1545,10 @@ async fn build_app_state(
         active_ssh_cold_clones: Arc::new(AtomicI64::new(0)),
         draining: Arc::new(AtomicBool::new(false)),
         prewarm_ready: Arc::new(AtomicBool::new(!config.prewarm.enabled)),
+        prewarm_status: Arc::new(RwLock::new(crate::health::PrewarmStatus {
+            complete: !config.prewarm.enabled,
+            issues: Vec::new(),
+        })),
     };
     state.refresh_live_metrics();
     Ok(state)
@@ -1544,7 +1572,7 @@ async fn run_metrics_refresh_loop(state: AppState) -> Result<()> {
 async fn run_startup_prewarm(state: AppState) -> Result<()> {
     let config = state.config();
     if !config.prewarm.enabled {
-        state.mark_prewarm_ready();
+        state.finish_prewarm(Vec::new());
         return Ok(());
     }
 
@@ -1562,7 +1590,7 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
     );
 
     if repos.is_empty() {
-        state.mark_prewarm_ready();
+        state.finish_prewarm(Vec::new());
         tracing::info!("repository pre-warm complete; no repos configured");
         return Ok(());
     }
@@ -1572,7 +1600,7 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
         async move {
             let started_at = Instant::now();
             let warmed = crate::coordination::registry::prewarm_repo(&state, &owner_repo).await;
-            if warmed.is_ok()
+            if warmed.initialized_locally
                 && state.pack_cache.enabled()
                 && let Err(error) =
                     crate::coordination::registry::warm_current_published_generation_pack_cache(
@@ -1585,6 +1613,7 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
                 tracing::warn!(
                     repo = %owner_repo,
                     error = %error,
+                    error_chain = %format!("{error:#}"),
                     "startup pre-warm could not run pack-cache warming"
                 );
             }
@@ -1595,35 +1624,38 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
     .collect::<Vec<_>>()
     .await;
 
-    let mut failures = Vec::new();
+    let mut issues = Vec::new();
     for (owner_repo, elapsed, warmed) in results {
-        match warmed {
-            Ok(()) => {
-                tracing::info!(
-                    repo = %owner_repo,
-                    elapsed_ms = elapsed.as_millis(),
-                    "repository pre-warm completed"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    repo = %owner_repo,
-                    elapsed_ms = elapsed.as_millis(),
-                    error = %error,
-                    "repository pre-warm failed"
-                );
-                failures.push(format!("{owner_repo}: {error}"));
-            }
+        if warmed.initialized_locally {
+            tracing::info!(
+                repo = %owner_repo,
+                elapsed_ms = elapsed.as_millis(),
+                issue_count = warmed.issues.len(),
+                "repository pre-warm completed"
+            );
+        } else {
+            tracing::warn!(
+                repo = %owner_repo,
+                elapsed_ms = elapsed.as_millis(),
+                issue_count = warmed.issues.len(),
+                "repository pre-warm finished without a local warm cache"
+            );
         }
+
+        issues.extend(warmed.issues);
     }
 
-    if failures.is_empty() {
-        state.mark_prewarm_ready();
+    state.finish_prewarm(issues.clone());
+    if issues.is_empty() {
         tracing::info!("repository pre-warm complete; readiness gate opened");
-        Ok(())
     } else {
-        anyhow::bail!("repository pre-warm failed: {}", failures.join("; "))
+        tracing::warn!(
+            issue_count = issues.len(),
+            issues = %issues.join("; "),
+            "repository pre-warm completed with issues; readiness gate opened and /healthz will report degraded"
+        );
     }
+    Ok(())
 }
 
 #[cfg(test)]
