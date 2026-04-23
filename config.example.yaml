@@ -90,6 +90,7 @@ prewarm:
   enabled: false
   repos: []
   max_concurrent: 2
+  force_open_secs: 1500
 storage:
   local:
     path: "/var/cache/forgeproxy"

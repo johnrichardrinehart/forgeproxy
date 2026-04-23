@@ -1595,54 +1595,72 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
         return Ok(());
     }
 
-    let results = futures::stream::iter(repos.into_iter().map(|owner_repo| {
-        let state = state.clone();
-        async move {
-            let started_at = Instant::now();
-            let warmed = crate::coordination::registry::prewarm_repo(&state, &owner_repo).await;
-            if warmed.initialized_locally
-                && state.pack_cache.enabled()
-                && let Err(error) =
-                    crate::coordination::registry::warm_current_published_generation_pack_cache(
-                        &state,
-                        &owner_repo,
-                        "startup prewarm",
-                    )
-                    .await
-            {
-                tracing::warn!(
-                    repo = %owner_repo,
-                    error = %error,
-                    error_chain = %format!("{error:#}"),
-                    "startup pre-warm could not run pack-cache warming"
-                );
+    let force_open_secs = config.prewarm.force_open_secs;
+    let prewarm_results = tokio::time::timeout(
+        Duration::from_secs(force_open_secs),
+        futures::stream::iter(repos.into_iter().map(|owner_repo| {
+            let state = state.clone();
+            async move {
+                let started_at = Instant::now();
+                let warmed = crate::coordination::registry::prewarm_repo(&state, &owner_repo).await;
+                if warmed.initialized_locally
+                    && state.pack_cache.enabled()
+                    && let Err(error) =
+                        crate::coordination::registry::warm_current_published_generation_pack_cache(
+                            &state,
+                            &owner_repo,
+                            "startup prewarm",
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        repo = %owner_repo,
+                        error = %error,
+                        error_chain = %format!("{error:#}"),
+                        "startup pre-warm could not run pack-cache warming"
+                    );
+                }
+                (owner_repo, started_at.elapsed(), warmed)
             }
-            (owner_repo, started_at.elapsed(), warmed)
-        }
-    }))
-    .buffer_unordered(max_concurrent)
-    .collect::<Vec<_>>()
+        }))
+        .buffer_unordered(max_concurrent)
+        .collect::<Vec<_>>(),
+    )
     .await;
 
     let mut issues = Vec::new();
-    for (owner_repo, elapsed, warmed) in results {
-        if warmed.initialized_locally {
-            tracing::info!(
-                repo = %owner_repo,
-                elapsed_ms = elapsed.as_millis(),
-                issue_count = warmed.issues.len(),
-                "repository pre-warm completed"
-            );
-        } else {
+    match prewarm_results {
+        Ok(results) => {
+            for (owner_repo, elapsed, warmed) in results {
+                if warmed.initialized_locally {
+                    tracing::info!(
+                        repo = %owner_repo,
+                        elapsed_ms = elapsed.as_millis(),
+                        issue_count = warmed.issues.len(),
+                        "repository pre-warm completed"
+                    );
+                } else {
+                    tracing::warn!(
+                        repo = %owner_repo,
+                        elapsed_ms = elapsed.as_millis(),
+                        issue_count = warmed.issues.len(),
+                        "repository pre-warm finished without a local warm cache"
+                    );
+                }
+
+                issues.extend(warmed.issues);
+            }
+        }
+        Err(_) => {
+            issues.push(format!(
+                "startup repository pre-warm exceeded {} seconds; force-opening readiness",
+                force_open_secs
+            ));
             tracing::warn!(
-                repo = %owner_repo,
-                elapsed_ms = elapsed.as_millis(),
-                issue_count = warmed.issues.len(),
-                "repository pre-warm finished without a local warm cache"
+                force_open_secs,
+                "repository pre-warm timed out; force-opening readiness and reporting degraded health"
             );
         }
-
-        issues.extend(warmed.issues);
     }
 
     state.finish_prewarm(issues.clone());
