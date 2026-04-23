@@ -730,6 +730,13 @@ pkgs.testers.runNixOSTest {
             " | jq -e '.checks.valkey.ok == true'"
         )
 
+    with subtest("Ready endpoint through nginx stays local and does not redirect upstream"):
+        response_headers = client.succeed(
+            "curl -skD - -o /dev/null https://proxy/readyz"
+        )
+        assert "HTTP/2 200" in response_headers or "HTTP/1.1 200" in response_headers, response_headers
+        assert "location:" not in response_headers.lower(), response_headers
+
     with subtest("Metrics endpoint responds"):
         result = proxy.succeed("curl -sf http://localhost:8080/metrics")
         assert "# EOF" in result or "forgeproxy" in result.lower() or "process" in result.lower(), \
