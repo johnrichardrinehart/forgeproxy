@@ -288,6 +288,13 @@ in
             '';
           };
 
+          "/readyz" = {
+            proxyPass = "http://127.0.0.1:${toString cfg.backendPort}/readyz";
+            extraConfig = ''
+              proxy_set_header Host $host;
+            '';
+          };
+
           # ── Webhook receiver ─────────────────────────────────────
           "/webhook" = {
             proxyPass = "http://127.0.0.1:${toString cfg.backendPort}/webhook";
