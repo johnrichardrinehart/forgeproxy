@@ -85,6 +85,12 @@ variable "forgeproxy_count" {
   description = "Number of forgeproxy instances"
 }
 
+variable "forgeproxy_health_check_grace_period_secs" {
+  type        = number
+  default     = 1800
+  description = "Seconds an Auto Scaling Group should ignore ELB/NLB health-check failures after launching a forgeproxy instance before considering it for replacement."
+}
+
 variable "forgeproxy_active_slot" {
   type        = string
   default     = null

@@ -22,6 +22,7 @@ module "forgeproxy" {
 
   forgeproxy_instance_type                          = var.forgeproxy_instance_type
   forgeproxy_count                                  = var.forgeproxy_count
+  forgeproxy_health_check_grace_period_secs         = var.forgeproxy_health_check_grace_period_secs
   forgeproxy_active_slot                            = var.forgeproxy_active_slot
   forgeproxy_cutover_check_interval_secs            = var.forgeproxy_cutover_check_interval_secs
   forgeproxy_cutover_required_consecutive_successes = var.forgeproxy_cutover_required_consecutive_successes

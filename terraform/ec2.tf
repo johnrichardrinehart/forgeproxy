@@ -126,7 +126,7 @@ resource "aws_autoscaling_group" "forgeproxy" {
   desired_capacity          = 0
   max_size                  = var.forgeproxy_count
   health_check_type         = "ELB"
-  health_check_grace_period = 900
+  health_check_grace_period = var.forgeproxy_health_check_grace_period_secs
   wait_for_elb_capacity     = 0
   wait_for_capacity_timeout = "0"
   vpc_zone_identifier       = [local.private_subnet_id]
