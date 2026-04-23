@@ -1881,72 +1881,270 @@ fn spawn_pack_cache_warming(
     if !state.pack_cache.enabled() {
         return;
     }
+
+    tokio::spawn(run_pack_cache_warming(
+        state,
+        owner_repo,
+        published_path,
+        published_lease,
+        source,
+    ));
+}
+
+pub async fn warm_current_published_generation_pack_cache(
+    state: &crate::AppState,
+    owner_repo: &str,
+    source: &str,
+) -> Result<()> {
+    if !state.pack_cache.enabled() {
+        return Ok(());
+    }
+
+    let published_path = state.cache_manager.repo_path(owner_repo);
+    if !tokio::fs::try_exists(&published_path)
+        .await
+        .with_context(|| format!("stat published repo for pack-cache warming {owner_repo}"))?
+    {
+        return Ok(());
+    }
+    let published_lease = lease_published_generation_path(state, owner_repo, &published_path);
+
+    run_pack_cache_warming(
+        state.clone(),
+        owner_repo.to_string(),
+        published_path,
+        published_lease,
+        source.to_string(),
+    )
+    .await;
+    Ok(())
+}
+
+async fn run_pack_cache_warming(
+    state: crate::AppState,
+    owner_repo: String,
+    published_path: PathBuf,
+    published_lease: PublishedGenerationLease,
+    source: String,
+) {
+    refresh_pack_cache_ref_tip_ready_metric(&state, &owner_repo, &published_path);
     let prev_entries = state.pack_cache.lookup_recent_full_tip_keys(&owner_repo);
+    let _published_lease = published_lease;
+    let started_at = Instant::now();
     if prev_entries.is_empty() {
         crate::metrics::inc_pack_cache_warming_skip(
             &state.metrics,
             &owner_repo,
             "no_recent_full_tip",
         );
-        debug!(
-            repo = %owner_repo,
-            source,
-            path = %published_path.display(),
-            "skipping pack cache stitching because no recent full-tip entry is available"
-        );
-        return;
-    }
-
-    tokio::spawn(async move {
-        let _published_lease = published_lease;
-        let started_at = Instant::now();
+        crate::metrics::inc_pack_cache_warming(&state.metrics, &owner_repo, "base", "start");
         info!(
             repo = %owner_repo,
             source,
             path = %published_path.display(),
-            "starting pack cache stitching for published generation"
+            "starting base pack cache warming for first published generation"
         );
-
-        for prev_entry in prev_entries {
-            crate::metrics::inc_pack_cache_stitch_attempt(&state.metrics, &owner_repo);
-            let result =
-                warm_pack_cache_for_generation(&state, &owner_repo, &published_path, prev_entry)
-                    .await;
-            crate::metrics::observe_pack_cache_stitch_duration(
-                &state.metrics,
-                &owner_repo,
-                started_at.elapsed(),
-            );
-
-            match result {
-                Ok(()) => {
-                    info!(
-                        repo = %owner_repo,
-                        source,
-                        path = %published_path.display(),
-                        elapsed_ms = started_at.elapsed().as_millis(),
-                        "finished pack cache stitching for published generation"
-                    );
-                }
-                Err(failure) => {
-                    crate::metrics::inc_pack_cache_stitch_failure(
-                        &state.metrics,
-                        &owner_repo,
-                        failure.reason,
-                    );
-                    warn!(
-                        repo = %owner_repo,
-                        source,
-                        path = %published_path.display(),
-                        elapsed_ms = started_at.elapsed().as_millis(),
-                        reason = failure.reason,
-                        error = %failure.error,
-                        "pack cache stitching failed for published generation"
-                    );
-                }
+        match warm_pack_cache_base_for_generation(&state, &owner_repo, &published_path).await {
+            Ok(()) => {
+                crate::metrics::inc_pack_cache_warming(&state.metrics, &owner_repo, "base", "ok");
+                crate::metrics::observe_pack_cache_warming_duration(
+                    &state.metrics,
+                    &owner_repo,
+                    "base",
+                    "ok",
+                    started_at.elapsed(),
+                );
+                info!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "finished base pack cache warming for first published generation"
+                );
+            }
+            Err(failure) => {
+                crate::metrics::inc_pack_cache_warming(
+                    &state.metrics,
+                    &owner_repo,
+                    "base",
+                    "error",
+                );
+                crate::metrics::observe_pack_cache_warming_duration(
+                    &state.metrics,
+                    &owner_repo,
+                    "base",
+                    "error",
+                    started_at.elapsed(),
+                );
+                crate::metrics::inc_pack_cache_stitch_failure(
+                    &state.metrics,
+                    &owner_repo,
+                    failure.reason,
+                );
+                warn!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    reason = failure.reason,
+                    error = %failure.error,
+                    "base pack cache warming failed for first published generation"
+                );
             }
         }
-    });
+        refresh_pack_cache_ref_tip_ready_metric(&state, &owner_repo, &published_path);
+        return;
+    }
+
+    info!(
+        repo = %owner_repo,
+        source,
+        path = %published_path.display(),
+        "starting pack cache stitching for published generation"
+    );
+
+    for prev_entry in prev_entries {
+        crate::metrics::inc_pack_cache_stitch_attempt(&state.metrics, &owner_repo);
+        crate::metrics::inc_pack_cache_warming(&state.metrics, &owner_repo, "stitch", "start");
+        let result =
+            warm_pack_cache_for_generation(&state, &owner_repo, &published_path, prev_entry).await;
+        crate::metrics::observe_pack_cache_stitch_duration(
+            &state.metrics,
+            &owner_repo,
+            started_at.elapsed(),
+        );
+
+        match result {
+            Ok(()) => {
+                crate::metrics::inc_pack_cache_warming(&state.metrics, &owner_repo, "stitch", "ok");
+                crate::metrics::observe_pack_cache_warming_duration(
+                    &state.metrics,
+                    &owner_repo,
+                    "stitch",
+                    "ok",
+                    started_at.elapsed(),
+                );
+                info!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "finished pack cache stitching for published generation"
+                );
+            }
+            Err(failure) => {
+                crate::metrics::inc_pack_cache_warming(
+                    &state.metrics,
+                    &owner_repo,
+                    "stitch",
+                    "error",
+                );
+                crate::metrics::observe_pack_cache_warming_duration(
+                    &state.metrics,
+                    &owner_repo,
+                    "stitch",
+                    "error",
+                    started_at.elapsed(),
+                );
+                crate::metrics::inc_pack_cache_stitch_failure(
+                    &state.metrics,
+                    &owner_repo,
+                    failure.reason,
+                );
+                warn!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    reason = failure.reason,
+                    error = %failure.error,
+                    "pack cache stitching failed for published generation"
+                );
+            }
+        }
+    }
+    refresh_pack_cache_ref_tip_ready_metric(&state, &owner_repo, &published_path);
+}
+
+fn refresh_pack_cache_ref_tip_ready_metric(
+    state: &crate::AppState,
+    owner_repo: &str,
+    published_path: &Path,
+) {
+    match state
+        .pack_cache
+        .has_usable_full_tip_entry(owner_repo, published_path)
+    {
+        Ok(ready) => {
+            crate::metrics::set_pack_cache_ref_tip_ready(&state.metrics, owner_repo, ready)
+        }
+        Err(reason) => {
+            crate::metrics::set_pack_cache_ref_tip_ready(&state.metrics, owner_repo, false);
+            warn!(
+                repo = %owner_repo,
+                path = %published_path.display(),
+                reason,
+                "failed to determine whether a published generation has a usable full-tip pack cache entry"
+            );
+        }
+    }
+}
+
+async fn warm_pack_cache_base_for_generation(
+    state: &crate::AppState,
+    owner_repo: &str,
+    published_path: &Path,
+) -> std::result::Result<(), PackCacheStitchFailure> {
+    let key = state
+        .pack_cache
+        .key_for_default_full_tip_warming(owner_repo, published_path)
+        .map_err(|reason| PackCacheStitchFailure::new(reason, anyhow::anyhow!(reason)))?;
+    let request_wants = key
+        .base_request_wants()
+        .ok_or_else(|| {
+            PackCacheStitchFailure::new(
+                "missing_base_request_wants",
+                anyhow::anyhow!("warming key did not carry request wants"),
+            )
+        })?
+        .to_vec();
+
+    let writer = match state
+        .pack_cache
+        .lookup_or_reserve(crate::metrics::Protocol::Https, key)
+        .await
+    {
+        Ok(crate::pack_cache::PackCacheLookup::Hit(_)) => return Ok(()),
+        Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => writer,
+        Ok(crate::pack_cache::PackCacheLookup::BypassAfterWait) => {
+            return Err(PackCacheStitchFailure::new(
+                "reservation_bypassed",
+                anyhow::anyhow!("pack cache reservation bypassed after in-flight wait"),
+            ));
+        }
+        Err(error) => return Err(PackCacheStitchFailure::new("reserve", error)),
+    };
+
+    let pack = match build_pack_cache_delta(
+        state,
+        published_path,
+        &request_wants,
+        PackCacheDeltaPriority::Background,
+    )
+    .await
+    {
+        Ok(delta) => delta.pack,
+        Err(error) => {
+            writer.abort().await;
+            return Err(error);
+        }
+    };
+
+    writer
+        .finish_exact_pack(&pack, "base")
+        .await
+        .map(|_| ())
+        .map_err(|error| PackCacheStitchFailure::new("finish_base", error))
 }
 
 async fn warm_pack_cache_for_generation(
@@ -5136,6 +5334,7 @@ pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::collections::BTreeMap;
     use std::process::Command;
     use tempfile::tempdir;
@@ -5616,6 +5815,131 @@ mod tests {
         crate::git::commands::git_index_pack_to_idx(&stitched_path, &stitched_idx_path, 1)
             .await
             .expect("filtered composite pack should index without duplicate objects");
+    }
+
+    #[tokio::test]
+    async fn fast_forward_single_branch_composite_replay_contains_new_tip() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let status = Command::new("git").arg("init").arg(&repo).status().unwrap();
+        assert!(status.success());
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test User"]);
+
+        std::fs::write(repo.join("README.md"), "base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+        let main_before = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+        let cache = crate::pack_cache::PackCache::new(
+            &tmp.path().join("cache"),
+            crate::config::PackCacheConfig {
+                enabled: true,
+                min_response_bytes: 0,
+                ..Default::default()
+            },
+            1.0,
+            crate::metrics::MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+        let base_key = cache
+            .key_for_fresh_clone_with_ref_tips(
+                "owner/repo",
+                &fetch_request_for(&main_before),
+                Some("version=2"),
+                &BTreeMap::from([("refs/heads/main".to_string(), main_before.clone())]),
+            )
+            .unwrap();
+        let main_before_objects =
+            crate::git::commands::git_rev_list_objects(&repo, std::slice::from_ref(&main_before))
+                .await
+                .unwrap();
+        let base_pack =
+            crate::git::commands::git_pack_objects_exact(&repo, &main_before_objects, 1)
+                .await
+                .unwrap();
+        let base_pack_path = tmp.path().join("main-before.pack");
+        std::fs::write(&base_pack_path, base_pack).unwrap();
+        store_pack_cache_base(&cache, base_key.clone(), &base_pack_path).await;
+
+        std::fs::write(repo.join("README.md"), "base\nmain fast-forward\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "fast-forward"]);
+        let main_after = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+        let composite_key = cache
+            .key_for_fresh_clone_with_ref_tips(
+                "owner/repo",
+                &fetch_request_for(&main_after),
+                Some("version=2"),
+                &BTreeMap::from([("refs/heads/main".to_string(), main_after.clone())]),
+            )
+            .unwrap();
+        let writer = match cache
+            .lookup_or_reserve(crate::metrics::Protocol::Https, composite_key.clone())
+            .await
+            .unwrap()
+        {
+            crate::pack_cache::PackCacheLookup::Generate(writer) => writer,
+            _ => panic!("expected composite cache reservation"),
+        };
+        let candidate = crate::pack_cache::PackCacheRecentEntry {
+            key: base_key.clone(),
+            request_wants: vec![main_before.clone()],
+            covered_wants: vec![main_before.clone()],
+            request_template: vec![
+                "command=fetch".to_string(),
+                "done".to_string(),
+                "flush".to_string(),
+            ],
+            full_tip: false,
+        };
+        let selection = select_pack_cache_base_entry(
+            &repo,
+            &cache,
+            &[candidate],
+            std::slice::from_ref(&main_after),
+        )
+        .await
+        .unwrap()
+        .expect("expected reusable base for fast-forward");
+        let delta_pack =
+            crate::git::commands::git_pack_objects_exact(&repo, &selection.missing_objects, 1)
+                .await
+                .unwrap();
+        writer
+            .finish_composite(&selection.entry.key, &delta_pack)
+            .await
+            .unwrap();
+
+        let hit = cache.lookup_by_key(&composite_key).await.unwrap().unwrap();
+        let mut response = Vec::new();
+        let mut stream = hit.into_stream();
+        while let Some(chunk) = stream.next().await {
+            response.extend_from_slice(&chunk.unwrap());
+        }
+        let raw_pack =
+            crate::pack_cache::stitch::extract_raw_pack(&response).expect("composite replay pack");
+        let raw_pack_path = tmp.path().join("main-after-composite.pack");
+        std::fs::write(&raw_pack_path, raw_pack).unwrap();
+
+        let verify_repo = tmp.path().join("verify.git");
+        crate::git::commands::git_init_bare(&verify_repo)
+            .await
+            .unwrap();
+        crate::git::commands::git_index_pack(&verify_repo, &raw_pack_path, 1)
+            .await
+            .unwrap();
+        let missing = crate::git::commands::git_missing_objects(
+            &verify_repo,
+            std::slice::from_ref(&main_after),
+        )
+        .await
+        .unwrap();
+        assert!(
+            missing.is_empty(),
+            "composite replay should contain the fast-forwarded main tip"
+        );
     }
 
     #[test]

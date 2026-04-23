@@ -30,6 +30,7 @@ const PACK_ENTRY_MANIFEST_VERSION: u32 = 1;
 const PACK_CACHE_METADATA_VERSION: u32 = 4;
 const MAX_RECENT_ENTRIES_PER_REPO: usize = 16;
 const METADATA_HIT_UPDATE_INTERVAL_SECS: u64 = 60;
+const DEFAULT_FULL_TIP_WARMING_TEMPLATE: &[&str] = &["command=fetch", "done", "flush"];
 // Capacity for large pack-cache response streams. Production profiles justify
 // extra read-ahead while keeping bounded backpressure between producer and body.
 const PACK_CACHE_STREAM_CHANNEL_CAPACITY: usize = 256;
@@ -488,6 +489,18 @@ impl PackCache {
         ))
     }
 
+    pub fn key_for_default_full_tip_warming(
+        &self,
+        owner_repo: &str,
+        repo_path: &Path,
+    ) -> std::result::Result<PackCacheKey, &'static str> {
+        let request_template = DEFAULT_FULL_TIP_WARMING_TEMPLATE
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        self.key_for_warming(owner_repo, repo_path, &request_template)
+    }
+
     pub fn lookup_recent_compatible_keys(&self, key: &PackCacheKey) -> Vec<PackCacheRecentEntry> {
         let Some(base) = key.base.as_ref() else {
             return Vec::new();
@@ -498,7 +511,7 @@ impl PackCache {
             .and_then(|entries| entries.get(&key.owner_repo).cloned())
             .unwrap_or_default()
             .into_iter()
-            .filter(|entry| entry.request_template == base.request_template && entry.key != *key)
+            .filter(|entry| entry.key != *key && entry.request_template == base.request_template)
             .collect()
     }
 
@@ -508,7 +521,7 @@ impl PackCache {
             .find(|entry| {
                 key.base
                     .as_ref()
-                    .is_some_and(|base| entry.request_wants.len() == base.request_wants.len())
+                    .is_some_and(|base| entry.request_wants == base.request_wants)
             })
     }
 
@@ -532,6 +545,10 @@ impl PackCache {
             crate::metrics::inc_pack_cache_request(&self.metrics, protocol, "hit", "ready");
             return Ok(PackCacheLookup::Hit(hit));
         }
+        if let Some(hit) = self.lookup_compatible_read_lease(&key)? {
+            crate::metrics::inc_pack_cache_request(&self.metrics, protocol, "hit", "compatible");
+            return Ok(PackCacheLookup::Hit(hit));
+        }
 
         let notified = {
             let mut inflight = self.inflight.lock().await;
@@ -544,6 +561,15 @@ impl PackCache {
                         protocol,
                         "hit",
                         "ready_after_lock",
+                    );
+                    return Ok(PackCacheLookup::Hit(hit));
+                }
+                if let Some(hit) = self.lookup_compatible_read_lease(&key)? {
+                    crate::metrics::inc_pack_cache_request(
+                        &self.metrics,
+                        protocol,
+                        "hit",
+                        "compatible_after_lock",
                     );
                     return Ok(PackCacheLookup::Hit(hit));
                 }
@@ -575,6 +601,20 @@ impl PackCache {
                             protocol,
                             "hit",
                             "after_wait",
+                        );
+                        return Ok(PackCacheLookup::Hit(hit));
+                    }
+                    if let Some(hit) = self.lookup_compatible_read_lease(&key)? {
+                        crate::metrics::inc_pack_cache_inflight_wait(
+                            &self.metrics,
+                            protocol.clone(),
+                            "hit",
+                        );
+                        crate::metrics::inc_pack_cache_request(
+                            &self.metrics,
+                            protocol,
+                            "hit",
+                            "compatible_after_wait",
                         );
                         return Ok(PackCacheLookup::Hit(hit));
                     }
@@ -623,9 +663,48 @@ impl PackCache {
         self.lookup_read_lease(key)
     }
 
+    pub fn has_usable_full_tip_entry(
+        &self,
+        owner_repo: &str,
+        repo_path: &Path,
+    ) -> std::result::Result<bool, &'static str> {
+        let ref_tips = collect_repo_ref_tips(repo_path)?;
+        let current_wants = unique_tip_oids(&ref_tips);
+        if current_wants.is_empty() {
+            return Ok(false);
+        }
+        let _lifecycle = self.artifact_lifecycle.lock().unwrap();
+        Ok(self
+            .recent_pack_cache_keys
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(owner_repo).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .any(|entry| {
+                entry.full_tip
+                    && entry.covered_wants == current_wants
+                    && self.lookup_sync(&entry.key).ok().flatten().is_some()
+            }))
+    }
+
     pub fn pack_paths_for_key(&self, key: &PackCacheKey) -> Result<Vec<PathBuf>> {
         let manifest = self.read_entry_manifest(key)?;
         self.entry_pack_paths(&manifest)
+    }
+
+    fn lookup_compatible_read_lease(
+        &self,
+        key: &PackCacheKey,
+    ) -> Result<Option<PackCacheReadLease>> {
+        let Some(compatible) = self.lookup_recent_compatible_key(key) else {
+            return Ok(None);
+        };
+        let _lifecycle = self.artifact_lifecycle.lock().unwrap();
+        let Some(hit) = self.lookup_sync(&compatible.key)? else {
+            return Ok(None);
+        };
+        self.open_read_lease_for_hit(hit).map(Some)
     }
 
     fn lookup_read_lease(&self, key: &PackCacheKey) -> Result<Option<PackCacheReadLease>> {
@@ -975,6 +1054,7 @@ impl PackCacheWriter {
                 stitched_trailer_sha1: None,
             })?;
             self.completed = true;
+            self.record_ready_entry(None);
             self.record_pack_cache_usage_metric();
             self.release_inflight().await;
             let pack_id = self.key.as_str().to_string();
@@ -1029,10 +1109,37 @@ impl PackCacheWriter {
         })?;
         self.raw_pack_bytes_written = delta_pack.len() as u64;
         self.completed = true;
+        self.record_ready_entry(Some(base_key));
         self.record_pack_cache_usage_metric();
         self.release_inflight().await;
         let pack_id = format!("{}-delta", self.key.as_str());
         self.spawn_indexed_promotion(pack_id, Some(base_key.clone()));
+        Ok(())
+    }
+
+    pub async fn finish_exact_pack(mut self, pack_bytes: &[u8], suffix: &str) -> Result<()> {
+        self.pack_writer
+            .shutdown()
+            .await
+            .context("shutdown unused exact pack cache temp raw pack writer")?;
+        if let Err(error) = tokio::fs::remove_file(&self.tmp_pack_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove unused exact pack cache temp raw pack");
+        }
+
+        let pack_id = self.write_exact_pack_for_replay(pack_bytes, suffix).await?;
+        self.write_entry_manifest(&PackEntryManifest {
+            version: PACK_ENTRY_MANIFEST_VERSION,
+            pack_ids: vec![pack_id.clone()],
+            stitched_trailer_sha1: None,
+        })?;
+        self.raw_pack_bytes_written = pack_bytes.len() as u64;
+        self.completed = true;
+        self.record_ready_entry(None);
+        self.record_pack_cache_usage_metric();
+        self.release_inflight().await;
+        self.spawn_indexed_promotion(pack_id, None);
         Ok(())
     }
 
@@ -1051,9 +1158,13 @@ impl PackCacheWriter {
         self.write_entry_manifest(&manifest)?;
         self.raw_pack_bytes_written = 0;
         self.completed = true;
+        self.record_ready_entry(Some(base_key));
         self.record_pack_cache_usage_metric();
         self.release_inflight().await;
-        self.record_promotion(Some(base_key));
+        crate::metrics::observe_pack_cache_artifact_generation(
+            &self.metrics,
+            self.started_at.elapsed(),
+        );
         Ok(())
     }
 
@@ -1073,11 +1184,7 @@ impl PackCacheWriter {
         self.notify.notify_waiters();
     }
 
-    fn record_promotion(&self, composite_base_key: Option<&PackCacheKey>) {
-        crate::metrics::observe_pack_cache_artifact_generation(
-            &self.metrics,
-            self.started_at.elapsed(),
-        );
+    fn record_ready_entry(&self, composite_base_key: Option<&PackCacheKey>) {
         if let Some(base) = &self.key.base {
             let covered_wants = self.covered_wants_for_promotion(base, composite_base_key);
             let entry = PackCacheRecentEntry {
@@ -1196,14 +1303,17 @@ impl PackCacheWriter {
     async fn finalize_indexed_promotion(
         &mut self,
         pack_id: &str,
-        composite_base_key: Option<&PackCacheKey>,
+        _composite_base_key: Option<&PackCacheKey>,
     ) -> Result<()> {
         let pack_path = self.pack_path_for_id(pack_id);
         let idx_path = self.pack_index_path_for_id(pack_id);
         crate::git::commands::git_index_pack_to_idx(&pack_path, &idx_path, self.index_pack_threads)
             .await?;
         self.refresh_packstore_midx().await?;
-        self.record_promotion(composite_base_key);
+        crate::metrics::observe_pack_cache_artifact_generation(
+            &self.metrics,
+            self.started_at.elapsed(),
+        );
         Ok(())
     }
 
@@ -2079,10 +2189,11 @@ fn parse_sha1_hex(value: &str) -> Result<[u8; 20]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PackCache, PackCacheBaseMetadata, PackCacheKey, PackCacheMetadata, active_reader_keys,
-        collect_prune_entries, collect_repo_ref_tips, metadata_path, normalize_fresh_clone_request,
-        normalize_fresh_clone_request_parts, prune_to_byte_watermarks,
-        prune_to_byte_watermarks_with_active, unique_tip_oids, write_pack_cache_metadata,
+        PackCache, PackCacheBaseMetadata, PackCacheKey, PackCacheLookup, PackCacheMetadata,
+        active_reader_keys, collect_prune_entries, collect_repo_ref_tips, metadata_path,
+        normalize_fresh_clone_request, normalize_fresh_clone_request_parts,
+        prune_to_byte_watermarks, prune_to_byte_watermarks_with_active, unique_tip_oids,
+        write_pack_cache_metadata,
     };
     use crate::config::{EvictionPolicy, PackCacheConfig};
     use crate::metrics::{MetricsRegistry, Protocol};
@@ -2819,7 +2930,9 @@ mod tests {
                 full_tip: false,
             }),
         };
-        let recent = cache.lookup_recent_compatible_key(&future_key).unwrap();
+        let candidates = cache.lookup_recent_compatible_keys(&future_key);
+        assert_eq!(candidates.len(), 1);
+        let recent = &candidates[0];
         assert_eq!(recent.key.as_str(), composite_key.as_str());
         assert_eq!(recent.request_wants, vec![want_c.clone()]);
         assert_eq!(recent.covered_wants, vec![want_a, want_b, want_c]);
@@ -3181,7 +3294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_metadata_reloads_recent_compatible_base() {
+    async fn persisted_metadata_reloads_recent_compatible_candidates() {
         let temp = tempfile::tempdir().unwrap();
         let config = PackCacheConfig {
             enabled: true,
@@ -3247,8 +3360,10 @@ mod tests {
             }),
         };
 
-        let recent = reloaded.lookup_recent_compatible_key(&future_key).unwrap();
+        let candidates = reloaded.lookup_recent_compatible_keys(&future_key);
 
+        assert_eq!(candidates.len(), 1);
+        let recent = &candidates[0];
         assert_eq!(recent.key.as_str(), "persisted-base");
         assert_eq!(
             recent.request_wants,
@@ -3259,6 +3374,143 @@ mod tests {
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         );
         assert!(!recent.full_tip);
+    }
+
+    #[tokio::test]
+    async fn lookup_or_reserve_does_not_reuse_full_tip_entry_when_templates_differ() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+
+        let base_key = PackCacheKey {
+            digest: "full-tip-base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: true,
+            }),
+        };
+        let lookup = cache
+            .lookup_or_reserve(Protocol::Https, base_key.clone())
+            .await
+            .unwrap();
+        let PackCacheLookup::Generate(mut writer) = lookup else {
+            panic!("expected cache reservation");
+        };
+        let (base_pack, _) = valid_base_and_delta_packs().await;
+        writer
+            .write_chunk(&pack_response(&base_pack))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let future_key = PackCacheKey {
+            digest: "compatible-full-tip".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "thin-pack".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: true,
+            }),
+        };
+
+        let lookup = cache
+            .lookup_or_reserve(Protocol::Https, future_key)
+            .await
+            .unwrap();
+        let PackCacheLookup::Generate(writer) = lookup else {
+            panic!("expected cache reservation");
+        };
+        writer.abort().await;
+    }
+
+    #[tokio::test]
+    async fn lookup_or_reserve_does_not_reuse_entry_when_wants_differ() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+
+        let base_key = PackCacheKey {
+            digest: "single-branch-base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+        let lookup = cache
+            .lookup_or_reserve(Protocol::Https, base_key.clone())
+            .await
+            .unwrap();
+        let PackCacheLookup::Generate(mut writer) = lookup else {
+            panic!("expected cache reservation");
+        };
+        let (base_pack, _) = valid_base_and_delta_packs().await;
+        writer
+            .write_chunk(&pack_response(&base_pack))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let future_key = PackCacheKey {
+            digest: "single-branch-fast-forward".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+
+        let lookup = cache
+            .lookup_or_reserve(Protocol::Https, future_key)
+            .await
+            .unwrap();
+        let PackCacheLookup::Generate(writer) = lookup else {
+            panic!("expected cache reservation");
+        };
+        writer.abort().await;
     }
 
     #[test]
