@@ -3,6 +3,7 @@
   bash,
   awscli2,
   coreutils,
+  curl,
   makeWrapper,
   stdenvNoCC,
   symlinkJoin,
@@ -31,6 +32,7 @@ symlinkJoin {
     awscli2
     bash
     coreutils
+    curl
   ];
   nativeBuildInputs = [ makeWrapper ];
   postBuild = ''
