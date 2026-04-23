@@ -660,7 +660,7 @@ fn default_request_wait_for_local_catch_up_secs() -> u64 {
 }
 
 fn default_request_wait_for_active_local_catch_up_secs() -> u64 {
-    300
+    360
 }
 
 fn default_tee_cleanup_interval_secs() -> u64 {
@@ -1218,7 +1218,7 @@ mod tests {
         let config = parse_config_str(include_str!("../../config.example.yaml")).unwrap();
         assert_eq!(
             config.clone.request_wait_for_active_local_catch_up_secs,
-            300
+            360
         );
         assert!(config.config_reload.enabled);
         assert_eq!(config.config_reload.interval_secs, 60);
