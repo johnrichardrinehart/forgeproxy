@@ -226,6 +226,7 @@ The resulting rollout behavior is:
 - By default, Terraform derives the next target slot automatically from the listener that is currently serving traffic; `forgeproxy_active_slot` is only needed as a manual override.
 - The NLB health checks gate cutover on `/readyz`, so warm-up must finish before the new slot can receive production traffic.
 - Each forgeproxy Auto Scaling Group uses `health_check_type = "ELB"` with a configurable `forgeproxy_health_check_grace_period_secs`, which defaults to `1800` seconds (30 minutes) before failed target-group checks can trigger replacement.
+- Startup pre-warm also has a configurable `prewarm_force_open_secs` timeout, and Terraform validates that the ASG grace period is at least that timeout plus the `/readyz` target-group healthy window so readiness force-opens before the ASG can terminate the instance for failed health checks.
 - Listener cutover moves all production traffic to a single slot at a time, avoiding mixed `git_revision` values from `/healthz`.
 - After listener cutover, Terraform performs a bounded HTTPS soak against `/readyz` and `/healthz` through each configured client-facing hostname before scaling the old slot down.
 - If that soak never stabilizes before `forgeproxy_cutover_timeout_secs`, `terraform apply` fails and the old slot is left running instead of being terminated.

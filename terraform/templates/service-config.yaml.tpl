@@ -74,6 +74,7 @@ prewarm:
   enabled: ${prewarm_enabled}
   repos: ${jsonencode(prewarm_repos)}
   max_concurrent: ${prewarm_max_concurrent}
+  force_open_secs: ${prewarm_force_open_secs}
 
 storage:
   local:
