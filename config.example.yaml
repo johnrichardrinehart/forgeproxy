@@ -115,6 +115,10 @@ observability:
     sample_ratio: 1.0
 logging:
   level: "info"
+delegated_repositories:
+  # Repositories listed here are always delegated to the upstream forge and do
+  # not use local disk, pack-cache, bundle-uri, or tee-hydration paths.
+  - "org/problem-repo"
 repo_overrides:
   "org/monorepo":
     fetch_interval: 900

@@ -13,6 +13,8 @@ upstream:
 
 backend_type: "${backend_type}"
 
+delegated_repositories: ${jsonencode(delegated_repositories)}
+
 upstream_credentials:
   default_mode: "pat"
   orgs:

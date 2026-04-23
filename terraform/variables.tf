@@ -429,6 +429,21 @@ variable "local_upload_pack_first_byte_secs" {
   description = "Request path: seconds a client may wait for first byte from local git upload-pack before proxying upstream. Zero disables this stage budget."
 }
 
+variable "delegated_repositories" {
+  type        = list(string)
+  default     = []
+  description = "Canonical owner/repo repositories that forgeproxy must always proxy to upstream, bypassing local disk, pack-cache, bundle-uri, and tee hydration."
+
+  validation {
+    condition = alltrue([
+      for repo in var.delegated_repositories :
+      length(regexall("^[^/\\s]+/.+[^/\\s]$", repo)) > 0
+      && !strcontains(repo, "..")
+    ])
+    error_message = "delegated_repositories entries must be canonical owner/repo slugs without '..'."
+  }
+}
+
 variable "max_concurrent_local_upload_packs_per_repo" {
   type        = number
   default     = 1

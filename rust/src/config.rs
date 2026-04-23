@@ -108,7 +108,18 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
+    pub delegated_repositories: Vec<String>,
+    #[serde(default)]
     pub repo_overrides: HashMap<String, RepoOverride>,
+}
+
+impl Config {
+    pub fn repository_is_delegated(&self, owner_repo: &str) -> bool {
+        let canonical = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+        self.delegated_repositories
+            .iter()
+            .any(|entry| crate::repo_identity::canonicalize_owner_repo(entry) == canonical)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,6 +1149,19 @@ fn validate_config(config: &Config) -> Result<()> {
         config.config_reload.interval_secs > 0,
         "config_reload.interval_secs must be greater than 0"
     );
+    for repo in &config.delegated_repositories {
+        let canonical = crate::repo_identity::canonicalize_owner_repo(repo);
+        let Some((owner, repo_name)) = canonical.split_once('/') else {
+            anyhow::bail!("delegated_repositories entries must use owner/repo form: {repo:?}");
+        };
+        anyhow::ensure!(
+            !owner.is_empty()
+                && !repo_name.is_empty()
+                && !canonical.contains("..")
+                && !canonical.contains('\0'),
+            "delegated_repositories entries must be valid owner/repo slugs: {repo:?}"
+        );
+    }
     Ok(())
 }
 
@@ -1180,6 +1204,14 @@ mod tests {
         );
         assert!(config.config_reload.enabled);
         assert_eq!(config.config_reload.interval_secs, 60);
+        assert!(config.repository_is_delegated("org/problem-repo.git"));
+    }
+
+    #[test]
+    fn rejects_invalid_delegated_repository_entries() {
+        let config = include_str!("../../config.example.yaml")
+            .replace("  - \"org/problem-repo\"\n", "  - \"problem-repo\"\n");
+        assert!(parse_config_str(&config).is_err());
     }
 
     #[test]

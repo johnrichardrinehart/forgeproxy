@@ -11,6 +11,7 @@ let
         upstream_api_url                           = "https://ghe.example.com/api/v3"
         upstream_git_url_base                      = "https://ghe.example.com"
         backend_type                               = "github-enterprise"
+        delegated_repositories                     = []
         config_reload_enabled                      = true
         config_reload_interval_secs                = 60
         valkey_private_ip                          = "10.0.0.10"

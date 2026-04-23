@@ -100,6 +100,7 @@ Top-level sections:
 | `fetch_schedule`       | Background re-fetch interval, backoff, rolling window          |
 | `bundles`              | Consolidation schedule, min clone count, filtered bundles      |
 | `storage`              | Local disk path/percentages/eviction policy, S3 bucket/region/FIPS |
+| `delegated_repositories` | Repositories always delegated to upstream instead of local cache |
 | `repo_overrides`       | Per-repo overrides for fetch interval, freshness, bundles      |
 
 ## NixOS Deployment
