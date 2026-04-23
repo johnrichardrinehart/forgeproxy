@@ -11,13 +11,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::ReaderStream;
 use tracing::{debug, warn};
 
 use crate::config::{EvictionPolicy, PackCacheConfig};
@@ -104,6 +105,9 @@ struct PackCacheHit {
 }
 
 enum PackCacheReadArtifact {
+    SinglePack {
+        file: File,
+    },
     Entry {
         packs: Vec<stitch::OpenedPack>,
         synthetic_trailer_sha1: Option<[u8; 20]>,
@@ -120,8 +124,8 @@ struct PackCacheReadGuard {
     active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
 
-struct LeasedPackCacheStream<S> {
-    inner: S,
+struct LeasedPackCacheStream {
+    inner: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
     _guard: PackCacheReadGuard,
 }
 
@@ -145,6 +149,32 @@ impl PackCacheReadLease {
     pub fn into_stream(self) -> Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>> {
         let Self { artifact, _guard } = self;
         match artifact {
+            PackCacheReadArtifact::SinglePack { file } => {
+                let packfile = stream::once(async {
+                    Ok::<Bytes, io::Error>(Bytes::from(stitch::packfile_section_pkt()))
+                });
+                let framed_pack =
+                    ReaderStream::with_capacity(file, stitch::MAX_SIDEBAND_PACK_CHUNK).map(
+                        |chunk| {
+                            chunk.and_then(|chunk| {
+                            if chunk.len() > stitch::MAX_SIDEBAND_PACK_CHUNK {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "single-pack async replay chunk exceeded sideband packet limit",
+                                ));
+                            }
+                            Ok(Bytes::from(stitch::encode_sideband1_pkt(&chunk)))
+                        })
+                        },
+                    );
+                let flush = stream::once(async {
+                    Ok::<Bytes, io::Error>(Bytes::from(stitch::flush_pkt()))
+                });
+                Box::pin(LeasedPackCacheStream {
+                    inner: Box::pin(packfile.chain(framed_pack).chain(flush)),
+                    _guard,
+                })
+            }
             PackCacheReadArtifact::Entry {
                 packs,
                 synthetic_trailer_sha1,
@@ -166,7 +196,7 @@ impl PackCacheReadLease {
                     }
                 });
                 Box::pin(LeasedPackCacheStream {
-                    inner: ReceiverStream::new(receiver),
+                    inner: Box::pin(ReceiverStream::new(receiver)),
                     _guard,
                 })
             }
@@ -188,14 +218,11 @@ impl Drop for PackCacheReadGuard {
     }
 }
 
-impl<S> Stream for LeasedPackCacheStream<S>
-where
-    S: Stream<Item = io::Result<Bytes>> + Unpin,
-{
+impl Stream for LeasedPackCacheStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        self.inner.as_mut().poll_next(cx)
     }
 }
 
@@ -770,12 +797,23 @@ impl PackCache {
             .as_deref()
             .map(parse_sha1_hex)
             .transpose()?;
-        let packs = self
-            .entry_replay_pack_paths(&hit.manifest)?
+        let guard = self.acquire_read_guard(vec![hit.key.as_str().to_string()]);
+        let pack_paths = self.entry_replay_pack_paths(&hit.manifest)?;
+        if pack_paths.len() == 1 && synthetic_trailer_sha1.is_none() {
+            let pack_path = &pack_paths[0];
+            let file = std::fs::File::open(pack_path)
+                .with_context(|| format!("open pack {}", pack_path.display()))?;
+            return Ok(PackCacheReadLease {
+                artifact: PackCacheReadArtifact::SinglePack {
+                    file: File::from_std(file),
+                },
+                _guard: guard,
+            });
+        }
+        let packs = pack_paths
             .into_iter()
             .map(|path| stitch::OpenedPack::from_path(&path))
             .collect::<Result<Vec<_>>>()?;
-        let guard = self.acquire_read_guard(vec![hit.key.as_str().to_string()]);
         Ok(PackCacheReadLease {
             artifact: PackCacheReadArtifact::Entry {
                 packs,
