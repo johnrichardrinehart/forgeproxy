@@ -168,6 +168,10 @@ pub struct PrewarmConfig {
     /// Maximum repositories to pre-warm concurrently.
     #[serde(default = "default_prewarm_max_concurrent")]
     pub max_concurrent: usize,
+    /// Upper bound on how long startup pre-warm is allowed to hold `/readyz`
+    /// closed before readiness force-opens and `/healthz` reports degradation.
+    #[serde(default = "default_prewarm_force_open_secs")]
+    pub force_open_secs: u64,
 }
 
 impl Default for PrewarmConfig {
@@ -176,12 +180,17 @@ impl Default for PrewarmConfig {
             enabled: false,
             repos: Vec::new(),
             max_concurrent: default_prewarm_max_concurrent(),
+            force_open_secs: default_prewarm_force_open_secs(),
         }
     }
 }
 
 fn default_prewarm_max_concurrent() -> usize {
     2
+}
+
+fn default_prewarm_force_open_secs() -> u64 {
+    1500
 }
 
 // ---------------------------------------------------------------------------
