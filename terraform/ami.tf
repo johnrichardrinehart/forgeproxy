@@ -96,6 +96,14 @@ resource "null_resource" "build_forgeproxy_ami" {
     architecture = local.forgeproxy_ami_arch
   }
 
+  lifecycle {
+    # Replacements happen while prior forgeproxy resources may still depend on
+    # the old builder via state edges from the pre-ASG rollout shape.
+    # Creating the new AMI build first avoids a destroy/create cycle during
+    # rollout applies that replace the image hash.
+    create_before_destroy = true
+  }
+
   provisioner "local-exec" {
     command = <<-EOT
       set -euo pipefail
@@ -243,6 +251,10 @@ resource "null_resource" "build_valkey_ami" {
     image_hash   = data.external.valkey_image_hash.result.hash
     name_prefix  = var.name_prefix
     architecture = local.valkey_ami_arch
+  }
+
+  lifecycle {
+    create_before_destroy = true
   }
 
   provisioner "local-exec" {
@@ -394,6 +406,10 @@ resource "null_resource" "build_ghe_key_lookup_ami" {
     image_hash   = data.external.ghe_key_lookup_image_hash.result.hash
     name_prefix  = var.name_prefix
     architecture = local.ghe_key_lookup_ami_arch
+  }
+
+  lifecycle {
+    create_before_destroy = true
   }
 
   provisioner "local-exec" {

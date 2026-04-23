@@ -100,6 +100,17 @@ variable "forgeproxy_count" {
   }
 }
 
+variable "forgeproxy_active_slot" {
+  type        = string
+  default     = "blue"
+  description = "Blue/green deployment slot that should receive production traffic after apply. Flip this value on each rollout to avoid mixed revisions behind the load balancer."
+
+  validation {
+    condition     = contains(["blue", "green"], var.forgeproxy_active_slot)
+    error_message = "forgeproxy_active_slot must be either 'blue' or 'green'."
+  }
+}
+
 variable "forgeproxy_ssh_host_key_secret_arn" {
   type        = string
   default     = null

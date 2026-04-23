@@ -13,6 +13,11 @@ output "forgeproxy_instance_ids" {
   description = "List of forgeproxy instance IDs"
 }
 
+output "forgeproxy_active_slot" {
+  value       = module.forgeproxy.forgeproxy_active_slot
+  description = "Blue/green deployment slot currently receiving production traffic"
+}
+
 output "valkey_instance_id" {
   value       = module.forgeproxy.valkey_instance_id
   description = "Valkey instance ID"
