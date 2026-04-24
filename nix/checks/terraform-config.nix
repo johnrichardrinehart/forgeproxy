@@ -49,6 +49,7 @@ let
         prewarm_enabled                            = false
         prewarm_repos                              = []
         prewarm_max_concurrent                     = 2
+        prewarm_force_open_secs                    = 1500
         bundle_pack_threads                        = 4
         bundle_max_incremental_bundles             = 1
         metrics_enabled                            = true

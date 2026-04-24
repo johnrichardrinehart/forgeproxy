@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use fred::clients::Pool;
 use fred::interfaces::ClientLike;
 use fred::interfaces::KeysInterface;
@@ -59,8 +59,7 @@ const CLONE_CAPTURE_MEMORY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 #[command(
     name = "forgeproxy",
     about = "Git Caching Reverse Proxy",
-    version = crate::build_info::VERSION,
-    long_version = crate::build_info::LONG_VERSION
+    version = crate::build_info::VERSION
 )]
 struct Cli {
     /// Path to the YAML configuration file.
@@ -1155,7 +1154,12 @@ async fn main() -> Result<()> {
         .expect("failed to install rustls CryptoProvider");
 
     // ---- CLI ----
-    let cli = Cli::parse();
+    let cli = {
+        let matches = Cli::command()
+            .long_version(crate::build_info::long_version())
+            .get_matches();
+        Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+    };
 
     if let Some(Command::WriteRuntimeResourceAttributes { output }) = &cli.command {
         let detection = crate::runtime_resource::write_runtime_resource_attributes_file(
@@ -1198,7 +1202,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         config_path = %cli.config,
         version = crate::build_info::VERSION,
-        git_revision = crate::build_info::GIT_REVISION,
+        git_revision = crate::build_info::git_revision(),
         host_id = runtime_resource_detection
             .attributes
             .host_id

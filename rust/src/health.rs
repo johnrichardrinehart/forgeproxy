@@ -20,8 +20,8 @@ const GITHUB_TOKEN_EXPIRATION_FORMAT: &str = "%Y-%m-%d %H:%M:%S UTC";
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: HealthStatus,
-    pub version: &'static str,
-    pub git_revision: &'static str,
+    pub version: String,
+    pub git_revision: String,
     pub checks: HealthChecks,
 }
 
@@ -295,8 +295,8 @@ pub async fn health_handler(State(state): State<HealthState>) -> impl IntoRespon
     let status = aggregate_status(&checks);
     let body = HealthResponse {
         status,
-        version: crate::build_info::VERSION,
-        git_revision: crate::build_info::GIT_REVISION,
+        version: crate::build_info::VERSION.to_string(),
+        git_revision: crate::build_info::git_revision().to_string(),
         checks,
     };
 
