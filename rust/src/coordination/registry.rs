@@ -5196,16 +5196,9 @@ async fn refresh_prewarmed_repo_from_upstream(
     info!(
         repo = %owner_repo,
         initialized_from,
-        "startup pre-warm is fetching from upstream to maximize freshness before first traffic"
+        "startup pre-warm is fetching directly into the mirror to maximize freshness before first traffic"
     );
-    match fetch_delta_into_repo_mirror(
-        state,
-        owner_repo,
-        &clone_url,
-        None,
-        FetchPriority::Background,
-    )
-    .await
+    match refresh_prewarmed_repo_mirror_directly_from_upstream(state, owner_repo, &clone_url).await
     {
         Ok(fetch_result) => {
             info!(
@@ -5227,7 +5220,7 @@ async fn refresh_prewarmed_repo_from_upstream(
                 initialized_from,
                 error = %error,
                 error_chain = %format!("{error:#}"),
-                "startup pre-warm upstream refresh failed; keeping the current local repo state"
+                "startup pre-warm upstream refresh failed; keeping the current published repo state"
             );
             PrewarmRepoReport {
                 initialized_locally: true,
@@ -5237,6 +5230,69 @@ async fn refresh_prewarmed_repo_from_upstream(
             }
         }
     }
+}
+
+async fn refresh_prewarmed_repo_mirror_directly_from_upstream(
+    state: &crate::AppState,
+    owner_repo: &str,
+    clone_url: &str,
+) -> Result<DeltaMirrorFetchResult> {
+    if state.config().clone.max_concurrent_upstream_fetches == 0 {
+        bail!("upstream fetch semaphore is disabled");
+    }
+
+    let mirror_path = require_existing_repo_mirror(state, owner_repo).await?;
+    let Some(fetch_permits) =
+        acquire_fetch_permits(state, owner_repo, FetchPriority::Background).await?
+    else {
+        bail!("no upstream fetch slots are available for startup pre-warm refresh");
+    };
+
+    let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+    let fetch_result = crate::git::commands::git_fetch_with_context(
+        &mirror_path,
+        clone_url,
+        &[],
+        Some(FetchPriority::Background.as_label()),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to refresh pre-warmed mirror {} from upstream",
+            mirror_path.display()
+        )
+    })?;
+    drop(fetch_permits);
+
+    ensure_bare_head_ref(&mirror_path).await?;
+    let mirror_validation_started_at = Instant::now();
+    info!(
+        repo = %owner_repo,
+        source = "startup prewarm upstream refresh",
+        path = %mirror_path.display(),
+        "starting quick mirror verification before publishing a pre-warm refresh"
+    );
+    quick_check_ready_repo(&mirror_path, "startup prewarm upstream refresh", None).await?;
+    info!(
+        repo = %owner_repo,
+        source = "startup prewarm upstream refresh",
+        path = %mirror_path.display(),
+        elapsed_ms = mirror_validation_started_at.elapsed().as_millis(),
+        "finished quick mirror verification before publishing a pre-warm refresh"
+    );
+
+    let published_repo_path = publish_repo_mirror_generation_inner(
+        state,
+        owner_repo,
+        "startup prewarm upstream refresh",
+        true,
+    )
+    .await?;
+
+    Ok(DeltaMirrorFetchResult {
+        fetch_result,
+        published_repo_path,
+    })
 }
 
 async fn classify_local_wants_satisfaction_inner(
