@@ -750,7 +750,6 @@ async fn serve_local_upload_pack_once(
                     });
                     let composite_result = if let Some(timeout) = composite_timeout {
                         let state_for_task = state.clone();
-                        let metrics = state.metrics.clone();
                         let owner_repo_for_task = owner_repo.to_string();
                         let serve_from_for_task = serve_from;
                         let mut handle = tokio::spawn(async move {
@@ -802,19 +801,12 @@ async fn serve_local_upload_pack_once(
                                 warn!(
                                     repo = %owner_repo,
                                     timeout_secs = timeout.as_secs_f64(),
-                                    "short-circuiting SSH fetch to upstream while on-demand pack cache composite continues in the background"
+                                    "bypassing SSH on-demand pack cache composite for this request; continuing with local upload-pack while composite runs in the background"
                                 );
-                                crate::metrics::inc_upstream_fallback(
-                                    &metrics,
-                                    Protocol::Ssh,
-                                    "short_circuit_pack_cache_composite",
-                                );
-                                crate::metrics::inc_short_circuit_upstream(
-                                    &metrics,
-                                    Protocol::Ssh,
-                                    "pack_cache_composite",
-                                );
-                                return false;
+                                Err(crate::coordination::registry::PackCacheCompositeMiss {
+                                    writer: None,
+                                    reason: "composite_timeout",
+                                })
                             }
                         }
                     } else {
