@@ -34,6 +34,7 @@ let
         local_upload_pack_first_byte_secs          = 0
         max_concurrent_local_upload_packs          = 4
         max_concurrent_local_upload_packs_per_repo = 1
+        local_upload_pack_threads                  = 2
         index_pack_threads                         = 2
         pack_cache_enabled                         = true
         pack_cache_max_percent                     = 0.20

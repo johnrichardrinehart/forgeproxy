@@ -40,6 +40,8 @@ clone:
   # Higher values improve parallel clone/fetch throughput but allow more concurrent pack-objects CPU.
   max_concurrent_local_upload_packs: 4
   max_concurrent_local_upload_packs_per_repo: 1
+  # Request path: local git upload-pack inherits this as pack.threads for pack generation.
+  local_upload_pack_threads: 2
   # Request-adjacent CPU: tee imports and pack-cache indexing use this git index-pack thread cap.
   # It does not gate cache-hit replay, but request-generated artifacts can index while clients are active.
   index_pack_threads: 2
@@ -69,8 +71,7 @@ bundles:
   min_clone_count_for_bundles: 2
   bundle_lock_ttl: 300
   # Optional. Defaults to available parallelism divided by max_concurrent_generations.
-  # Set explicitly to bound CPU used by bundle and bitmap/MIDX generation.
-  # Request path: request-time pack-cache composite delta generation also uses this pack.threads value.
+  # Used for bundle generation, background bitmap/MIDX preparation, and request-time pack-cache deltas.
   pack_threads: 4
   generate_filtered_bundles: true
   max_incremental_bundles: 1

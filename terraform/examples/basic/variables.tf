@@ -386,6 +386,17 @@ variable "max_concurrent_local_upload_packs_per_repo" {
   description = "Request path: maximum concurrent local git upload-pack subprocesses per repository per forgeproxy instance."
 }
 
+variable "local_upload_pack_threads" {
+  type        = number
+  default     = 2
+  description = "Request path: git pack.threads value applied to local git upload-pack subprocesses so pack generation is bounded per client serve."
+
+  validation {
+    condition     = var.local_upload_pack_threads > 0
+    error_message = "local_upload_pack_threads must be greater than 0."
+  }
+}
+
 variable "index_pack_threads" {
   type        = number
   default     = 2
