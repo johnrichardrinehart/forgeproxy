@@ -2002,8 +2002,25 @@ impl Handler for SshSession {
                 let repo_cached_locally = self.cache_manager.has_repo(&repo);
                 let route_v2_through_upstream = self.git_protocol.as_deref() == Some("version=2");
                 let repository_delegated = self.state.config().repository_is_delegated(&repo);
+                let (owner, repo_leaf) =
+                    super::upstream::split_owner_repo(&repo).unwrap_or((&repo, ""));
+                let org_credential_status = Some(
+                    crate::credentials::org_policy::local_acceleration_status_for_repo(
+                        &self.state,
+                        owner,
+                        repo_leaf,
+                    )
+                    .await,
+                );
+                let local_acceleration_allowed = org_credential_status
+                    .as_ref()
+                    .is_none_or(|status| status.is_eligible());
 
-                if repo_cached_locally && !route_v2_through_upstream && !repository_delegated {
+                if repo_cached_locally
+                    && !route_v2_through_upstream
+                    && !repository_delegated
+                    && local_acceleration_allowed
+                {
                     let clone_started = Instant::now();
                     // ── Serve from local cache via bidirectional upload-pack ──
                     let Some(channel) = self.channels.get(&channel_id).cloned() else {
@@ -2261,10 +2278,25 @@ impl Handler for SshSession {
                     }
                 } else {
                     if repository_delegated {
+                        if let Some(status) = org_credential_status
+                            .as_ref()
+                            .filter(|status| !status.is_eligible())
+                        {
+                            crate::credentials::org_policy::log_local_acceleration_bypass(
+                                status, &repo, "ssh", "exec",
+                            );
+                        }
                         info!(
                             repo = %repo,
                             has_local_repo = repo_cached_locally,
                             "repository is delegated to upstream; proxying SSH upload-pack upstream"
+                        );
+                    } else if let Some(status) = org_credential_status
+                        .as_ref()
+                        .filter(|status| !status.is_eligible())
+                    {
+                        crate::credentials::org_policy::log_local_acceleration_bypass(
+                            status, &repo, "ssh", "exec",
                         );
                     } else if route_v2_through_upstream {
                         info!(
@@ -2283,6 +2315,7 @@ impl Handler for SshSession {
                     // Auth is fail-closed, so this should be true in normal
                     // operation.
                     let authenticated = self.username.is_some();
+                    let upstream_authenticated = authenticated && local_acceleration_allowed;
 
                     // Initialise the accumulation buffer NOW, before spawning,
                     // so the `data` callback can capture any client bytes that
@@ -2292,7 +2325,7 @@ impl Handler for SshSession {
                     self.upstream_proxy_buf = Some((
                         repo.clone(),
                         Vec::new(),
-                        authenticated,
+                        upstream_authenticated,
                         self.git_protocol.clone(),
                     ));
                     let channel_state = UpstreamProxyChannelState {
@@ -2326,9 +2359,10 @@ impl Handler for SshSession {
                         match super::upstream::fetch_ref_advertisement(
                             &state,
                             &repo_bg,
-                            authenticated,
+                            upstream_authenticated,
                             git_protocol.as_deref(),
                             &metric_username,
+                            local_acceleration_allowed && !repository_delegated,
                         )
                         .await
                         {
@@ -2447,7 +2481,24 @@ async fn proxy_upstream_upload_pack(
     let mut fetch_started_at = None;
     let mut fetch_cache_status = None;
     let repository_delegated = state.config().repository_is_delegated(&owner_repo);
-    if request_kind == V2RequestKind::BundleUri && !repository_delegated {
+    let org_credential_status = if let Some((owner, repo)) =
+        crate::credentials::org_policy::local_acceleration_status_from_owner_repo_missing_ok(
+            &owner_repo,
+        ) {
+        Some(
+            crate::credentials::org_policy::local_acceleration_status_for_repo(&state, owner, repo)
+                .await,
+        )
+    } else {
+        None
+    };
+    let local_acceleration_allowed = org_credential_status
+        .as_ref()
+        .is_none_or(|status| status.is_eligible());
+    if request_kind == V2RequestKind::BundleUri
+        && !repository_delegated
+        && local_acceleration_allowed
+    {
         let response = if authenticated {
             match crate::http::bundle_serve::bundle_uri_command_response(&state, &owner_repo).await
             {
@@ -2505,11 +2556,33 @@ async fn proxy_upstream_upload_pack(
             .and_then(crate::coordination::registry::advertised_ref_tips);
         if repository_delegated {
             fetch_cache_status = Some(CacheStatus::Cold);
+            if let Some(status) = org_credential_status
+                .as_ref()
+                .filter(|status| !status.is_eligible())
+            {
+                crate::credentials::org_policy::log_local_acceleration_bypass(
+                    status,
+                    &owner_repo,
+                    "ssh",
+                    "fetch",
+                );
+            }
             info!(
                 repo = %owner_repo,
                 wants = wants.len(),
                 want_sample,
                 "repository is delegated to upstream; skipping SSH pack-cache and local serveability checks"
+            );
+        } else if let Some(status) = org_credential_status
+            .as_ref()
+            .filter(|status| !status.is_eligible())
+        {
+            fetch_cache_status = Some(CacheStatus::Cold);
+            crate::credentials::org_policy::log_local_acceleration_bypass(
+                status,
+                &owner_repo,
+                "ssh",
+                "fetch",
             );
         } else {
             if authenticated
@@ -2686,7 +2759,8 @@ async fn proxy_upstream_upload_pack(
 
     let stream_channel = stream_channel;
     let mut stream_writer = stream_channel.as_ref().map(|channel| channel.make_writer());
-    let mut upstream_clone_permits = if behavior.capture_for_hydration {
+    let mut upstream_clone_permits = if behavior.capture_for_hydration && local_acceleration_allowed
+    {
         match crate::coordination::registry::try_acquire_clone_hydration_permits(
             &state,
             &owner_repo,
@@ -2736,11 +2810,12 @@ async fn proxy_upstream_upload_pack(
     } else {
         None
     };
+    let upstream_authenticated = authenticated && local_acceleration_allowed;
     match super::upstream::post_upload_pack_stream(
         &state,
         &owner_repo,
         &want_have,
-        authenticated,
+        upstream_authenticated,
         git_protocol.as_deref(),
         &metric_username,
     )
@@ -3002,8 +3077,8 @@ async fn build_clone_auth_header_for_repo(state: &AppState, owner_repo: &str) ->
         .upstream_credentials
         .orgs
         .get(owner)
-        .map(|oc| oc.keyring_key_name.as_str())
-        .unwrap_or(&config.upstream.admin_token_env);
+        .filter(|oc| oc.mode == crate::config::CredentialMode::Pat)
+        .map(|oc| oc.keyring_key_name.as_str())?;
 
     let token = crate::credentials::keyring::resolve_secret(token_key).await?;
     if token.is_empty() {

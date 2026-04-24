@@ -140,6 +140,88 @@ async fn resolve_archive_ref_name(
         .ok_or_else(|| AppError::NotFound(format!("default branch not found for {owner}/{repo}")))
 }
 
+async fn proxy_archive_to_upstream(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    rest: &str,
+    ref_name: &str,
+    ext: &str,
+    auth_header: Option<&str>,
+) -> Result<Response, AppError> {
+    let upstream_url = format!(
+        "https://{}/{}/{}/archive/{}",
+        state.config().upstream.hostname,
+        owner,
+        repo,
+        rest,
+    );
+
+    debug!(%upstream_url, "proxying archive request directly to upstream forge");
+
+    let mut upstream_req = state.http_client.get(&upstream_url);
+    if let Some(header) = auth_header {
+        upstream_req = upstream_req.header(header::AUTHORIZATION, header);
+    }
+    let upstream_resp = upstream_req
+        .send()
+        .await
+        .context("failed to reach upstream forge for archive")?;
+
+    let status = upstream_resp.status();
+    if !status.is_success() {
+        let body_text = upstream_resp
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("<unreadable>"));
+        warn!(%status, "upstream forge returned error for archive request");
+        return Ok((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            body_text,
+        )
+            .into_response());
+    }
+
+    let content_length = upstream_resp.content_length();
+    let content_disposition = upstream_resp
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let cache_control = upstream_resp
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let etag = upstream_resp
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let last_modified = upstream_resp
+        .headers()
+        .get(header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let body = Body::from_stream(upstream_resp.bytes_stream());
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    apply_archive_response_headers(
+        &mut response,
+        repo,
+        ref_name,
+        ext,
+        content_length,
+        content_disposition.as_deref(),
+        cache_control.as_deref(),
+        etag.as_deref(),
+        last_modified.as_deref(),
+    );
+
+    Ok(response)
+}
+
 /// Handle an archive request with three-tier caching.
 ///
 /// 1. Validate inputs and authenticate the caller.
@@ -158,14 +240,53 @@ pub async fn handle_archive(
     validate_path_segment(&repo, "repo")?;
     validate_archive_rest(&rest)?;
 
-    // ---------- auth ----------
-    let auth_header = extract_optional_auth_header(&headers);
-    crate::auth::http_validator::validate_http_auth(&state, auth_header.as_deref(), &owner, &repo)
-        .await?;
-
     // ---------- parse rest → (ref_name, ext) ----------
     let (ref_name, ext) = parse_archive_rest(&rest)
         .ok_or_else(|| AppError::NotFound(format!("unrecognised archive format: {rest}")))?;
+
+    // ---------- auth ----------
+    let auth_header = extract_optional_auth_header(&headers);
+    let owner_repo = crate::repo_identity::canonical_owner_repo(&owner, &repo);
+    if state.config().repository_is_delegated(&owner_repo) {
+        info!(
+            repo = %owner_repo,
+            "repository is delegated to upstream; proxying archive without local cache"
+        );
+        return proxy_archive_to_upstream(
+            &state,
+            &owner,
+            &repo,
+            &rest,
+            &ref_name,
+            &ext,
+            auth_header.as_deref(),
+        )
+        .await;
+    }
+
+    let org_credential_status =
+        crate::credentials::org_policy::local_acceleration_status_for_repo(&state, &owner, &repo)
+            .await;
+    if !org_credential_status.is_eligible() {
+        crate::credentials::org_policy::log_local_acceleration_bypass(
+            &org_credential_status,
+            &owner_repo,
+            "http",
+            "archive",
+        );
+        return proxy_archive_to_upstream(
+            &state,
+            &owner,
+            &repo,
+            &rest,
+            &ref_name,
+            &ext,
+            auth_header.as_deref(),
+        )
+        .await;
+    }
+    crate::auth::http_validator::validate_http_auth(&state, auth_header.as_deref(), &owner, &repo)
+        .await?;
 
     // ---------- resolve ref → SHA ----------
     let sha = state
