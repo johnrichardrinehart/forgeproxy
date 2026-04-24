@@ -1271,12 +1271,11 @@ async fn try_ensure_repo_cloned_inner(
                             },
                             "tee capture convergence repaired the local mirror and published a fresh generation"
                         );
-                        publish_bootstrap_bundle_best_effort(
-                            state,
-                            &owner_repo,
-                            &repair.published_repo_path,
-                        )
-                        .await;
+                        spawn_bootstrap_bundle_publication(
+                            state.clone(),
+                            owner_repo.clone(),
+                            repair.published_repo_path.clone(),
+                        );
                         return Ok::<(), anyhow::Error>(());
                     }
                     Ok(None) => {
@@ -1334,7 +1333,11 @@ async fn try_ensure_repo_cloned_inner(
                 bytes_received = delta_fetch.fetch_result.bytes_received,
                 "delta workspace fetch integrated into the local mirror and published"
             );
-            publish_bootstrap_bundle_best_effort(state, &owner_repo, &published_repo_path).await;
+            spawn_bootstrap_bundle_publication(
+                state.clone(),
+                owner_repo.clone(),
+                published_repo_path.clone(),
+            );
             return Ok::<(), anyhow::Error>(());
         }
 
@@ -1431,8 +1434,11 @@ async fn try_ensure_repo_cloned_inner(
                 set_repo_info(&state.valkey, &owner_repo, &info).await?;
                 crate::coordination::pubsub::publish_ready(&state.valkey, &owner_repo, &node_id)
                     .await?;
-                publish_bootstrap_bundle_best_effort(state, &owner_repo, &published_repo_path)
-                    .await;
+                spawn_bootstrap_bundle_publication(
+                    state.clone(),
+                    owner_repo.clone(),
+                    published_repo_path.clone(),
+                );
                 info!(
                     %owner_repo,
                     mirror = %mirror_path.display(),
@@ -1628,7 +1634,11 @@ async fn try_ensure_repo_cloned_inner(
                 auth_header.map(ToOwned::to_owned),
             );
         } else {
-            publish_bootstrap_bundle_best_effort(state, &owner_repo, &published_repo_path).await;
+            spawn_bootstrap_bundle_publication(
+                state.clone(),
+                owner_repo.clone(),
+                published_repo_path.clone(),
+            );
         }
 
         debug!(
@@ -3473,7 +3483,7 @@ async fn restore_repo_from_s3_into_path(
         "starting S3 bundle restore into local repo"
     );
 
-    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for S3 hydration")?;
+    let tmp_dir = create_s3_hydration_tempdir(state)?;
     let bundle_path = tmp_dir.path().join("hydrate.bundle");
     let bundle_download_started_at = Instant::now();
     let config = state.config();
@@ -3511,6 +3521,21 @@ async fn restore_repo_from_s3_into_path(
     );
 
     Ok(restored)
+}
+
+fn create_s3_hydration_tempdir(state: &crate::AppState) -> Result<tempfile::TempDir> {
+    let tmp_root = crate::cache::layout::state_hydration_tmp_root(&state.cache_manager.base_path);
+    std::fs::create_dir_all(&tmp_root).with_context(|| {
+        format!(
+            "failed to create S3 hydration temp root {}",
+            tmp_root.display()
+        )
+    })?;
+
+    tempfile::Builder::new()
+        .prefix("forgeproxy-hydrate-")
+        .tempdir_in(&tmp_root)
+        .context("failed to create temp dir for S3 hydration")
 }
 
 async fn try_restore_repo_from_s3(
@@ -4028,7 +4053,11 @@ async fn converge_published_repo_generation(
         bytes_received = delta_fetch.fetch_result.bytes_received,
         "capture convergence follow-on delta fetch finished"
     );
-    publish_bootstrap_bundle_best_effort(state, owner_repo, &delta_fetch.published_repo_path).await;
+    spawn_bootstrap_bundle_publication(
+        state.clone(),
+        owner_repo.to_owned(),
+        delta_fetch.published_repo_path.clone(),
+    );
     Ok(())
 }
 
@@ -4600,6 +4629,16 @@ async fn publish_bootstrap_bundle_best_effort(
             "bootstrap bundle publication failed; keeping locally cached repo"
         );
     }
+}
+
+fn spawn_bootstrap_bundle_publication(
+    state: crate::AppState,
+    owner_repo: String,
+    published_repo_path: PathBuf,
+) {
+    tokio::spawn(async move {
+        publish_bootstrap_bundle_best_effort(&state, &owner_repo, &published_repo_path).await;
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
