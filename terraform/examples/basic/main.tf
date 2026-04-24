@@ -77,6 +77,7 @@ module "forgeproxy" {
   delegated_repositories                        = var.delegated_repositories
   max_concurrent_local_upload_packs             = var.max_concurrent_local_upload_packs
   max_concurrent_local_upload_packs_per_repo    = var.max_concurrent_local_upload_packs_per_repo
+  local_upload_pack_threads                     = var.local_upload_pack_threads
   index_pack_threads                            = var.index_pack_threads
   pack_cache_enabled                            = var.pack_cache_enabled
   pack_cache_max_percent                        = var.pack_cache_max_percent

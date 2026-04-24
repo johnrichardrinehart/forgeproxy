@@ -54,6 +54,8 @@ clone:
   # Higher values improve parallel clone/fetch throughput but allow more concurrent pack-objects CPU.
   max_concurrent_local_upload_packs: ${max_concurrent_local_upload_packs}
   max_concurrent_local_upload_packs_per_repo: ${max_concurrent_local_upload_packs_per_repo}
+  # Request path: local git upload-pack inherits this as pack.threads for pack generation.
+  local_upload_pack_threads: ${local_upload_pack_threads}
   # Request-adjacent CPU: tee imports and pack-cache indexing use this git index-pack thread cap.
   index_pack_threads: ${index_pack_threads}
 
@@ -89,7 +91,7 @@ storage:
     presigned_url_ttl: ${s3_presigned_url_ttl}
 
 bundles:
-  # Request path: request-time pack-cache composite delta generation also uses this pack.threads value.
+  # Used for bundle generation, background bitmap/MIDX preparation, and request-time pack-cache deltas.
   pack_threads: ${bundle_pack_threads}
   max_incremental_bundles: ${bundle_max_incremental_bundles}
 

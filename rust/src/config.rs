@@ -530,6 +530,13 @@ pub struct CloneConfig {
     /// for a single repository on this instance.
     #[serde(default = "default_max_concurrent_local_upload_packs_per_repo")]
     pub max_concurrent_local_upload_packs_per_repo: usize,
+    /// Request path: number of worker threads local `git upload-pack`
+    /// subprocesses may use for pack generation.
+    ///
+    /// Forgeproxy applies this as `git -c pack.threads=<n> upload-pack` so
+    /// upload-pack's internal `pack-objects` child inherits the setting.
+    #[serde(default = "default_local_upload_pack_threads")]
+    pub local_upload_pack_threads: usize,
     /// Request-adjacent CPU: number of worker threads allowed for local
     /// `git index-pack` subprocesses.
     ///
@@ -613,6 +620,7 @@ impl Default for CloneConfig {
             max_concurrent_local_upload_packs: default_max_concurrent_local_upload_packs(),
             max_concurrent_local_upload_packs_per_repo:
                 default_max_concurrent_local_upload_packs_per_repo(),
+            local_upload_pack_threads: default_local_upload_pack_threads(),
             index_pack_threads: default_index_pack_threads(),
             hydration_mode: HydrationMode::default(),
             prepare_published_generation_indexes: false,
@@ -707,6 +715,10 @@ fn default_index_pack_threads() -> usize {
     DEFAULT_INDEX_PACK_THREADS
 }
 
+fn default_local_upload_pack_threads() -> usize {
+    DEFAULT_INDEX_PACK_THREADS
+}
+
 // ---------------------------------------------------------------------------
 // Adaptive fetch schedule
 // ---------------------------------------------------------------------------
@@ -779,7 +791,8 @@ pub struct BundleConfig {
     /// parallel on this instance during the periodic lifecycle tick.
     #[serde(default = "default_max_concurrent_generations")]
     pub max_concurrent_generations: usize,
-    /// Number of `git pack-objects` threads to use for each generated bundle.
+    /// Number of Git pack worker threads to use for bundle generation,
+    /// background bitmap/MIDX preparation, and pack-cache composite deltas.
     ///
     /// When unset, forgeproxy derives a value from the host's CPU count and
     /// the resolved bundle-generation concurrency so the total pack thread
@@ -1138,6 +1151,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "max_concurrent_upstream_clones_per_repo_per_instance",
             "max_concurrent_local_upload_packs",
             "max_concurrent_local_upload_packs_per_repo",
+            "local_upload_pack_threads",
             "index_pack_threads",
             "hydration_mode",
             "prepare_published_generation_indexes",
@@ -1386,6 +1400,10 @@ fn validate_config(config: &Config) -> Result<()> {
         "max_concurrent_local_upload_packs_per_repo must be greater than 0"
     );
     anyhow::ensure!(
+        config.clone.local_upload_pack_threads > 0,
+        "clone.local_upload_pack_threads must be greater than 0"
+    );
+    anyhow::ensure!(
         config.clone.index_pack_threads > 0,
         "clone.index_pack_threads must be greater than 0"
     );
@@ -1545,6 +1563,15 @@ mod tests {
     fn rejects_zero_index_pack_threads() {
         let config = include_str!("../../config.example.yaml")
             .replace("  index_pack_threads: 2\n", "  index_pack_threads: 0\n");
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_local_upload_pack_threads() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  local_upload_pack_threads: 2\n",
+            "  local_upload_pack_threads: 0\n",
+        );
         assert!(parse_config_str(&config).is_err());
     }
 

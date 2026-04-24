@@ -1472,6 +1472,7 @@ async fn build_app_state(
     tracing::info!(
         max_concurrent_generations = bundle_execution_policy.max_concurrent_generations,
         pack_threads = bundle_execution_policy.pack_threads,
+        local_upload_pack_threads = config.clone.local_upload_pack_threads,
         index_pack_threads = config.clone.index_pack_threads,
         "resolved git subprocess execution policy"
     );
@@ -1695,6 +1696,7 @@ mod tests {
         next.auth.http_cache_ttl = current.auth.http_cache_ttl + 1;
         next.clone.global_short_circuit_upstream_secs =
             current.clone.global_short_circuit_upstream_secs + 5;
+        next.clone.local_upload_pack_threads = current.clone.local_upload_pack_threads + 1;
         next.upstream_credentials
             .orgs
             .get_mut("acme-corp")

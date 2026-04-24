@@ -126,8 +126,11 @@ pub async fn spawn_local_upload_pack_with_lease_timeout(
     };
     let repo_path = repo_lease.repo_path().to_path_buf();
 
+    let pack_threads = state.config().clone.local_upload_pack_threads;
     let mut cmd = Command::new("git");
-    cmd.arg("upload-pack");
+    cmd.arg("-c")
+        .arg(format!("pack.threads={pack_threads}"))
+        .arg("upload-pack");
     if mode == LocalUploadPackMode::StatelessRpc {
         cmd.arg("--stateless-rpc");
     }
@@ -154,6 +157,7 @@ pub async fn spawn_local_upload_pack_with_lease_timeout(
         protocol = protocol_name,
         serve_from = %serve_from,
         mode = %mode,
+        pack_threads,
         path = %repo_path.display(),
         "serving upload-pack directly from local disk"
     );

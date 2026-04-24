@@ -70,13 +70,17 @@ limited by disk, memory pressure, or downstream socket backpressure?
 
 ### Terraform knobs
 
-The module now exposes forgeproxy gp3 tuning directly:
+The module now exposes these performance controls directly:
 
 - `forgeproxy_root_volume_iops` (default `3000`)
 - `forgeproxy_root_volume_throughput_mbps` (default `125`)
+- `bundle_pack_threads` (default `4`), wired through `pack.threads` for bundle
+  generation, background bitmap/MIDX preparation, and pack-cache deltas
+- `local_upload_pack_threads` (default `2`), wired to
+  `git -c pack.threads=<n> upload-pack` for local disk serves
 
-These only affect forgeproxy instance root volumes. Defaults stay unchanged so
-existing deployments do not drift without operator intent.
+The gp3 knobs only affect forgeproxy instance root volumes. Defaults stay
+unchanged so existing deployments do not drift without operator intent.
 
 ## How to read the signals
 
