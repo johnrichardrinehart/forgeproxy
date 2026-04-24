@@ -20,13 +20,30 @@
   outputs =
     inputs@{ self, flake-parts, ... }:
     let
+      lib = inputs.nixpkgs.lib;
       gitRevision =
         if self ? shortRev then
           self.shortRev
         else if self ? dirtyShortRev then
           self.dirtyShortRev
         else
-          "dirty";
+          "unknown";
+      appSource = lib.fileset.toSource {
+        root = ./.;
+        fileset = lib.fileset.unions [
+          ./.cargo
+          ./config.example.yaml
+          ./ghe-key-lookup
+          ./nix/lib
+          ./nix/nixosConfigurations
+          ./nix/nixosModules
+          ./nix/overlays
+          ./nix/packages
+          ./rust
+          ./scripts
+          ./terraform/scripts
+        ];
+      };
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
@@ -77,7 +94,7 @@
 
           legacyPackages = pkgs;
 
-          packages = import ./nix/packages {
+          packages = import "${appSource}/nix/packages" {
             inherit pkgs config;
           };
         };
@@ -86,9 +103,9 @@
       # Flake-wide outputs (overlays, modules, configurations)
       # ────────────────────────────────────────────────────────────────────
       flake = {
-        overlays.default = import ./nix/overlays/default.nix { inherit gitRevision; };
-        nixosModules = import ./nix/nixosModules;
-        nixosConfigurations = import ./nix/nixosConfigurations { inherit self inputs; };
+        overlays.default = import "${appSource}/nix/overlays/default.nix" { inherit gitRevision; };
+        nixosModules = import "${appSource}/nix/nixosModules";
+        nixosConfigurations = import "${appSource}/nix/nixosConfigurations" { inherit self inputs; };
       };
     };
 }
