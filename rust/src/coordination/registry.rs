@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::git::commands::git_fetch_refspecs_allow_missing_remote_refs_with_context;
@@ -9,7 +10,7 @@ use base64::Engine;
 use fred::interfaces::{ClientLike, HashesInterface, KeysInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, TryAcquireError};
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::short_circuit::{RequestBudget, duration_from_secs, min_timeout};
@@ -576,12 +577,19 @@ async fn acquire_fetch_permits(
         }
     };
 
-    let global_fetch_permit = state
-        .fetch_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| anyhow::anyhow!("fetch semaphore closed"))?;
+    let global_fetch_permit = match priority {
+        FetchPriority::RequestTime => match state.fetch_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => return Ok(None),
+            Err(TryAcquireError::Closed) => return Err(anyhow::anyhow!("fetch semaphore closed")),
+        },
+        FetchPriority::Background | FetchPriority::TeeConvergence => state
+            .fetch_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("fetch semaphore closed"))?,
+    };
 
     Ok(Some(FetchPermits {
         _global_fetch_permit: global_fetch_permit,
@@ -788,6 +796,23 @@ async fn acquire_repo_publish_guard(
         .await
 }
 
+async fn acquire_repo_publish_guard_with_timeout(
+    repo_publish_mutexes: &RepoPublishMutexes,
+    owner_repo: &str,
+    timeout: Option<Duration>,
+) -> Option<OwnedMutexGuard<()>> {
+    let mutex = repo_publish_mutex(repo_publish_mutexes, owner_repo).await;
+    if timeout == Some(Duration::ZERO) {
+        return mutex.try_lock_owned().ok();
+    }
+
+    let lock = mutex.lock_owned();
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, lock).await.ok(),
+        None => Some(lock.await),
+    }
+}
+
 async fn try_acquire_repo_publish_guard(
     repo_publish_mutexes: &RepoPublishMutexes,
     owner_repo: &str,
@@ -819,13 +844,30 @@ async fn try_acquire_repo_catch_up_guard(
         .ok()
 }
 
-async fn pin_current_published_generation(
+async fn try_pin_current_published_generation(
     cache_manager: &crate::cache::CacheManager,
     repo_publish_mutexes: &RepoPublishMutexes,
     published_generation_leases: &PublishedGenerationLeases,
     owner_repo: &str,
+    timeout: Option<Duration>,
+) -> Result<Option<PathBuf>> {
+    let Some(_publish_guard) =
+        acquire_repo_publish_guard_with_timeout(repo_publish_mutexes, owner_repo, timeout).await
+    else {
+        return Ok(None);
+    };
+    Ok(Some(pin_current_published_generation_after_guard(
+        cache_manager,
+        published_generation_leases,
+        owner_repo,
+    )?))
+}
+
+fn pin_current_published_generation_after_guard(
+    cache_manager: &crate::cache::CacheManager,
+    published_generation_leases: &PublishedGenerationLeases,
+    owner_repo: &str,
 ) -> Result<PathBuf> {
-    let _publish_guard = acquire_repo_publish_guard(repo_publish_mutexes, owner_repo).await;
     let generation_path = cache_manager
         .current_repo_target(owner_repo)?
         .ok_or_else(|| anyhow::anyhow!("published repo generation is not available"))?;
@@ -897,6 +939,14 @@ fn lease_published_generation_path(
     *count += 1;
     drop(leases);
 
+    published_generation_lease_for_path(state, owner_repo, generation_path)
+}
+
+fn published_generation_lease_for_path(
+    state: &crate::AppState,
+    owner_repo: &str,
+    generation_path: &Path,
+) -> PublishedGenerationLease {
     PublishedGenerationLease {
         owner_repo: owner_repo.to_string(),
         generation_path: generation_path.to_path_buf(),
@@ -1020,19 +1070,37 @@ pub async fn acquire_published_generation_lease(
     state: &crate::AppState,
     owner_repo: &str,
 ) -> Result<PublishedGenerationLease> {
-    let generation_path = pin_current_published_generation(
+    let Some(lease) =
+        acquire_published_generation_lease_with_timeout(state, owner_repo, None).await?
+    else {
+        unreachable!("published generation lease cannot time out without a timeout");
+    };
+
+    Ok(lease)
+}
+
+pub async fn acquire_published_generation_lease_with_timeout(
+    state: &crate::AppState,
+    owner_repo: &str,
+    timeout: Option<Duration>,
+) -> Result<Option<PublishedGenerationLease>> {
+    let Some(generation_path) = try_pin_current_published_generation(
         &state.cache_manager,
         &state.repo_publish_mutexes,
         &state.published_generation_leases,
         owner_repo,
+        timeout,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(None);
+    };
 
-    Ok(lease_published_generation_path(
+    Ok(Some(published_generation_lease_for_path(
         state,
         owner_repo,
         &generation_path,
-    ))
+    )))
 }
 
 pub async fn acquire_local_serve_repo_lease(
@@ -1044,6 +1112,24 @@ pub async fn acquire_local_serve_repo_lease(
         LocalServeRepoSource::PublishedGeneration => Ok(LocalServeRepoLease::Published(
             acquire_published_generation_lease(state, owner_repo).await?,
         )),
+    }
+}
+
+pub async fn acquire_local_serve_repo_lease_with_timeout(
+    state: &crate::AppState,
+    owner_repo: &str,
+    source: LocalServeRepoSource,
+    timeout: Option<Duration>,
+) -> Result<Option<LocalServeRepoLease>> {
+    match source {
+        LocalServeRepoSource::PublishedGeneration => {
+            let Some(lease) =
+                acquire_published_generation_lease_with_timeout(state, owner_repo, timeout).await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(LocalServeRepoLease::Published(lease)))
+        }
     }
 }
 
@@ -1827,11 +1913,9 @@ fn spawn_published_generation_index_preparation(
             }
         };
 
-        let Some(_upload_pack_idle_gate) =
-            try_acquire_idle_local_upload_pack_gate(&state, &owner_repo, &source)
-        else {
+        if !try_confirm_idle_local_upload_pack_gate(&state, &owner_repo, &source) {
             return;
-        };
+        }
 
         let result = crate::git::commands::git_prepare_published_generation_indexes(
             &published_path,
@@ -1864,11 +1948,11 @@ fn spawn_published_generation_index_preparation(
     });
 }
 
-fn try_acquire_idle_local_upload_pack_gate(
+fn try_confirm_idle_local_upload_pack_gate(
     state: &crate::AppState,
     owner_repo: &str,
     source: &str,
-) -> Option<OwnedSemaphorePermit> {
+) -> bool {
     let permit_count = match u32::try_from(state.config().clone.max_concurrent_local_upload_packs) {
         Ok(permit_count) => permit_count,
         Err(_) => {
@@ -1878,40 +1962,60 @@ fn try_acquire_idle_local_upload_pack_gate(
                 max_concurrent_local_upload_packs = state.config().clone.max_concurrent_local_upload_packs,
                 "skipping background bitmap/MIDX preparation because upload-pack semaphore size exceeds git maintenance gate capacity"
             );
-            return None;
+            return false;
         }
     };
 
-    match state
-        .local_upload_pack_semaphore
-        .clone()
-        .try_acquire_many_owned(permit_count)
-    {
-        Ok(permit) => {
+    match confirm_idle_local_upload_pack_semaphore(
+        state.local_upload_pack_semaphore.clone(),
+        permit_count,
+    ) {
+        IdleLocalUploadPackGate::Idle => {
             debug!(
                 repo = %owner_repo,
                 source,
                 permits = permit_count,
-                "acquired idle local upload-pack gate for background bitmap/MIDX preparation"
+                "confirmed local upload-pack is idle before background bitmap/MIDX preparation"
             );
-            Some(permit)
+            true
         }
-        Err(TryAcquireError::NoPermits) => {
+        IdleLocalUploadPackGate::Busy => {
             info!(
                 repo = %owner_repo,
                 source,
-                "skipping background bitmap/MIDX preparation because local upload-pack is active"
+                "skipping background bitmap/MIDX preparation because local upload-pack admission is busy"
             );
-            None
+            false
         }
-        Err(TryAcquireError::Closed) => {
+        IdleLocalUploadPackGate::Closed => {
             warn!(
                 repo = %owner_repo,
                 source,
                 "skipping background bitmap/MIDX preparation because local upload-pack semaphore is closed"
             );
-            None
+            false
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdleLocalUploadPackGate {
+    Idle,
+    Busy,
+    Closed,
+}
+
+fn confirm_idle_local_upload_pack_semaphore(
+    semaphore: Arc<Semaphore>,
+    permit_count: u32,
+) -> IdleLocalUploadPackGate {
+    match semaphore.try_acquire_many_owned(permit_count) {
+        Ok(permit) => {
+            drop(permit);
+            IdleLocalUploadPackGate::Idle
+        }
+        Err(TryAcquireError::NoPermits) => IdleLocalUploadPackGate::Busy,
+        Err(TryAcquireError::Closed) => IdleLocalUploadPackGate::Closed,
     }
 }
 
@@ -5714,6 +5818,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn idle_upload_pack_confirmation_releases_permits() {
+        let semaphore = Arc::new(Semaphore::new(2));
+
+        assert_eq!(
+            confirm_idle_local_upload_pack_semaphore(semaphore.clone(), 2),
+            IdleLocalUploadPackGate::Idle
+        );
+        assert_eq!(semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn idle_upload_pack_confirmation_reports_busy() {
+        let semaphore = Arc::new(Semaphore::new(2));
+        let _held = semaphore.clone().acquire_many_owned(1).await.unwrap();
+
+        assert_eq!(
+            confirm_idle_local_upload_pack_semaphore(semaphore.clone(), 2),
+            IdleLocalUploadPackGate::Busy
+        );
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
     fn git_stdout(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")
@@ -6443,11 +6570,12 @@ mod tests {
             let repo_publish_mutexes = std::sync::Arc::clone(&repo_publish_mutexes);
             let published_generation_leases = std::sync::Arc::clone(&published_generation_leases);
             tokio::spawn(async move {
-                pin_current_published_generation(
+                try_pin_current_published_generation(
                     &cache_manager,
                     &repo_publish_mutexes,
                     &published_generation_leases,
                     owner_repo,
+                    None,
                 )
                 .await
             })
@@ -6472,13 +6600,44 @@ mod tests {
 
         drop(publish_guard);
 
-        let pinned_generation = pinned_generation.await.unwrap().unwrap();
+        let pinned_generation = pinned_generation.await.unwrap().unwrap().unwrap();
         assert_eq!(pinned_generation, second);
 
         let leases = published_generation_leases.lock().unwrap();
         let repo_leases = leases.get(owner_repo).unwrap();
         assert_eq!(repo_leases.get(&second), Some(&1));
         assert!(!repo_leases.contains_key(&first));
+    }
+
+    #[tokio::test]
+    async fn try_pin_current_published_generation_times_out_when_publish_busy() {
+        let tmp = tempdir().unwrap();
+        let cache_manager = test_cache_manager(tmp.path());
+        let owner_repo = "acme/widgets";
+
+        let first = cache_manager.create_staging_repo_path(owner_repo).unwrap();
+        create_usable_bare_repo(&first);
+        cache_manager
+            .publish_staged_repo(owner_repo, &first)
+            .unwrap();
+
+        let repo_publish_mutexes = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let published_generation_leases =
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let _publish_guard = acquire_repo_publish_guard(&repo_publish_mutexes, owner_repo).await;
+
+        let pinned = try_pin_current_published_generation(
+            &cache_manager,
+            &repo_publish_mutexes,
+            &published_generation_leases,
+            owner_repo,
+            Some(Duration::ZERO),
+        )
+        .await
+        .unwrap();
+
+        assert!(pinned.is_none());
+        assert!(published_generation_leases.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

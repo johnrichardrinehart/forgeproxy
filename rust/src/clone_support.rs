@@ -1,9 +1,10 @@
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tracing::{info, warn};
 
 use crate::AppState;
@@ -59,19 +60,30 @@ pub struct LocalUploadPackProcess {
     pub _lease: LocalServeRepoLease,
 }
 
-pub async fn spawn_local_upload_pack(
+pub async fn spawn_local_upload_pack_timeout(
     state: &AppState,
     owner_repo: &str,
     protocol: Protocol,
     serve_from: LocalServeRepoSource,
     mode: LocalUploadPackMode,
     git_protocol: Option<&str>,
-) -> Result<LocalUploadPackProcess> {
-    let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease(
-        state, owner_repo, serve_from,
+    permit_timeout: Option<Duration>,
+) -> Result<Option<LocalUploadPackProcess>> {
+    let permit_wait_started = Instant::now();
+    let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease_with_timeout(
+        state,
+        owner_repo,
+        serve_from,
+        permit_timeout,
     )
     .await?;
-    spawn_local_upload_pack_with_lease(
+    let Some(repo_lease) = repo_lease else {
+        return Ok(None);
+    };
+    let remaining_timeout =
+        permit_timeout.map(|timeout| timeout.saturating_sub(permit_wait_started.elapsed()));
+
+    spawn_local_upload_pack_with_lease_timeout(
         state,
         owner_repo,
         protocol,
@@ -79,11 +91,13 @@ pub async fn spawn_local_upload_pack(
         repo_lease,
         mode,
         git_protocol,
+        remaining_timeout,
     )
     .await
 }
 
-pub async fn spawn_local_upload_pack_with_lease(
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_local_upload_pack_with_lease_timeout(
     state: &AppState,
     owner_repo: &str,
     protocol: Protocol,
@@ -91,14 +105,25 @@ pub async fn spawn_local_upload_pack_with_lease(
     repo_lease: LocalServeRepoLease,
     mode: LocalUploadPackMode,
     git_protocol: Option<&str>,
-) -> Result<LocalUploadPackProcess> {
-    let repo_upload_pack_permit = acquire_local_repo_upload_pack_permit(state, owner_repo).await?;
-    let global_upload_pack_permit = state
-        .local_upload_pack_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| anyhow::anyhow!("local upload-pack semaphore closed"))?;
+    permit_timeout: Option<Duration>,
+) -> Result<Option<LocalUploadPackProcess>> {
+    let permit_wait_started = Instant::now();
+    let repo_upload_pack_permit =
+        acquire_local_repo_upload_pack_permit(state, owner_repo, permit_timeout).await?;
+    let Some(repo_upload_pack_permit) = repo_upload_pack_permit else {
+        return Ok(None);
+    };
+    let remaining_timeout =
+        permit_timeout.map(|timeout| timeout.saturating_sub(permit_wait_started.elapsed()));
+    let global_upload_pack_permit = acquire_owned_permit_with_timeout(
+        state.local_upload_pack_semaphore.clone(),
+        remaining_timeout,
+        "local upload-pack semaphore closed",
+    )
+    .await?;
+    let Some(global_upload_pack_permit) = global_upload_pack_permit else {
+        return Ok(None);
+    };
     let repo_path = repo_lease.repo_path().to_path_buf();
 
     let mut cmd = Command::new("git");
@@ -133,7 +158,7 @@ pub async fn spawn_local_upload_pack_with_lease(
         "serving upload-pack directly from local disk"
     );
 
-    Ok(LocalUploadPackProcess {
+    Ok(Some(LocalUploadPackProcess {
         stdin: child.stdin.take(),
         stdout: child.stdout.take(),
         stderr: child.stderr.take(),
@@ -142,13 +167,14 @@ pub async fn spawn_local_upload_pack_with_lease(
         _global_upload_pack_permit: global_upload_pack_permit,
         _repo_upload_pack_permit: repo_upload_pack_permit,
         _lease: repo_lease,
-    })
+    }))
 }
 
 async fn acquire_local_repo_upload_pack_permit(
     state: &AppState,
     owner_repo: &str,
-) -> Result<OwnedSemaphorePermit> {
+    timeout: Option<Duration>,
+) -> Result<Option<OwnedSemaphorePermit>> {
     let semaphore = {
         let mut semaphores = state.repo_upload_pack_semaphores.lock().await;
         semaphores
@@ -164,10 +190,34 @@ async fn acquire_local_repo_upload_pack_permit(
             .clone()
     };
 
-    semaphore
-        .acquire_owned()
-        .await
-        .map_err(|_| anyhow::anyhow!("repo upload-pack semaphore closed"))
+    acquire_owned_permit_with_timeout(semaphore, timeout, "repo upload-pack semaphore closed").await
+}
+
+async fn acquire_owned_permit_with_timeout(
+    semaphore: Arc<Semaphore>,
+    timeout: Option<Duration>,
+    closed_message: &'static str,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    if timeout == Some(Duration::ZERO) {
+        return match semaphore.try_acquire_owned() {
+            Ok(permit) => Ok(Some(permit)),
+            Err(TryAcquireError::NoPermits) => Ok(None),
+            Err(TryAcquireError::Closed) => Err(anyhow::anyhow!(closed_message)),
+        };
+    }
+
+    let acquire = semaphore.acquire_owned();
+    match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, acquire).await {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Err(_)) => Err(anyhow::anyhow!(closed_message)),
+            Err(_) => Ok(None),
+        },
+        None => acquire
+            .await
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!(closed_message)),
+    }
 }
 
 pub struct LocalUploadPackExit {
@@ -524,7 +574,12 @@ fn spawn_background_upstream_hydration(
 
 #[cfg(test)]
 mod tests {
-    use super::LocalUploadPackMode;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::Semaphore;
+
+    use super::{LocalUploadPackMode, acquire_owned_permit_with_timeout};
 
     #[test]
     fn local_upload_pack_mode_display_uses_lowercase_labels() {
@@ -533,5 +588,37 @@ mod tests {
             "stateless_rpc"
         );
         assert_eq!(LocalUploadPackMode::Interactive.to_string(), "interactive");
+    }
+
+    #[tokio::test]
+    async fn upload_pack_permit_zero_timeout_returns_none_when_saturated() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let _held = semaphore.clone().acquire_owned().await.unwrap();
+
+        let permit = acquire_owned_permit_with_timeout(
+            semaphore,
+            Some(Duration::ZERO),
+            "test semaphore closed",
+        )
+        .await
+        .unwrap();
+
+        assert!(permit.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_pack_permit_zero_timeout_uses_available_permit() {
+        let semaphore = Arc::new(Semaphore::new(1));
+
+        let permit = acquire_owned_permit_with_timeout(
+            semaphore.clone(),
+            Some(Duration::ZERO),
+            "test semaphore closed",
+        )
+        .await
+        .unwrap();
+
+        assert!(permit.is_some());
+        assert_eq!(semaphore.available_permits(), 0);
     }
 }
