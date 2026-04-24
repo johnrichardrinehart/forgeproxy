@@ -71,17 +71,13 @@ output "ghe_key_lookup_nlb_dns_name" {
 }
 
 output "secrets_to_populate" {
-  value = concat(
-    [
-      aws_secretsmanager_secret.forge_admin_token.name,
-      aws_secretsmanager_secret.webhook_secret.name,
-    ],
-    [for _, secret in aws_secretsmanager_secret.org_creds : secret.name],
-    local.ghe_key_lookup_enabled ? [
-      aws_secretsmanager_secret.ghe_key_lookup_admin_key[0].name,
-    ] : []
-  )
-  description = "List of actual Secrets Manager secret names that must be populated before first use"
+  value       = [aws_secretsmanager_secret.bootstrap_secrets.name]
+  description = "Backing Secrets Manager secret that stores the structured bootstrap secrets JSON consumed by Terraform"
+}
+
+output "bootstrap_secrets_secret_name" {
+  value       = aws_secretsmanager_secret.bootstrap_secrets.name
+  description = "Stable Secrets Manager secret name used to store structured bootstrap secrets for this deployment"
 }
 
 output "configured_proxy_hostnames" {

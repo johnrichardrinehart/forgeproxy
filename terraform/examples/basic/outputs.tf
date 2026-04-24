@@ -65,7 +65,12 @@ output "ghe_key_lookup_nlb_dns_name" {
 
 output "secrets_to_populate" {
   value       = module.forgeproxy.secrets_to_populate
-  description = "List of Secrets Manager secrets that must be populated before first use"
+  description = "Backing Secrets Manager secret that stores the structured bootstrap secrets JSON consumed by Terraform"
+}
+
+output "bootstrap_secrets_secret_name" {
+  value       = module.forgeproxy.bootstrap_secrets_secret_name
+  description = "Stable Secrets Manager secret name used to store structured bootstrap secrets for this deployment"
 }
 
 output "configured_proxy_hostnames" {
