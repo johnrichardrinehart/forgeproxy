@@ -52,8 +52,39 @@ pub async fn handle_bundle_list(
     repo: &str,
     auth_token: Option<&str>,
 ) -> Result<Response, AppError> {
-    // 1. Validate that the caller has at least read access.
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
+    if state.config().repository_is_delegated(&owner_repo) {
+        info!(
+            repo = %owner_repo,
+            "repository is delegated to upstream; refusing local bundle-list"
+        );
+        crate::metrics::inc_bundle_list_request(&state.metrics, &owner_repo, "delegated");
+        return Ok((
+            StatusCode::NOT_FOUND,
+            "No bundles available for this repository.\n",
+        )
+            .into_response());
+    }
+
+    let org_credential_status =
+        crate::credentials::org_policy::local_acceleration_status_for_repo(state, owner, repo)
+            .await;
+    if !org_credential_status.is_eligible() {
+        crate::credentials::org_policy::log_local_acceleration_bypass(
+            &org_credential_status,
+            &owner_repo,
+            "http",
+            "bundle-list",
+        );
+        crate::metrics::inc_bundle_list_request(&state.metrics, &owner_repo, "not_managed");
+        return Ok((
+            StatusCode::NOT_FOUND,
+            "No bundles available for this repository.\n",
+        )
+            .into_response());
+    }
+
+    // 1. Validate that the caller has at least read access.
     if let Err(error) =
         crate::auth::http_validator::validate_http_auth(state, auth_token, owner, repo).await
     {

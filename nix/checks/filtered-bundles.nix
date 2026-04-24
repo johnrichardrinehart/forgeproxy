@@ -53,6 +53,10 @@ let
 
     upstream_credentials:
       default_mode: "pat"
+      orgs:
+        octocat:
+          mode: "pat"
+          keyring_key_name: "FORGE_ADMIN_TOKEN"
 
     proxy:
       ssh_listen: "0.0.0.0:2222"

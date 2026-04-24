@@ -4,4 +4,5 @@
 //! variables, supporting per-organisation credential overrides.
 
 pub mod keyring;
+pub mod org_policy;
 pub mod ssh_to_https;

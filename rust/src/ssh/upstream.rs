@@ -56,6 +56,7 @@ pub async fn fetch_ref_advertisement(
     authenticated: bool,
     git_protocol: Option<&str>,
     metric_username: &str,
+    inject_bundle_uri: bool,
 ) -> Result<Vec<u8>> {
     let (owner, repo) = split_owner_repo(owner_repo)?;
     let (clone_url, _) =
@@ -89,10 +90,10 @@ pub async fn fetch_ref_advertisement(
                 .context("failed to read ref advertisement body")?;
 
             let stripped = strip_http_service_line(&body);
-            let stripped = if state.config().repository_is_delegated(owner_repo) {
+            let stripped = if !inject_bundle_uri {
                 info!(
                     %owner_repo,
-                    "repository is delegated to upstream; forwarding SSH ref advertisement without bundle-uri injection"
+                    "forwarding SSH ref advertisement without bundle-uri injection"
                 );
                 stripped.to_vec()
             } else {
@@ -235,7 +236,7 @@ fn credential_mode(config: &Config, owner: &str) -> CredentialMode {
         .orgs
         .get(owner)
         .map(|oc| oc.mode)
-        .unwrap_or(config.upstream_credentials.default_mode)
+        .unwrap_or(CredentialMode::Pat)
 }
 
 /// Resolve the upstream clone URL and any environment variables needed for
@@ -255,15 +256,19 @@ async fn resolve_upstream_url_and_creds(
     match credential_mode(config, owner) {
         CredentialMode::Pat => {
             let token = if authenticated {
-                let key_name = config
+                if let Some(key_name) = config
                     .upstream_credentials
                     .orgs
                     .get(owner)
+                    .filter(|oc| oc.mode == CredentialMode::Pat)
                     .map(|oc| oc.keyring_key_name.as_str())
-                    .unwrap_or(&config.upstream.admin_token_env);
-                crate::credentials::keyring::resolve_secret(key_name)
-                    .await
-                    .unwrap_or_default()
+                {
+                    crate::credentials::keyring::resolve_secret(key_name)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
             } else {
                 // Anonymous SSH session — do not inject a token.  The forge
                 // will reject the request if the repo is private, which is the
@@ -398,5 +403,22 @@ mod tests {
     #[test]
     fn strip_service_line_too_short() {
         assert_eq!(strip_http_service_line(b"001"), b"001");
+    }
+
+    #[tokio::test]
+    async fn missing_org_credential_does_not_fall_back_to_admin_token() {
+        let config = crate::config::parse_config_str(include_str!("../../../config.example.yaml"))
+            .expect("example config should parse");
+
+        let (url, env_vars) =
+            resolve_upstream_url_and_creds(&config, "unknown-org", "widgets", true)
+                .await
+                .expect("missing org should still produce a direct upstream URL");
+
+        assert_eq!(
+            url,
+            "https://ghe.internal.example.com/unknown-org/widgets.git"
+        );
+        assert!(env_vars.is_empty());
     }
 }

@@ -4952,6 +4952,54 @@ pub async fn prewarm_repo(state: &crate::AppState, owner_repo: &str) -> PrewarmR
             issues: vec![format!("invalid prewarm repository slug: {owner_repo}")],
         };
     };
+    if state.config().repository_is_delegated(owner_repo) {
+        info!(
+            repo = %owner_repo,
+            "repository is delegated to upstream; skipping startup pre-warm"
+        );
+        return PrewarmRepoReport {
+            initialized_locally: false,
+            issues: vec![format!(
+                "{owner_repo}: startup pre-warm skipped because repository is delegated to upstream"
+            )],
+        };
+    }
+
+    let credential_mode = state
+        .config()
+        .upstream_credentials
+        .orgs
+        .get(owner)
+        .map(|credential| credential.mode);
+    if credential_mode != Some(crate::config::CredentialMode::Pat) {
+        info!(
+            repo = %owner_repo,
+            "startup pre-warm requires a managed PAT credential for the repository organization; skipping local initialization"
+        );
+        return PrewarmRepoReport {
+            initialized_locally: false,
+            issues: vec![format!(
+                "{owner_repo}: startup pre-warm skipped because no managed PAT credential is configured"
+            )],
+        };
+    }
+    let credential_status =
+        crate::credentials::org_policy::local_acceleration_status_for_repo(state, owner, repo)
+            .await;
+    if !credential_status.is_eligible() {
+        crate::credentials::org_policy::log_local_acceleration_bypass(
+            &credential_status,
+            owner_repo,
+            "prewarm",
+            "startup",
+        );
+        return PrewarmRepoReport {
+            initialized_locally: false,
+            issues: vec![format!(
+                "{owner_repo}: startup pre-warm skipped because managed organization credentials are unavailable or unusable"
+            )],
+        };
+    }
     let auth_header = prewarm_clone_auth_header(state, owner).await;
 
     let local_available =
@@ -5045,8 +5093,8 @@ async fn prewarm_clone_auth_header(state: &crate::AppState, owner: &str) -> Opti
         .upstream_credentials
         .orgs
         .get(owner)
-        .map(|oc| oc.keyring_key_name.as_str())
-        .unwrap_or(&config.upstream.admin_token_env);
+        .filter(|oc| oc.mode == crate::config::CredentialMode::Pat)
+        .map(|oc| oc.keyring_key_name.as_str())?;
     let token = crate::credentials::keyring::resolve_secret(token_key).await?;
     (!token.is_empty()).then(|| format!("Bearer {token}"))
 }

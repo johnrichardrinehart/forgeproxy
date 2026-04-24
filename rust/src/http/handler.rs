@@ -543,10 +543,31 @@ async fn handle_info_refs(
     }
 
     let repo_slug = crate::repo_identity::canonical_owner_repo(&owner, &repo);
-    if state.config().repository_is_delegated(&repo_slug) {
+    let org_credential_status =
+        crate::credentials::org_policy::local_acceleration_status_for_repo(&state, &owner, &repo)
+            .await;
+    let repository_delegated = state.config().repository_is_delegated(&repo_slug);
+    if repository_delegated {
+        if !org_credential_status.is_eligible() {
+            crate::credentials::org_policy::log_local_acceleration_bypass(
+                &org_credential_status,
+                &repo_slug,
+                "http",
+                "info-refs",
+            );
+        }
         info!(
             repo = %repo_slug,
             "repository is delegated to upstream; proxying info/refs without bundle-uri injection"
+        );
+        return proxy_info_refs_to_upstream(&state, &owner, &repo, &service, &headers).await;
+    }
+    if !org_credential_status.is_eligible() {
+        crate::credentials::org_policy::log_local_acceleration_bypass(
+            &org_credential_status,
+            &repo_slug,
+            "http",
+            "info-refs",
         );
         return proxy_info_refs_to_upstream(&state, &owner, &repo, &service, &headers).await;
     }
@@ -731,10 +752,53 @@ async fn handle_upload_pack(
     .unwrap_or_default();
     let client_fingerprint = http_git_client_fingerprint(&headers, &metric_username, &owner, &repo);
     let repository_delegated = state.config().repository_is_delegated(&repo_slug);
+    let org_credential_status =
+        crate::credentials::org_policy::local_acceleration_status_for_repo(&state, &owner, &repo)
+            .await;
     if repository_delegated {
+        if !org_credential_status.is_eligible() {
+            crate::credentials::org_policy::log_local_acceleration_bypass(
+                &org_credential_status,
+                &repo_slug,
+                "http",
+                "upload-pack",
+            );
+        }
         info!(
             repo = %repo_slug,
             "repository is delegated to upstream; proxying upload-pack without cache or hydration"
+        );
+        let response = proxy_upload_pack_to_upstream(
+            &state,
+            &owner,
+            &repo,
+            auth_header.as_deref(),
+            body,
+            decoded_body,
+            CloneCompletion {
+                cache_status: CacheStatus::Cold,
+                started_at,
+                metric_username,
+                metric_repo: repo_slug,
+            },
+            &headers,
+            request_metadata,
+            format!("http-{}", Uuid::new_v4().simple()),
+            client_fingerprint,
+            HttpUpstreamProxyBehavior {
+                capture_for_hydration: false,
+            },
+        )
+        .await?;
+
+        return Ok(response);
+    }
+    if !org_credential_status.is_eligible() {
+        crate::credentials::org_policy::log_local_acceleration_bypass(
+            &org_credential_status,
+            &repo_slug,
+            "http",
+            "upload-pack",
         );
         let response = proxy_upload_pack_to_upstream(
             &state,
