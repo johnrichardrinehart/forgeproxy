@@ -73,7 +73,7 @@ This will:
 2. Create VPC, subnets, Internet Gateway, NAT Gateway
 3. Create security groups and NLB
 4. Generate internal TLS materials for backend services
-5. Create all AWS Secrets Manager secrets
+5. Validate or seed the structured bootstrap secrets in AWS Secrets Manager
 6. Launch Valkey and the forgeproxy Auto Scaling Group
 7. Wait for `/readyz` health checks before the NLB sends traffic to new forgeproxy instances
 
@@ -85,32 +85,23 @@ terraform apply
 
 The build step for AMIs may take 10-15 minutes. Snapshot import can take 5-10 additional minutes.
 
-### 5. Populate required secrets
+### 5. Provide bootstrap secrets before apply
 
-After `terraform apply` completes, populate these Secrets Manager secrets with actual values.
-Note: this module creates secrets with `name_prefix`, so final names include a random suffix.
-Use Terraform outputs (or prefix lookup) to get exact names.
+Create a structured JSON file named `./forgeproxy-bootstrap-secrets.json` before the first `terraform apply`. An example file is included at `forgeproxy-bootstrap-secrets.example.json`.
 
 ```bash
-terraform output -json secrets_to_populate | jq -r '.[]'
-# Example output:
-# forgeproxy/forge-admin-token-abc123
-# forgeproxy/webhook-secret-def456
+cp terraform/forgeproxy-bootstrap-secrets.example.json ./forgeproxy-bootstrap-secrets.json
+chmod 600 ./forgeproxy-bootstrap-secrets.json
 ```
 
-When `enable_ghe_key_lookup = true`, also populate:
-```bash
-aws secretsmanager put-secret-value \
-  --secret-id "$(terraform output -json secrets_to_populate | jq -r '.[] | select(startswith("forgeproxy/ghe-key-lookup-admin-key-"))')" \
-  --secret-string "$(cat /path/to/ghe-admin-private-key)"
-```
+Terraform will:
+1. Create or update the stable backing secret `<name_prefix>/bootstrap-secrets`
+2. Validate that required fields are present before instance creation
+3. Derive the individual runtime Secrets Manager secrets from that structured JSON
 
-For each organization in `org_creds`, populate:
-```bash
-aws secretsmanager put-secret-value \
-  --secret-id "$(terraform output -json secrets_to_populate | jq -r '.[] | select(startswith("forgeproxy/creds-example-org-"))')" \
-  --secret-string "org-specific-credentials-or-pat"
-```
+After the first successful apply, later applies can omit the local file and Terraform will read the existing backing secret from AWS Secrets Manager instead.
+
+If the local file exists and conflicts with the existing backing secret, Terraform emits a warning and asks for interactive confirmation before overwriting the AWS value.
 
 ### 6. Verify the deployment
 
@@ -146,7 +137,8 @@ terraform/
 ├── iam.tf                         # IAM roles and policies
 ├── networking.tf                  # VPC, subnets, IGW, NAT, NLB, SGs
 ├── tls.tf                         # Self-signed TLS certificates
-├── secrets.tf                     # Secrets Manager secrets
+├── bootstrap-secrets.tf           # Structured bootstrap secret ingestion and validation
+├── secrets.tf                     # Derived Secrets Manager secrets
 ├── ami.tf                         # NixOS AMI build and registration
 ├── ec2.tf                         # EC2 instances and NLB attachments
 ├── ghe-key-lookup.tf              # Optional ghe-key-lookup sidecar fleet + internal NLB
@@ -253,36 +245,13 @@ terraform apply -var='forgeproxy_count=3'
 No AMI rebuild; existing instances unaffected.
 
 ### Change upstream Git forge
-```bash
-aws secretsmanager put-secret-value \
-  --secret-id "$(aws secretsmanager list-secrets --query 'SecretList[?starts_with(Name, `forgeproxy/nginx-upstream-hostname-`)].Name | [0]' --output text)" \
-  --secret-string "new-ghe.example.com"
-
-aws secretsmanager put-secret-value \
-  --secret-id "$(aws secretsmanager list-secrets --query 'SecretList[?starts_with(Name, `forgeproxy/nginx-upstream-port-`)].Name | [0]' --output text)" \
-  --secret-string "443"
-
-# Restart nginx on all instances (via SSM)
-aws ssm send-command \
-  --document-name "AWS-RunShellScript" \
-  --parameters 'commands=["systemctl restart nginx"]' \
-  --targets "Key=tag:Role,Values=forgeproxy"
-```
+Update `upstream_hostname`, `upstream_port`, `upstream_api_url`, or `upstream_git_url_base` in Terraform inputs and rerun `terraform apply`. Terraform regenerates the runtime secrets from those inputs.
 
 ### Add new organization
-1. Create the Secrets Manager secret:
-   ```bash
-   aws secretsmanager create-secret \
-     --name forgeproxy/creds/new-org \
-     --secret-string "org-pat-token"
-   ```
-
-2. Update the forgeproxy config secret to add the org:
-   ```bash
-   # (manually via AWS console or aws cli put-secret-value)
-   ```
-
-3. Restart forgeproxy:
+1. Add the new org to `org_creds`.
+2. Update `bootstrap-secrets.json` with the new `org_credentials` entry.
+3. Rerun `terraform apply`.
+4. Restart forgeproxy if you need the new org credentials to be picked up immediately:
    ```bash
    aws ssm send-command \
      --document-name "AWS-RunShellScript" \
@@ -291,21 +260,7 @@ aws ssm send-command \
    ```
 
 ### Rotate Valkey password
-```bash
-# Generate new password
-NEW_PASS=$(openssl rand -base64 32)
-
-# Update the secret
-aws secretsmanager put-secret-value \
-  --secret-id "$(aws secretsmanager list-secrets --query 'SecretList[?starts_with(Name, `forgeproxy/valkey-auth-token-`)].Name | [0]' --output text)" \
-  --secret-string "$NEW_PASS"
-
-# Restart valkey and forgeproxy
-aws ssm send-command \
-  --document-name "AWS-RunShellScript" \
-  --parameters 'commands=["systemctl restart valkey && systemctl restart forgeproxy"]' \
-  --targets "Key=tag:Name,Values=forgeproxy-valkey"
-```
+Terraform generates and persists the Valkey auth token internally. To rotate it, update the Terraform-managed secret and then restart valkey and forgeproxy.
 
 ## Region and Partition Support
 
