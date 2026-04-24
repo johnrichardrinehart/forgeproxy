@@ -76,7 +76,7 @@ resource "terraform_data" "bootstrap_secrets_validation" {
 resource "terraform_data" "bootstrap_secrets_conflict_prompt" {
   count = local.bootstrap_secrets_file_exists ? 1 : 0
 
-  input = {
+  triggers_replace = {
     bootstrap_secrets_secret_name = local.bootstrap_secrets_secret_name
     bootstrap_secrets_file_path   = local.bootstrap_secrets_file_path
     bootstrap_secrets_file_sha256 = local.bootstrap_secrets_file_exists ? filesha256(local.bootstrap_secrets_file_path) : ""
