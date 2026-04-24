@@ -5285,9 +5285,14 @@ async fn refresh_prewarmed_repo_mirror_directly_from_upstream(
         state,
         owner_repo,
         "startup prewarm upstream refresh",
-        true,
+        false,
     )
     .await?;
+    spawn_bootstrap_bundle_publication(
+        state.clone(),
+        owner_repo.to_string(),
+        published_repo_path.clone(),
+    );
 
     Ok(DeltaMirrorFetchResult {
         fetch_result,
