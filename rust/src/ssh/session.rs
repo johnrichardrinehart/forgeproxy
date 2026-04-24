@@ -28,7 +28,8 @@ use crate::AppState;
 use crate::cache::CacheManager;
 use crate::clone_support::{
     CloneCompletion, LocalUploadPackMode, UpstreamHydrationRequest, UpstreamHydrationTracker,
-    spawn_local_upload_pack, spawn_local_upload_pack_with_lease, wait_for_local_upload_pack_exit,
+    spawn_local_upload_pack_timeout, spawn_local_upload_pack_with_lease_timeout,
+    wait_for_local_upload_pack_exit,
 };
 use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoSource, try_finish_pack_cache_delta_composite,
@@ -623,22 +624,43 @@ async fn serve_local_upload_pack_once(
         should_close_channel,
     } = response;
 
-    let repo_lease = match crate::coordination::registry::acquire_local_serve_repo_lease(
-        state, owner_repo, serve_from,
-    )
-    .await
-    {
-        Ok(lease) => lease,
-        Err(error) => {
-            error!(repo = %owner_repo, error = %error, "failed to acquire local repo lease for SSH upload-pack");
-            if should_close_channel {
-                let _ = handle.exit_status_request(channel_id, 1).await;
-                let _ = handle.eof(channel_id).await;
-                let _ = handle.close(channel_id).await;
+    let repo_lease =
+        match crate::coordination::registry::acquire_local_serve_repo_lease_with_timeout(
+            state,
+            owner_repo,
+            serve_from,
+            budget.and_then(RequestBudget::remaining),
+        )
+        .await
+        {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                warn!(
+                    repo = %owner_repo,
+                    "short-circuiting SSH fetch to upstream before published generation lease was acquired"
+                );
+                crate::metrics::inc_upstream_fallback(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    "short_circuit_published_generation_lease",
+                );
+                crate::metrics::inc_short_circuit_upstream(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    "published_generation_lease",
+                );
+                return false;
             }
-            return true;
-        }
-    };
+            Err(error) => {
+                error!(repo = %owner_repo, error = %error, "failed to acquire local repo lease for SSH upload-pack");
+                if should_close_channel {
+                    let _ = handle.exit_status_request(channel_id, 1).await;
+                    let _ = handle.eof(channel_id).await;
+                    let _ = handle.close(channel_id).await;
+                }
+                return true;
+            }
+        };
     let mut pack_cache_writer = None;
 
     match pack_cache_key_context
@@ -659,175 +681,201 @@ async fn serve_local_upload_pack_once(
                 pack_cache_key_context.git_protocol,
             )
         }) {
-        Ok(key) => match state.pack_cache.lookup_or_reserve(Protocol::Ssh, key).await {
-            Ok(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
-                match replay_ssh_pack_cache_hit(
-                    state,
-                    owner_repo,
-                    hit,
-                    &completion,
-                    LocalUploadPackReplayContext {
-                        handle: &handle,
-                        channel_states: &channel_states,
-                        channel_id,
-                        stream_channel: stream_channel.as_ref(),
-                        should_close_channel,
-                    },
-                )
-                .await
-                {
-                    Ok(_) => return true,
-                    Err(error) => {
+        Ok(key) => {
+            let lookup = state.pack_cache.lookup_or_reserve(Protocol::Ssh, key);
+            let lookup = match budget.and_then(RequestBudget::remaining) {
+                Some(timeout) => match tokio::time::timeout(timeout, lookup).await {
+                    Ok(result) => result,
+                    Err(_) => {
                         warn!(
                             repo = %owner_repo,
-                            error = %error,
-                            "failed to replay SSH pack cache artifact; falling back to local upload-pack"
+                            "short-circuiting SSH fetch to upstream before pack cache lookup completed"
                         );
-                        crate::metrics::inc_pack_cache_request(
+                        crate::metrics::inc_upstream_fallback(
                             &state.metrics,
                             Protocol::Ssh,
-                            "bypass",
-                            "artifact_open_failed",
+                            "short_circuit_pack_cache_lookup",
                         );
-                    }
-                }
-            }
-            Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
-                let composite_timeout = budget.and_then(|budget| {
-                    budget.stage_timeout(min_timeout(
-                        duration_from_secs(
-                            state.config().pack_cache.on_demand_composite_total_secs,
-                        ),
-                        duration_from_secs(state.config().pack_cache.request_delta_pack_secs),
-                    ))
-                });
-                let composite_result = if let Some(timeout) = composite_timeout {
-                    let state_for_task = state.clone();
-                    let metrics = state.metrics.clone();
-                    let owner_repo_for_task = owner_repo.to_string();
-                    let serve_from_for_task = serve_from;
-                    let mut handle = tokio::spawn(async move {
-                        let background_lease =
-                            match crate::coordination::registry::acquire_local_serve_repo_lease(
-                                &state_for_task,
-                                &owner_repo_for_task,
-                                serve_from_for_task,
-                            )
-                            .await
-                            {
-                                Ok(lease) => lease,
-                                Err(error) => {
-                                    warn!(
-                                        repo = %owner_repo_for_task,
-                                        error = %error,
-                                        "failed to reacquire repo lease for background SSH pack cache composite"
-                                    );
-                                    writer.abort().await;
-                                    return Err(
-                                        crate::coordination::registry::PackCacheCompositeMiss {
-                                            writer: None,
-                                            reason: "lease_failed",
-                                        },
-                                    );
-                                }
-                            };
-                        try_finish_pack_cache_delta_composite(
-                            &state_for_task,
+                        crate::metrics::inc_short_circuit_upstream(
+                            &state.metrics,
                             Protocol::Ssh,
-                            &owner_repo_for_task,
-                            background_lease.repo_path(),
-                            writer,
-                        )
-                        .await
-                    });
-                    tokio::select! {
-                        result = &mut handle => match result {
-                            Ok(result) => result,
-                            Err(error) => {
-                                warn!(repo = %owner_repo, error = %error, "on-demand SSH pack cache composite task failed");
-                                Err(crate::coordination::registry::PackCacheCompositeMiss {
-                                    writer: None,
-                                    reason: "task_failed",
-                                })
-                            }
-                        },
-                        _ = tokio::time::sleep(timeout) => {
-                            warn!(
-                                repo = %owner_repo,
-                                timeout_secs = timeout.as_secs_f64(),
-                                "short-circuiting SSH fetch to upstream while on-demand pack cache composite continues in the background"
-                            );
-                            crate::metrics::inc_upstream_fallback(
-                                &metrics,
-                                Protocol::Ssh,
-                                "short_circuit_pack_cache_composite",
-                            );
-                            crate::metrics::inc_short_circuit_upstream(
-                                &metrics,
-                                Protocol::Ssh,
-                                "pack_cache_composite",
-                            );
-                            return false;
-                        }
+                            "pack_cache_lookup",
+                        );
+                        return false;
                     }
-                } else {
-                    try_finish_pack_cache_delta_composite(
+                },
+                None => lookup.await,
+            };
+            match lookup {
+                Ok(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
+                    match replay_ssh_pack_cache_hit(
                         state,
-                        Protocol::Ssh,
                         owner_repo,
-                        repo_lease.repo_path(),
-                        writer,
+                        hit,
+                        &completion,
+                        LocalUploadPackReplayContext {
+                            handle: &handle,
+                            channel_states: &channel_states,
+                            channel_id,
+                            stream_channel: stream_channel.as_ref(),
+                            should_close_channel,
+                        },
                     )
                     .await
-                };
-                match composite_result {
-                    Ok(hit) => {
-                        match replay_ssh_pack_cache_hit(
-                            state,
-                            owner_repo,
-                            hit,
-                            &completion,
-                            LocalUploadPackReplayContext {
-                                handle: &handle,
-                                channel_states: &channel_states,
-                                channel_id,
-                                stream_channel: stream_channel.as_ref(),
-                                should_close_channel,
-                            },
-                        )
-                        .await
-                        {
-                            Ok(_) => return true,
-                            Err(error) => {
-                                warn!(
-                                    repo = %owner_repo,
-                                    error = %error,
-                                    "on-demand SSH pack cache composite could not be replayed; falling back without cache writer"
-                                );
-                            }
-                        }
-                    }
-                    Err(miss) => {
-                        if miss.reason != "no_base"
-                            && miss.reason != "missing_request_wants"
-                            && miss.reason != "same_tips"
-                        {
+                    {
+                        Ok(_) => return true,
+                        Err(error) => {
+                            warn!(
+                                repo = %owner_repo,
+                                error = %error,
+                                "failed to replay SSH pack cache artifact; falling back to local upload-pack"
+                            );
                             crate::metrics::inc_pack_cache_request(
                                 &state.metrics,
                                 Protocol::Ssh,
                                 "bypass",
-                                miss.reason,
+                                "artifact_open_failed",
                             );
                         }
-                        pack_cache_writer = miss.writer;
                     }
                 }
+                Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => {
+                    let composite_timeout = budget.and_then(|budget| {
+                        budget.stage_timeout(min_timeout(
+                            duration_from_secs(
+                                state.config().pack_cache.on_demand_composite_total_secs,
+                            ),
+                            duration_from_secs(state.config().pack_cache.request_delta_pack_secs),
+                        ))
+                    });
+                    let composite_result = if let Some(timeout) = composite_timeout {
+                        let state_for_task = state.clone();
+                        let metrics = state.metrics.clone();
+                        let owner_repo_for_task = owner_repo.to_string();
+                        let serve_from_for_task = serve_from;
+                        let mut handle = tokio::spawn(async move {
+                            let background_lease =
+                                match crate::coordination::registry::acquire_local_serve_repo_lease(
+                                    &state_for_task,
+                                    &owner_repo_for_task,
+                                    serve_from_for_task,
+                                )
+                                .await
+                                {
+                                    Ok(lease) => lease,
+                                    Err(error) => {
+                                        warn!(
+                                            repo = %owner_repo_for_task,
+                                            error = %error,
+                                            "failed to reacquire repo lease for background SSH pack cache composite"
+                                        );
+                                        writer.abort().await;
+                                        return Err(
+                                            crate::coordination::registry::PackCacheCompositeMiss {
+                                                writer: None,
+                                                reason: "lease_failed",
+                                            },
+                                        );
+                                    }
+                                };
+                            try_finish_pack_cache_delta_composite(
+                                &state_for_task,
+                                Protocol::Ssh,
+                                &owner_repo_for_task,
+                                background_lease.repo_path(),
+                                writer,
+                            )
+                            .await
+                        });
+                        tokio::select! {
+                            result = &mut handle => match result {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    warn!(repo = %owner_repo, error = %error, "on-demand SSH pack cache composite task failed");
+                                    Err(crate::coordination::registry::PackCacheCompositeMiss {
+                                        writer: None,
+                                        reason: "task_failed",
+                                    })
+                                }
+                            },
+                            _ = tokio::time::sleep(timeout) => {
+                                warn!(
+                                    repo = %owner_repo,
+                                    timeout_secs = timeout.as_secs_f64(),
+                                    "short-circuiting SSH fetch to upstream while on-demand pack cache composite continues in the background"
+                                );
+                                crate::metrics::inc_upstream_fallback(
+                                    &metrics,
+                                    Protocol::Ssh,
+                                    "short_circuit_pack_cache_composite",
+                                );
+                                crate::metrics::inc_short_circuit_upstream(
+                                    &metrics,
+                                    Protocol::Ssh,
+                                    "pack_cache_composite",
+                                );
+                                return false;
+                            }
+                        }
+                    } else {
+                        try_finish_pack_cache_delta_composite(
+                            state,
+                            Protocol::Ssh,
+                            owner_repo,
+                            repo_lease.repo_path(),
+                            writer,
+                        )
+                        .await
+                    };
+                    match composite_result {
+                        Ok(hit) => {
+                            match replay_ssh_pack_cache_hit(
+                                state,
+                                owner_repo,
+                                hit,
+                                &completion,
+                                LocalUploadPackReplayContext {
+                                    handle: &handle,
+                                    channel_states: &channel_states,
+                                    channel_id,
+                                    stream_channel: stream_channel.as_ref(),
+                                    should_close_channel,
+                                },
+                            )
+                            .await
+                            {
+                                Ok(_) => return true,
+                                Err(error) => {
+                                    warn!(
+                                        repo = %owner_repo,
+                                        error = %error,
+                                        "on-demand SSH pack cache composite could not be replayed; falling back without cache writer"
+                                    );
+                                }
+                            }
+                        }
+                        Err(miss) => {
+                            if miss.reason != "no_base"
+                                && miss.reason != "missing_request_wants"
+                                && miss.reason != "same_tips"
+                            {
+                                crate::metrics::inc_pack_cache_request(
+                                    &state.metrics,
+                                    Protocol::Ssh,
+                                    "bypass",
+                                    miss.reason,
+                                );
+                            }
+                            pack_cache_writer = miss.writer;
+                        }
+                    }
+                }
+                Ok(crate::pack_cache::PackCacheLookup::BypassAfterWait) => {}
+                Err(error) => {
+                    warn!(repo = %owner_repo, error = %error, "SSH pack cache lookup failed; falling back to local upload-pack");
+                }
             }
-            Ok(crate::pack_cache::PackCacheLookup::BypassAfterWait) => {}
-            Err(error) => {
-                warn!(repo = %owner_repo, error = %error, "SSH pack cache lookup failed; falling back to local upload-pack");
-            }
-        },
+        }
         Err(reason) => {
             if state.pack_cache.enabled() && reason != "disabled" {
                 crate::metrics::inc_pack_cache_request(
@@ -846,7 +894,7 @@ async fn serve_local_upload_pack_once(
         }
     }
 
-    let mut process = match spawn_local_upload_pack_with_lease(
+    let mut process = match spawn_local_upload_pack_with_lease_timeout(
         state,
         owner_repo,
         Protocol::Ssh,
@@ -854,10 +902,31 @@ async fn serve_local_upload_pack_once(
         repo_lease,
         LocalUploadPackMode::StatelessRpc,
         pack_cache_key_context.git_protocol,
+        budget.and_then(RequestBudget::remaining),
     )
     .await
     {
-        Ok(process) => process,
+        Ok(Some(process)) => process,
+        Ok(None) => {
+            warn!(
+                repo = %owner_repo,
+                "short-circuiting SSH fetch to upstream before local upload-pack permit was acquired"
+            );
+            crate::metrics::inc_upstream_fallback(
+                &state.metrics,
+                Protocol::Ssh,
+                "short_circuit_local_upload_pack_permit",
+            );
+            crate::metrics::inc_short_circuit_upstream(
+                &state.metrics,
+                Protocol::Ssh,
+                "local_upload_pack_permit",
+            );
+            if let Some(writer) = pack_cache_writer.take() {
+                writer.abort().await;
+            }
+            return false;
+        }
         Err(error) => {
             error!(repo = %owner_repo, error = %error, "failed to spawn local git upload-pack");
             if let Some(writer) = pack_cache_writer.take() {
@@ -1948,17 +2017,21 @@ impl Handler for SshSession {
                         return Ok(());
                     };
 
-                    match spawn_local_upload_pack(
+                    let spawn_timeout =
+                        RequestBudget::from_config(self.state.config().as_ref(), clone_started)
+                            .remaining();
+                    match spawn_local_upload_pack_timeout(
                         &self.state,
                         &repo,
                         Protocol::Ssh,
                         LocalServeRepoSource::PublishedGeneration,
                         LocalUploadPackMode::Interactive,
                         self.git_protocol.as_deref(),
+                        spawn_timeout,
                     )
                     .await
                     {
-                        Ok(mut process) => {
+                        Ok(Some(mut process)) => {
                             // Take ownership of the child's I/O handles.
                             let stdin = process.stdin.take();
                             let stdout = process
@@ -2159,6 +2232,19 @@ impl Handler for SshSession {
 
                             // Return immediately — the background task handles
                             // the rest of the channel lifecycle.
+                        }
+                        Ok(None) => {
+                            warn!(
+                                repo = %repo,
+                                "closing SSH upload-pack before local upload-pack became ready"
+                            );
+                            let _ = session.extended_data(
+                                channel_id,
+                                1,
+                                b"ERROR: Local upload-pack did not become ready before timeout.\n"
+                                    .as_slice(),
+                            );
+                            finish_channel(session, channel_id, 1);
                         }
                         Err(e) => {
                             error!(

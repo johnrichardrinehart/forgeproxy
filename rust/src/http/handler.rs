@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::clone_support::{
     CloneCompletion, LocalUploadPackMode, UpstreamHydrationRequest, UpstreamHydrationTracker,
-    spawn_local_upload_pack_with_lease, wait_for_local_upload_pack_exit,
+    spawn_local_upload_pack_with_lease_timeout, wait_for_local_upload_pack_exit,
 };
 use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoLease, LocalServeRepoSource,
@@ -1759,13 +1759,32 @@ async fn serve_local_upload_pack(
     budget: Option<RequestBudget>,
 ) -> Result<Option<Response>, AppError> {
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
-    let repo_lease = crate::coordination::registry::acquire_local_serve_repo_lease(
-        state,
-        &owner_repo,
-        serve_from,
-    )
-    .await?;
-    let mut pack_cache_lookup = match pack_cache_key_context
+    let Some(repo_lease) =
+        crate::coordination::registry::acquire_local_serve_repo_lease_with_timeout(
+            state,
+            &owner_repo,
+            serve_from,
+            budget.and_then(RequestBudget::remaining),
+        )
+        .await?
+    else {
+        warn!(
+            repo = %owner_repo,
+            "short-circuiting to upstream before published generation lease was acquired"
+        );
+        crate::metrics::inc_upstream_fallback(
+            &state.metrics,
+            Protocol::Https,
+            "short_circuit_published_generation_lease",
+        );
+        crate::metrics::inc_short_circuit_upstream(
+            &state.metrics,
+            Protocol::Https,
+            "published_generation_lease",
+        );
+        return Ok(None);
+    };
+    let pack_cache_key = pack_cache_key_context
         .advertised_ref_tips
         .map(|ref_tips| {
             state.pack_cache.key_for_fresh_clone_with_ref_tips(
@@ -1782,14 +1801,35 @@ async fn serve_local_upload_pack(
                 request_body,
                 pack_cache_key_context.git_protocol,
             )
-        }) {
-        Ok(key) => Some(
-            state
-                .pack_cache
-                .lookup_or_reserve(Protocol::Https, key)
-                .await
-                .map_err(AppError::Internal)?,
-        ),
+        });
+    let mut pack_cache_lookup = match pack_cache_key {
+        Ok(key) => {
+            let lookup = state.pack_cache.lookup_or_reserve(Protocol::Https, key);
+            let lookup = match budget.and_then(RequestBudget::remaining) {
+                Some(timeout) => match tokio::time::timeout(timeout, lookup).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            repo = %owner_repo,
+                            "short-circuiting to upstream before pack cache lookup completed"
+                        );
+                        crate::metrics::inc_upstream_fallback(
+                            &state.metrics,
+                            Protocol::Https,
+                            "short_circuit_pack_cache_lookup",
+                        );
+                        crate::metrics::inc_short_circuit_upstream(
+                            &state.metrics,
+                            Protocol::Https,
+                            "pack_cache_lookup",
+                        );
+                        return Ok(None);
+                    }
+                },
+                None => lookup.await,
+            };
+            Some(lookup.map_err(AppError::Internal)?)
+        }
         Err(reason) => {
             if state.pack_cache.enabled() && reason != "disabled" {
                 crate::metrics::inc_pack_cache_request(
@@ -1954,7 +1994,7 @@ async fn serve_local_upload_pack(
         Some(crate::pack_cache::PackCacheLookup::Hit(_)) => unreachable!(),
     };
 
-    let mut process = spawn_local_upload_pack_with_lease(
+    let Some(mut process) = spawn_local_upload_pack_with_lease_timeout(
         state,
         &owner_repo,
         Protocol::Https,
@@ -1962,8 +2002,29 @@ async fn serve_local_upload_pack(
         repo_lease,
         LocalUploadPackMode::StatelessRpc,
         pack_cache_key_context.git_protocol,
+        budget.and_then(RequestBudget::remaining),
     )
-    .await?;
+    .await?
+    else {
+        warn!(
+            repo = %owner_repo,
+            "short-circuiting to upstream before local upload-pack permit was acquired"
+        );
+        crate::metrics::inc_upstream_fallback(
+            &state.metrics,
+            Protocol::Https,
+            "short_circuit_local_upload_pack_permit",
+        );
+        crate::metrics::inc_short_circuit_upstream(
+            &state.metrics,
+            Protocol::Https,
+            "local_upload_pack_permit",
+        );
+        if let Some(writer) = pack_cache_writer {
+            writer.abort().await;
+        }
+        return Ok(None);
+    };
 
     // Write the request body to stdin.
     if let Some(mut stdin) = process.stdin.take() {
