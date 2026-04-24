@@ -8,6 +8,7 @@ pub(crate) const STATE_GENERATIONS_DIR: &str = "generations";
 pub(crate) const STATE_DELTA_DIR: &str = "delta";
 pub(crate) const STATE_TEE_DIR: &str = "tee";
 pub(crate) const STATE_BUNDLE_TMP_DIR: &str = "bundle-tmp";
+pub(crate) const STATE_HYDRATION_TMP_DIR: &str = "hydration-tmp";
 
 pub(crate) fn generations_root(base_path: &Path) -> PathBuf {
     base_path.join(GENERATIONS_ROOT_DIR)
@@ -39,6 +40,10 @@ pub(crate) fn state_tee_root(base_path: &Path) -> PathBuf {
 
 pub(crate) fn state_bundle_tmp_root(base_path: &Path) -> PathBuf {
     state_root(base_path).join(STATE_BUNDLE_TMP_DIR)
+}
+
+pub(crate) fn state_hydration_tmp_root(base_path: &Path) -> PathBuf {
+    state_root(base_path).join(STATE_HYDRATION_TMP_DIR)
 }
 
 pub(crate) fn repo_path_under(
