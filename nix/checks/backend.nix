@@ -146,6 +146,17 @@ pkgs.testers.runNixOSTest {
         assert "X-Gitea-Signature" in nginx_conf, \
             "Gitea backend should reference X-Gitea-Signature in nginx config"
 
+    with subtest("Gitea nginx access log captures upstream fallback details"):
+        nginx_conf = get_nginx_conf(gitea)
+        assert "log_format forgeproxy_upstream" in nginx_conf, \
+            "nginx should define forgeproxy upstream diagnostic access log format"
+        assert 'access_log /var/log/nginx/access.log forgeproxy_upstream;' in nginx_conf, \
+            "forgeproxy vhost should use diagnostic access log format"
+        assert 'upstream_status="$upstream_status"' in nginx_conf, \
+            "access log should record upstream status chain"
+        assert 'forgeproxy_upstream_fallback="$upstream_http_x_forgeproxy_upstream_fallback"' in nginx_conf, \
+            "access log should record forgeproxy fallback header from upstream response"
+
     # ── GitLab: verify nginx config uses /api/v4 and GitLab headers ───
     with subtest("GitLab backend uses /api/v4 path prefix"):
         gitlab.wait_for_unit("multi-user.target")

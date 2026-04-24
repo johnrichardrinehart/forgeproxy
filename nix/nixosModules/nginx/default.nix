@@ -85,6 +85,20 @@ in
       recommendedProxySettings = true;
       recommendedGzipSettings = true;
 
+      commonHttpConfig = ''
+        log_format forgeproxy_upstream
+          '$remote_addr - $remote_user [$time_local] "$request" '
+          '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+          'request_time=$request_time '
+          'upstream_addr="$upstream_addr" '
+          'upstream_status="$upstream_status" '
+          'upstream_response_time="$upstream_response_time" '
+          'upstream_bytes_sent="$upstream_bytes_sent" '
+          'upstream_bytes_received="$upstream_bytes_received" '
+          'forgeproxy_upstream_fallback="$upstream_http_x_forgeproxy_upstream_fallback" '
+          'sent_forgeproxy_upstream_fallback="$sent_http_x_forgeproxy_upstream_fallback"';
+      '';
+
       # ── Global HTTP-level configuration ────────────────────────────
       appendHttpConfig = ''
         proxy_headers_hash_max_size 1024;
@@ -130,6 +144,8 @@ in
         sslCertificateKey = cfg.sslCertificateKey;
 
         extraConfig = ''
+          access_log /var/log/nginx/access.log forgeproxy_upstream;
+
           # Runtime-configured upstream hostname variable (written by nginx-runtime provider at boot).
           include /run/nginx/forgeproxy-server.conf;
         '';
