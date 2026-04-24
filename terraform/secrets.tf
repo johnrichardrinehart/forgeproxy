@@ -82,6 +82,8 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     # tries to destroy legacy instance/attachment edges still present in state.
     create_before_destroy = true
   }
+
+  depends_on = [aws_secretsmanager_secret_version.bootstrap_secrets]
 }
 
 resource "aws_secretsmanager_secret" "forgeproxy_otel_collector_config" {
@@ -132,11 +134,9 @@ resource "aws_secretsmanager_secret" "forge_admin_token" {
 resource "aws_secretsmanager_secret_version" "forge_admin_token" {
   secret_id = aws_secretsmanager_secret.forge_admin_token.id
 
-  secret_string = "REPLACE_ME_WITH_ACTUAL_FORGE_ADMIN_TOKEN"
+  secret_string = trimspace(local.bootstrap_secrets.forge_admin_token)
 
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
+  depends_on = [aws_secretsmanager_secret_version.bootstrap_secrets]
 }
 
 # ── Valkey Auth Token Secret ───────────────────────────────────────────────
@@ -153,6 +153,8 @@ resource "aws_secretsmanager_secret_version" "valkey_auth_token" {
   secret_id = aws_secretsmanager_secret.valkey_auth_token.id
 
   secret_string = random_password.valkey_auth.result
+
+  depends_on = [aws_secretsmanager_secret_version.bootstrap_secrets]
 }
 
 # ── Webhook Secret ────────────────────────────────────────────────────────
@@ -168,11 +170,9 @@ resource "aws_secretsmanager_secret" "webhook_secret" {
 resource "aws_secretsmanager_secret_version" "webhook_secret" {
   secret_id = aws_secretsmanager_secret.webhook_secret.id
 
-  secret_string = "REPLACE_ME_WITH_ACTUAL_WEBHOOK_SECRET"
+  secret_string = trimspace(local.bootstrap_secrets.webhook_secret)
 
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
+  depends_on = [aws_secretsmanager_secret_version.bootstrap_secrets]
 }
 
 # ── nginx upstream hostname secret ────────────────────────────────────────
@@ -321,11 +321,9 @@ resource "aws_secretsmanager_secret_version" "org_creds" {
 
   secret_id = aws_secretsmanager_secret.org_creds[each.key].id
 
-  secret_string = "REPLACE_ME_WITH_${upper(replace(each.value.name, "-", "_"))}_CREDENTIALS"
+  secret_string = trimspace(local.bootstrap_org_credentials[each.key])
 
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
+  depends_on = [aws_secretsmanager_secret_version.bootstrap_secrets]
 }
 
 # ── ghe-key-lookup Runtime Config Secret ───────────────────────────────────
@@ -356,6 +354,8 @@ resource "aws_secretsmanager_secret_version" "ghe_key_lookup_config" {
     cache_ttl_pos        = var.ghe_key_lookup_cache_ttl_pos
     cache_ttl_neg        = var.ghe_key_lookup_cache_ttl_neg
   })
+
+  depends_on = [aws_secretsmanager_secret_version.bootstrap_secrets]
 }
 
 # ── ghe-key-lookup Admin Key Secret ────────────────────────────────────────
@@ -374,11 +374,7 @@ resource "aws_secretsmanager_secret_version" "ghe_key_lookup_admin_key" {
   count = local.ghe_key_lookup_enabled ? 1 : 0
 
   secret_id     = aws_secretsmanager_secret.ghe_key_lookup_admin_key[0].id
-  secret_string = <<-EOT
-REPLACE_ME_WITH_GHE_ADMIN_PRIVATE_KEY
-EOT
+  secret_string = trimspace(local.bootstrap_secrets.ghe_key_lookup_admin_key)
 
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
+  depends_on = [aws_secretsmanager_secret_version.bootstrap_secrets]
 }
