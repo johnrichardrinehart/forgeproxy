@@ -55,6 +55,17 @@ variable "upstream_port" {
   description = "Port of the upstream Git forge server"
 }
 
+variable "upstream_ssh_port" {
+  type        = number
+  default     = 22
+  description = "SSH port of the upstream Git forge server used by the emergency forgeproxy-disable bypass."
+
+  validation {
+    condition     = var.upstream_ssh_port >= 1 && var.upstream_ssh_port <= 65535
+    error_message = "upstream_ssh_port must be a valid TCP port (1-65535)."
+  }
+}
+
 variable "upstream_api_url" {
   type        = string
   description = "API URL of the upstream forge (e.g., https://ghe.example.com/api/v3)"

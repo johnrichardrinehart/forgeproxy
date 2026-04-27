@@ -154,6 +154,7 @@ resource "aws_iam_role_policy" "forgeproxy" {
             "ec2:CreateTags",
             "ec2:CreateVolume",
             "ec2:DescribeSnapshots",
+            "ec2:DescribeTags",
             "ec2:DescribeVolumes",
           ]
           Resource = "*"

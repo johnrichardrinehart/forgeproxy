@@ -91,6 +91,13 @@ standby-slot cache EBS volumes from those snapshots before scaling the standby
 ASG. On the first deployment, or when no live cache volumes exist yet, the
 standby cache volumes are created blank.
 
+Emergency bypass: set the EC2 instance tag `forgeproxy-disable` to exactly
+`true` on a forgeproxy instance to make nginx send client HTTPS and SSH Git
+traffic directly to the configured upstream instead of the forgeproxy
+application. Missing tags and all other values are ignored. The instance polls
+runtime nginx configuration every 15 seconds, so tag changes do not require a
+deployment.
+
 ### 5. Provide bootstrap secrets before apply
 
 Create a structured JSON file named `./forgeproxy-bootstrap-secrets.json` before the first `terraform apply`. An example file is included at `forgeproxy-bootstrap-secrets.example.json`.
@@ -164,8 +171,8 @@ All secrets and runtime configuration come from AWS Secrets Manager. The forgepr
 Configuration is fetched at boot time via `ExecStartPre` scripts in systemd services. To change config, update the secret and restart the service — no AMI rebuild needed.
 
 ### 2. Upstream and Credentials
-- **Upstream hostname/port**: Stored in `forgeproxy/nginx-upstream-hostname` and `forgeproxy/nginx-upstream-port`
-  - Changes require restarting nginx: `systemctl restart nginx`
+- **Upstream hostname/ports**: Stored in `forgeproxy/nginx-upstream-hostname`, `forgeproxy/nginx-upstream-port`, and `forgeproxy/nginx-upstream-ssh-port`
+  - AWS deployments refresh nginx runtime config periodically; force an immediate refresh with `systemctl start forgeproxy-nginx-runtime-refresh`
 - **Service config**: Complete `config.yaml` in `forgeproxy/service-config`
   - Includes only forgeproxy-owned observability toggles such as local metrics exposure, journald log export enablement, and trace sampling
   - Changes require restarting forgeproxy: `systemctl restart forgeproxy`
@@ -251,7 +258,7 @@ terraform apply -var='forgeproxy_count=3'
 No AMI rebuild; existing instances unaffected.
 
 ### Change upstream Git forge
-Update `upstream_hostname`, `upstream_port`, `upstream_api_url`, or `upstream_git_url_base` in Terraform inputs and rerun `terraform apply`. Terraform regenerates the runtime secrets from those inputs.
+Update `upstream_hostname`, `upstream_port`, `upstream_ssh_port`, `upstream_api_url`, or `upstream_git_url_base` in Terraform inputs and rerun `terraform apply`. Terraform regenerates the runtime secrets from those inputs.
 
 ### Add new organization
 1. Add the new org to `org_creds`.
