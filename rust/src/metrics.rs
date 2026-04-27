@@ -157,6 +157,20 @@ pub struct ActiveCloneLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ActiveCloneServedLabels {
+    pub served_by: CloneServedBy,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ActiveCloneDetailLabels {
+    pub protocol: Protocol,
+    pub served_by: CloneServedBy,
+    pub path: String,
+    pub reason: String,
+    pub cache_status: CacheStatus,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct CloneUpstreamBytesLabels {
     pub protocol: Protocol,
     pub phase: ClonePhase,
@@ -513,6 +527,8 @@ pub struct Metrics {
     pub active_connections: Family<ProtocolLabels, Gauge>,
     pub upload_pack_concurrent: Family<ProtocolLabels, Gauge>,
     pub active_clones: Family<ActiveCloneLabels, Gauge>,
+    pub active_clone_served: Family<ActiveCloneServedLabels, Gauge>,
+    pub active_clone_detail: Family<ActiveCloneDetailLabels, Gauge>,
     pub cache_apparent_usage_bytes: Gauge,
     pub cache_physical_usage_bytes: Gauge,
     pub cache_repos_total: Gauge,
@@ -762,6 +778,30 @@ impl Metrics {
             "forgeproxy_active_clones",
             "Currently active clone streams by protocol and cache status",
             active_clones.clone(),
+        );
+
+        let active_clone_served = Family::<ActiveCloneServedLabels, Gauge>::default();
+        active_clone_served
+            .get_or_create(&ActiveCloneServedLabels {
+                served_by: CloneServedBy::Forgeproxy,
+            })
+            .set(0);
+        active_clone_served
+            .get_or_create(&ActiveCloneServedLabels {
+                served_by: CloneServedBy::Upstream,
+            })
+            .set(0);
+        registry.register(
+            "forgeproxy_active_clone_served",
+            "Currently active clone streams by serving authority",
+            active_clone_served.clone(),
+        );
+
+        let active_clone_detail = Family::<ActiveCloneDetailLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_active_clone_detail",
+            "Currently active clone streams by serving authority, path, reason, protocol, and cache status",
+            active_clone_detail.clone(),
         );
 
         let cache_apparent_usage_bytes: Gauge = Gauge::default();
@@ -1049,6 +1089,8 @@ impl Metrics {
             active_connections,
             upload_pack_concurrent,
             active_clones,
+            active_clone_served,
+            active_clone_detail,
             cache_apparent_usage_bytes,
             cache_physical_usage_bytes,
             cache_repos_total,
@@ -1311,6 +1353,30 @@ pub fn set_active_clones(
         .active_clones
         .get_or_create(&labels)
         .set(value);
+}
+
+pub fn set_active_clone_served(metrics: &MetricsRegistry, served_by: CloneServedBy, value: i64) {
+    metrics
+        .metrics
+        .active_clone_served
+        .get_or_create(&ActiveCloneServedLabels { served_by })
+        .set(value.max(0));
+}
+
+pub fn inc_active_clone_detail(metrics: &MetricsRegistry, labels: &ActiveCloneDetailLabels) {
+    metrics
+        .metrics
+        .active_clone_detail
+        .get_or_create(labels)
+        .inc();
+}
+
+pub fn dec_active_clone_detail(metrics: &MetricsRegistry, labels: &ActiveCloneDetailLabels) {
+    metrics
+        .metrics
+        .active_clone_detail
+        .get_or_create(labels)
+        .dec();
 }
 
 pub fn set_cache_usage_bytes(
@@ -1800,38 +1866,53 @@ impl Drop for UploadPackGuard {
 
 pub struct ActiveCloneGuard {
     metrics: MetricsRegistry,
-    protocol: Protocol,
-    cache_status: CacheStatus,
-    counter: Arc<AtomicI64>,
+    labels: ActiveCloneDetailLabels,
+    cache_status_counter: Arc<AtomicI64>,
+    served_by_counter: Arc<AtomicI64>,
 }
 
 impl ActiveCloneGuard {
     pub fn new(
         metrics: MetricsRegistry,
-        protocol: Protocol,
-        cache_status: CacheStatus,
-        counter: Arc<AtomicI64>,
+        labels: ActiveCloneDetailLabels,
+        cache_status_counter: Arc<AtomicI64>,
+        served_by_counter: Arc<AtomicI64>,
     ) -> Self {
-        let next = counter.fetch_add(1, Ordering::SeqCst) + 1;
-        set_active_clones(&metrics, protocol.clone(), cache_status.clone(), next);
+        let next_by_cache_status = cache_status_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let next_by_served_by = served_by_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        set_active_clones(
+            &metrics,
+            labels.protocol.clone(),
+            labels.cache_status.clone(),
+            next_by_cache_status,
+        );
+        set_active_clone_served(&metrics, labels.served_by.clone(), next_by_served_by);
+        inc_active_clone_detail(&metrics, &labels);
         Self {
             metrics,
-            protocol,
-            cache_status,
-            counter,
+            labels,
+            cache_status_counter,
+            served_by_counter,
         }
     }
 }
 
 impl Drop for ActiveCloneGuard {
     fn drop(&mut self) {
-        let next = self.counter.fetch_sub(1, Ordering::SeqCst) - 1;
+        let next_by_cache_status = self.cache_status_counter.fetch_sub(1, Ordering::SeqCst) - 1;
+        let next_by_served_by = self.served_by_counter.fetch_sub(1, Ordering::SeqCst) - 1;
         set_active_clones(
             &self.metrics,
-            self.protocol.clone(),
-            self.cache_status.clone(),
-            next,
+            self.labels.protocol.clone(),
+            self.labels.cache_status.clone(),
+            next_by_cache_status,
         );
+        set_active_clone_served(
+            &self.metrics,
+            self.labels.served_by.clone(),
+            next_by_served_by,
+        );
+        dec_active_clone_detail(&self.metrics, &self.labels);
     }
 }
 
@@ -2198,14 +2279,21 @@ mod tests {
     #[test]
     fn active_clone_guard_omits_idle_series() {
         let metrics = MetricsRegistry::new();
-        let counter = Arc::new(AtomicI64::new(0));
+        let cache_status_counter = Arc::new(AtomicI64::new(0));
+        let served_by_counter = Arc::new(AtomicI64::new(0));
 
         {
             let _guard = ActiveCloneGuard::new(
                 metrics.clone(),
-                Protocol::Https,
-                CacheStatus::Warm,
-                Arc::clone(&counter),
+                ActiveCloneDetailLabels {
+                    protocol: Protocol::Https,
+                    served_by: CloneServedBy::Forgeproxy,
+                    path: "local_upload_pack".to_string(),
+                    reason: "ready_generation".to_string(),
+                    cache_status: CacheStatus::Warm,
+                },
+                Arc::clone(&cache_status_counter),
+                Arc::clone(&served_by_counter),
             );
             let encoded = encode_metrics(&metrics.registry);
             assert!(encoded.lines().any(|line| {
@@ -2214,9 +2302,40 @@ mod tests {
                     && line.contains("cache_status=\"warm\"")
                     && line.ends_with(" 1")
             }));
+            assert!(encoded.lines().any(|line| {
+                line.starts_with("forgeproxy_active_clone_served{")
+                    && line.contains("served_by=\"forgeproxy\"")
+                    && line.ends_with(" 1")
+            }));
+            assert!(encoded.lines().any(|line| {
+                line.starts_with("forgeproxy_active_clone_detail{")
+                    && line.contains("protocol=\"https\"")
+                    && line.contains("served_by=\"forgeproxy\"")
+                    && line.contains("path=\"local_upload_pack\"")
+                    && line.contains("reason=\"ready_generation\"")
+                    && line.contains("cache_status=\"warm\"")
+                    && line.ends_with(" 1")
+            }));
         }
 
         let encoded = encode_metrics(&metrics.registry);
         assert!(!encoded.contains("forgeproxy_active_clones{"));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_active_clone_served{")
+                && line.contains("served_by=\"forgeproxy\"")
+                && line.ends_with(" 0")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_active_clone_served{")
+                && line.contains("served_by=\"upstream\"")
+                && line.ends_with(" 0")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_active_clone_detail{")
+                && line.contains("served_by=\"forgeproxy\"")
+                && line.contains("path=\"local_upload_pack\"")
+                && line.contains("reason=\"ready_generation\"")
+                && line.ends_with(" 0")
+        }));
     }
 }

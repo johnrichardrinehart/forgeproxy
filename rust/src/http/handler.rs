@@ -1826,8 +1826,13 @@ async fn serve_http_pack_cache_hit_response(
             repo: completion.metric_repo.clone(),
         })
         .clone();
-    let active_clone_guard =
-        state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
+    let active_clone_guard = state.begin_active_clone(
+        Protocol::Https,
+        completion.cache_status.clone(),
+        completion.serve_outcome.served_by.clone(),
+        completion.serve_outcome.path,
+        completion.serve_outcome.reason,
+    );
     let first_byte_stream = FirstByteMetricStream::new(
         source_stream,
         FirstByteMetricContext::new(
@@ -2169,8 +2174,13 @@ async fn serve_local_upload_pack(
             repo: completion.metric_repo.clone(),
         })
         .clone();
-    let active_clone_guard =
-        state.begin_active_clone(Protocol::Https, completion.cache_status.clone());
+    let active_clone_guard = state.begin_active_clone(
+        Protocol::Https,
+        completion.cache_status.clone(),
+        completion.serve_outcome.served_by.clone(),
+        completion.serve_outcome.path,
+        completion.serve_outcome.reason,
+    );
     let upload_pack_cpu_metrics = state.metrics.clone();
     let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = if let Some(
         pack_cache_writer,
@@ -2509,8 +2519,15 @@ async fn proxy_upload_pack_to_upstream(
     let auth_header = auth_header.map(ToOwned::to_owned);
     let request_phase = request_metadata.request_phase.clone();
     let records_clone_completion = request_phase.expects_local_pack_serve();
-    let active_clone_guard = records_clone_completion
-        .then(|| state.begin_active_clone(Protocol::Https, completion.cache_status.clone()));
+    let active_clone_guard = records_clone_completion.then(|| {
+        state.begin_active_clone(
+            Protocol::Https,
+            completion.cache_status.clone(),
+            completion.serve_outcome.served_by.clone(),
+            completion.serve_outcome.path,
+            completion.serve_outcome.reason,
+        )
+    });
     let ls_refs_request_body = capture_body.clone();
     let upstream_counter = records_clone_completion.then(|| {
         state_for_stream

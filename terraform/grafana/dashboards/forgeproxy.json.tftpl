@@ -439,30 +439,29 @@
     {
       "id": 15,
       "type": "timeseries",
-      "title": "Clone Serving Effectiveness",
-      "description": "Percentage of clone upload-pack traffic served by forgeproxy versus upstream. forgeproxy includes pack-cache replay and local upload-pack; upstream includes both forgeproxy-proxied upstream and nginx direct-upstream handoff.",
+      "title": "Active Clones by Serving Authority",
+      "description": "Instantaneous count of active SSH and HTTPS clone upload-pack streams observed by forgeproxy for the selected instance. forgeproxy includes pack-cache replay and local upload-pack; upstream includes upstream streams proxied through forgeproxy. Nginx direct-upstream fallback is tracked as a handoff/completion reason, but forgeproxy cannot observe its post-handoff active duration.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
-          "expr": "100 * sum by (served_by) (rate(forgeproxy_clone_served_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) / scalar(sum(rate(forgeproxy_clone_served_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "expr": "sum by (served_by) (forgeproxy_active_clone_served{service\\.instance\\.id=~\"$instance\"})",
           "legendFormat": "{{ served_by }}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percent",
-          "decimals": 1,
+          "unit": "short",
+          "decimals": 0,
           "min": 0,
-          "max": 100,
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 20,
-            "gradientMode": "opacity",
+            "gradientMode": "none",
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "mode": "normal", "group": "A" },
+            "stacking": { "mode": "none", "group": "A" },
             "axisBorderShow": false
           }
         },
@@ -476,29 +475,29 @@
     {
       "id": 16,
       "type": "timeseries",
-      "title": "Upstream Clone Share by Path & Reason",
-      "description": "Percentage of clone upload-pack traffic served by upstream, split by whether it went through forgeproxy or nginx direct-upstream fallback and by the operational reason.",
+      "title": "Active Upstream Clones by Path & Reason",
+      "description": "Instantaneous count of active SSH and HTTPS clone upload-pack streams currently proxied upstream through forgeproxy, split by upstream path and reason for the selected instance. Nginx direct-upstream fallback is tracked as a handoff/completion reason, but forgeproxy cannot observe its post-handoff active duration.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
-          "expr": "100 * sum by (path, reason) (rate(forgeproxy_clone_served_total{service\\.instance\\.id=~\"$instance\", served_by=\"upstream\"}[$__rate_interval])) / scalar(sum(rate(forgeproxy_clone_served_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "expr": "sum by (path, reason) (forgeproxy_active_clone_detail{service\\.instance\\.id=~\"$instance\", served_by=\"upstream\"})",
           "legendFormat": "{{ path }} / {{ reason }}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percent",
-          "decimals": 1,
+          "unit": "short",
+          "decimals": 0,
           "min": 0,
           "custom": {
             "lineWidth": 2,
             "fillOpacity": 20,
-            "gradientMode": "opacity",
+            "gradientMode": "none",
             "showPoints": "never",
             "spanNulls": false,
-            "stacking": { "mode": "normal", "group": "A" },
+            "stacking": { "mode": "none", "group": "A" },
             "axisBorderShow": false
           }
         },
