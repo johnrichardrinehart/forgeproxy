@@ -6,6 +6,8 @@ if [[ -z "${AWS_PROFILE:-}" && -n "${AWS_PROFILE_FALLBACK:-}" ]]; then
 fi
 
 active_slot="${ACTIVE_SLOT:?ACTIVE_SLOT is required}"
+desired_count="${DESIRED_COUNT:?DESIRED_COUNT is required}"
+max_count="${MAX_COUNT:-${desired_count}}"
 blue_asg="${BLUE_ASG_NAME:?BLUE_ASG_NAME is required}"
 green_asg="${GREEN_ASG_NAME:?GREEN_ASG_NAME is required}"
 aws_region="${AWS_REGION:?AWS_REGION is required}"
@@ -17,9 +19,11 @@ cutover_timeout_seconds="${CUTOVER_TIMEOUT_SECONDS:?CUTOVER_TIMEOUT_SECONDS is r
 
 case "${active_slot}" in
   blue)
+    active_asg="${blue_asg}"
     inactive_asg="${green_asg}"
     ;;
   green)
+    active_asg="${green_asg}"
     inactive_asg="${blue_asg}"
     ;;
   *)
@@ -122,6 +126,13 @@ wait_for_cutover_soak() {
 }
 
 wait_for_cutover_soak
+
+echo "Reconciling active slot (${active_asg}) to ${desired_count} instances"
+aws "${aws_args[@]}" autoscaling update-auto-scaling-group \
+  --auto-scaling-group-name "${active_asg}" \
+  --min-size "${desired_count}" \
+  --desired-capacity "${desired_count}" \
+  --max-size "${max_count}"
 
 echo "Scaling inactive slot (${inactive_asg}) down to zero"
 aws "${aws_args[@]}" autoscaling update-auto-scaling-group \

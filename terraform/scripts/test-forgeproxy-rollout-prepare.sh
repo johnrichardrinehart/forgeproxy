@@ -8,7 +8,7 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
 
 mock_bin="${tmpdir}/bin"
-mkdir -p "${mock_bin}"
+mkdir -p "${mock_bin}" "${tmpdir}/state"
 
 cat > "${mock_bin}/sleep" <<'EOF'
 #!/usr/bin/env bash
@@ -34,6 +34,7 @@ query=""
 asg_name=""
 listener_arn=""
 target_group_arn=""
+desired_capacity=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -41,7 +42,7 @@ while [[ "$#" -gt 0 ]]; do
       query="$2"
       shift 2
       ;;
-    --auto-scaling-group-names)
+    --auto-scaling-group-name|--auto-scaling-group-names)
       asg_name="$2"
       shift 2
       ;;
@@ -53,6 +54,10 @@ while [[ "$#" -gt 0 ]]; do
       target_group_arn="$2"
       shift 2
       ;;
+    --desired-capacity)
+      desired_capacity="$2"
+      shift 2
+      ;;
     --output)
       shift 2
       ;;
@@ -62,7 +67,56 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
+asg_state_file() {
+  local name="$1"
+  printf '%s/%s.count\n' "${TEST_STATE_DIR:?TEST_STATE_DIR is required}" "${name}"
+}
+
+asg_count_for() {
+  local name="$1"
+  local default_count="$2"
+  local state_file
+  state_file="$(asg_state_file "${name}")"
+  if [[ -f "${state_file}" ]]; then
+    cat "${state_file}"
+  else
+    printf '%s\n' "${default_count}"
+  fi
+}
+
 case "${scenario}:${service}:${command}:${query}" in
+  stale_standby:elbv2:describe-listeners:*)
+    if [[ -n "${listener_arn}" ]]; then
+      printf '%s\n' "blue-https"
+    else
+      printf '%s\n' "https-listener"
+    fi
+    ;;
+  stale_standby:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\))
+    if [[ "${asg_name}" == "green-asg" ]]; then
+      asg_count_for "${asg_name}" "2"
+    else
+      printf '%s\n' "1"
+    fi
+    ;;
+  stale_standby:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\]\))
+    asg_count_for "${asg_name}" "1"
+    ;;
+  stale_standby:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\ \&\&\ HealthStatus==\'Healthy\'\]\))
+    asg_count_for "${asg_name}" "1"
+    ;;
+  stale_standby:elbv2:describe-target-health:length\(TargetHealthDescriptions\[\?TargetHealth.State==\'healthy\'\]\))
+    printf '%s\n' "1"
+    ;;
+  stale_standby:elbv2:describe-target-health:length\(TargetHealthDescriptions\[\?TargetHealth.State==\'unused\'\]\))
+    printf '%s\n' "0"
+    ;;
+  stale_standby:elbv2:describe-target-health:length\(TargetHealthDescriptions\))
+    printf '%s\n' "1"
+    ;;
+  stale_standby:elbv2:describe-target-groups:length\(TargetGroups\[0\].LoadBalancerArns\))
+    printf '%s\n' "1"
+    ;;
   stale_same_slot:elbv2:describe-listeners:*)
     if [[ -n "${listener_arn}" ]]; then
       printf '%s\n' "${listener_arn/https-listener/blue-https}"
@@ -84,13 +138,25 @@ case "${scenario}:${service}:${command}:${query}" in
     fi
     ;;
   bootstrap_unattached:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\))
-    printf '%s\n' "1"
+    if [[ "${asg_name}" == "blue-asg" ]]; then
+      asg_count_for "${asg_name}" "1"
+    else
+      printf '%s\n' "1"
+    fi
     ;;
   bootstrap_unattached:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\]\))
-    printf '%s\n' "1"
+    if [[ "${asg_name}" == "blue-asg" ]]; then
+      asg_count_for "${asg_name}" "1"
+    else
+      printf '%s\n' "1"
+    fi
     ;;
   bootstrap_unattached:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\ \&\&\ HealthStatus==\'Healthy\'\]\))
-    printf '%s\n' "1"
+    if [[ "${asg_name}" == "blue-asg" ]]; then
+      asg_count_for "${asg_name}" "1"
+    else
+      printf '%s\n' "1"
+    fi
     ;;
   bootstrap_unattached:elbv2:describe-target-health:length\(TargetHealthDescriptions\[\?TargetHealth.State==\'healthy\'\]\))
     printf '%s\n' "0"
@@ -149,13 +215,25 @@ case "${scenario}:${service}:${command}:${query}" in
     printf '%s\n' "us-east-1a"
     ;;
   cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\))
-    printf '%s\n' "2"
+    if [[ "${asg_name}" == "green-asg" ]]; then
+      asg_count_for "${asg_name}" "2"
+    else
+      printf '%s\n' "2"
+    fi
     ;;
   cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\]\))
-    printf '%s\n' "2"
+    if [[ "${asg_name}" == "green-asg" ]]; then
+      asg_count_for "${asg_name}" "2"
+    else
+      printf '%s\n' "2"
+    fi
     ;;
   cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\ \&\&\ HealthStatus==\'Healthy\'\]\))
-    printf '%s\n' "2"
+    if [[ "${asg_name}" == "green-asg" ]]; then
+      asg_count_for "${asg_name}" "2"
+    else
+      printf '%s\n' "2"
+    fi
     ;;
   cache_seeded:ec2:describe-volumes:Volumes\[\].VolumeId)
     printf '%s\n' ""
@@ -200,6 +278,9 @@ case "${scenario}:${service}:${command}:${query}" in
     printf '%s\n' "1"
     ;;
   *:autoscaling:update-auto-scaling-group:*)
+    if [[ -n "${desired_capacity}" ]]; then
+      printf '%s\n' "${desired_capacity}" >"$(asg_state_file "${asg_name}")"
+    fi
     printf '%s\n' ""
     ;;
   *)
@@ -212,6 +293,7 @@ chmod +x "${mock_bin}/aws"
 
 base_env=(
   PATH="${mock_bin}:${PATH}"
+  TEST_STATE_DIR="${tmpdir}/state"
   AWS_REGION="us-east-1"
   ACTIVE_SLOT="blue"
   DESIRED_COUNT="1"
@@ -230,6 +312,7 @@ base_env=(
 run_expect_fail() {
   local scenario="$1"
 
+  rm -f "${tmpdir}/state"/*
   if env TEST_SCENARIO="${scenario}" "${base_env[@]}" bash "${script_path}" >"${tmpdir}/${scenario}.out" 2>"${tmpdir}/${scenario}.err"; then
     echo "expected scenario ${scenario} to fail" >&2
     return 1
@@ -242,6 +325,7 @@ run_expect_success() {
   local active_https_tg="${3:-blue-https}"
   local active_ssh_tg="${4:-blue-ssh}"
 
+  rm -f "${tmpdir}/state"/*
   env \
     "${base_env[@]}" \
     TEST_SCENARIO="${scenario}" \
@@ -260,6 +344,11 @@ grep -q "skipping health wait during bootstrap" "${tmpdir}/bootstrap_unattached.
 run_expect_success "attached_healthy" "green" "green-https" "green-ssh"
 grep -q "Active slot green is ready for cutover" "${tmpdir}/attached_healthy.out"
 
+run_expect_success "stale_standby" "green" "green-https" "green-ssh"
+grep -q "Resetting standby target slot green (green-asg) from 2 stale instances to zero before rollout" "${tmpdir}/stale_standby.out"
+grep -q "Scaling active slot green (green-asg) to 1 instances" "${tmpdir}/stale_standby.out"
+
+rm -f "${tmpdir}/state"/*
 env \
   "${base_env[@]}" \
   TEST_SCENARIO="cache_seeded" \
