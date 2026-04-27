@@ -89,6 +89,27 @@ pub struct CloneLabels {
     pub repo: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CloneServedLabels {
+    pub protocol: Protocol,
+    pub served_by: CloneServedBy,
+    pub path: String,
+    pub reason: String,
+    pub cache_status: CacheStatus,
+    pub client: String,
+    pub repo: String,
+}
+
+pub struct CloneServedRecord<'a> {
+    pub protocol: Protocol,
+    pub served_by: CloneServedBy,
+    pub path: &'a str,
+    pub reason: &'a str,
+    pub cache_status: CacheStatus,
+    pub client: &'a str,
+    pub repo: &'a str,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Protocol {
     Ssh,
@@ -161,6 +182,12 @@ pub enum ClonePhase {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum CloneSource {
     Local,
+    Upstream,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub enum CloneServedBy {
+    Forgeproxy,
     Upstream,
 }
 
@@ -382,6 +409,25 @@ impl EncodeLabelValue for CloneSource {
     }
 }
 
+impl CloneServedBy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Forgeproxy => "forgeproxy",
+            Self::Upstream => "upstream",
+        }
+    }
+}
+
+impl EncodeLabelValue for CloneServedBy {
+    fn encode(
+        &self,
+        encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+    ) -> Result<(), fmt::Error> {
+        encoder.write_str(self.as_str())?;
+        Ok(())
+    }
+}
+
 impl EncodeLabelValue for AuthState {
     fn encode(
         &self,
@@ -425,6 +471,7 @@ pub struct CloneSummaryLabels {
 pub struct Metrics {
     // -- clone --
     pub clone_total: Family<CloneLabels, Counter>,
+    pub clone_served_total: Family<CloneServedLabels, Counter>,
     pub clone_summary_total: Family<CloneSummaryLabels, Counter>,
     pub clone_duration_seconds: Family<CloneDurationLabels, Histogram>,
     pub upload_pack_duration_seconds: Family<UploadPackDurationLabels, Histogram>,
@@ -523,6 +570,13 @@ impl Metrics {
             "forgeproxy_clone",
             "Total clone requests by protocol and cache status",
             clone_total.clone(),
+        );
+
+        let clone_served_total = Family::<CloneServedLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_clone_served",
+            "Clone upload-pack completions and direct-upstream handoffs by serving authority, path, reason, client, and repository",
+            clone_served_total.clone(),
         );
 
         let clone_summary_total = Family::<CloneSummaryLabels, Counter>::default();
@@ -969,6 +1023,7 @@ impl Metrics {
 
         Self {
             clone_total,
+            clone_served_total,
             clone_summary_total,
             clone_duration_seconds,
             upload_pack_duration_seconds,
@@ -1102,6 +1157,22 @@ pub fn record_clone_completion(
             repo: repo.to_string(),
         })
         .observe(elapsed.as_secs_f64());
+}
+
+pub fn record_clone_served(metrics: &MetricsRegistry, record: CloneServedRecord<'_>) {
+    metrics
+        .metrics
+        .clone_served_total
+        .get_or_create(&CloneServedLabels {
+            protocol: record.protocol,
+            served_by: record.served_by,
+            path: record.path.to_string(),
+            reason: record.reason.to_string(),
+            cache_status: record.cache_status,
+            client: record.client.to_string(),
+            repo: record.repo.to_string(),
+        })
+        .inc();
 }
 
 pub fn clone_metric_auth_state(metric_username: &str) -> AuthState {
@@ -2069,6 +2140,18 @@ mod tests {
             "acme/widgets",
             Duration::from_secs(1),
         );
+        record_clone_served(
+            &metrics,
+            CloneServedRecord {
+                protocol: Protocol::Ssh,
+                served_by: CloneServedBy::Forgeproxy,
+                path: "pack_cache",
+                reason: "pack_cache_hit",
+                cache_status: CacheStatus::Hot,
+                client: "octocat",
+                repo: "acme/widgets",
+            },
+        );
 
         let encoded = encode_metrics(&metrics.registry);
         assert!(encoded.lines().any(|line| {
@@ -2081,6 +2164,15 @@ mod tests {
                 && line.contains("protocol=\"ssh\"")
                 && line.contains("cache_status=\"hot\"")
                 && line.contains("auth_state=\"resolved\"")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_clone_served_total{")
+                && line.contains("protocol=\"ssh\"")
+                && line.contains("served_by=\"forgeproxy\"")
+                && line.contains("path=\"pack_cache\"")
+                && line.contains("reason=\"pack_cache_hit\"")
+                && line.contains("client=\"octocat\"")
+                && line.contains("repo=\"acme/widgets\"")
         }));
     }
 
