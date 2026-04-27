@@ -1,4 +1,5 @@
 mod auth;
+mod background_work;
 mod build_info;
 mod bundleuri;
 mod cache;
@@ -278,6 +279,26 @@ impl AppState {
             cache_status_counter,
             served_by_counter,
         )
+    }
+
+    pub fn active_clone_count(&self) -> i64 {
+        self.active_forgeproxy_served_clones.load(Ordering::SeqCst)
+            + self.active_upstream_served_clones.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_for_background_work_admission(
+        &self,
+        kind: &'static str,
+        repo: Option<&str>,
+    ) -> bool {
+        crate::background_work::wait_for_admission(self, kind, repo, 0).await
+    }
+
+    pub async fn background_work_defer_reason(
+        &self,
+        active_clone_allowance: i64,
+    ) -> Option<crate::background_work::BackgroundWorkDeferReason> {
+        crate::background_work::defer_reason(self, active_clone_allowance).await
     }
 
     pub fn start_draining(&self) {

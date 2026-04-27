@@ -1,6 +1,16 @@
 config_reload:
   enabled: true
   interval_secs: 60
+background_work:
+  enabled: true
+  defer_when_active_clones: true
+  # Point-in-time CPU pressure sampled over approximately 100ms.
+  cpu_busy_100ms_high_watermark: 0.80
+  # One-minute load average divided by cgroup-aware CPU budget.
+  load_1m_per_cpu_high_watermark: 0.80
+  retry_interval_secs: 60
+  max_defer_retries: 10
+  max_defer_secs: 1800
 upstream:
   hostname: "ghe.internal.example.com"
   api_url: "https://ghe.internal.example.com/api/v3"

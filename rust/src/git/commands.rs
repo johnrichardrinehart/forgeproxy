@@ -22,6 +22,43 @@ use tracing::{debug, info, instrument, warn};
 // Types
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GitProcessPriority {
+    Normal,
+    Background,
+}
+
+fn git_command(priority: GitProcessPriority) -> Command {
+    let mut cmd = Command::new("git");
+    if priority == GitProcessPriority::Background {
+        apply_background_process_priority(&mut cmd);
+    }
+    cmd
+}
+
+#[cfg(unix)]
+fn apply_background_process_priority(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            // Best-effort equivalent of `nice -n 10 ionice -c2 -n7` without
+            // depending on those binaries being present in Nix test sandboxes.
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            libc::syscall(
+                libc::SYS_ioprio_set,
+                1, // IOPRIO_WHO_PROCESS
+                0,
+                (2 << 13) | 7, // IOPRIO_CLASS_BE, priority 7
+            );
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_background_process_priority(_cmd: &mut Command) {
+    // Non-Unix platforms keep normal priority.
+}
+
 /// Summary of a `git fetch` operation.
 #[derive(Debug, Clone)]
 pub struct FetchResult {
@@ -452,7 +489,7 @@ pub async fn git_multi_pack_index_write_for_object_dir(
             object_dir.display()
         )
     })?;
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command(GitProcessPriority::Background);
     cmd.current_dir(git_dir)
         .env("GIT_DIR", git_dir)
         .arg("-c")
@@ -906,7 +943,7 @@ pub async fn git_index_pack(repo_path: &Path, pack_path: &Path, pack_threads: us
         .with_context(|| format!("open pack file {}", pack_path.display()))?;
     let input_pack_size = pack_file.metadata().map(|m| m.len()).unwrap_or_default();
 
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command(GitProcessPriority::Background);
     cmd.arg("-C")
         .arg(repo_path)
         .arg("index-pack")
@@ -1013,7 +1050,7 @@ pub async fn git_index_pack_to_idx(
     idx_path: &Path,
     pack_threads: usize,
 ) -> Result<()> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command(GitProcessPriority::Background);
     cmd.arg("index-pack")
         .arg(format!("--threads={pack_threads}"))
         .arg("-o")
@@ -1572,6 +1609,35 @@ pub async fn git_pack_objects_exact(
     object_ids: &[String],
     pack_threads: usize,
 ) -> Result<Vec<u8>> {
+    git_pack_objects_exact_with_priority(
+        repo_path,
+        object_ids,
+        pack_threads,
+        GitProcessPriority::Normal,
+    )
+    .await
+}
+
+pub async fn git_pack_objects_exact_background(
+    repo_path: &Path,
+    object_ids: &[String],
+    pack_threads: usize,
+) -> Result<Vec<u8>> {
+    git_pack_objects_exact_with_priority(
+        repo_path,
+        object_ids,
+        pack_threads,
+        GitProcessPriority::Background,
+    )
+    .await
+}
+
+async fn git_pack_objects_exact_with_priority(
+    repo_path: &Path,
+    object_ids: &[String],
+    pack_threads: usize,
+    priority: GitProcessPriority,
+) -> Result<Vec<u8>> {
     if object_ids.is_empty() {
         bail!("cannot create exact pack without object ids");
     }
@@ -1582,7 +1648,7 @@ pub async fn git_pack_objects_exact(
         input.push(b'\n');
     }
 
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command(priority);
     cmd.arg("-C")
         .arg(repo_path)
         .arg("-c")

@@ -14,6 +14,13 @@ let
         delegated_repositories                     = []
         config_reload_enabled                      = true
         config_reload_interval_secs                = 60
+        background_work_enabled                    = true
+        background_work_defer_when_active_clones   = true
+        background_work_cpu_busy_100ms_high_watermark = 0.80
+        background_work_load_1m_per_cpu_high_watermark = 0.80
+        background_work_retry_interval_secs        = 60
+        background_work_max_defer_retries          = 10
+        background_work_max_defer_secs             = 1800
         valkey_private_ip                          = "10.0.0.10"
         valkey_enable_tls                          = false
         backend_port                               = 8080

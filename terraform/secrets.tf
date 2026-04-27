@@ -21,6 +21,15 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
   secret_string = templatefile("${path.module}/templates/service-config.yaml.tpl", {
     config_reload_enabled                         = var.config_reload_enabled
     config_reload_interval_secs                   = var.config_reload_interval_secs
+    background_work_enabled                       = var.background_work_enabled
+    background_work_defer_when_active_clones      = var.background_work_defer_when_active_clones
+    background_work_cpu_busy_100ms_high_watermark = var.background_work_cpu_busy_100ms_high_watermark
+    background_work_load_1m_per_cpu_high_watermark = (
+      var.background_work_load_1m_per_cpu_high_watermark
+    )
+    background_work_retry_interval_secs           = var.background_work_retry_interval_secs
+    background_work_max_defer_retries             = var.background_work_max_defer_retries
+    background_work_max_defer_secs                = var.background_work_max_defer_secs
     upstream_hostname                             = var.upstream_hostname
     upstream_api_url                              = var.upstream_api_url
     upstream_git_url_base                         = coalesce(var.upstream_git_url_base, "https://${var.upstream_hostname}")
