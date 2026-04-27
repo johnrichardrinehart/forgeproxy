@@ -136,7 +136,7 @@ resource "aws_launch_template" "forgeproxy" {
 resource "aws_autoscaling_group" "forgeproxy" {
   for_each = local.forgeproxy_slots
 
-  name                      = "${var.name_prefix}-forgeproxy-${each.key}"
+  name                      = local.forgeproxy_asg_names[each.key]
   min_size                  = 0
   desired_capacity          = 0
   max_size                  = local.forgeproxy_max_count
@@ -153,7 +153,7 @@ resource "aws_autoscaling_group" "forgeproxy" {
 
   launch_template {
     id      = aws_launch_template.forgeproxy[each.key].id
-    version = aws_launch_template.forgeproxy[each.key].latest_version
+    version = local.forgeproxy_asg_launch_template_versions[each.key]
   }
 
   tag {

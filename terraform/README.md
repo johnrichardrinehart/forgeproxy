@@ -236,6 +236,7 @@ This module intentionally does not use AWS CodeDeploy for this path. CodeDeploy 
 
 The resulting rollout behavior is:
 - The inactive slot launches and warms on the updated launch template while the active slot remains registered with the production listeners.
+- Terraform pins the current live slot's Auto Scaling Group to its already-attached launch-template version during the apply. Only the target standby slot is moved to the new launch-template version before readiness checks pass, so live-slot ASG self-healing cannot launch an unproven revision ahead of cutover.
 - Before launching the target slot, the prepare helper resets that target ASG to zero when it is not the current live slot. This removes stale instances left by failed earlier applies and guarantees the new target slot comes up on the current launch-template version.
 - By default, Terraform derives the next target slot automatically from the listener that is currently serving traffic; `forgeproxy_active_slot` is only needed as a manual override.
 - The NLB health checks gate cutover on `/readyz`, so warm-up must finish before the new slot can receive production traffic.
