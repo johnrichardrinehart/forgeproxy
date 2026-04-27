@@ -1904,6 +1904,22 @@ fn spawn_published_generation_index_preparation(
             "starting background bitmap/MIDX preparation for published generation"
         );
 
+        if !state
+            .wait_for_background_work_admission(
+                "published_generation_index_preparation",
+                Some(&owner_repo),
+            )
+            .await
+        {
+            info!(
+                repo = %owner_repo,
+                source,
+                path = %published_path.display(),
+                "abandoning background bitmap/MIDX preparation after repeated foreground clone/CPU pressure"
+            );
+            return;
+        }
+
         let permit = match state
             .bundle_generation_semaphore
             .clone()
@@ -2116,6 +2132,17 @@ async fn run_pack_cache_warming(
     let _published_lease = published_lease;
     let started_at = Instant::now();
     if prev_entries.is_empty() {
+        if !state
+            .wait_for_background_work_admission("pack_cache_base_warming", Some(&owner_repo))
+            .await
+        {
+            crate::metrics::inc_pack_cache_warming_skip(
+                &state.metrics,
+                &owner_repo,
+                "background_pressure",
+            );
+            return;
+        }
         crate::metrics::inc_pack_cache_warming_skip(
             &state.metrics,
             &owner_repo,
@@ -2188,6 +2215,17 @@ async fn run_pack_cache_warming(
     );
 
     for prev_entry in prev_entries {
+        if !state
+            .wait_for_background_work_admission("pack_cache_stitch_warming", Some(&owner_repo))
+            .await
+        {
+            crate::metrics::inc_pack_cache_warming_skip(
+                &state.metrics,
+                &owner_repo,
+                "background_pressure",
+            );
+            return;
+        }
         crate::metrics::inc_pack_cache_stitch_attempt(&state.metrics, &owner_repo);
         crate::metrics::inc_pack_cache_warming(&state.metrics, &owner_repo, "stitch", "start");
         let result =
@@ -2420,12 +2458,24 @@ async fn build_pack_cache_delta(
         .map_err(|error| PackCacheStitchFailure::new("semaphore", error))?;
     let semaphore_wait = wait_started_at.elapsed();
     let pack_started_at = Instant::now();
-    let delta_pack = crate::git::commands::git_pack_objects_exact(
-        published_path,
-        object_ids,
-        state.bundle_pack_threads,
-    )
-    .await
+    let delta_pack = match priority {
+        PackCacheDeltaPriority::Background => {
+            crate::git::commands::git_pack_objects_exact_background(
+                published_path,
+                object_ids,
+                state.bundle_pack_threads,
+            )
+            .await
+        }
+        PackCacheDeltaPriority::Request => {
+            crate::git::commands::git_pack_objects_exact(
+                published_path,
+                object_ids,
+                state.bundle_pack_threads,
+            )
+            .await
+        }
+    }
     .map_err(|error| PackCacheStitchFailure::new("delta_pack", error))?;
     let pack_objects_elapsed = pack_started_at.elapsed();
     drop(permit);
@@ -4133,6 +4183,15 @@ async fn hydrate_repo_from_tee_capture(
         destination = %repo_path.display(),
         "starting tee hydration index-pack"
     );
+    if let Some(reason) = state.background_work_defer_reason(1).await {
+        info!(
+            repo = %owner_repo,
+            reason = reason.reason,
+            detail = %reason.detail,
+            "skipping tee hydration index-pack because foreground clone/CPU pressure is present"
+        );
+        return Ok(TeeHydrationOutcome::NotHydrated);
+    }
     crate::git::commands::git_index_pack(repo_path, &pack_path, state.index_pack_threads).await?;
     if state.cache_manager.has_repo(owner_repo) && !allow_existing_repo_publish {
         info!(

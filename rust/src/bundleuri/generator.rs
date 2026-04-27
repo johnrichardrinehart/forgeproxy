@@ -59,6 +59,12 @@ pub async fn generate_full_bundle(
     );
 
     // --all includes every ref.
+    if !state
+        .wait_for_background_work_admission("full_bundle_generation", Some(owner_repo))
+        .await
+    {
+        anyhow::bail!("full bundle generation deferred too long for {owner_repo}");
+    }
     let _bundle_generation_permit = state
         .bundle_generation_semaphore
         .clone()
@@ -135,6 +141,12 @@ pub async fn generate_filtered_bundle(
 
     info!(owner_repo, "creating filtered (blob:none) bundle");
 
+    if !state
+        .wait_for_background_work_admission("filtered_bundle_generation", Some(owner_repo))
+        .await
+    {
+        anyhow::bail!("filtered bundle generation deferred too long for {owner_repo}");
+    }
     let _bundle_generation_permit = state
         .bundle_generation_semaphore
         .clone()
@@ -227,6 +239,12 @@ pub async fn generate_incremental_bundle(
         "creating incremental bundle"
     );
 
+    if !state
+        .wait_for_background_work_admission("incremental_bundle_generation", Some(owner_repo))
+        .await
+    {
+        anyhow::bail!("incremental bundle generation deferred too long for {owner_repo}");
+    }
     let _bundle_generation_permit = state
         .bundle_generation_semaphore
         .clone()

@@ -83,6 +83,8 @@ impl fmt::Display for BackendType {
 pub struct Config {
     #[serde(default)]
     pub config_reload: ConfigReloadConfig,
+    #[serde(default)]
+    pub background_work: BackgroundWorkConfig,
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub backend_type: BackendType,
@@ -119,6 +121,73 @@ impl Config {
             .iter()
             .any(|entry| crate::repo_identity::canonicalize_owner_repo(entry) == canonical)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Background work
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BackgroundWorkConfig {
+    /// Defer lower-priority cache/index/bundle work when the host is busy.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Defer background work while clone streams are active.
+    #[serde(default = "default_true")]
+    pub defer_when_active_clones: bool,
+    /// Defer background work when the 100ms sampled CPU busy fraction is at or
+    /// above this value. Set to `0.0` to disable CPU-busy sampling.
+    #[serde(default = "default_background_cpu_busy_100ms_high_watermark")]
+    pub cpu_busy_100ms_high_watermark: f64,
+    /// Defer background work when one-minute load divided by the cgroup-aware
+    /// CPU budget is at or above this value. Set to `0.0` to disable load checks.
+    #[serde(default = "default_background_load_1m_per_cpu_high_watermark")]
+    pub load_1m_per_cpu_high_watermark: f64,
+    /// Seconds between retries while lower-priority work is deferred.
+    #[serde(default = "default_background_work_retry_interval_secs")]
+    pub retry_interval_secs: u64,
+    /// Maximum number of pressure deferrals before abandoning one background
+    /// task attempt.
+    #[serde(default = "default_background_work_max_defer_retries")]
+    pub max_defer_retries: u32,
+    /// Maximum wall-clock seconds one background task attempt may remain
+    /// deferred before it is abandoned.
+    #[serde(default = "default_background_work_max_defer_secs")]
+    pub max_defer_secs: u64,
+}
+
+impl Default for BackgroundWorkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            defer_when_active_clones: default_true(),
+            cpu_busy_100ms_high_watermark: default_background_cpu_busy_100ms_high_watermark(),
+            load_1m_per_cpu_high_watermark: default_background_load_1m_per_cpu_high_watermark(),
+            retry_interval_secs: default_background_work_retry_interval_secs(),
+            max_defer_retries: default_background_work_max_defer_retries(),
+            max_defer_secs: default_background_work_max_defer_secs(),
+        }
+    }
+}
+
+fn default_background_cpu_busy_100ms_high_watermark() -> f64 {
+    0.80
+}
+
+fn default_background_load_1m_per_cpu_high_watermark() -> f64 {
+    0.80
+}
+
+fn default_background_work_retry_interval_secs() -> u64 {
+    60
+}
+
+fn default_background_work_max_defer_retries() -> u32 {
+    10
+}
+
+fn default_background_work_max_defer_secs() -> u64 {
+    30 * 60
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,6 +1135,7 @@ pub struct RepoOverride {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigSchemaNode {
     Root,
+    BackgroundWork,
     ConfigReload,
     Upstream,
     UpstreamCredentials,
@@ -1102,6 +1172,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
     match node {
         ConfigSchemaNode::Root => &[
             "config_reload",
+            "background_work",
             "upstream",
             "backend_type",
             "upstream_credentials",
@@ -1118,6 +1189,15 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "logging",
             "delegated_repositories",
             "repo_overrides",
+        ],
+        ConfigSchemaNode::BackgroundWork => &[
+            "enabled",
+            "defer_when_active_clones",
+            "cpu_busy_100ms_high_watermark",
+            "load_1m_per_cpu_high_watermark",
+            "retry_interval_secs",
+            "max_defer_retries",
+            "max_defer_secs",
         ],
         ConfigSchemaNode::ConfigReload => &["enabled", "interval_secs"],
         ConfigSchemaNode::Upstream => &[
@@ -1226,6 +1306,9 @@ fn schema_child(node: ConfigSchemaNode, key: &str) -> ConfigSchemaChild {
     match (node, key) {
         (ConfigSchemaNode::Root, "config_reload") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::ConfigReload)
+        }
+        (ConfigSchemaNode::Root, "background_work") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::BackgroundWork)
         }
         (ConfigSchemaNode::Root, "upstream") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::Upstream)
@@ -1384,6 +1467,28 @@ fn validate_config(config: &Config) -> Result<()> {
         "storage.local.max_percent must be in range (0.0, 1.0]"
     );
     anyhow::ensure!(
+        config.background_work.cpu_busy_100ms_high_watermark >= 0.0
+            && config.background_work.cpu_busy_100ms_high_watermark <= 1.0,
+        "background_work.cpu_busy_100ms_high_watermark must be in range [0.0, 1.0]"
+    );
+    anyhow::ensure!(
+        config.background_work.load_1m_per_cpu_high_watermark >= 0.0
+            && config.background_work.load_1m_per_cpu_high_watermark <= 1.0,
+        "background_work.load_1m_per_cpu_high_watermark must be in range [0.0, 1.0]"
+    );
+    anyhow::ensure!(
+        config.background_work.retry_interval_secs > 0,
+        "background_work.retry_interval_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.background_work.max_defer_retries > 0,
+        "background_work.max_defer_retries must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.background_work.max_defer_secs > 0,
+        "background_work.max_defer_secs must be greater than 0"
+    );
+    anyhow::ensure!(
         config.bundles.max_concurrent_generations > 0,
         "max_concurrent_generations must be greater than 0"
     );
@@ -1503,6 +1608,13 @@ mod tests {
         );
         assert!(config.config_reload.enabled);
         assert_eq!(config.config_reload.interval_secs, 60);
+        assert!(config.background_work.enabled);
+        assert!(config.background_work.defer_when_active_clones);
+        assert_eq!(config.background_work.cpu_busy_100ms_high_watermark, 0.80);
+        assert_eq!(config.background_work.load_1m_per_cpu_high_watermark, 0.80);
+        assert_eq!(config.background_work.retry_interval_secs, 60);
+        assert_eq!(config.background_work.max_defer_retries, 10);
+        assert_eq!(config.background_work.max_defer_secs, 1800);
         assert!(config.repository_is_delegated("org/problem-repo.git"));
     }
 
@@ -1519,6 +1631,36 @@ mod tests {
             "config_reload:\n  enabled: true\n  interval_secs: 60\n",
             "config_reload:\n  enabled: true\n  interval_secs: 0\n",
         );
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_background_work_thresholds_outside_unit_range() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  cpu_busy_100ms_high_watermark: 0.80\n",
+            "  cpu_busy_100ms_high_watermark: 1.01\n",
+        );
+        assert!(parse_config_str(&config).is_err());
+
+        let config = include_str!("../../config.example.yaml").replace(
+            "  load_1m_per_cpu_high_watermark: 0.80\n",
+            "  load_1m_per_cpu_high_watermark: -0.01\n",
+        );
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_non_positive_background_work_retry_limits() {
+        let config = include_str!("../../config.example.yaml")
+            .replace("  retry_interval_secs: 60\n", "  retry_interval_secs: 0\n");
+        assert!(parse_config_str(&config).is_err());
+
+        let config = include_str!("../../config.example.yaml")
+            .replace("  max_defer_retries: 10\n", "  max_defer_retries: 0\n");
+        assert!(parse_config_str(&config).is_err());
+
+        let config = include_str!("../../config.example.yaml")
+            .replace("  max_defer_secs: 1800\n", "  max_defer_secs: 0\n");
         assert!(parse_config_str(&config).is_err());
     }
 

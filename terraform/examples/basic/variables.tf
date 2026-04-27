@@ -642,6 +642,73 @@ variable "config_reload_interval_secs" {
   }
 }
 
+variable "background_work_enabled" {
+  type        = bool
+  default     = true
+  description = "Enable foreground-pressure throttling for lower-priority bundle, index, tee hydration, and pack-cache warming work."
+}
+
+variable "background_work_defer_when_active_clones" {
+  type        = bool
+  default     = true
+  description = "Defer lower-priority background work while clone streams are active."
+}
+
+variable "background_work_cpu_busy_100ms_high_watermark" {
+  type        = number
+  default     = 0.80
+  description = "Point-in-time CPU busy fraction sampled over about 100ms that causes lower-priority background work to defer. Set to 0 to disable this gate."
+
+  validation {
+    condition     = var.background_work_cpu_busy_100ms_high_watermark >= 0 && var.background_work_cpu_busy_100ms_high_watermark <= 1
+    error_message = "background_work_cpu_busy_100ms_high_watermark must be in range [0, 1]."
+  }
+}
+
+variable "background_work_load_1m_per_cpu_high_watermark" {
+  type        = number
+  default     = 0.80
+  description = "One-minute load average divided by cgroup-aware CPU budget that causes lower-priority background work to defer. Set to 0 to disable this gate."
+
+  validation {
+    condition     = var.background_work_load_1m_per_cpu_high_watermark >= 0 && var.background_work_load_1m_per_cpu_high_watermark <= 1
+    error_message = "background_work_load_1m_per_cpu_high_watermark must be in range [0, 1]."
+  }
+}
+
+variable "background_work_retry_interval_secs" {
+  type        = number
+  default     = 60
+  description = "Seconds between lower-priority background work retries while foreground clone/CPU pressure is high."
+
+  validation {
+    condition     = var.background_work_retry_interval_secs > 0
+    error_message = "background_work_retry_interval_secs must be greater than 0."
+  }
+}
+
+variable "background_work_max_defer_retries" {
+  type        = number
+  default     = 10
+  description = "Maximum number of pressure deferrals before one lower-priority background work attempt is abandoned."
+
+  validation {
+    condition     = var.background_work_max_defer_retries > 0
+    error_message = "background_work_max_defer_retries must be greater than 0."
+  }
+}
+
+variable "background_work_max_defer_secs" {
+  type        = number
+  default     = 1800
+  description = "Maximum wall-clock seconds one lower-priority background work attempt may remain deferred before it is abandoned."
+
+  validation {
+    condition     = var.background_work_max_defer_secs > 0
+    error_message = "background_work_max_defer_secs must be greater than 0."
+  }
+}
+
 variable "prepare_published_generation_indexes" {
   type        = bool
   default     = false
