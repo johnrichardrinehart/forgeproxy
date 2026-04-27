@@ -100,6 +100,22 @@ asg_instance_count() {
     --output text
 }
 
+wait_for_asg_instance_count() {
+  local asg_name="$1"
+  local expected_count="$2"
+  local instance_count
+
+  echo "Waiting for Auto Scaling Group ${asg_name} to contain ${expected_count} instances"
+  while true; do
+    instance_count="$(asg_instance_count "${asg_name}")"
+    if [[ "${instance_count}" == "${expected_count}" ]]; then
+      break
+    fi
+    echo "ASG ${asg_name}: ${instance_count}/${expected_count} instances present"
+    sleep 10
+  done
+}
+
 asg_running_launch_template_versions() {
   local asg_name="$1"
 
@@ -149,6 +165,34 @@ target_group_attached_to_load_balancer() {
 }
 
 enforce_blue_green_slot_flip
+
+reset_standby_target_slot() {
+  local current_slot current_instance_count
+
+  current_slot="$(current_listener_slot)"
+  if [[ "${current_slot}" == "${active_slot}" ]]; then
+    return 0
+  fi
+  if [[ "${current_slot}" == "unknown" ]]; then
+    echo "Current live slot is unknown; not resetting target slot ${active_slot} before rollout"
+    return 0
+  fi
+
+  current_instance_count="$(asg_instance_count "${active_asg}")"
+  if [[ "${current_instance_count}" == "0" ]]; then
+    return 0
+  fi
+
+  echo "Resetting standby target slot ${active_slot} (${active_asg}) from ${current_instance_count} stale instances to zero before rollout"
+  aws "${aws_args[@]}" autoscaling update-auto-scaling-group \
+    --auto-scaling-group-name "${active_asg}" \
+    --min-size 0 \
+    --desired-capacity 0 \
+    --max-size "${max_count}"
+  wait_for_asg_instance_count "${active_asg}" "0"
+}
+
+reset_standby_target_slot
 
 asg_instance_ids() {
   local asg_name="$1"
