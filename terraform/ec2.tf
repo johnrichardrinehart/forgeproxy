@@ -190,6 +190,7 @@ resource "aws_autoscaling_group" "forgeproxy" {
 
 resource "null_resource" "forgeproxy_rollout_prepare" {
   triggers = {
+    behavior_revision            = "reset-standby-target-v1"
     active_slot                  = local.forgeproxy_target_slot
     desired_count                = tostring(var.forgeproxy_count)
     max_count                    = tostring(local.forgeproxy_max_count)
@@ -252,6 +253,7 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
 
 resource "null_resource" "forgeproxy_rollout_cleanup" {
   triggers = {
+    behavior_revision            = "reconcile-active-and-inactive-v1"
     active_slot                  = local.forgeproxy_target_slot
     desired_count                = tostring(var.forgeproxy_count)
     blue_asg_name                = aws_autoscaling_group.forgeproxy["blue"].name
@@ -260,6 +262,7 @@ resource "null_resource" "forgeproxy_rollout_cleanup" {
     green_launch_template_version = tostring(
       aws_launch_template.forgeproxy["green"].latest_version
     )
+    max_count                           = tostring(local.forgeproxy_max_count)
     listener_https_arn                  = aws_lb_listener.https.arn
     listener_ssh_arn                    = aws_lb_listener.ssh.arn
     nlb_dns_name                        = aws_lb.nlb.dns_name
@@ -281,6 +284,8 @@ resource "null_resource" "forgeproxy_rollout_cleanup" {
       AWS_REGION                             = var.aws_region
       AWS_PROFILE_FALLBACK                   = var.aws_profile
       ACTIVE_SLOT                            = local.forgeproxy_target_slot
+      DESIRED_COUNT                          = tostring(var.forgeproxy_count)
+      MAX_COUNT                              = tostring(local.forgeproxy_max_count)
       BLUE_ASG_NAME                          = aws_autoscaling_group.forgeproxy["blue"].name
       GREEN_ASG_NAME                         = aws_autoscaling_group.forgeproxy["green"].name
       NLB_DNS_NAME                           = aws_lb.nlb.dns_name
