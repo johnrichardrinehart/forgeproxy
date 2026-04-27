@@ -303,11 +303,11 @@ in
       device = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        example = "/dev/disk/by-label/forgeproxy-cache";
+        example = "/dev/disk/by-label/forgeproxy";
         description = ''
           Optional dedicated block device for the forgeproxy cache directory.
-          When set, the module mounts it with noatime/nodiratime so Git cache
-          reads do not generate access-time writes.
+          When set, the module mounts it with noatime so Git cache reads do
+          not generate access-time writes.
         '';
       };
 
@@ -368,7 +368,6 @@ in
         fsType = cfg.cacheMount.fsType;
         options = [
           "noatime"
-          "nodiratime"
         ]
         ++ cfg.cacheMount.options;
       };
