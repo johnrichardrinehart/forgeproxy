@@ -16,13 +16,44 @@ data "external" "forgeproxy_rollout_slot" {
   ]
 }
 
+data "external" "forgeproxy_asg_launch_template_versions" {
+  program = ["bash", "-c", <<-EOT
+    set -euo pipefail
+    export BLUE_ASG_NAME='${local.forgeproxy_asg_names.blue}'
+    export GREEN_ASG_NAME='${local.forgeproxy_asg_names.green}'
+    export AWS_REGION='${var.aws_region}'
+    export AWS_PROFILE_FALLBACK='${var.aws_profile}'
+    exec bash '${path.module}/scripts/forgeproxy-resolve-asg-launch-templates.sh'
+  EOT
+  ]
+}
+
 locals {
+  forgeproxy_asg_names = {
+    blue  = "${var.name_prefix}-forgeproxy-blue"
+    green = "${var.name_prefix}-forgeproxy-green"
+  }
   forgeproxy_current_live_slot = data.external.forgeproxy_rollout_slot.result.current_slot
   forgeproxy_target_slot = (
     var.forgeproxy_active_slot != null
     ? var.forgeproxy_active_slot
     : data.external.forgeproxy_rollout_slot.result.target_slot
   )
+  forgeproxy_current_asg_launch_template_versions = {
+    blue  = data.external.forgeproxy_asg_launch_template_versions.result.blue_version
+    green = data.external.forgeproxy_asg_launch_template_versions.result.green_version
+  }
+  forgeproxy_asg_launch_template_versions = {
+    for slot in ["blue", "green"] : slot => (
+      slot == local.forgeproxy_target_slot
+      ? tostring(aws_launch_template.forgeproxy[slot].latest_version)
+      : (
+        local.forgeproxy_current_asg_launch_template_versions[slot] != ""
+        ? local.forgeproxy_current_asg_launch_template_versions[slot]
+        : tostring(aws_launch_template.forgeproxy[slot].latest_version)
+      )
+    )
+  }
 }
 
 data "aws_instances" "forgeproxy_blue" {
