@@ -84,7 +84,68 @@ asg_count_for() {
   fi
 }
 
+counter_file() {
+  local name="$1"
+  printf '%s/%s.counter\n' "${TEST_STATE_DIR:?TEST_STATE_DIR is required}" "${name}"
+}
+
+next_counter_value() {
+  local name="$1"
+  local state_file current_value
+  state_file="$(counter_file "${name}")"
+  if [[ -f "${state_file}" ]]; then
+    current_value="$(cat "${state_file}")"
+  else
+    current_value="0"
+  fi
+  printf '%s\n' "${current_value}"
+  printf '%s\n' "$(( current_value + 1 ))" >"${state_file}"
+}
+
 case "${scenario}:${service}:${command}:${query}" in
+  target_diagnostics:elbv2:describe-listeners:*)
+    if [[ -n "${listener_arn}" ]]; then
+      printf '%s\n' "blue-https"
+    else
+      printf '%s\n' "https-listener"
+    fi
+    ;;
+  target_diagnostics:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\))
+    if [[ "${asg_name}" == "green-asg" ]]; then
+      asg_count_for "${asg_name}" "0"
+    else
+      printf '%s\n' "1"
+    fi
+    ;;
+  target_diagnostics:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\]\))
+    asg_count_for "${asg_name}" "1"
+    ;;
+  target_diagnostics:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\ \&\&\ HealthStatus==\'Healthy\'\]\))
+    asg_count_for "${asg_name}" "1"
+    ;;
+  target_diagnostics:elbv2:describe-target-health:length\(TargetHealthDescriptions\[\?TargetHealth.State==\'healthy\'\]\))
+    if [[ "${target_group_arn}" == "green-https" ]]; then
+      if [[ "$(next_counter_value "green-https-healthy")" == "0" ]]; then
+        printf '%s\n' "0"
+      else
+        printf '%s\n' "1"
+      fi
+    else
+      printf '%s\n' "1"
+    fi
+    ;;
+  target_diagnostics:elbv2:describe-target-health:length\(TargetHealthDescriptions\[\?TargetHealth.State==\'unused\'\]\))
+    printf '%s\n' "0"
+    ;;
+  target_diagnostics:elbv2:describe-target-health:length\(TargetHealthDescriptions\))
+    printf '%s\n' "1"
+    ;;
+  target_diagnostics:elbv2:describe-target-health:TargetHealthDescriptions\[\].\{Target:Target.Id,Port:Target.Port,State:TargetHealth.State,Reason:TargetHealth.Reason,Description:TargetHealth.Description\})
+    printf '%s\n' "i-unhealthy-target 443 unhealthy Target.ResponseCodeMismatch Health checks failed with these codes: [503]"
+    ;;
+  target_diagnostics:elbv2:describe-target-groups:length\(TargetGroups\[0\].LoadBalancerArns\))
+    printf '%s\n' "1"
+    ;;
   stale_standby:elbv2:describe-listeners:*)
     if [[ -n "${listener_arn}" ]]; then
       printf '%s\n' "blue-https"
@@ -277,6 +338,15 @@ case "${scenario}:${service}:${command}:${query}" in
   cache_seeded:elbv2:describe-target-groups:length\(TargetGroups\[0\].LoadBalancerArns\))
     printf '%s\n' "1"
     ;;
+  *:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].Instances\[\].\{Id:InstanceId,State:LifecycleState,Health:HealthStatus,AZ:AvailabilityZone,LT:LaunchTemplate.Version,Protected:ProtectedFromScaleIn\})
+    printf '%s\n' "i-mock InService Healthy us-east-1a 1 false"
+    ;;
+  *:autoscaling:describe-scaling-activities:Activities\[\].\{Start:StartTime,Status:StatusCode,Progress:Progress,Description:Description,Cause:Cause,StatusMessage:StatusMessage\})
+    printf '%s\n' "2026-01-01T00:00:00Z Successful 100 mock-scaling-activity mock-cause mock-status"
+    ;;
+  *:elbv2:describe-target-health:TargetHealthDescriptions\[\].\{Target:Target.Id,Port:Target.Port,State:TargetHealth.State,Reason:TargetHealth.Reason,Description:TargetHealth.Description\})
+    printf '%s\n' "i-mock 443 initial Elb.InitialHealthChecking Initial health checks in progress"
+    ;;
   *:autoscaling:update-auto-scaling-group:*)
     if [[ -n "${desired_capacity}" ]]; then
       printf '%s\n' "${desired_capacity}" >"$(asg_state_file "${asg_name}")"
@@ -347,6 +417,10 @@ grep -q "Active slot green is ready for cutover" "${tmpdir}/attached_healthy.out
 run_expect_success "stale_standby" "green" "green-https" "green-ssh"
 grep -q "Resetting standby target slot green (green-asg) from 2 stale instances to zero before rollout" "${tmpdir}/stale_standby.out"
 grep -q "Scaling active slot green (green-asg) to 1 instances" "${tmpdir}/stale_standby.out"
+
+run_expect_success "target_diagnostics" "green" "green-https" "green-ssh"
+grep -q "HTTPS target group target health details" "${tmpdir}/target_diagnostics.out"
+grep -q "Target.ResponseCodeMismatch" "${tmpdir}/target_diagnostics.out"
 
 rm -f "${tmpdir}/state"/*
 env \
