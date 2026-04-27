@@ -52,6 +52,17 @@ resource "aws_launch_template" "forgeproxy" {
   user_data = base64encode(<<-EOT
     # SM_PREFIX=${var.name_prefix}
     # FORGEPROXY_SSH_HOST_KEY_SECRET_ARN=${var.forgeproxy_ssh_host_key_secret_arn != null ? var.forgeproxy_ssh_host_key_secret_arn : ""}
+    # FORGEPROXY_DEPLOYMENT_SLOT=${each.key}
+    # FORGEPROXY_CACHE_EBS_ENABLED=${var.forgeproxy_cache_volume_enabled ? "true" : "false"}
+    # FORGEPROXY_CACHE_VOLUME_GB=${var.forgeproxy_cache_volume_gb}
+    # FORGEPROXY_CACHE_VOLUME_TYPE=${var.forgeproxy_cache_volume_type}
+    # FORGEPROXY_CACHE_VOLUME_IOPS=${var.forgeproxy_cache_volume_iops}
+    # FORGEPROXY_CACHE_VOLUME_THROUGHPUT_MBPS=${var.forgeproxy_cache_volume_throughput_mbps}
+    # FORGEPROXY_CACHE_VOLUME_DEVICE_NAME=${var.forgeproxy_cache_volume_device_name}
+    # FORGEPROXY_CACHE_VOLUME_FS_TYPE=${var.forgeproxy_cache_volume_fs_type}
+    # FORGEPROXY_CACHE_VOLUME_LABEL=${var.forgeproxy_cache_volume_label}
+    # FORGEPROXY_CACHE_MOUNT_DIR=/var/cache/forgeproxy
+    # FORGEPROXY_CACHE_MOUNT_OPTIONS=${var.forgeproxy_cache_volume_mount_options}
     { ... }: {}
   EOT
   )
@@ -85,6 +96,7 @@ resource "aws_launch_template" "forgeproxy" {
       Name           = "${var.name_prefix}-forgeproxy-${each.key}"
       Role           = "forgeproxy"
       DeploymentSlot = each.key
+      CacheEbs       = var.forgeproxy_cache_volume_enabled ? "enabled" : "disabled"
     }
   }
 
@@ -94,6 +106,7 @@ resource "aws_launch_template" "forgeproxy" {
       Name           = "${var.name_prefix}-forgeproxy-${each.key}-root"
       Role           = "forgeproxy"
       DeploymentSlot = each.key
+      CacheEbs       = var.forgeproxy_cache_volume_enabled ? "enabled" : "disabled"
     }
   }
 
@@ -101,6 +114,7 @@ resource "aws_launch_template" "forgeproxy" {
     Name           = "${var.name_prefix}-forgeproxy-${each.key}"
     Role           = "forgeproxy"
     DeploymentSlot = each.key
+    CacheEbs       = var.forgeproxy_cache_volume_enabled ? "enabled" : "disabled"
   }
 
   depends_on = [
@@ -124,7 +138,7 @@ resource "aws_autoscaling_group" "forgeproxy" {
   name                      = "${var.name_prefix}-forgeproxy-${each.key}"
   min_size                  = 0
   desired_capacity          = 0
-  max_size                  = var.forgeproxy_count
+  max_size                  = local.forgeproxy_max_count
   health_check_type         = "ELB"
   health_check_grace_period = var.forgeproxy_health_check_grace_period_secs
   wait_for_elb_capacity     = 0
@@ -177,6 +191,7 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
   triggers = {
     active_slot                  = local.forgeproxy_target_slot
     desired_count                = tostring(var.forgeproxy_count)
+    max_count                    = tostring(local.forgeproxy_max_count)
     blue_asg_name                = aws_autoscaling_group.forgeproxy["blue"].name
     green_asg_name               = aws_autoscaling_group.forgeproxy["green"].name
     active_https_target_group    = aws_lb_target_group.https[local.forgeproxy_target_slot].arn
@@ -185,7 +200,13 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
     green_launch_template_version = tostring(
       aws_launch_template.forgeproxy["green"].latest_version
     )
-    valkey_instance_id = aws_instance.valkey.id
+    valkey_instance_id            = aws_instance.valkey.id
+    cache_volume_enabled          = tostring(var.forgeproxy_cache_volume_enabled)
+    cache_volume_gb               = tostring(var.forgeproxy_cache_volume_gb)
+    cache_volume_type             = var.forgeproxy_cache_volume_type
+    cache_volume_iops             = tostring(var.forgeproxy_cache_volume_iops)
+    cache_volume_throughput_mbps  = tostring(var.forgeproxy_cache_volume_throughput_mbps)
+    cache_seed_wait_for_snapshots = tostring(var.forgeproxy_cache_seed_wait_for_snapshots)
   }
 
   depends_on = [
@@ -200,7 +221,9 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
       AWS_REGION                   = var.aws_region
       AWS_PROFILE_FALLBACK         = var.aws_profile
       ACTIVE_SLOT                  = local.forgeproxy_target_slot
+      CURRENT_LIVE_SLOT            = local.forgeproxy_current_live_slot
       DESIRED_COUNT                = tostring(var.forgeproxy_count)
+      MAX_COUNT                    = tostring(local.forgeproxy_max_count)
       BLUE_ASG_NAME                = aws_autoscaling_group.forgeproxy["blue"].name
       GREEN_ASG_NAME               = aws_autoscaling_group.forgeproxy["green"].name
       ACTIVE_HTTPS_TARGET_ARN      = aws_lb_target_group.https[local.forgeproxy_target_slot].arn
@@ -208,6 +231,15 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
       BLUE_HTTPS_TARGET_ARN        = aws_lb_target_group.https["blue"].arn
       GREEN_HTTPS_TARGET_ARN       = aws_lb_target_group.https["green"].arn
       NLB_ARN                      = aws_lb.nlb.arn
+      NAME_PREFIX                  = var.name_prefix
+      CACHE_EBS_ENABLED            = tostring(var.forgeproxy_cache_volume_enabled)
+      CACHE_VOLUME_GB              = tostring(var.forgeproxy_cache_volume_gb)
+      CACHE_VOLUME_TYPE            = var.forgeproxy_cache_volume_type
+      CACHE_VOLUME_IOPS            = tostring(var.forgeproxy_cache_volume_iops)
+      CACHE_VOLUME_THROUGHPUT_MBPS = tostring(var.forgeproxy_cache_volume_throughput_mbps)
+      CACHE_SEED_WAIT_FOR_SNAPSHOTS = tostring(
+        var.forgeproxy_cache_seed_wait_for_snapshots
+      )
       BLUE_LAUNCH_TEMPLATE_VERSION = tostring(aws_launch_template.forgeproxy["blue"].latest_version)
       GREEN_LAUNCH_TEMPLATE_VERSION = tostring(
         aws_launch_template.forgeproxy["green"].latest_version

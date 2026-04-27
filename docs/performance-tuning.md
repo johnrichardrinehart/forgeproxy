@@ -77,13 +77,21 @@ The module now exposes these performance controls directly:
 
 - `forgeproxy_root_volume_iops` (default `3000`)
 - `forgeproxy_root_volume_throughput_mbps` (default `125`)
+- `forgeproxy_cache_volume_enabled` (default `false`) moves
+  `/var/cache/forgeproxy` onto a retained dedicated EBS volume. During
+  blue/green rollout, the standby slot is seeded from live snapshots of the
+  currently active slot's cache volumes when available.
+- `forgeproxy_cache_volume_gb` (default `1024`), plus gp3
+  `forgeproxy_cache_volume_iops` and
+  `forgeproxy_cache_volume_throughput_mbps`, size and tune those dedicated
+  cache volumes.
 - `bundle_pack_threads` (default `4`), wired through `pack.threads` for bundle
   generation, background bitmap/MIDX preparation, and pack-cache deltas
 - `local_upload_pack_threads` (default `2`), wired to
   `git -c pack.threads=<n> upload-pack` for local disk serves
 
-The gp3 knobs only affect forgeproxy instance root volumes. Defaults stay
-unchanged so existing deployments do not drift without operator intent.
+Dedicated cache EBS is opt-in. Defaults stay unchanged so existing deployments
+do not drift without operator intent.
 
 ## How to read the signals
 

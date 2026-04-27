@@ -147,6 +147,17 @@ resource "aws_iam_role_policy" "forgeproxy" {
           ]
           Resource = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/ec2/forgeproxy-*"
         },
+        {
+          Effect = "Allow"
+          Action = [
+            "ec2:AttachVolume",
+            "ec2:CreateTags",
+            "ec2:CreateVolume",
+            "ec2:DescribeSnapshots",
+            "ec2:DescribeVolumes",
+          ]
+          Resource = "*"
+        },
       ],
       var.forgeproxy_ssh_host_key_secret_arn == null ? [] : [
         {

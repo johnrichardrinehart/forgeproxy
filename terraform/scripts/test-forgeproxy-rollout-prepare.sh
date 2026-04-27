@@ -135,6 +135,70 @@ case "${scenario}:${service}:${command}:${query}" in
   attached_healthy:elbv2:describe-target-groups:length\(TargetGroups\[0\].LoadBalancerArns\))
     printf '%s\n' "1"
     ;;
+  cache_seeded:elbv2:describe-listeners:*)
+    if [[ -n "${listener_arn}" ]]; then
+      printf '%s\n' "blue-https"
+    else
+      printf '%s\n' "https-listener"
+    fi
+    ;;
+  cache_seeded:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].Instances\[\].InstanceId)
+    printf '%s\n' "i-blue-1"
+    ;;
+  cache_seeded:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].AvailabilityZones\[0\])
+    printf '%s\n' "us-east-1a"
+    ;;
+  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\))
+    printf '%s\n' "2"
+    ;;
+  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\]\))
+    printf '%s\n' "2"
+    ;;
+  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\ \&\&\ HealthStatus==\'Healthy\'\]\))
+    printf '%s\n' "2"
+    ;;
+  cache_seeded:ec2:describe-volumes:Volumes\[\].VolumeId)
+    printf '%s\n' ""
+    ;;
+  cache_seeded:ec2:describe-volumes:Volumes\[\].\[VolumeId,\ Tags\[\?Key==\`CacheSlot\`\].Value\ \|\ \[0\]\])
+    printf '%s\t%s\n' "vol-blue-1" "0"
+    ;;
+  cache_seeded:ec2:describe-volumes:length\(Volumes\))
+    printf '%s\n' "0"
+    ;;
+  cache_seeded:ec2:create-snapshot:SnapshotId)
+    printf '%s\n' "snap-blue-1"
+    ;;
+  cache_seeded:ec2:describe-snapshots:Snapshots\[\].SnapshotId)
+    printf '%s\n' "snap-blue-1"
+    ;;
+  cache_seeded:ec2:describe-snapshots:Snapshots\[\].\[SnapshotId,\ Tags\[\?Key==\`SourceCacheSlot\`\].Value\ \|\ \[0\]\])
+    printf '%s\t%s\n' "snap-blue-1" "0"
+    ;;
+  cache_seeded:ec2:describe-snapshots:Snapshots\[0\].VolumeSize)
+    printf '%s\n' "1024"
+    ;;
+  cache_seeded:ec2:create-volume:VolumeId)
+    printf '%s\n' "vol-green-created"
+    ;;
+  cache_seeded:ec2:wait:*)
+    printf '%s\n' ""
+    ;;
+  cache_seeded:ec2:create-tags:*)
+    printf '%s\n' ""
+    ;;
+  cache_seeded:elbv2:describe-target-health:length\(TargetHealthDescriptions\[\?TargetHealth.State==\'healthy\'\]\))
+    printf '%s\n' "2"
+    ;;
+  cache_seeded:elbv2:describe-target-health:length\(TargetHealthDescriptions\[\?TargetHealth.State==\'unused\'\]\))
+    printf '%s\n' "0"
+    ;;
+  cache_seeded:elbv2:describe-target-health:length\(TargetHealthDescriptions\))
+    printf '%s\n' "2"
+    ;;
+  cache_seeded:elbv2:describe-target-groups:length\(TargetGroups\[0\].LoadBalancerArns\))
+    printf '%s\n' "1"
+    ;;
   *:autoscaling:update-auto-scaling-group:*)
     printf '%s\n' ""
     ;;
@@ -195,5 +259,21 @@ grep -q "skipping health wait during bootstrap" "${tmpdir}/bootstrap_unattached.
 
 run_expect_success "attached_healthy" "green" "green-https" "green-ssh"
 grep -q "Active slot green is ready for cutover" "${tmpdir}/attached_healthy.out"
+
+env \
+  "${base_env[@]}" \
+  TEST_SCENARIO="cache_seeded" \
+  ACTIVE_SLOT="green" \
+  CURRENT_LIVE_SLOT="blue" \
+  DESIRED_COUNT="2" \
+  MAX_COUNT="4" \
+  ACTIVE_HTTPS_TARGET_ARN="green-https" \
+  ACTIVE_SSH_TARGET_ARN="green-ssh" \
+  CACHE_EBS_ENABLED="true" \
+  CACHE_VOLUME_GB="4096" \
+  bash "${script_path}" >"${tmpdir}/cache_seeded.out" 2>"${tmpdir}/cache_seeded.err"
+grep -q "Preparing dedicated cache EBS seed volumes for target slot green" "${tmpdir}/cache_seeded.out"
+grep -q "Creating live cache snapshot from blue volume vol-blue-1" "${tmpdir}/cache_seeded.out"
+grep -q "Created green cache volume vol-green-created for cache slot 1 from snap-blue-1" "${tmpdir}/cache_seeded.out"
 
 echo "forgeproxy-rollout-prepare tests passed"
