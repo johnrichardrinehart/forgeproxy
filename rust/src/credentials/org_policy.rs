@@ -12,6 +12,14 @@ impl ManagedOrgCredentialStatus {
     pub fn is_eligible(&self) -> bool {
         matches!(self, Self::Eligible { .. })
     }
+
+    pub fn as_metric_reason(&self) -> &'static str {
+        match self {
+            Self::Eligible { .. } => "eligible",
+            Self::Missing { .. } => "managed_org_credential_missing",
+            Self::Unusable { .. } => "managed_org_credential_unusable",
+        }
+    }
 }
 
 /// Decide whether forgeproxy may use local acceleration for an organisation.
@@ -163,6 +171,20 @@ mod tests {
                 reason: "bad".to_string()
             }
             .is_eligible()
+        );
+        assert_eq!(
+            ManagedOrgCredentialStatus::Missing {
+                reason: "missing".to_string()
+            }
+            .as_metric_reason(),
+            "managed_org_credential_missing"
+        );
+        assert_eq!(
+            ManagedOrgCredentialStatus::Unusable {
+                reason: "bad".to_string()
+            }
+            .as_metric_reason(),
+            "managed_org_credential_unusable"
         );
     }
 }

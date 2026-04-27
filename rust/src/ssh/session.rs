@@ -27,9 +27,9 @@ use tracing::{Instrument, debug, error, info, warn};
 use crate::AppState;
 use crate::cache::CacheManager;
 use crate::clone_support::{
-    CloneCompletion, LocalUploadPackMode, UpstreamHydrationRequest, UpstreamHydrationTracker,
-    spawn_local_upload_pack_timeout, spawn_local_upload_pack_with_lease_timeout,
-    wait_for_local_upload_pack_exit,
+    CloneCompletion, CloneServeOutcome, LocalUploadPackMode, UpstreamHydrationRequest,
+    UpstreamHydrationTracker, spawn_local_upload_pack_timeout,
+    spawn_local_upload_pack_with_lease_timeout, wait_for_local_upload_pack_exit,
 };
 use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoSource, try_finish_pack_cache_delta_composite,
@@ -2195,6 +2195,10 @@ impl Handler for SshSession {
                                                     started_at: clone_started,
                                                     metric_username: metric_username.clone(),
                                                     metric_repo: repo_for_stream.clone(),
+                                                    serve_outcome: CloneServeOutcome::forgeproxy(
+                                                        "local_upload_pack",
+                                                        "interactive_local_upload_pack",
+                                                    ),
                                                 }
                                                 .record_success(
                                                     &state_for_stream.metrics,
@@ -2487,6 +2491,7 @@ async fn proxy_upstream_upload_pack(
     let local_acceleration_allowed = org_credential_status
         .as_ref()
         .is_none_or(|status| status.is_eligible());
+    let mut upstream_serve_reason = "non_fetch_rpc";
     if request_kind == V2RequestKind::BundleUri
         && !repository_delegated
         && local_acceleration_allowed
@@ -2547,6 +2552,7 @@ async fn proxy_upstream_upload_pack(
             .as_ref()
             .and_then(crate::coordination::registry::advertised_ref_tips);
         if repository_delegated {
+            upstream_serve_reason = "delegated_repository";
             fetch_cache_status = Some(CacheStatus::Cold);
             if let Some(status) = org_credential_status
                 .as_ref()
@@ -2569,6 +2575,7 @@ async fn proxy_upstream_upload_pack(
             .as_ref()
             .filter(|status| !status.is_eligible())
         {
+            upstream_serve_reason = status.as_metric_reason();
             fetch_cache_status = Some(CacheStatus::Cold);
             crate::credentials::org_policy::log_local_acceleration_bypass(
                 status,
@@ -2604,6 +2611,10 @@ async fn proxy_upstream_upload_pack(
                                     .expect("fetch start time must be set for fetch requests"),
                                 metric_username: metric_username.clone(),
                                 metric_repo: owner_repo.clone(),
+                                serve_outcome: CloneServeOutcome::forgeproxy(
+                                    "pack_cache",
+                                    "pack_cache_hit",
+                                ),
                             },
                             LocalUploadPackReplayContext {
                                 handle: &handle,
@@ -2669,6 +2680,7 @@ async fn proxy_upstream_upload_pack(
                     want_count,
                     ..
                 } => {
+                    upstream_serve_reason = "local_upload_pack_short_circuit";
                     info!(
                         repo = %owner_repo,
                         serve_from = %serve_from,
@@ -2694,6 +2706,10 @@ async fn proxy_upstream_upload_pack(
                                 .expect("fetch start time must be set for fetch requests"),
                             metric_username: metric_username.clone(),
                             metric_repo: owner_repo.clone(),
+                            serve_outcome: CloneServeOutcome::forgeproxy(
+                                "local_upload_pack",
+                                "local_upload_pack",
+                            ),
                         },
                         LocalUploadPackResponseContext {
                             handle: handle.clone(),
@@ -2713,6 +2729,7 @@ async fn proxy_upstream_upload_pack(
                     had_local_repo_before_check,
                     restored_from_s3_for_request,
                 } => {
+                    upstream_serve_reason = "local_unavailable";
                     info!(
                         repo = %owner_repo,
                         wants = wants.len(),
@@ -2728,6 +2745,7 @@ async fn proxy_upstream_upload_pack(
                     want_count,
                     missing_wants,
                 } => {
+                    upstream_serve_reason = "missing_wanted_objects";
                     let missing_sample = missing_wants
                         .iter()
                         .take(5)
@@ -2976,6 +2994,10 @@ async fn proxy_upstream_upload_pack(
                         started_at,
                         metric_username: metric_username.clone(),
                         metric_repo: owner_repo.clone(),
+                        serve_outcome: CloneServeOutcome::upstream(
+                            "forgeproxy_upstream_proxy",
+                            upstream_serve_reason,
+                        ),
                     }
                     .record_success(&state.metrics, Protocol::Ssh);
                 }

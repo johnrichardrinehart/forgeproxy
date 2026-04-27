@@ -96,7 +96,9 @@ in
           'upstream_bytes_sent="$upstream_bytes_sent" '
           'upstream_bytes_received="$upstream_bytes_received" '
           'forgeproxy_upstream_fallback="$upstream_http_x_forgeproxy_upstream_fallback" '
-          'sent_forgeproxy_upstream_fallback="$sent_http_x_forgeproxy_upstream_fallback"';
+          'forgeproxy_upstream_fallback_reason="$upstream_http_x_forgeproxy_upstream_fallback_reason" '
+          'sent_forgeproxy_upstream_fallback="$sent_http_x_forgeproxy_upstream_fallback" '
+          'sent_forgeproxy_upstream_fallback_reason="$sent_http_x_forgeproxy_upstream_fallback_reason"';
       '';
 
       # ── Global HTTP-level configuration ────────────────────────────

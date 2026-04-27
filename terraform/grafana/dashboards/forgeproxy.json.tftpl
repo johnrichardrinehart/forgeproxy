@@ -437,17 +437,90 @@
     },
 
     {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Clone Serving Effectiveness",
+      "description": "Percentage of clone upload-pack traffic served by forgeproxy versus upstream. forgeproxy includes pack-cache replay and local upload-pack; upstream includes both forgeproxy-proxied upstream and nginx direct-upstream handoff.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "100 * sum by (served_by) (rate(forgeproxy_clone_served_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) / scalar(sum(rate(forgeproxy_clone_served_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{ served_by }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "max": 100,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" },
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean"] }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Upstream Clone Share by Path & Reason",
+      "description": "Percentage of clone upload-pack traffic served by upstream, split by whether it went through forgeproxy or nginx direct-upstream fallback and by the operational reason.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+      "targets": [
+        {
+          "expr": "100 * sum by (path, reason) (rate(forgeproxy_clone_served_total{service\\.instance\\.id=~\"$instance\", served_by=\"upstream\"}[$__rate_interval])) / scalar(sum(rate(forgeproxy_clone_served_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{ path }} / {{ reason }}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "min": 0,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "mode": "normal", "group": "A" },
+            "axisBorderShow": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "mean"] }
+      }
+    },
+    {
       "id": 20,
       "type": "row",
       "title": "Data Transfer",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
       "collapsed": false
     },
     {
       "id": 21,
       "type": "timeseries",
       "title": "Upstream Bytes / sec (fetched from origin)",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -480,7 +553,7 @@
       "id": 22,
       "type": "timeseries",
       "title": "Downstream Bytes / sec (sent to clients)",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -513,7 +586,7 @@
       "id": 23,
       "type": "timeseries",
       "title": "S3 Transfer Bytes / sec",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -551,14 +624,14 @@
       "id": 30,
       "type": "row",
       "title": "Cache & Storage",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
       "collapsed": false
     },
     {
       "id": 31,
       "type": "timeseries",
       "title": "Forgeproxy Cache Subtrees",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -645,7 +718,7 @@
       "id": 32,
       "type": "timeseries",
       "title": "Largest Mirrors by Physical Usage",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -677,7 +750,7 @@
       "id": 33,
       "type": "timeseries",
       "title": "Cache Operations / min",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -745,7 +818,7 @@
       "id": 34,
       "type": "timeseries",
       "title": "On-Demand Pack Composite Stage Latency",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -787,7 +860,7 @@
       "id": 35,
       "type": "timeseries",
       "title": "Pack Cache Diagnostics",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -840,14 +913,14 @@
       "id": 40,
       "type": "row",
       "title": "Bundle Generation",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
       "collapsed": false
     },
     {
       "id": 41,
       "type": "timeseries",
       "title": "Bundle Generations / min",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -894,7 +967,7 @@
       "id": 42,
       "type": "timeseries",
       "title": "Bundle Generation Duration Percentiles",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -947,14 +1020,14 @@
       "id": 50,
       "type": "row",
       "title": "Coordination & Auth",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
       "collapsed": false
     },
     {
       "id": 51,
       "type": "timeseries",
       "title": "Distributed Lock Operations / min",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 50 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 58 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -1005,7 +1078,7 @@
       "id": 52,
       "type": "timeseries",
       "title": "GHE API Calls / min & Rate Limit",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 50 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 58 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -1052,7 +1125,7 @@
       "id": 53,
       "type": "timeseries",
       "title": "Auth Cache / min",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 50 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 58 },
       "datasource": { "type": "prometheus", "uid": "$${datasource}" },
       "targets": [
         {
@@ -1096,14 +1169,14 @@
       "id": 60,
       "type": "row",
       "title": "Host Metrics",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
       "collapsed": true,
       "panels": [
         {
           "id": 61,
           "type": "timeseries",
           "title": "CPU Busy %",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1135,7 +1208,7 @@
           "id": 62,
           "type": "timeseries",
           "title": "Memory Breakdown",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1168,7 +1241,7 @@
           "id": 63,
           "type": "timeseries",
           "title": "Disk I/O",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1200,7 +1273,7 @@
           "id": 64,
           "type": "timeseries",
           "title": "Network I/O",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 75 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1232,7 +1305,7 @@
           "id": 65,
           "type": "timeseries",
           "title": "I/O Wait %",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 83 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1264,7 +1337,7 @@
           "id": 66,
           "type": "timeseries",
           "title": "Disk Queue Depth",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 75 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 83 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1296,7 +1369,7 @@
           "id": 67,
           "type": "timeseries",
           "title": "Disk Read Latency",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 83 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 91 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1328,7 +1401,7 @@
           "id": 68,
           "type": "timeseries",
           "title": "Major Page Faults / sec",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 83 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 91 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1360,7 +1433,7 @@
           "id": 69,
           "type": "timeseries",
           "title": "Page Cache Size",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 91 },
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 99 },
           "datasource": { "type": "prometheus", "uid": "$${datasource}" },
           "targets": [
             {
@@ -1395,14 +1468,14 @@
       "id": 70,
       "type": "row",
       "title": "Logs",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 59 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
       "collapsed": true,
       "panels": [
         {
           "id": 71,
           "type": "logs",
           "title": "Forgeproxy Logs",
-          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 60 },
+          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 68 },
           "datasource": { "type": "loki", "uid": "$${loki}" },
           "targets": [
             {
@@ -1428,7 +1501,7 @@
       "id": 80,
       "type": "row",
       "title": "Traces",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 60 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 68 },
       "collapsed": true,
       "panels": [
         {
@@ -1436,7 +1509,7 @@
           "type": "table",
           "title": "Trace Search",
           "description": "Recent traces from forgeproxy — click a Trace ID to open the trace view",
-          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 61 },
+          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 69 },
           "datasource": { "type": "tempo", "uid": "$${tempo}" },
           "targets": [
             {
