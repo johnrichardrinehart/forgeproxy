@@ -73,6 +73,15 @@ module "forgeproxy" {
   eviction_policy                               = var.eviction_policy
   config_reload_enabled                         = var.config_reload_enabled
   config_reload_interval_secs                   = var.config_reload_interval_secs
+  background_work_enabled                       = var.background_work_enabled
+  background_work_defer_when_active_clones      = var.background_work_defer_when_active_clones
+  background_work_cpu_busy_100ms_high_watermark = var.background_work_cpu_busy_100ms_high_watermark
+  background_work_load_1m_per_cpu_high_watermark = (
+    var.background_work_load_1m_per_cpu_high_watermark
+  )
+  background_work_retry_interval_secs           = var.background_work_retry_interval_secs
+  background_work_max_defer_retries             = var.background_work_max_defer_retries
+  background_work_max_defer_secs                = var.background_work_max_defer_secs
   generation_coalescing_window_secs             = var.generation_coalescing_window_secs
   global_short_circuit_upstream_secs            = var.global_short_circuit_upstream_secs
   request_wait_for_local_catch_up_secs          = var.request_wait_for_local_catch_up_secs

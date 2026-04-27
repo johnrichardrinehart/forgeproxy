@@ -55,6 +55,13 @@ vim terraform.tfvars  # Edit with your values
 - `forgeproxy_cutover_check_interval_secs` controls how often the cleanup helper probes the client-facing HTTPS endpoint after listener cutover.
 - `forgeproxy_cutover_required_consecutive_successes` controls how many consecutive successful soak rounds are required before the old slot is scaled down.
 - `forgeproxy_cutover_timeout_secs` bounds how long cleanup will keep trying before the apply fails and leaves the old slot intact.
+- Failed post-cutover probes print the HTTP status and the first 4096 bytes of the response body, so `/readyz` 503 responses include the failing dependency detail in Terraform output.
+
+**Optional background-work pressure controls:**
+- `background_work_defer_when_active_clones` keeps cache/index/bundle maintenance from competing with active clone streams.
+- `background_work_cpu_busy_100ms_high_watermark` is point-in-time CPU busy over an approximately 100ms `/proc/stat` sample.
+- `background_work_load_1m_per_cpu_high_watermark` is one-minute load average divided by the cgroup-aware CPU budget.
+- `background_work_retry_interval_secs`, `background_work_max_defer_retries`, and `background_work_max_defer_secs` control the retry cadence and when a single background attempt is abandoned.
 
 ### 2. Initialize Terraform
 

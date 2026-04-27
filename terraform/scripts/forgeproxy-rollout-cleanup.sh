@@ -35,15 +35,45 @@ IFS=',' read -r -a rollout_hostnames <<< "${client_facing_hostnames}"
 probe_https_endpoint() {
   local hostname="$1"
   local path="$2"
+  local body_file
+  local status
+  local curl_exit=0
 
-  curl \
+  body_file="$(mktemp)"
+
+  status="$(curl \
     --silent \
     --show-error \
-    --fail \
+    --output "${body_file}" \
+    --write-out "%{http_code}" \
     --connect-timeout 10 \
     --max-time 30 \
     --connect-to "${hostname}:443:${nlb_dns_name}:443" \
-    "https://${hostname}${path}" >/dev/null
+    "https://${hostname}${path}")" || curl_exit=$?
+
+  if (( curl_exit != 0 )); then
+    echo "Probe curl failed for https://${hostname}${path}: exit ${curl_exit}" >&2
+    if [[ -s "${body_file}" ]]; then
+      echo "Probe response body (first 4096 bytes):" >&2
+      head -c 4096 "${body_file}" >&2 || true
+      echo >&2
+    fi
+    rm -f "${body_file}"
+    return 1
+  fi
+
+  if [[ ! "${status}" =~ ^2[0-9][0-9]$ ]]; then
+    echo "Probe returned HTTP ${status} for https://${hostname}${path}" >&2
+    if [[ -s "${body_file}" ]]; then
+      echo "Probe response body (first 4096 bytes):" >&2
+      head -c 4096 "${body_file}" >&2 || true
+      echo >&2
+    fi
+    rm -f "${body_file}"
+    return 1
+  fi
+
+  rm -f "${body_file}"
 }
 
 wait_for_cutover_soak() {

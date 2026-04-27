@@ -2,6 +2,15 @@ config_reload:
   enabled: ${config_reload_enabled}
   interval_secs: ${config_reload_interval_secs}
 
+background_work:
+  enabled: ${background_work_enabled}
+  defer_when_active_clones: ${background_work_defer_when_active_clones}
+  cpu_busy_100ms_high_watermark: ${background_work_cpu_busy_100ms_high_watermark}
+  load_1m_per_cpu_high_watermark: ${background_work_load_1m_per_cpu_high_watermark}
+  retry_interval_secs: ${background_work_retry_interval_secs}
+  max_defer_retries: ${background_work_max_defer_retries}
+  max_defer_secs: ${background_work_max_defer_secs}
+
 upstream:
   hostname: "${upstream_hostname}"
   api_url: "${upstream_api_url}"

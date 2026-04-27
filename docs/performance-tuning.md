@@ -89,6 +89,12 @@ The module now exposes these performance controls directly:
   generation, background bitmap/MIDX preparation, and pack-cache deltas
 - `local_upload_pack_threads` (default `2`), wired to
   `git -c pack.threads=<n> upload-pack` for local disk serves
+- `background_work_*` controls lower-priority cache/index/bundle admission:
+  by default background work defers while clones are active, when CPU busy over
+  a point-in-time ~100ms sample is at least `0.80`, or when one-minute load
+  average divided by cgroup-aware CPU budget is at least `0.80`. Deferred work
+  retries every 60 seconds and abandons the current attempt after 10 deferrals
+  or 30 minutes, whichever comes first.
 
 Dedicated cache EBS is opt-in. Defaults stay unchanged so existing deployments
 do not drift without operator intent.
@@ -131,6 +137,30 @@ Compare these two metric families:
 If local upload-pack remains slow while disk signals stay quiet, the bottleneck
 is probably after pack generation: TCP buffers, client receive rate, or another
 network boundary.
+
+### Background-work admission
+
+Forgeproxy treats bundle generation, background pack-cache warming, background
+MIDX/bitmap preparation, and tee-hydration indexing as lower priority than
+foreground clone serving. The admission check uses three signals:
+
+- active clone count observed by forgeproxy
+- point-in-time CPU busy fraction sampled from `/proc/stat` over approximately
+  100ms
+- one-minute load average from `/proc/loadavg`, normalized by cgroup v2
+  `cpu.max` when present and by host parallelism otherwise
+
+When any enabled signal is over threshold, the background task logs the reason
+and retries after `background_work.retry_interval_secs` (60 seconds by
+default). A single background attempt is abandoned after
+`background_work.max_defer_retries` deferrals or
+`background_work.max_defer_secs` wall-clock seconds (10 deferrals or 30 minutes
+by default). Future scheduled or event-triggered attempts can still run later.
+
+The Git subprocesses used for background indexing and background pack-cache
+deltas also lower their CPU and I/O scheduling priority before `exec`, using
+the same effective policy as `nice -n 10` and `ionice -c2 -n7` without requiring
+those helper binaries in the service or test environment.
 
 ## Follow-up work not yet implemented
 
