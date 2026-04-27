@@ -100,6 +100,12 @@ variable "forgeproxy_count" {
   }
 }
 
+variable "forgeproxy_max_count" {
+  type        = number
+  default     = null
+  description = "Maximum forgeproxy ASG capacity for autoscaling. Defaults to forgeproxy_count when null."
+}
+
 variable "forgeproxy_health_check_grace_period_secs" {
   type        = number
   default     = 1800
@@ -199,6 +205,91 @@ variable "forgeproxy_root_volume_throughput_mbps" {
     condition     = var.forgeproxy_root_volume_throughput_mbps >= 125
     error_message = "forgeproxy_root_volume_throughput_mbps must be at least 125 for gp3 volumes."
   }
+}
+
+variable "forgeproxy_cache_volume_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, forgeproxy instances attach and mount a dedicated retained EBS volume at /var/cache/forgeproxy instead of storing cache data on the root filesystem."
+}
+
+variable "forgeproxy_cache_volume_gb" {
+  type        = number
+  default     = 1024
+  description = "Dedicated forgeproxy cache EBS volume size in GiB. Used for blank volumes and as the minimum size when creating volumes from smaller seed snapshots."
+
+  validation {
+    condition     = var.forgeproxy_cache_volume_gb >= 1
+    error_message = "forgeproxy_cache_volume_gb must be at least 1."
+  }
+}
+
+variable "forgeproxy_cache_volume_type" {
+  type        = string
+  default     = "gp3"
+  description = "Dedicated forgeproxy cache EBS volume type."
+
+  validation {
+    condition     = contains(["gp3"], var.forgeproxy_cache_volume_type)
+    error_message = "forgeproxy_cache_volume_type currently supports gp3."
+  }
+}
+
+variable "forgeproxy_cache_volume_iops" {
+  type        = number
+  default     = 3000
+  description = "gp3 IOPS for dedicated forgeproxy cache EBS volumes."
+
+  validation {
+    condition     = var.forgeproxy_cache_volume_iops >= 3000
+    error_message = "forgeproxy_cache_volume_iops must be at least 3000 for gp3 volumes."
+  }
+}
+
+variable "forgeproxy_cache_volume_throughput_mbps" {
+  type        = number
+  default     = 125
+  description = "gp3 throughput in MiB/s for dedicated forgeproxy cache EBS volumes."
+
+  validation {
+    condition     = var.forgeproxy_cache_volume_throughput_mbps >= 125
+    error_message = "forgeproxy_cache_volume_throughput_mbps must be at least 125 for gp3 volumes."
+  }
+}
+
+variable "forgeproxy_cache_volume_device_name" {
+  type        = string
+  default     = "/dev/sdf"
+  description = "EC2 attachment device name requested for dedicated forgeproxy cache EBS volumes. Nitro instances expose the device as NVMe by volume id."
+}
+
+variable "forgeproxy_cache_volume_fs_type" {
+  type        = string
+  default     = "xfs"
+  description = "Filesystem type to create on blank dedicated forgeproxy cache volumes."
+
+  validation {
+    condition     = contains(["xfs", "ext4"], var.forgeproxy_cache_volume_fs_type)
+    error_message = "forgeproxy_cache_volume_fs_type must be xfs or ext4."
+  }
+}
+
+variable "forgeproxy_cache_volume_label" {
+  type        = string
+  default     = "forgeproxy-cache"
+  description = "Filesystem label used when formatting blank dedicated forgeproxy cache volumes."
+}
+
+variable "forgeproxy_cache_volume_mount_options" {
+  type        = string
+  default     = "noatime,nodiratime"
+  description = "Comma-separated mount options for the dedicated forgeproxy cache filesystem."
+}
+
+variable "forgeproxy_cache_seed_wait_for_snapshots" {
+  type        = bool
+  default     = true
+  description = "When true, rollout preparation waits for active-slot cache snapshots to complete before creating standby-slot cache volumes from them."
 }
 
 variable "valkey_root_volume_gb" {

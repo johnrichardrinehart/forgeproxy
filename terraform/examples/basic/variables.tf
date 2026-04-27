@@ -85,6 +85,12 @@ variable "forgeproxy_count" {
   description = "Number of forgeproxy instances"
 }
 
+variable "forgeproxy_max_count" {
+  type        = number
+  default     = null
+  description = "Maximum forgeproxy ASG capacity for autoscaling. Defaults to forgeproxy_count when null."
+}
+
 variable "forgeproxy_health_check_grace_period_secs" {
   type        = number
   default     = 1800
@@ -154,6 +160,30 @@ variable "forgeproxy_root_volume_throughput_mbps" {
   type        = number
   default     = 125
   description = "gp3 throughput in MiB/s for forgeproxy root volumes"
+}
+
+variable "forgeproxy_cache_volume_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, attach a dedicated retained EBS cache volume at /var/cache/forgeproxy."
+}
+
+variable "forgeproxy_cache_volume_gb" {
+  type        = number
+  default     = 1024
+  description = "Dedicated forgeproxy cache EBS volume size in GiB."
+}
+
+variable "forgeproxy_cache_volume_iops" {
+  type        = number
+  default     = 3000
+  description = "gp3 IOPS for dedicated forgeproxy cache EBS volumes."
+}
+
+variable "forgeproxy_cache_volume_throughput_mbps" {
+  type        = number
+  default     = 125
+  description = "gp3 throughput in MiB/s for dedicated forgeproxy cache EBS volumes."
 }
 
 variable "valkey_root_volume_gb" {

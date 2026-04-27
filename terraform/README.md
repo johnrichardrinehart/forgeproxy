@@ -85,6 +85,12 @@ terraform apply
 
 The build step for AMIs may take 10-15 minutes. Snapshot import can take 5-10 additional minutes.
 
+When `forgeproxy_cache_volume_enabled = true`, rollout preparation also creates
+cache seed snapshots from the currently live forgeproxy slot and creates
+standby-slot cache EBS volumes from those snapshots before scaling the standby
+ASG. On the first deployment, or when no live cache volumes exist yet, the
+standby cache volumes are created blank.
+
 ### 5. Provide bootstrap secrets before apply
 
 Create a structured JSON file named `./forgeproxy-bootstrap-secrets.json` before the first `terraform apply`. An example file is included at `forgeproxy-bootstrap-secrets.example.json`.

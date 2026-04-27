@@ -34,6 +34,7 @@ locals {
   forgeproxy_readyz_healthy_window_secs = (
     local.forgeproxy_readyz_health_check_interval_secs * local.forgeproxy_readyz_healthy_threshold
   )
+  forgeproxy_max_count = coalesce(var.forgeproxy_max_count, var.forgeproxy_count)
 }
 
 # Validate that forgeproxy_security_group_id and valkey_security_group_id are
@@ -78,6 +79,13 @@ check "forgeproxy_prewarm_force_open_beats_asg_replacement" {
       var.prewarm_force_open_secs + local.forgeproxy_readyz_healthy_window_secs
     )
     error_message = "forgeproxy_health_check_grace_period_secs must be at least prewarm_force_open_secs + the /readyz target-group healthy window so readiness force-opens before the ASG can replace the instance."
+  }
+}
+
+check "forgeproxy_max_count_covers_desired_count" {
+  assert {
+    condition     = local.forgeproxy_max_count >= var.forgeproxy_count
+    error_message = "forgeproxy_max_count must be null or greater than or equal to forgeproxy_count."
   }
 }
 

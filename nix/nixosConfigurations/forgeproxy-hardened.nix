@@ -11,6 +11,7 @@ inputs.nixpkgs.lib.nixosSystem {
     inputs.sops-nix.nixosModules.sops
     self.nixosModules.proxy-host
     self.nixosModules.ami
+    ./aws/forgeproxy-cache-volume.nix
     ./aws/forgeproxy-secrets.nix
   ];
 }
