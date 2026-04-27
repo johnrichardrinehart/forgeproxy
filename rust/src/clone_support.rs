@@ -11,7 +11,7 @@ use crate::AppState;
 use crate::coordination::registry::{
     LocalServeRepoLease, LocalServeRepoSource, RequestAdvertisedRefs, TeeCapturePermits,
 };
-use crate::metrics::{CacheStatus, MetricsRegistry, Protocol};
+use crate::metrics::{CacheStatus, CloneServedBy, CloneServedRecord, MetricsRegistry, Protocol};
 
 #[derive(Clone)]
 pub struct CloneCompletion {
@@ -19,17 +19,66 @@ pub struct CloneCompletion {
     pub started_at: Instant,
     pub metric_username: String,
     pub metric_repo: String,
+    pub serve_outcome: CloneServeOutcome,
+}
+
+#[derive(Clone)]
+pub struct CloneServeOutcome {
+    pub served_by: CloneServedBy,
+    pub path: &'static str,
+    pub reason: &'static str,
+}
+
+impl CloneServeOutcome {
+    pub fn forgeproxy(path: &'static str, reason: &'static str) -> Self {
+        Self {
+            served_by: CloneServedBy::Forgeproxy,
+            path,
+            reason,
+        }
+    }
+
+    pub fn upstream(path: &'static str, reason: &'static str) -> Self {
+        Self {
+            served_by: CloneServedBy::Upstream,
+            path,
+            reason,
+        }
+    }
 }
 
 impl CloneCompletion {
     pub fn record_success(&self, metrics: &MetricsRegistry, protocol: Protocol) {
         crate::metrics::record_clone_completion(
             metrics,
-            protocol,
+            protocol.clone(),
             self.cache_status.clone(),
             &self.metric_username,
             &self.metric_repo,
             self.started_at.elapsed(),
+        );
+        crate::metrics::record_clone_served(
+            metrics,
+            CloneServedRecord {
+                protocol: protocol.clone(),
+                served_by: self.serve_outcome.served_by.clone(),
+                path: self.serve_outcome.path,
+                reason: self.serve_outcome.reason,
+                cache_status: self.cache_status.clone(),
+                client: &self.metric_username,
+                repo: &self.metric_repo,
+            },
+        );
+        info!(
+            protocol = ?protocol,
+            repo = %self.metric_repo,
+            client = %self.metric_username,
+            served_by = self.serve_outcome.served_by.as_str(),
+            path = self.serve_outcome.path,
+            reason = self.serve_outcome.reason,
+            cache_status = ?self.cache_status,
+            elapsed_ms = self.started_at.elapsed().as_millis(),
+            "clone served"
         );
     }
 }

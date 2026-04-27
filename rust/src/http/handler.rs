@@ -44,16 +44,17 @@ use uuid::Uuid;
 
 use crate::AppState;
 use crate::clone_support::{
-    CloneCompletion, LocalUploadPackMode, UpstreamHydrationRequest, UpstreamHydrationTracker,
-    spawn_local_upload_pack_with_lease_timeout, wait_for_local_upload_pack_exit,
+    CloneCompletion, CloneServeOutcome, LocalUploadPackMode, UpstreamHydrationRequest,
+    UpstreamHydrationTracker, spawn_local_upload_pack_with_lease_timeout,
+    wait_for_local_upload_pack_exit,
 };
 use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoLease, LocalServeRepoSource,
     try_finish_pack_cache_delta_composite,
 };
 use crate::metrics::{
-    ActiveCloneGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource,
-    CloneUpstreamBytesLabels, Protocol,
+    ActiveCloneGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneServedBy,
+    CloneServedRecord, CloneSource, CloneUpstreamBytesLabels, Protocol,
 };
 use crate::observability::GitRequestObservation;
 use crate::short_circuit::RequestBudget;
@@ -168,6 +169,25 @@ impl FirstByteMetricContext {
 #[derive(Clone, Copy)]
 struct HttpUpstreamProxyBehavior {
     capture_for_hydration: bool,
+    reason: &'static str,
+}
+
+fn local_decision_upstream_reason(
+    local_authz_confirmed: bool,
+    local_decision: &LocalServeDecision,
+    expects_local_pack_serve: bool,
+) -> &'static str {
+    if !local_authz_confirmed {
+        return "local_auth_unconfirmed";
+    }
+    if !expects_local_pack_serve {
+        return "non_pack_rpc";
+    }
+    match local_decision {
+        LocalServeDecision::SatisfiesWants { .. } => "local_upload_pack_short_circuit",
+        LocalServeDecision::MissingWantedObjects { .. } => "missing_wanted_objects",
+        LocalServeDecision::Unavailable { .. } => "local_unavailable",
+    }
 }
 
 async fn await_first_local_upload_pack_chunk(
@@ -780,6 +800,10 @@ async fn handle_upload_pack(
                 started_at,
                 metric_username,
                 metric_repo: repo_slug,
+                serve_outcome: CloneServeOutcome::upstream(
+                    "forgeproxy_upstream_proxy",
+                    "delegated_repository",
+                ),
             },
             &headers,
             request_metadata,
@@ -787,6 +811,7 @@ async fn handle_upload_pack(
             client_fingerprint,
             HttpUpstreamProxyBehavior {
                 capture_for_hydration: false,
+                reason: "delegated_repository",
             },
         )
         .await?;
@@ -812,6 +837,10 @@ async fn handle_upload_pack(
                 started_at,
                 metric_username,
                 metric_repo: repo_slug,
+                serve_outcome: CloneServeOutcome::upstream(
+                    "forgeproxy_upstream_proxy",
+                    org_credential_status.as_metric_reason(),
+                ),
             },
             &headers,
             request_metadata,
@@ -819,6 +848,7 @@ async fn handle_upload_pack(
             client_fingerprint,
             HttpUpstreamProxyBehavior {
                 capture_for_hydration: false,
+                reason: org_credential_status.as_metric_reason(),
             },
         )
         .await?;
@@ -888,6 +918,10 @@ async fn handle_upload_pack(
                         started_at,
                         metric_username: metric_username.clone(),
                         metric_repo: repo_slug.clone(),
+                        serve_outcome: CloneServeOutcome::forgeproxy(
+                            "pack_cache",
+                            "pack_cache_hit",
+                        ),
                     },
                 )
                 .await
@@ -1077,6 +1111,10 @@ async fn handle_upload_pack(
                             started_at,
                             metric_username: metric_username.clone(),
                             metric_repo: repo_slug.clone(),
+                            serve_outcome: CloneServeOutcome::forgeproxy(
+                                "local_upload_pack",
+                                "local_upload_pack",
+                            ),
                         },
                         Some(short_circuit_budget),
                     )
@@ -1140,6 +1178,14 @@ async fn handle_upload_pack(
             started_at,
             metric_username,
             metric_repo: repo_slug,
+            serve_outcome: CloneServeOutcome::upstream(
+                "forgeproxy_upstream_proxy",
+                local_decision_upstream_reason(
+                    local_authz_confirmed,
+                    &local_decision,
+                    expects_local_pack_serve,
+                ),
+            ),
         },
         &headers,
         request_metadata,
@@ -1147,6 +1193,11 @@ async fn handle_upload_pack(
         client_fingerprint,
         HttpUpstreamProxyBehavior {
             capture_for_hydration: true,
+            reason: local_decision_upstream_reason(
+                local_authz_confirmed,
+                &local_decision,
+                expects_local_pack_serve,
+            ),
         },
     )
     .await?;
@@ -1729,11 +1780,12 @@ async fn local_http_clone_access(
             );
             LocalHttpAccess::Indeterminate
         }
-        Err(AppError::UpstreamFallback(message)) => {
+        Err(AppError::UpstreamFallback { message, reason }) => {
             warn!(
                 %owner,
                 %repo,
                 %message,
+                reason,
                 auth_kind,
                 "local HTTP clone access probe was capacity-limited; proxying upstream"
             );
@@ -2356,19 +2408,36 @@ async fn proxy_upload_pack_to_upstream(
             {
                 Ok(permits) => permits,
                 Err(reason) => {
+                    let metric_reason = reason.as_metric_reason();
                     warn!(
                         repo = %owner_repo,
-                        reason = reason.as_metric_reason(),
+                        path = "nginx_upstream_fallback",
+                        reason = metric_reason,
+                        upstream_proxy_reason = behavior.reason,
                         "upstream upload-pack proxy is saturated; asking nginx to fall back to upstream"
                     );
                     crate::metrics::inc_upstream_fallback(
                         &state.metrics,
                         Protocol::Https,
-                        reason.as_metric_reason(),
+                        metric_reason,
                     );
-                    return Err(AppError::UpstreamFallback(
-                        "Upstream clone capacity is saturated. Please retry later.\n".to_string(),
-                    ));
+                    crate::metrics::record_clone_served(
+                        &state.metrics,
+                        CloneServedRecord {
+                            protocol: Protocol::Https,
+                            served_by: CloneServedBy::Upstream,
+                            path: "nginx_upstream_fallback",
+                            reason: metric_reason,
+                            cache_status: completion.cache_status.clone(),
+                            client: &completion.metric_username,
+                            repo: &completion.metric_repo,
+                        },
+                    );
+                    return Err(AppError::UpstreamFallback {
+                        message: "Upstream clone capacity is saturated. Please retry later.\n"
+                            .to_string(),
+                        reason: metric_reason,
+                    });
                 }
             },
         )
@@ -2702,7 +2771,10 @@ pub enum AppError {
     },
     /// Ask the fronting proxy to retry this Git request directly against the
     /// upstream forge.
-    UpstreamFallback(String),
+    UpstreamFallback {
+        message: String,
+        reason: &'static str,
+    },
     /// The upstream forge was unreachable before response bytes were sent.
     BadGateway(String),
     /// An unexpected internal error.
@@ -2742,12 +2814,16 @@ impl IntoResponse for AppError {
                 }
                 response
             }
-            AppError::UpstreamFallback(msg) => {
+            AppError::UpstreamFallback { message, reason } => {
                 let status = StatusCode::from_u16(530).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
-                let mut response = (status, msg).into_response();
+                let mut response = (status, message).into_response();
                 response.headers_mut().insert(
                     HeaderName::from_static("x-forgeproxy-upstream-fallback"),
                     HeaderValue::from_static("1"),
+                );
+                response.headers_mut().insert(
+                    HeaderName::from_static("x-forgeproxy-upstream-fallback-reason"),
+                    HeaderValue::from_static(reason),
                 );
                 response
             }
@@ -2887,6 +2963,7 @@ mod tests {
                 started_at: Instant::now(),
                 metric_username: "octocat".to_string(),
                 metric_repo: "acme/widgets".to_string(),
+                serve_outcome: CloneServeOutcome::upstream("forgeproxy_upstream_proxy", "test"),
             },
             Some(CloneSource::Upstream),
             None,
@@ -2916,6 +2993,7 @@ mod tests {
                 started_at: Instant::now(),
                 metric_username: "octocat".to_string(),
                 metric_repo: "acme/widgets".to_string(),
+                serve_outcome: CloneServeOutcome::upstream("forgeproxy_upstream_proxy", "test"),
             },
             Some(CloneSource::Upstream),
             None,
