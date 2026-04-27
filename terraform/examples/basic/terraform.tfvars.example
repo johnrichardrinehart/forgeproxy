@@ -2,6 +2,7 @@
 
 upstream_hostname  = "ghe.example.com"
 upstream_api_url   = "https://ghe.example.com/api/v3"
+upstream_ssh_port  = 22
 nlb_tls_cert_arns_by_hostname = {
   "forgeproxy.example.com" = "arn:aws:acm:us-east-1:123456789012:certificate/11111111-2222-3333-4444-555555555555"
 }

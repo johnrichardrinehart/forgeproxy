@@ -13,6 +13,7 @@ closure_variant = "hardened"
 # Upstream forge configuration
 upstream_hostname  = "ghe.example.com"
 upstream_port      = 443
+upstream_ssh_port  = 22
 upstream_api_url   = "https://ghe.example.com/api/v3"
 backend_type       = "github-enterprise"
 

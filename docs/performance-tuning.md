@@ -93,6 +93,12 @@ The module now exposes these performance controls directly:
 Dedicated cache EBS is opt-in. Defaults stay unchanged so existing deployments
 do not drift without operator intent.
 
+For emergency relief, an AWS forgeproxy instance tagged
+`forgeproxy-disable=true` is removed from the acceleration path locally: nginx
+continues to answer health checks but sends client HTTPS and SSH Git traffic
+directly to the upstream forge. This is intentionally instance-scoped and only
+the exact value `true` activates it.
+
 ## How to read the signals
 
 ### Disk vs. socket pressure

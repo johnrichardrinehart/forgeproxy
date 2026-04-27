@@ -208,6 +208,22 @@ resource "aws_secretsmanager_secret_version" "nginx_upstream_port" {
   secret_string = tostring(var.upstream_port)
 }
 
+# ── nginx upstream SSH port secret ────────────────────────────────────────
+resource "aws_secretsmanager_secret" "nginx_upstream_ssh_port" {
+  name_prefix = "${var.name_prefix}/nginx-upstream-ssh-port-"
+  description = "nginx upstream SSH port for emergency bypass (written to runtime config)"
+
+  tags = {
+    Name = "${var.name_prefix}-nginx-upstream-ssh-port"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "nginx_upstream_ssh_port" {
+  secret_id = aws_secretsmanager_secret.nginx_upstream_ssh_port.id
+
+  secret_string = tostring(var.upstream_ssh_port)
+}
+
 # ── nginx TLS Certificate Secret ──────────────────────────────────────────
 resource "aws_secretsmanager_secret" "nginx_tls_cert" {
   name_prefix = "${var.name_prefix}/nginx-tls-cert-"

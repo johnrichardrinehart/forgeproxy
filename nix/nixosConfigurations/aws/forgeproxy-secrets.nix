@@ -6,6 +6,7 @@
 }:
 
 let
+  nginxCfg = config.services.forgeproxy-nginx;
   awsForgeProxyProvider = pkgs.writeShellScript "forgeproxy-aws-provider" ''
     set -euo pipefail
 
@@ -117,7 +118,10 @@ let
                     # ── Read SM_PREFIX from EC2 user_data ─────────────────────────
                     _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
                     _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+                    _IDENTITY=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/dynamic/instance-identity/document")
                     SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
+                    INSTANCE_ID=$(printf '%s\n' "$_IDENTITY" | ${pkgs.jq}/bin/jq -r '.instanceId')
+                    REGION=$(printf '%s\n' "$_IDENTITY" | ${pkgs.jq}/bin/jq -r '.region')
                     if [ -z "$SM_PREFIX" ]; then
                       echo "FATAL: Could not resolve SM_PREFIX from EC2 user_data" >&2
                       exit 1
@@ -156,6 +160,26 @@ let
                     UPSTREAM_PORT=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
                       --secret-id "$(resolve nginx-upstream-port)" \
                       --query 'SecretString' --output text)
+                    UPSTREAM_SSH_PORT_SECRET=$(resolve nginx-upstream-ssh-port)
+                    if [ "$UPSTREAM_SSH_PORT_SECRET" = "null" ]; then
+                      UPSTREAM_SSH_PORT=${toString nginxCfg.upstreamSshPort}
+                    else
+                      UPSTREAM_SSH_PORT=$(${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+                        --secret-id "$UPSTREAM_SSH_PORT_SECRET" \
+                        --query 'SecretString' --output text)
+                    fi
+                    DISABLE_TAG_VALUE=$(${pkgs.awscli2}/bin/aws --region "$REGION" ec2 describe-tags \
+                      --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=forgeproxy-disable" \
+                      --query 'Tags[0].Value' --output text 2>/dev/null || true)
+                    if [ "$DISABLE_TAG_VALUE" = "true" ]; then
+                      FORGEPROXY_DISABLED=true
+                      SSH_TARGET="$UPSTREAM:$UPSTREAM_SSH_PORT"
+                    else
+                      FORGEPROXY_DISABLED=false
+                      SSH_TARGET="${nginxCfg.sshProxy.localAddress}:${toString nginxCfg.sshProxy.localPort}"
+                    fi
+                    echo "forgeproxy-nginx-provider: forgeproxy-disable tag value=''${DISABLE_TAG_VALUE:-missing}; disabled=$FORGEPROXY_DISABLED" >&2
+
                     # TLS material for nginx goes into the kernel keyring.
                     put_key "NGINX_TLS_CERT" "nginx-tls-cert"
                     put_key "NGINX_TLS_KEY" "nginx-tls-key"
@@ -171,6 +195,18 @@ let
                     # Server-level variable (server-level include)
                     cat > /run/nginx/forgeproxy-server.conf <<EOF
     set \$forge_upstream_host "$UPSTREAM";
+    set \$forgeproxy_disabled "$FORGEPROXY_DISABLED";
+    EOF
+
+                    # Stream-level variables for SSH traffic.
+                    cat > /run/nginx/forgeproxy-stream.conf <<EOF
+    map \$time_iso8601 \$forgeproxy_disabled {
+      default "$FORGEPROXY_DISABLED";
+    }
+
+    map \$time_iso8601 \$forgeproxy_ssh_target {
+      default "$SSH_TARGET";
+    }
     EOF
   '';
 in
@@ -208,5 +244,8 @@ in
   services.forgeproxy-nginx-runtime = lib.mkDefault {
     enable = true;
     providerScript = awsNginxProvider;
+    refreshIntervalSec = 15;
   };
+
+  services.forgeproxy-nginx.sshProxy.enable = lib.mkDefault true;
 }

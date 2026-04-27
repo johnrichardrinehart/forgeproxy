@@ -127,6 +127,7 @@ resource "aws_launch_template" "forgeproxy" {
     aws_secretsmanager_secret_version.webhook_secret,
     aws_secretsmanager_secret_version.nginx_upstream_hostname,
     aws_secretsmanager_secret_version.nginx_upstream_port,
+    aws_secretsmanager_secret_version.nginx_upstream_ssh_port,
     aws_secretsmanager_secret_version.nginx_tls_cert,
     aws_secretsmanager_secret_version.nginx_tls_key,
   ]
