@@ -13,6 +13,7 @@ module "forgeproxy" {
 
   upstream_hostname     = var.upstream_hostname
   upstream_port         = var.upstream_port
+  upstream_ssh_port     = var.upstream_ssh_port
   upstream_api_url      = var.upstream_api_url
   upstream_git_url_base = var.upstream_git_url_base
   backend_type          = var.backend_type

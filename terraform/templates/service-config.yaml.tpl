@@ -27,7 +27,7 @@ upstream_credentials:
   # create a forgeproxy/creds/<keyring-key> secret; then restart forgeproxy.
 
 proxy:
-  ssh_listen: "0.0.0.0:2222"
+  ssh_listen: "127.0.0.1:2223"
   http_listen: "127.0.0.1:${backend_port}"
 
 valkey:
