@@ -44,8 +44,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::Config;
 use crate::metrics::{
-    ActiveCloneGuard, ActiveConnectionGuard, CacheStatus, MetricsRegistry, Protocol,
-    UploadPackGuard,
+    ActiveCloneDetailLabels, ActiveCloneGuard, ActiveConnectionGuard, CacheStatus, CloneServedBy,
+    MetricsRegistry, Protocol, UploadPackGuard,
 };
 use crate::runtime_resource::RuntimeResourceAttributes;
 
@@ -187,6 +187,8 @@ pub struct AppState {
     pub active_ssh_hot_clones: Arc<AtomicI64>,
     pub active_ssh_warm_clones: Arc<AtomicI64>,
     pub active_ssh_cold_clones: Arc<AtomicI64>,
+    pub active_forgeproxy_served_clones: Arc<AtomicI64>,
+    pub active_upstream_served_clones: Arc<AtomicI64>,
     pub draining: Arc<AtomicBool>,
     pub prewarm_ready: Arc<AtomicBool>,
     pub prewarm_status: Arc<RwLock<crate::health::PrewarmStatus>>,
@@ -248,8 +250,11 @@ impl AppState {
         &self,
         protocol: Protocol,
         cache_status: CacheStatus,
+        served_by: CloneServedBy,
+        path: &'static str,
+        reason: &'static str,
     ) -> ActiveCloneGuard {
-        let counter = match (&protocol, &cache_status) {
+        let cache_status_counter = match (&protocol, &cache_status) {
             (Protocol::Https, CacheStatus::Hot) => Arc::clone(&self.active_https_hot_clones),
             (Protocol::Https, CacheStatus::Warm) => Arc::clone(&self.active_https_warm_clones),
             (Protocol::Https, CacheStatus::Cold) => Arc::clone(&self.active_https_cold_clones),
@@ -257,7 +262,22 @@ impl AppState {
             (Protocol::Ssh, CacheStatus::Warm) => Arc::clone(&self.active_ssh_warm_clones),
             (Protocol::Ssh, CacheStatus::Cold) => Arc::clone(&self.active_ssh_cold_clones),
         };
-        ActiveCloneGuard::new(self.metrics.clone(), protocol, cache_status, counter)
+        let served_by_counter = match &served_by {
+            CloneServedBy::Forgeproxy => Arc::clone(&self.active_forgeproxy_served_clones),
+            CloneServedBy::Upstream => Arc::clone(&self.active_upstream_served_clones),
+        };
+        ActiveCloneGuard::new(
+            self.metrics.clone(),
+            ActiveCloneDetailLabels {
+                protocol,
+                served_by,
+                path: path.to_string(),
+                reason: reason.to_string(),
+                cache_status,
+            },
+            cache_status_counter,
+            served_by_counter,
+        )
     }
 
     pub fn start_draining(&self) {
@@ -1548,6 +1568,8 @@ async fn build_app_state(
         active_ssh_hot_clones: Arc::new(AtomicI64::new(0)),
         active_ssh_warm_clones: Arc::new(AtomicI64::new(0)),
         active_ssh_cold_clones: Arc::new(AtomicI64::new(0)),
+        active_forgeproxy_served_clones: Arc::new(AtomicI64::new(0)),
+        active_upstream_served_clones: Arc::new(AtomicI64::new(0)),
         draining: Arc::new(AtomicBool::new(false)),
         prewarm_ready: Arc::new(AtomicBool::new(!config.prewarm.enabled)),
         prewarm_status: Arc::new(RwLock::new(crate::health::PrewarmStatus {

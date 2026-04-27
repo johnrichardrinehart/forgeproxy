@@ -35,8 +35,8 @@ use crate::coordination::registry::{
     LocalServeDecision, LocalServeRepoSource, try_finish_pack_cache_delta_composite,
 };
 use crate::metrics::{
-    ActiveConnectionGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneSource,
-    CloneUpstreamBytesLabels, Protocol,
+    ActiveConnectionGuard, CacheStatus, CloneDownstreamBytesLabels, ClonePhase, CloneServedBy,
+    CloneSource, CloneUpstreamBytesLabels, Protocol,
 };
 use crate::observability::GitRequestObservation;
 use crate::short_circuit::{RequestBudget, duration_from_secs, min_timeout};
@@ -547,8 +547,13 @@ async fn replay_ssh_pack_cache_hit(
             repo: completion.metric_repo.clone(),
         })
         .clone();
-    let _active_clone_guard =
-        state.begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
+    let _active_clone_guard = state.begin_active_clone(
+        Protocol::Ssh,
+        completion.cache_status.clone(),
+        completion.serve_outcome.served_by.clone(),
+        completion.serve_outcome.path,
+        completion.serve_outcome.reason,
+    );
 
     let mut stream = hit.into_stream();
     let mut observed_first_byte = false;
@@ -982,8 +987,13 @@ async fn serve_local_upload_pack_once(
             repo: completion.metric_repo.clone(),
         })
         .clone();
-    let _active_clone_guard =
-        state.begin_active_clone(Protocol::Ssh, completion.cache_status.clone());
+    let _active_clone_guard = state.begin_active_clone(
+        Protocol::Ssh,
+        completion.cache_status.clone(),
+        completion.serve_outcome.served_by.clone(),
+        completion.serve_outcome.path,
+        completion.serve_outcome.reason,
+    );
     let mut stdout_buf = vec![0u8; SSH_DATA_CHUNK_SIZE];
     let mut disconnected = false;
     let mut observed_first_byte = false;
@@ -2095,7 +2105,13 @@ impl Handler for SshSession {
                                 let _repo_upload_pack_permit = repo_upload_pack_permit;
                                 let _repo_lease = repo_lease;
                                 let _active_clone_guard = state_for_stream
-                                    .begin_active_clone(Protocol::Ssh, CacheStatus::Hot);
+                                    .begin_active_clone(
+                                        Protocol::Ssh,
+                                        CacheStatus::Hot,
+                                        CloneServedBy::Forgeproxy,
+                                        "local_upload_pack",
+                                        "interactive_local_upload_pack",
+                                    );
                                 let mut stdout = stdout;
                                 let mut stderr = stderr;
                                 let mut disconnected = false;
@@ -2885,9 +2901,15 @@ async fn proxy_upstream_upload_pack(
             )
             .await;
             let _active_clone_guard = if request_kind == V2RequestKind::Fetch {
-                fetch_cache_status
-                    .clone()
-                    .map(|cache_status| state.begin_active_clone(Protocol::Ssh, cache_status))
+                fetch_cache_status.clone().map(|cache_status| {
+                    state.begin_active_clone(
+                        Protocol::Ssh,
+                        cache_status,
+                        CloneServedBy::Upstream,
+                        "forgeproxy_upstream_proxy",
+                        upstream_serve_reason,
+                    )
+                })
             } else {
                 None
             };

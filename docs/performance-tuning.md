@@ -54,8 +54,9 @@ Existing metrics that remain useful for the same investigation:
 The forgeproxy dashboard now includes:
 
 - local upload-pack subprocess concurrency in the Clone Operations row
-- clone serving effectiveness: forgeproxy-served versus upstream-served clone
-  share, plus upstream path/reason breakdown
+- active clone serving counts observed by forgeproxy: forgeproxy-served versus
+  forgeproxy-proxied upstream upload-pack streams across SSH and HTTPS, plus
+  the active upstream path/reason breakdown
 - upload-pack first-byte percentiles by source and cache status
 - pack-cache bypass, warming-skip, recent-entry, and composite-candidate
   diagnostics in the Cache & Storage row
