@@ -100,9 +100,31 @@ asg_instance_count() {
     --output text
 }
 
+describe_asg_instances() {
+  local asg_name="$1"
+
+  echo "ASG ${asg_name} instance details:"
+  aws "${aws_args[@]}" autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "${asg_name}" \
+    --query 'AutoScalingGroups[0].Instances[].{Id:InstanceId,State:LifecycleState,Health:HealthStatus,AZ:AvailabilityZone,LT:LaunchTemplate.Version,Protected:ProtectedFromScaleIn}' \
+    --output table || true
+}
+
+describe_recent_scaling_activities() {
+  local asg_name="$1"
+
+  echo "ASG ${asg_name} recent scaling activities:"
+  aws "${aws_args[@]}" autoscaling describe-scaling-activities \
+    --auto-scaling-group-name "${asg_name}" \
+    --max-items 5 \
+    --query 'Activities[].{Start:StartTime,Status:StatusCode,Progress:Progress,Description:Description,Cause:Cause,StatusMessage:StatusMessage}' \
+    --output table || true
+}
+
 wait_for_asg_instance_count() {
   local asg_name="$1"
   local expected_count="$2"
+  local attempt=0
   local instance_count
 
   echo "Waiting for Auto Scaling Group ${asg_name} to contain ${expected_count} instances"
@@ -112,6 +134,11 @@ wait_for_asg_instance_count() {
       break
     fi
     echo "ASG ${asg_name}: ${instance_count}/${expected_count} instances present"
+    if (( attempt % 6 == 0 )); then
+      describe_asg_instances "${asg_name}"
+      describe_recent_scaling_activities "${asg_name}"
+    fi
+    attempt="$(( attempt + 1 ))"
     sleep 10
   done
 }
@@ -451,6 +478,7 @@ prepare_cache_seed_volumes
 wait_for_asg_in_service() {
   local asg_name="$1"
   local expected_count="$2"
+  local attempt=0
   local in_service_count
   local instance_count
   local healthy_count
@@ -478,6 +506,11 @@ wait_for_asg_in_service() {
       break
     fi
     echo "ASG ${asg_name}: ${healthy_count}/${expected_count} healthy InService, ${in_service_count}/${expected_count} InService, ${instance_count}/${expected_count} instances present"
+    if (( attempt % 6 == 0 )); then
+      describe_asg_instances "${asg_name}"
+      describe_recent_scaling_activities "${asg_name}"
+    fi
+    attempt="$(( attempt + 1 ))"
     sleep 10
   done
 }
@@ -494,6 +527,7 @@ wait_for_asg_in_service "${active_asg}" "${desired_count}"
 wait_for_target_group_health() {
   local target_group_arn="$1"
   local label="$2"
+  local attempt=0
   local healthy_count
   local unused_count
   local total_count
@@ -520,6 +554,16 @@ wait_for_target_group_health() {
       break
     fi
     echo "${label} target group is not ready yet: healthy=${healthy_count}/${desired_count}, unused=${unused_count}/${total_count}"
+    if (( attempt % 6 == 0 )); then
+      echo "${label} target group target health details:"
+      aws "${aws_args[@]}" elbv2 describe-target-health \
+        --target-group-arn "${target_group_arn}" \
+        --query 'TargetHealthDescriptions[].{Target:Target.Id,Port:Target.Port,State:TargetHealth.State,Reason:TargetHealth.Reason,Description:TargetHealth.Description}' \
+        --output table || true
+      describe_asg_instances "${active_asg}"
+      describe_recent_scaling_activities "${active_asg}"
+    fi
+    attempt="$(( attempt + 1 ))"
     sleep 10
   done
 }
