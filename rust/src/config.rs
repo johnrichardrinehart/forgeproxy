@@ -103,6 +103,8 @@ pub struct Config {
     pub pack_cache: PackCacheConfig,
     #[serde(default)]
     pub prewarm: PrewarmConfig,
+    #[serde(default)]
+    pub health: HealthConfig,
     pub storage: StorageConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -257,6 +259,29 @@ fn default_prewarm_max_concurrent() -> usize {
 
 fn default_prewarm_force_open_secs() -> u64 {
     1500
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct HealthConfig {
+    /// Per-check timeout for `/healthz` and `/readyz` probe checks.
+    #[serde(default = "default_health_check_timeout_secs")]
+    pub check_timeout_secs: u64,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            check_timeout_secs: default_health_check_timeout_secs(),
+        }
+    }
+}
+
+fn default_health_check_timeout_secs() -> u64 {
+    5
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1173,7 @@ enum ConfigSchemaNode {
     Bundles,
     PackCache,
     Prewarm,
+    Health,
     Storage,
     LocalStorage,
     S3Storage,
@@ -1184,6 +1210,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "bundles",
             "pack_cache",
             "prewarm",
+            "health",
             "storage",
             "observability",
             "logging",
@@ -1275,6 +1302,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "min_response_bytes",
         ],
         ConfigSchemaNode::Prewarm => &["enabled", "repos", "max_concurrent", "force_open_secs"],
+        ConfigSchemaNode::Health => &["check_timeout_secs"],
         ConfigSchemaNode::Storage => &["local", "s3"],
         ConfigSchemaNode::LocalStorage => &[
             "path",
@@ -1328,6 +1356,7 @@ fn schema_child(node: ConfigSchemaNode, key: &str) -> ConfigSchemaChild {
             ConfigSchemaChild::Object(ConfigSchemaNode::PackCache)
         }
         (ConfigSchemaNode::Root, "prewarm") => ConfigSchemaChild::Object(ConfigSchemaNode::Prewarm),
+        (ConfigSchemaNode::Root, "health") => ConfigSchemaChild::Object(ConfigSchemaNode::Health),
         (ConfigSchemaNode::Root, "storage") => ConfigSchemaChild::Object(ConfigSchemaNode::Storage),
         (ConfigSchemaNode::Root, "observability") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::Observability)
@@ -1487,6 +1516,10 @@ fn validate_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.background_work.max_defer_secs > 0,
         "background_work.max_defer_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.health.check_timeout_secs > 0,
+        "health.check_timeout_secs must be greater than 0"
     );
     anyhow::ensure!(
         config.bundles.max_concurrent_generations > 0,

@@ -1264,15 +1264,11 @@ async fn handle_webhook(
 
 /// `GET /healthz`
 async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let health_state = crate::health::HealthState {
-        config: state.config(),
-        valkey: state.valkey.clone(),
-        http_client: state.http_client.clone(),
-        prewarm: state.prewarm_status(),
-    };
-    crate::health::health_handler(axum::extract::State(health_state))
-        .await
-        .into_response()
+    let (status, body) = state
+        .health_worker
+        .run(state.config(), state.prewarm_status())
+        .await;
+    (status, axum::Json(body)).into_response()
 }
 
 /// `GET /readyz`
@@ -1293,15 +1289,11 @@ async fn handle_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     }
 
-    let health_state = crate::health::HealthState {
-        config: state.config(),
-        valkey: state.valkey.clone(),
-        http_client: state.http_client.clone(),
-        prewarm: state.prewarm_status(),
-    };
-    crate::health::health_handler(axum::extract::State(health_state))
-        .await
-        .into_response()
+    let (status, body) = state
+        .health_worker
+        .run(state.config(), state.prewarm_status())
+        .await;
+    (status, axum::Json(body)).into_response()
 }
 
 /// `GET /metrics`

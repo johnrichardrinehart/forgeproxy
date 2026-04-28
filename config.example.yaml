@@ -102,6 +102,8 @@ prewarm:
   repos: []
   max_concurrent: 2
   force_open_secs: 1500
+health:
+  check_timeout_secs: 5
 storage:
   local:
     path: "/var/cache/forgeproxy"

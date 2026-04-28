@@ -61,6 +61,7 @@ force_destroy      = false
 # prewarm_repos         = []
 # prewarm_max_concurrent = 2
 # prewarm_force_open_secs = 1500
+# health_check_timeout_secs = 5
 # bundle_pack_threads      = 4
 # logs_enabled             = true
 # traces_enabled           = false

@@ -109,6 +109,7 @@ pub struct AppState {
     pub s3_client: aws_sdk_s3::Client,
     pub metrics: MetricsRegistry,
     pub http_client: reqwest::Client,
+    pub health_worker: Arc<crate::health::HealthWorker>,
     pub cache_manager: cache::CacheManager,
     pub node_id: String,
     pub runtime_resource_attributes: RuntimeResourceAttributes,
@@ -676,6 +677,10 @@ async fn probe_s3(config: &Config) -> Result<()> {
 
 async fn probe_upstream(config: &Config) -> Result<()> {
     let http_client = build_http_client()?;
+    let health_worker = Arc::new(crate::health::HealthWorker::start(
+        valkey.clone(),
+        http_client.clone(),
+    ));
     let forge = forge::build_backend(config);
     let rate_limit = forge::rate_limit::RateLimitState::new();
     forge
@@ -1543,6 +1548,7 @@ async fn build_app_state(
         s3_client: s3,
         metrics,
         http_client,
+        health_worker,
         cache_manager,
         node_id,
         runtime_resource_attributes,

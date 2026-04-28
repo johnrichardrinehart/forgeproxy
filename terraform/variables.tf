@@ -764,6 +764,17 @@ variable "prewarm_force_open_secs" {
   }
 }
 
+variable "health_check_timeout_secs" {
+  type        = number
+  default     = 5
+  description = "Per-check timeout in seconds for forgeproxy /healthz and /readyz checks."
+
+  validation {
+    condition     = var.health_check_timeout_secs > 0
+    error_message = "health_check_timeout_secs must be greater than 0."
+  }
+}
+
 variable "eviction_policy" {
   type        = string
   default     = "lfu"
