@@ -21,6 +21,9 @@ let
       chmod 0600 /run/nginx/ssl/key.pem.tmp
       mv /run/nginx/ssl/cert.pem.tmp /run/nginx/ssl/cert.pem
       mv /run/nginx/ssl/key.pem.tmp /run/nginx/ssl/key.pem
+      if [ "$(id -u)" -eq 0 ]; then
+        chown nginx:nginx /run/nginx/ssl/cert.pem /run/nginx/ssl/key.pem
+      fi
     fi
   '';
 in
