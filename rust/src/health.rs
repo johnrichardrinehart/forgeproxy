@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::State;
@@ -7,6 +8,7 @@ use axum::response::IntoResponse;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::header::HeaderMap;
 use serde::Serialize;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{BackendType, Config};
 
@@ -79,6 +81,17 @@ pub struct HealthState {
     pub prewarm: PrewarmStatus,
 }
 
+struct HealthWorkerRequest {
+    config: Arc<Config>,
+    prewarm: PrewarmStatus,
+    response_tx: oneshot::Sender<(StatusCode, HealthResponse)>,
+}
+
+#[derive(Clone)]
+pub struct HealthWorker {
+    request_tx: mpsc::Sender<HealthWorkerRequest>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PrewarmStatus {
     pub complete: bool,
@@ -95,6 +108,63 @@ impl PrewarmStatus {
             CheckResult::healthy()
         } else {
             CheckResult::unhealthy(self.issues.join("; "))
+        }
+    }
+}
+
+impl HealthWorker {
+    pub fn start(valkey: fred::clients::Pool, http_client: reqwest::Client) -> Self {
+        let (request_tx, mut request_rx) = mpsc::channel::<HealthWorkerRequest>(128);
+        std::thread::Builder::new()
+            .name("forgeproxy-health-worker".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .thread_name("forgeproxy-health-pool")
+                    .build()
+                    .expect("failed to build health worker runtime");
+                runtime.block_on(async move {
+                    while let Some(request) = request_rx.recv().await {
+                        let state = HealthState {
+                            config: request.config,
+                            valkey: valkey.clone(),
+                            http_client: http_client.clone(),
+                            prewarm: request.prewarm,
+                        };
+                        let _ = request
+                            .response_tx
+                            .send(compute_health_response(&state).await);
+                    }
+                });
+            })
+            .expect("failed to spawn health worker thread");
+        Self { request_tx }
+    }
+
+    pub async fn run(
+        &self,
+        config: Arc<Config>,
+        prewarm: PrewarmStatus,
+    ) -> (StatusCode, HealthResponse) {
+        let timeout = Duration::from_secs(config.health.check_timeout_secs);
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .request_tx
+            .send(HealthWorkerRequest {
+                config,
+                prewarm,
+                response_tx,
+            })
+            .await
+            .is_err()
+        {
+            return worker_unavailable_response("health worker queue is unavailable");
+        }
+        match tokio::time::timeout(timeout, response_rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => worker_unavailable_response("health worker dropped response"),
+            Err(_) => worker_unavailable_response("health worker timed out before responding"),
         }
     }
 }
@@ -244,6 +314,37 @@ async fn check_disk(config: &Config) -> CheckResult {
     }
 }
 
+async fn run_check_with_timeout<F>(name: &str, timeout: Duration, check: F) -> CheckResult
+where
+    F: std::future::Future<Output = CheckResult>,
+{
+    match tokio::time::timeout(timeout, check).await {
+        Ok(result) => result,
+        Err(_) => CheckResult::unhealthy(format!(
+            "{name} check timed out after {}s",
+            timeout.as_secs()
+        )),
+    }
+}
+
+fn worker_unavailable_response(detail: &str) -> (StatusCode, HealthResponse) {
+    let checks = HealthChecks {
+        valkey: CheckResult::unhealthy(detail),
+        ghe: CheckResult::unhealthy(detail),
+        disk: CheckResult::unhealthy(detail),
+        prewarm: CheckResult::unhealthy(detail),
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        HealthResponse {
+            status: HealthStatus::Unhealthy,
+            version: crate::build_info::VERSION.to_string(),
+            git_revision: crate::build_info::git_revision().to_string(),
+            checks,
+        },
+    )
+}
+
 /// Compute (cache_usage, filesystem_capacity, configured_budget_bytes)
 /// for the path's mount.
 fn disk_usage(
@@ -274,16 +375,16 @@ fn aggregate_status(checks: &HealthChecks) -> HealthStatus {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Axum handler
-// ---------------------------------------------------------------------------
-
-/// `GET /healthz` handler.  Returns 200 on Ok/Degraded, 503 on Unhealthy.
-pub async fn health_handler(State(state): State<HealthState>) -> impl IntoResponse {
+async fn compute_health_response(state: &HealthState) -> (StatusCode, HealthResponse) {
+    let timeout = Duration::from_secs(state.config.health.check_timeout_secs);
     let (valkey, ghe, disk) = tokio::join!(
-        check_valkey(&state.valkey),
-        check_ghe(&state.http_client, state.config.as_ref()),
-        check_disk(state.config.as_ref()),
+        run_check_with_timeout("valkey", timeout, check_valkey(&state.valkey)),
+        run_check_with_timeout(
+            "ghe",
+            timeout,
+            check_ghe(&state.http_client, state.config.as_ref())
+        ),
+        run_check_with_timeout("disk", timeout, check_disk(state.config.as_ref())),
     );
 
     let checks = HealthChecks {
@@ -304,7 +405,16 @@ pub async fn health_handler(State(state): State<HealthState>) -> impl IntoRespon
         HealthStatus::Ok | HealthStatus::Degraded => StatusCode::OK,
         HealthStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
     };
+    (http_status, body)
+}
 
+// ---------------------------------------------------------------------------
+// Axum handler
+// ---------------------------------------------------------------------------
+
+/// `GET /healthz` handler.  Returns 200 on Ok/Degraded, 503 on Unhealthy.
+pub async fn health_handler(State(state): State<HealthState>) -> impl IntoResponse {
+    let (http_status, body) = compute_health_response(&state).await;
     (http_status, Json(body))
 }
 
@@ -458,5 +568,20 @@ mod tests {
         };
 
         assert_eq!(aggregate_status(&checks), HealthStatus::Degraded);
+    }
+
+    #[tokio::test]
+    async fn timed_out_check_is_unhealthy() {
+        let result = run_check_with_timeout("ghe", Duration::from_millis(10), async {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            CheckResult::healthy()
+        })
+        .await;
+
+        assert!(!result.ok);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("ghe check timed out after 0s")
+        );
     }
 }

@@ -87,6 +87,9 @@ prewarm:
   max_concurrent: ${prewarm_max_concurrent}
   force_open_secs: ${prewarm_force_open_secs}
 
+health:
+  check_timeout_secs: ${health_check_timeout_secs}
+
 storage:
   local:
     path: "/var/cache/forgeproxy"
