@@ -34,10 +34,30 @@ locals {
     green = "${var.name_prefix}-forgeproxy-green"
   }
   forgeproxy_current_live_slot = data.external.forgeproxy_rollout_slot.result.current_slot
+  forgeproxy_default_live_slot = contains(
+    ["blue", "green"],
+    local.forgeproxy_current_live_slot
+  ) ? local.forgeproxy_current_live_slot : "blue"
+  forgeproxy_rollout_slots_needing_update = [
+    for slot in ["blue", "green"] : slot
+    if(
+      data.external.forgeproxy_asg_launch_template_versions.result["${slot}_version"] == ""
+      || data.external.forgeproxy_asg_launch_template_versions.result["${slot}_version"] != tostring(aws_launch_template.forgeproxy[slot].latest_version)
+    )
+  ]
+  forgeproxy_auto_target_slot = (
+    length(local.forgeproxy_rollout_slots_needing_update) == 0
+    ? local.forgeproxy_default_live_slot
+    : (
+      length(local.forgeproxy_rollout_slots_needing_update) == 1
+      ? local.forgeproxy_rollout_slots_needing_update[0]
+      : data.external.forgeproxy_rollout_slot.result.target_slot
+    )
+  )
   forgeproxy_target_slot = (
     var.forgeproxy_active_slot != null
     ? var.forgeproxy_active_slot
-    : data.external.forgeproxy_rollout_slot.result.target_slot
+    : local.forgeproxy_auto_target_slot
   )
   forgeproxy_current_asg_launch_template_versions = {
     blue  = data.external.forgeproxy_asg_launch_template_versions.result.blue_version
