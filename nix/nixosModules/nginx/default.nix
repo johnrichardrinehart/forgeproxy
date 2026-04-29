@@ -119,7 +119,21 @@ in
       recommendedProxySettings = true;
       recommendedGzipSettings = true;
 
+      appendConfig = ''
+        worker_rlimit_nofile 65536;
+      '';
+
+      eventsConfig = ''
+        worker_connections 16384;
+      '';
+
       commonHttpConfig = ''
+        # Default used when tests or early boot snippets do not provide the
+        # runtime server-level override yet.
+        map $time_iso8601 $forgeproxy_disabled {
+          default "false";
+        }
+
         log_format forgeproxy_upstream
           '$remote_addr - $remote_user [$time_local] "$request" '
           '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
@@ -158,6 +172,11 @@ in
 
       # ── Global HTTP-level configuration ────────────────────────────
       appendHttpConfig = ''
+        # Streaming optimizations for large git pack-file and archive responses.
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
+
         proxy_headers_hash_max_size 1024;
         proxy_headers_hash_bucket_size 128;
 
