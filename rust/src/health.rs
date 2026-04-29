@@ -1,10 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Json;
-use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use reqwest::header::HeaderMap;
 use serde::Serialize;
@@ -14,6 +11,8 @@ use crate::config::{BackendType, Config};
 
 const GITHUB_TOKEN_EXPIRATION_HEADER: &str = "github-authentication-token-expiration";
 const GITHUB_TOKEN_EXPIRATION_FORMAT: &str = "%Y-%m-%d %H:%M:%S UTC";
+const HEALTH_WORKER_RESPONSE_TIMEOUT_MIN_SLACK_SECS: u64 = 5;
+const HEALTH_WORKER_RESPONSE_TIMEOUT_DIVISOR: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -147,7 +146,7 @@ impl HealthWorker {
         config: Arc<Config>,
         prewarm: PrewarmStatus,
     ) -> (StatusCode, HealthResponse) {
-        let timeout = Duration::from_secs(config.health.check_timeout_secs);
+        let timeout = health_worker_response_timeout(config.health.check_timeout_secs);
         let (response_tx, response_rx) = oneshot::channel();
         if self
             .request_tx
@@ -167,6 +166,14 @@ impl HealthWorker {
             Err(_) => worker_unavailable_response("health worker timed out before responding"),
         }
     }
+}
+
+fn health_worker_response_timeout(check_timeout_secs: u64) -> Duration {
+    Duration::from_secs(
+        check_timeout_secs
+            + HEALTH_WORKER_RESPONSE_TIMEOUT_MIN_SLACK_SECS
+                .max(check_timeout_secs / HEALTH_WORKER_RESPONSE_TIMEOUT_DIVISOR),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -408,16 +415,6 @@ async fn compute_health_response(state: &HealthState) -> (StatusCode, HealthResp
     (http_status, body)
 }
 
-// ---------------------------------------------------------------------------
-// Axum handler
-// ---------------------------------------------------------------------------
-
-/// `GET /healthz` handler.  Returns 200 on Ok/Degraded, 503 on Unhealthy.
-pub async fn health_handler(State(state): State<HealthState>) -> impl IntoResponse {
-    let (http_status, body) = compute_health_response(&state).await;
-    (http_status, Json(body))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +580,12 @@ mod tests {
             result.detail.as_deref(),
             Some("ghe check timed out after 0s")
         );
+    }
+
+    #[test]
+    fn health_worker_response_timeout_includes_queue_slack() {
+        assert_eq!(health_worker_response_timeout(5), Duration::from_secs(10));
+        assert_eq!(health_worker_response_timeout(10), Duration::from_secs(15));
+        assert_eq!(health_worker_response_timeout(20), Duration::from_secs(30));
     }
 }
