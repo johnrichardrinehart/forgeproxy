@@ -6,6 +6,7 @@
   nginx = ./nginx/default.nix;
   nginx-runtime = ./nginx/runtime.nix;
   hardening = ./profiles/hardening.nix;
+  performance = ./profiles/performance.nix;
   secrets = ./forgeproxy/secrets.nix;
   ami = ./profiles/ami.nix;
   backend = ./forgeproxy/backend.nix;
