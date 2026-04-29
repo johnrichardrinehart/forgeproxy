@@ -1440,6 +1440,8 @@ async fn forward_upstream_response(upstream_resp: reqwest::Response) -> Result<R
 const MAX_GIT_PKT_LINE_LEN: usize = 65520;
 const PKT_HEADER_LEN: usize = 4;
 const SIDEBAND_PREFIX_LEN: usize = 1;
+const MAX_SIDEBAND_PACK_CHUNK_LEN: usize =
+    MAX_GIT_PKT_LINE_LEN - PKT_HEADER_LEN - SIDEBAND_PREFIX_LEN;
 const SIDEBAND_ERROR_CHANNEL: u8 = 3;
 
 fn pkt_line(payload: &[u8]) -> Bytes {
@@ -2188,7 +2190,8 @@ async fn serve_local_upload_pack(
                 let _repo_upload_pack_permit = repo_upload_pack_permit;
                 let mut child = child;
                 let mut stderr = stderr;
-                let mut stdout_stream = ReaderStream::new(stdout);
+                let mut stdout_stream =
+                    ReaderStream::with_capacity(stdout, MAX_SIDEBAND_PACK_CHUNK_LEN);
                 let mut writer = Some(pack_cache_writer);
                 let mut downstream_open = true;
 
@@ -2313,7 +2316,7 @@ async fn serve_local_upload_pack(
             .instrument(tracing::Span::current()),
         );
         Box::pin(LeasedReaderStream::new(
-            ReaderStream::new(stdout),
+            ReaderStream::with_capacity(stdout, MAX_SIDEBAND_PACK_CHUNK_LEN),
             repo_lease,
         ))
     };

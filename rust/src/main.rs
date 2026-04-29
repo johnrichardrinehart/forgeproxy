@@ -27,6 +27,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use axum::serve::ListenerExt;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use fred::clients::Pool;
 use fred::interfaces::ClientLike;
@@ -677,10 +678,6 @@ async fn probe_s3(config: &Config) -> Result<()> {
 
 async fn probe_upstream(config: &Config) -> Result<()> {
     let http_client = build_http_client()?;
-    let health_worker = Arc::new(crate::health::HealthWorker::start(
-        valkey.clone(),
-        http_client.clone(),
-    ));
     let forge = forge::build_backend(config);
     let rate_limit = forge::rate_limit::RateLimitState::new();
     forge
@@ -771,7 +768,12 @@ async fn run_http_server(state: AppState, mut shutdown_rx: watch::Receiver<bool>
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
-        .with_context(|| format!("failed to bind HTTP listener on {listen_addr}"))?;
+        .with_context(|| format!("failed to bind HTTP listener on {listen_addr}"))?
+        .tap_io(|tcp_stream| {
+            if let Err(error) = tcp_stream.set_nodelay(true) {
+                tracing::warn!(%error, "failed to set TCP_NODELAY on HTTP connection");
+            }
+        });
 
     tracing::info!(%listen_addr, "HTTP server listening");
 
@@ -1496,6 +1498,10 @@ async fn build_app_state(
     let valkey = build_valkey_pool(&config).await?;
     let s3 = build_s3_client(&config).await?;
     let http_client = build_http_client()?;
+    let health_worker = Arc::new(crate::health::HealthWorker::start(
+        valkey.clone(),
+        http_client.clone(),
+    ));
     let metrics = MetricsRegistry::with_backend(config.backend_type);
     let cache_manager = cache::CacheManager::new(&config.storage.local);
     let node_id = coordination::node::node_id();
