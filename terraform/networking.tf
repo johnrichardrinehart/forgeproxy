@@ -370,7 +370,7 @@ resource "aws_lb_target_group" "https" {
     enabled             = true
     healthy_threshold   = 3
     unhealthy_threshold = 2
-    timeout             = 10
+    timeout             = 20
     interval            = 30
     port                = "443"
     protocol            = "HTTPS"
@@ -397,7 +397,7 @@ resource "aws_lb_target_group" "ssh" {
     enabled             = true
     healthy_threshold   = 3
     unhealthy_threshold = 2
-    timeout             = 10
+    timeout             = 20
     interval            = 30
     port                = "443"
     protocol            = "HTTPS"
