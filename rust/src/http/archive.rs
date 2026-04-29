@@ -26,6 +26,8 @@ use crate::cache::archive::{
     tee_upstream_to_cache,
 };
 
+const LOCAL_ARCHIVE_STREAM_CHUNK_BYTES: usize = 256 * 1024;
+
 /// Validate that the `rest` segment of an archive URL is safe.
 ///
 /// Rejects path traversal attempts and null bytes.
@@ -551,7 +553,7 @@ async fn serve_local_file(
         .await
         .with_context(|| format!("stat cached archive: {}", path.display()))?;
 
-    let stream = ReaderStream::new(file);
+    let stream = ReaderStream::with_capacity(file, LOCAL_ARCHIVE_STREAM_CHUNK_BYTES);
     let body = Body::from_stream(stream);
 
     let mut response = Response::new(body);
