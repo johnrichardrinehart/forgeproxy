@@ -29,5 +29,9 @@
   nixos-vm-test-startup-init-failure = pkgs.callPackage ./startup-init-failure.nix {
     inherit self;
   };
+  nixos-module-performance = pkgs.callPackage ./performance-module.nix {
+    inherit self inputs;
+  };
+  lambda-health-check = pkgs.callPackage ./lambda-health-check.nix { };
   terraform-config-sync = pkgs.callPackage ./terraform-config.nix { inherit self; };
 }

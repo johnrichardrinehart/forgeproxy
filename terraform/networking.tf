@@ -27,14 +27,9 @@ locals {
     for hostname in slice(local.configured_proxy_hostnames, 1, length(local.configured_proxy_hostnames)) :
     hostname => var.nlb_tls_cert_arns_by_hostname[hostname]
   }
-  https_listener_protocol                      = "TLS"
-  https_target_group_protocol                  = "TLS"
-  forgeproxy_readyz_health_check_interval_secs = 30
-  forgeproxy_readyz_healthy_threshold          = 3
-  forgeproxy_readyz_healthy_window_secs = (
-    local.forgeproxy_readyz_health_check_interval_secs * local.forgeproxy_readyz_healthy_threshold
-  )
-  forgeproxy_max_count = coalesce(var.forgeproxy_max_count, var.forgeproxy_count)
+  https_listener_protocol     = "TLS"
+  https_target_group_protocol = "TLS"
+  forgeproxy_max_count        = coalesce(var.forgeproxy_max_count, var.forgeproxy_count)
 }
 
 # Validate that forgeproxy_security_group_id and valkey_security_group_id are
@@ -68,17 +63,6 @@ check "forgeproxy_cutover_soak_window_sufficient" {
       var.forgeproxy_cutover_check_interval_secs * var.forgeproxy_cutover_required_consecutive_successes
     )
     error_message = "forgeproxy_cutover_timeout_secs must be at least forgeproxy_cutover_check_interval_secs * forgeproxy_cutover_required_consecutive_successes."
-  }
-}
-
-check "forgeproxy_prewarm_force_open_beats_asg_replacement" {
-  assert {
-    condition = (
-      !var.prewarm_enabled ||
-      var.forgeproxy_health_check_grace_period_secs >=
-      var.prewarm_force_open_secs + local.forgeproxy_readyz_healthy_window_secs
-    )
-    error_message = "forgeproxy_health_check_grace_period_secs must be at least prewarm_force_open_secs + the /readyz target-group healthy window so readiness force-opens before the ASG can replace the instance."
   }
 }
 
@@ -264,6 +248,34 @@ resource "aws_security_group" "forgeproxy" {
   }
 }
 
+resource "aws_security_group" "forgeproxy_health_check_lambda" {
+  name        = "${var.name_prefix}-hc-lambda-sg"
+  description = "Security group for forgeproxy health-check Lambda"
+  vpc_id      = local.vpc_id
+
+  egress {
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    security_groups = [local.forgeproxy_security_group_id]
+    description     = "Direct /readyz probes to forgeproxy instances"
+  }
+
+  tags = {
+    Name = "${var.name_prefix}-hc-lambda-sg"
+  }
+}
+
+resource "aws_security_group_rule" "forgeproxy_health_check_lambda_https" {
+  type                     = "ingress"
+  security_group_id        = local.forgeproxy_security_group_id
+  source_security_group_id = aws_security_group.forgeproxy_health_check_lambda.id
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  description              = "Direct /readyz probes from forgeproxy health-check Lambda"
+}
+
 # ── Security Group: Valkey instance ──────────────────────────────────────────
 resource "aws_security_group" "valkey" {
   count       = local.create_security_groups ? 1 : 0
@@ -357,7 +369,7 @@ resource "aws_lb_target_group" "https" {
   health_check {
     enabled             = true
     healthy_threshold   = 3
-    unhealthy_threshold = 3
+    unhealthy_threshold = 2
     timeout             = 10
     interval            = 30
     port                = "443"
@@ -384,7 +396,7 @@ resource "aws_lb_target_group" "ssh" {
   health_check {
     enabled             = true
     healthy_threshold   = 3
-    unhealthy_threshold = 3
+    unhealthy_threshold = 2
     timeout             = 10
     interval            = 30
     port                = "443"

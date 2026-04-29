@@ -140,7 +140,7 @@ resource "aws_autoscaling_group" "forgeproxy" {
   min_size                  = 0
   desired_capacity          = 0
   max_size                  = local.forgeproxy_max_count
-  health_check_type         = "ELB"
+  health_check_type         = "EC2"
   health_check_grace_period = var.forgeproxy_health_check_grace_period_secs
   wait_for_elb_capacity     = 0
   wait_for_capacity_timeout = "0"

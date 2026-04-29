@@ -120,11 +120,39 @@ variable "forgeproxy_max_count" {
 variable "forgeproxy_health_check_grace_period_secs" {
   type        = number
   default     = 1800
-  description = "Seconds an Auto Scaling Group should ignore ELB/NLB health-check failures after launching a forgeproxy instance before considering it for replacement."
+  description = "Seconds an Auto Scaling Group should ignore EC2 status-check failures and Lambda-reported target-health failures after launching a forgeproxy instance before considering it for replacement."
 
   validation {
     condition     = var.forgeproxy_health_check_grace_period_secs >= 0
     error_message = "forgeproxy_health_check_grace_period_secs must be greater than or equal to 0."
+  }
+}
+
+variable "asg_unhealthy_termination_threshold" {
+  type        = number
+  default     = 10
+  description = "Consecutive Lambda observations of unhealthy forgeproxy target-group health required before marking the ASG instance unhealthy for replacement."
+
+  validation {
+    condition = (
+      var.asg_unhealthy_termination_threshold >= 1 &&
+      floor(var.asg_unhealthy_termination_threshold) == var.asg_unhealthy_termination_threshold
+    )
+    error_message = "asg_unhealthy_termination_threshold must be a whole number greater than or equal to 1."
+  }
+}
+
+variable "asg_health_check_lambda_interval_minutes" {
+  type        = number
+  default     = 1
+  description = "Minutes between Lambda observations of forgeproxy target-group health."
+
+  validation {
+    condition = (
+      var.asg_health_check_lambda_interval_minutes >= 1 &&
+      floor(var.asg_health_check_lambda_interval_minutes) == var.asg_health_check_lambda_interval_minutes
+    )
+    error_message = "asg_health_check_lambda_interval_minutes must be a whole number of minutes greater than or equal to 1."
   }
 }
 
