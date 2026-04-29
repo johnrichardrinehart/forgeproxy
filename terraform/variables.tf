@@ -572,6 +572,17 @@ variable "max_concurrent_local_upload_packs" {
   }
 }
 
+variable "max_concurrent_upstream_clones" {
+  type        = number
+  default     = 4
+  description = "Host-wide semaphore limit for concurrent full clones against upstream. Set to 0 only when intentionally disabling upstream hydration."
+
+  validation {
+    condition     = var.max_concurrent_upstream_clones >= 0 && floor(var.max_concurrent_upstream_clones) == var.max_concurrent_upstream_clones
+    error_message = "max_concurrent_upstream_clones must be a non-negative whole number."
+  }
+}
+
 variable "generation_coalescing_window_secs" {
   type        = number
   default     = 60

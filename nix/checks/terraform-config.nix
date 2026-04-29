@@ -39,6 +39,7 @@ let
         request_time_s3_restore_secs               = 0
         generation_publish_secs                    = 0
         local_upload_pack_first_byte_secs          = 0
+        max_concurrent_upstream_clones             = 7
         max_concurrent_local_upload_packs          = 4
         max_concurrent_local_upload_packs_per_repo = 1
         local_upload_pack_threads                  = 2
@@ -58,6 +59,7 @@ let
         prewarm_repos                              = []
         prewarm_max_concurrent                     = 2
         prewarm_force_open_secs                    = 1500
+        health_check_timeout_secs                  = 5
         bundle_pack_threads                        = 4
         bundle_max_incremental_bundles             = 1
         metrics_enabled                            = true

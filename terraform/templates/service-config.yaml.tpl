@@ -61,6 +61,7 @@ clone:
   local_upload_pack_first_byte_secs: ${local_upload_pack_first_byte_secs}
   # Request path: every local disk serve acquires these before spawning git upload-pack.
   # Higher values improve parallel clone/fetch throughput but allow more concurrent pack-objects CPU.
+  max_concurrent_upstream_clones: ${max_concurrent_upstream_clones}
   max_concurrent_local_upload_packs: ${max_concurrent_local_upload_packs}
   max_concurrent_local_upload_packs_per_repo: ${max_concurrent_local_upload_packs_per_repo}
   # Request path: local git upload-pack inherits this as pack.threads for pack generation.
