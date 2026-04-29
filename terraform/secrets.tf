@@ -53,6 +53,7 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     request_time_s3_restore_secs                  = var.request_time_s3_restore_secs
     generation_publish_secs                       = var.generation_publish_secs
     local_upload_pack_first_byte_secs             = var.local_upload_pack_first_byte_secs
+    max_concurrent_upstream_clones                = var.max_concurrent_upstream_clones
     max_concurrent_local_upload_packs             = var.max_concurrent_local_upload_packs
     max_concurrent_local_upload_packs_per_repo    = var.max_concurrent_local_upload_packs_per_repo
     local_upload_pack_threads                     = var.local_upload_pack_threads
