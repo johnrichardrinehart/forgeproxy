@@ -162,6 +162,9 @@ terraform/
 ├── ami.tf                         # NixOS AMI build and registration
 ├── ec2.tf                         # EC2 instances and NLB attachments
 ├── ghe-key-lookup.tf              # Optional ghe-key-lookup sidecar fleet + internal NLB
+├── lambda.tf                      # Scheduled ASG health-check decoupler
+├── lambda/
+│   └── health_check.py            # Lambda handler for sustained unhealthy target replacement
 └── templates/
     ├── otel-collector-config.yaml.tpl # forgeproxy collector config template
     └── service-config.yaml.tpl    # forgeproxy config.yaml template
@@ -225,7 +228,7 @@ Proper `depends_on` ordering ensures:
 4. TLS resources → Secrets Manager secrets
 5. Secrets → forgeproxy launch template
 6. Launch template + target groups → forgeproxy Auto Scaling Group
-7. Auto Scaling Group waits for NLB health checks before an update is considered complete
+7. Auto Scaling Group launches instances; NLB health checks gate traffic while a scheduled Lambda controls replacement after sustained failures
 
 No manual steps required.
 
@@ -240,8 +243,11 @@ The resulting rollout behavior is:
 - Before launching the target slot, the prepare helper resets that target ASG to zero when it is not the current live slot. This removes stale instances left by failed earlier applies and guarantees the new target slot comes up on the current launch-template version.
 - By default, Terraform derives the next target slot automatically from the listener that is currently serving traffic; `forgeproxy_active_slot` is only needed as a manual override.
 - The NLB health checks gate cutover on `/readyz`, so warm-up must finish before the new slot can receive production traffic.
-- Each forgeproxy Auto Scaling Group uses `health_check_type = "ELB"` with a configurable `forgeproxy_health_check_grace_period_secs`, which defaults to `1800` seconds (30 minutes) before failed target-group checks can trigger replacement.
-- Startup pre-warm also has a configurable `prewarm_force_open_secs` timeout, and Terraform validates that the ASG grace period is at least that timeout plus the `/readyz` target-group healthy window so readiness force-opens before the ASG can terminate the instance for failed health checks.
+- Each forgeproxy Auto Scaling Group uses `health_check_type = "EC2"` so target-group health controls traffic eligibility but does not directly trigger replacement.
+- The active HTTPS and SSH target groups use the fastest valid `unhealthy_threshold = 2` so failed `/readyz` checks remove an instance from NLB rotation quickly.
+- A scheduled Lambda observes active-slot target health and calls `SetInstanceHealth` only after `asg_unhealthy_termination_threshold` consecutive unhealthy observations, subject to the ASG grace period. When target health reports `/readyz` 503, the Lambda runs inside the VPC and probes the instance private IP directly so startup pre-warm responses suppress replacement while non-warm-up failures still count.
+- NLB target health is not an absolute isolation boundary when every target is unhealthy; AWS can fail open and route to unhealthy targets when no healthy target remains.
+- Startup pre-warm still has a configurable `prewarm_force_open_secs` timeout, but failed target-group checks no longer terminate instances directly.
 - Listener cutover moves all production traffic to a single slot at a time, avoiding mixed `git_revision` values from `/healthz`.
 - After listener cutover, Terraform performs a bounded HTTPS soak against `/readyz` and `/healthz` through each configured client-facing hostname. Once the soak passes, cleanup reconciles the live slot back to `forgeproxy_count` and scales the inactive slot down to zero.
 - If that soak never stabilizes before `forgeproxy_cutover_timeout_secs`, `terraform apply` fails and the old slot is left running instead of being terminated.
