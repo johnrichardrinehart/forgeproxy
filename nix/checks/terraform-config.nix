@@ -42,6 +42,7 @@ let
         max_concurrent_upstream_clones             = 7
         max_concurrent_local_upload_packs          = 4
         max_concurrent_local_upload_packs_per_repo = 1
+        max_concurrent_deep_validations            = 1
         local_upload_pack_threads                  = 2
         index_pack_threads                         = 2
         pack_cache_enabled                         = true
@@ -60,6 +61,7 @@ let
         prewarm_max_concurrent                     = 2
         prewarm_force_open_secs                    = 1500
         health_check_timeout_secs                  = 5
+        bundle_max_concurrent_generations          = 1
         bundle_pack_threads                        = 4
         bundle_max_incremental_bundles             = 1
         metrics_enabled                            = true

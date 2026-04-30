@@ -42,6 +42,8 @@ forgeproxy_cutover_timeout_secs = 600
 valkey_instance_type      = "r6i.large"
 # valkey_service_name = "valkey"
 # valkey_reload_wait_timeout_secs = 600
+cache_scrub_on_calendar = "*-*-* 00:00:00 UTC"
+cache_scrub_interval_secs = 86400
 
 # Volume sizes (GB)
 forgeproxy_root_volume_gb = 50
@@ -89,6 +91,8 @@ s3_presigned_url_ttl = 3600
 
 # Logging
 log_level = "info"  # trace, debug, info, warn, error
+max_concurrent_deep_validations = 1
+bundle_max_concurrent_generations = 1
 
 # Organization credentials configuration
 org_creds = [

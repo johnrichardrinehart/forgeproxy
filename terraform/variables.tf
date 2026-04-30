@@ -668,6 +668,17 @@ variable "max_concurrent_local_upload_packs_per_repo" {
   }
 }
 
+variable "max_concurrent_deep_validations" {
+  type        = number
+  default     = 1
+  description = "Maximum concurrent background deep validations (git fsck --connectivity-only) per forgeproxy instance."
+
+  validation {
+    condition     = var.max_concurrent_deep_validations > 0
+    error_message = "max_concurrent_deep_validations must be greater than 0."
+  }
+}
+
 variable "local_upload_pack_threads" {
   type        = number
   default     = 2
@@ -871,6 +882,23 @@ variable "log_level" {
   }
 }
 
+variable "cache_scrub_on_calendar" {
+  type        = string
+  default     = "*-*-* 00:00:00 UTC"
+  description = "Systemd OnCalendar expression for forgeproxy cache scrub timer scheduling."
+}
+
+variable "cache_scrub_interval_secs" {
+  type        = number
+  default     = 86400
+  description = "Systemd OnUnitActiveSec interval in seconds for forgeproxy cache scrub timer repeats."
+
+  validation {
+    condition     = var.cache_scrub_interval_secs > 0
+    error_message = "cache_scrub_interval_secs must be greater than 0."
+  }
+}
+
 variable "prepare_published_generation_indexes" {
   type        = bool
   default     = false
@@ -885,6 +913,17 @@ variable "bundle_pack_threads" {
   validation {
     condition     = var.bundle_pack_threads > 0
     error_message = "bundle_pack_threads must be greater than 0."
+  }
+}
+
+variable "bundle_max_concurrent_generations" {
+  type        = number
+  default     = 1
+  description = "Maximum concurrent repositories that may run bundle-generation and related background index preparation work per forgeproxy instance."
+
+  validation {
+    condition     = var.bundle_max_concurrent_generations > 0
+    error_message = "bundle_max_concurrent_generations must be greater than 0."
   }
 }
 

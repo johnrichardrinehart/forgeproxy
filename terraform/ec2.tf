@@ -95,6 +95,8 @@ resource "aws_launch_template" "forgeproxy" {
     # FORGEPROXY_CACHE_VOLUME_LABEL=${var.forgeproxy_cache_volume_label}
     # FORGEPROXY_CACHE_MOUNT_DIR=/var/cache/forgeproxy
     # FORGEPROXY_CACHE_MOUNT_OPTIONS=${var.forgeproxy_cache_volume_mount_options}
+    # FORGEPROXY_CACHE_SCRUB_ON_CALENDAR=${var.cache_scrub_on_calendar}
+    # FORGEPROXY_CACHE_SCRUB_INTERVAL_SECS=${var.cache_scrub_interval_secs}
     { ... }: {}
   EOT
   )
@@ -330,6 +332,6 @@ resource "null_resource" "forgeproxy_rollout_cleanup" {
       CUTOVER_TIMEOUT_SECONDS                = tostring(var.forgeproxy_cutover_timeout_secs)
     }
     interpreter = ["/usr/bin/env", "bash"]
-    on_failure  = "continue"
+    on_failure  = continue
   }
 }
