@@ -38,6 +38,38 @@ resource "aws_instance" "valkey" {
   }
 }
 
+resource "null_resource" "valkey_tls_reload" {
+  triggers = {
+    behavior_revision      = "ssm-valkey-tls-reload-v1"
+    valkey_tls_enable      = tostring(local.valkey_tls_enable)
+    valkey_instance_id     = aws_instance.valkey.id
+    valkey_tls_cert_secret = local.valkey_tls_enable ? aws_secretsmanager_secret_version.valkey_tls_cert[0].version_id : "tls-disabled"
+    valkey_tls_key_secret  = local.valkey_tls_enable ? aws_secretsmanager_secret_version.valkey_tls_key[0].version_id : "tls-disabled"
+    valkey_tls_ca_secret   = local.valkey_tls_enable ? aws_secretsmanager_secret_version.valkey_tls_ca[0].version_id : "tls-disabled"
+  }
+
+  depends_on = [
+    aws_instance.valkey,
+    aws_secretsmanager_secret_version.valkey_auth_token,
+    aws_secretsmanager_secret_version.valkey_tls_cert,
+    aws_secretsmanager_secret_version.valkey_tls_key,
+    aws_secretsmanager_secret_version.valkey_tls_ca,
+  ]
+
+  provisioner "local-exec" {
+    command = "${path.module}/scripts/valkey-tls-reload.sh"
+    environment = {
+      AWS_REGION           = var.aws_region
+      AWS_PROFILE_FALLBACK = var.aws_profile
+      VALKEY_TLS_ENABLE    = tostring(local.valkey_tls_enable)
+      VALKEY_INSTANCE_ID   = aws_instance.valkey.id
+      VALKEY_SERVICE_NAME  = var.valkey_service_name
+      WAIT_TIMEOUT_SECONDS = tostring(var.valkey_reload_wait_timeout_secs)
+    }
+    interpreter = ["/usr/bin/env", "bash"]
+  }
+}
+
 locals {
   forgeproxy_slots = toset(["blue", "green"])
 }
@@ -120,6 +152,7 @@ resource "aws_launch_template" "forgeproxy" {
   depends_on = [
     null_resource.build_forgeproxy_ami,
     aws_instance.valkey,
+    null_resource.valkey_tls_reload,
     aws_secretsmanager_secret_version.forgeproxy_config,
     aws_secretsmanager_secret_version.forgeproxy_otel_collector_config,
     aws_secretsmanager_secret_version.forge_admin_token,

@@ -205,6 +205,7 @@ Configuration is fetched at boot time via `ExecStartPre` scripts in systemd serv
 - **Valkey**: TLS disabled in reference deployment (plaintext on port 6379 in private subnet)
   - Network isolation via security groups provides security
   - For production: set `services.valkey.tls.enable = true` in flake.nix
+  - When Valkey TLS is enabled, Terraform now performs an SSM-driven `systemctl restart` of the Valkey service after TLS secret versions are updated and before forgeproxy slot rollout starts, preventing first-apply CA/cert skew during forgeproxy init probes
 
 ### 4. Optional ghe-key-lookup Sidecar
 - Set `enable_ghe_key_lookup = true` to deploy sidecars.
@@ -295,6 +296,11 @@ Update `upstream_hostname`, `upstream_port`, `upstream_ssh_port`, `upstream_api_
 
 ### Rotate Valkey password
 Terraform generates and persists the Valkey auth token internally. To rotate it, update the Terraform-managed secret and then restart valkey and forgeproxy.
+
+### Valkey TLS restart sequencing
+- New input `valkey_service_name` (default `valkey`) controls which systemd unit Terraform restarts during TLS secret updates.
+- New input `valkey_reload_wait_timeout_secs` (default `600`) controls how long Terraform waits for SSM online status and restart completion.
+- If your Valkey AMI uses a different unit name, set `valkey_service_name` accordingly.
 
 ## Region and Partition Support
 
