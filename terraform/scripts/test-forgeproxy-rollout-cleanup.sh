@@ -120,6 +120,6 @@ env \
 grep -q "Reconciling active slot (green-asg) to 1 instances" "${tmpdir}/cleanup.out"
 grep -q "Scaling inactive slot (blue-asg) down to zero" "${tmpdir}/cleanup.out"
 grep -q '^green-asg,1,1,4$' "${tmpdir}/state/asg-updates.csv"
-grep -q '^blue-asg,0,0,$' "${tmpdir}/state/asg-updates.csv"
+grep -q '^blue-asg,0,0,4$' "${tmpdir}/state/asg-updates.csv"
 
 echo "forgeproxy-rollout-cleanup tests passed"
