@@ -54,7 +54,7 @@ vim terraform.tfvars  # Edit with your values
 **Optional post-cutover soak controls:**
 - `forgeproxy_cutover_check_interval_secs` controls how often the cleanup helper probes the client-facing HTTPS endpoint after listener cutover.
 - `forgeproxy_cutover_required_consecutive_successes` controls how many consecutive successful soak rounds are required before the old slot is scaled down.
-- `forgeproxy_cutover_timeout_secs` bounds how long cleanup will keep trying before the apply fails and leaves the old slot intact.
+- `forgeproxy_cutover_timeout_secs` bounds how long cleanup will keep trying before it records a follow-up cleanup requirement and leaves the old slot intact.
 - Failed post-cutover probes print the HTTP status and the first 4096 bytes of the response body, so `/readyz` 503 responses include the failing dependency detail in Terraform output.
 
 **Optional background-work pressure controls:**
@@ -250,7 +250,13 @@ The resulting rollout behavior is:
 - Startup pre-warm still has a configurable `prewarm_force_open_secs` timeout, but failed target-group checks no longer terminate instances directly.
 - Listener cutover moves all production traffic to a single slot at a time, avoiding mixed `git_revision` values from `/healthz`.
 - After listener cutover, Terraform performs a bounded HTTPS soak against `/readyz` and `/healthz` through each configured client-facing hostname. Once the soak passes, cleanup reconciles the live slot back to `forgeproxy_count` and scales the inactive slot down to zero.
-- If that soak never stabilizes before `forgeproxy_cutover_timeout_secs`, `terraform apply` fails and the old slot is left running instead of being terminated.
+- If that soak never stabilizes before `forgeproxy_cutover_timeout_secs`, cleanup exits best-effort and leaves the old slot running instead of failing the full deployment apply.
+- Cleanup also performs best-effort Secrets Manager `AWSPREVIOUS` staging-label reconciliation for the forgeproxy service-config secret to reduce deposed secret-version deletion races.
+- Run follow-up cleanup with retries after deployment to converge non-critical cleanup:
+
+```bash
+terraform/scripts/forgeproxy-post-deploy-cleanup.sh
+```
 - If you force `forgeproxy_active_slot` to the currently live slot during a launch-template change, the prepare helper still fails fast instead of attempting an in-place turnover on the production slot.
 
 Two helper entrypoints back this sequencing:
