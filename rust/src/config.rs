@@ -640,6 +640,10 @@ pub struct CloneConfig {
     /// busy instances.
     #[serde(default = "default_index_pack_threads")]
     pub index_pack_threads: usize,
+    /// Maximum concurrent background deep validations (`git fsck
+    /// --connectivity-only`) that may run on this instance.
+    #[serde(default = "default_max_concurrent_deep_validations")]
+    pub max_concurrent_deep_validations: usize,
     /// Strategy used after tee capture successfully materializes the cloned
     /// pack into a staging generation.
     #[serde(default)]
@@ -716,6 +720,7 @@ impl Default for CloneConfig {
                 default_max_concurrent_local_upload_packs_per_repo(),
             local_upload_pack_threads: default_local_upload_pack_threads(),
             index_pack_threads: default_index_pack_threads(),
+            max_concurrent_deep_validations: default_max_concurrent_deep_validations(),
             hydration_mode: HydrationMode::default(),
             prepare_published_generation_indexes: false,
             generation_coalescing_window_secs: 0,
@@ -807,6 +812,10 @@ fn default_max_concurrent_local_upload_packs_per_repo() -> usize {
 
 fn default_index_pack_threads() -> usize {
     DEFAULT_INDEX_PACK_THREADS
+}
+
+fn default_max_concurrent_deep_validations() -> usize {
+    1
 }
 
 fn default_local_upload_pack_threads() -> usize {
@@ -1260,6 +1269,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "max_concurrent_local_upload_packs_per_repo",
             "local_upload_pack_threads",
             "index_pack_threads",
+            "max_concurrent_deep_validations",
             "hydration_mode",
             "prepare_published_generation_indexes",
             "generation_coalescing_window_secs",
@@ -1544,6 +1554,10 @@ fn validate_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.clone.index_pack_threads > 0,
         "clone.index_pack_threads must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.clone.max_concurrent_deep_validations > 0,
+        "clone.max_concurrent_deep_validations must be greater than 0"
     );
     anyhow::ensure!(
         config.pack_cache.max_percent > 0.0 && config.pack_cache.max_percent <= 1.0,
