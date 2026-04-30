@@ -135,6 +135,9 @@ pub struct AppState {
     /// Semaphore limiting background pack-cache warming work. This is separate
     /// from bundle/MIDX generation so both proactive lanes can make progress.
     pub pack_cache_warming_semaphore: Arc<Semaphore>,
+    /// Semaphore limiting background deep validation (`git fsck
+    /// --connectivity-only`) work.
+    pub deep_validation_semaphore: Arc<Semaphore>,
     /// Semaphore limiting request-time pack-cache delta generation. This is
     /// intentionally separate from background bundle generation so foreground
     /// clone misses do not queue behind proactive warming or index preparation.
@@ -919,6 +922,11 @@ fn ensure_reload_compatible(current: &Config, next: &Config) -> Result<()> {
         "clone.index_pack_threads",
     )?;
     ensure_same(
+        &current.clone.max_concurrent_deep_validations,
+        &next.clone.max_concurrent_deep_validations,
+        "clone.max_concurrent_deep_validations",
+    )?;
+    ensure_same(
         &current.clone.tee_cleanup_interval_secs,
         &next.clone.tee_cleanup_interval_secs,
         "clone.tee_cleanup_interval_secs",
@@ -1571,6 +1579,9 @@ async fn build_app_state(
         )),
         pack_cache_warming_semaphore: Arc::new(Semaphore::new(
             config.pack_cache.max_concurrent_background_warmings,
+        )),
+        deep_validation_semaphore: Arc::new(Semaphore::new(
+            config.clone.max_concurrent_deep_validations,
         )),
         request_pack_delta_semaphore: Arc::new(Semaphore::new(
             config.pack_cache.max_concurrent_request_deltas,

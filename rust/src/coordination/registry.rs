@@ -1876,102 +1876,95 @@ async fn publish_ready_repo(
     Ok(staged_repo_path.to_path_buf())
 }
 
-/// Spawn a background task to write MIDX and bitmap indexes on a
-/// just-published generation.  This keeps bitmap preparation off the
-/// publish-critical path so the generation is immediately available to
-/// `git upload-pack` readers.  The first few clones after publish may run
-/// without bitmaps (slower object enumeration); once the background task
-/// completes, subsequent clones benefit from the bitmap.
-fn spawn_published_generation_index_preparation(
+/// Write MIDX and bitmap indexes on a just-published generation.
+///
+/// This runs in the background pipeline after publish so the generation is
+/// immediately available to `git upload-pack` readers.
+async fn run_published_generation_index_preparation(
     state: crate::AppState,
     owner_repo: String,
     published_path: PathBuf,
-    published_lease: PublishedGenerationLease,
     source: String,
 ) {
     if !state.config().clone.prepare_published_generation_indexes {
         return;
     }
+    let started_at = Instant::now();
+    info!(
+        repo = %owner_repo,
+        source,
+        path = %published_path.display(),
+        pack_threads = state.bundle_pack_threads,
+        "starting background bitmap/MIDX preparation for published generation"
+    );
 
-    tokio::spawn(async move {
-        let _published_lease = published_lease;
-        let started_at = Instant::now();
+    if !state
+        .wait_for_background_work_admission(
+            "published_generation_index_preparation",
+            Some(&owner_repo),
+        )
+        .await
+    {
         info!(
             repo = %owner_repo,
             source,
             path = %published_path.display(),
-            pack_threads = state.bundle_pack_threads,
-            "starting background bitmap/MIDX preparation for published generation"
+            "abandoning background bitmap/MIDX preparation after repeated foreground clone/CPU pressure"
         );
+        return;
+    }
 
-        if !state
-            .wait_for_background_work_admission(
-                "published_generation_index_preparation",
-                Some(&owner_repo),
-            )
-            .await
-        {
+    let permit = match state
+        .bundle_generation_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                source,
+                path = %published_path.display(),
+                error = %error,
+                "skipping background bitmap/MIDX preparation because semaphore is closed"
+            );
+            return;
+        }
+    };
+
+    if !try_confirm_idle_local_upload_pack_gate(&state, &owner_repo, &source) {
+        return;
+    }
+
+    let result = crate::git::commands::git_prepare_published_generation_indexes(
+        &published_path,
+        state.bundle_pack_threads,
+    )
+    .await;
+    drop(permit);
+
+    match result {
+        Ok(()) => {
             info!(
                 repo = %owner_repo,
                 source,
                 path = %published_path.display(),
-                "abandoning background bitmap/MIDX preparation after repeated foreground clone/CPU pressure"
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "finished background bitmap/MIDX preparation for published generation"
             );
-            return;
         }
-
-        let permit = match state
-            .bundle_generation_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-        {
-            Ok(permit) => permit,
-            Err(error) => {
-                warn!(
-                    repo = %owner_repo,
-                    source,
-                    path = %published_path.display(),
-                    error = %error,
-                    "skipping background bitmap/MIDX preparation because semaphore is closed"
-                );
-                return;
-            }
-        };
-
-        if !try_confirm_idle_local_upload_pack_gate(&state, &owner_repo, &source) {
-            return;
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                source,
+                path = %published_path.display(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                error = %error,
+                "background bitmap/MIDX preparation failed for published generation"
+            );
         }
-
-        let result = crate::git::commands::git_prepare_published_generation_indexes(
-            &published_path,
-            state.bundle_pack_threads,
-        )
-        .await;
-        drop(permit);
-
-        match result {
-            Ok(()) => {
-                info!(
-                    repo = %owner_repo,
-                    source,
-                    path = %published_path.display(),
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    "finished background bitmap/MIDX preparation for published generation"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    repo = %owner_repo,
-                    source,
-                    path = %published_path.display(),
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    error = %error,
-                    "background bitmap/MIDX preparation failed for published generation"
-                );
-            }
-        }
-    });
+    }
 }
 
 fn try_confirm_idle_local_upload_pack_gate(
@@ -3249,32 +3242,14 @@ async fn publish_repo_mirror_generation_inner(
         );
         let published_path =
             publish_ready_repo(state, owner_repo, &staged_repo_path, source).await?;
-        let published_lease = lease_published_generation_path(state, owner_repo, &published_path);
-        spawn_published_generation_index_preparation(
-            state.clone(),
-            owner_repo.to_string(),
-            published_path.clone(),
-            published_lease,
-            source.to_string(),
-        );
-        let pack_cache_warming_lease =
+        let post_publish_lease =
             lease_published_generation_path(state, owner_repo, &published_path);
-        spawn_pack_cache_warming(
+        spawn_post_publish_background_work(
             state.clone(),
             owner_repo.to_string(),
             published_path.clone(),
-            pack_cache_warming_lease,
-            source.to_string(),
-        );
-        spawn_generation_deep_validation(
-            owner_repo.to_string(),
-            published_path.clone(),
-            source.to_string(),
-        );
-        spawn_mirror_deep_validation(
-            state.clone(),
-            owner_repo.to_string(),
             mirror_path.clone(),
+            post_publish_lease,
             source.to_string(),
         );
         info!(
@@ -4335,6 +4310,24 @@ async fn check_ready_repo(owner_repo: &str, repo_path: &Path, source: &str) -> R
     Ok(())
 }
 
+async fn check_ready_repo_background(
+    owner_repo: &str,
+    repo_path: &Path,
+    source: &str,
+) -> Result<()> {
+    if !crate::cache::manager::is_usable_bare_repo(repo_path) {
+        bail!("repo is missing required bare-repo refs after {source}");
+    }
+
+    crate::git::commands::git_fsck_connectivity_only_background(repo_path)
+        .await
+        .with_context(|| {
+            format!("connectivity validation failed for {owner_repo} after {source}")
+        })?;
+
+    Ok(())
+}
+
 async fn quick_check_ready_repo(
     repo_path: &Path,
     source: &str,
@@ -4486,143 +4479,245 @@ async fn repair_existing_repo_mirror_from_tee_capture(
     result
 }
 
-fn spawn_generation_deep_validation(owner_repo: String, generation_path: PathBuf, source: String) {
+fn spawn_post_publish_background_work(
+    state: crate::AppState,
+    owner_repo: String,
+    published_path: PathBuf,
+    mirror_path: PathBuf,
+    published_lease: PublishedGenerationLease,
+    source: String,
+) {
     tokio::spawn(async move {
-        let validation_started_at = Instant::now();
+        run_generation_deep_validation(
+            state.clone(),
+            owner_repo.clone(),
+            published_path.clone(),
+            source.clone(),
+        )
+        .await;
+        run_published_generation_index_preparation(
+            state.clone(),
+            owner_repo.clone(),
+            published_path.clone(),
+            source.clone(),
+        )
+        .await;
+        run_pack_cache_warming(
+            state.clone(),
+            owner_repo.clone(),
+            published_path.clone(),
+            published_lease,
+            source.clone(),
+        )
+        .await;
+        run_mirror_deep_validation(state, owner_repo, mirror_path, source).await;
+    });
+}
+
+async fn run_generation_deep_validation(
+    state: crate::AppState,
+    owner_repo: String,
+    generation_path: PathBuf,
+    source: String,
+) {
+    if !state
+        .wait_for_background_work_admission("generation_deep_validation", Some(&owner_repo))
+        .await
+    {
         info!(
             repo = %owner_repo,
             source,
             path = %generation_path.display(),
-            "starting background deep validation for published generation"
+            "abandoning background deep validation after repeated foreground clone/CPU pressure"
         );
-        match check_ready_repo(&owner_repo, &generation_path, &source).await {
-            Ok(()) => {
-                info!(
-                    repo = %owner_repo,
-                    source,
-                    path = %generation_path.display(),
-                    elapsed_ms = validation_started_at.elapsed().as_millis(),
-                    "finished background deep validation for published generation"
-                );
-            }
-            Err(error) => {
-                error!(
-                    repo = %owner_repo,
-                    source,
-                    path = %generation_path.display(),
-                    elapsed_ms = validation_started_at.elapsed().as_millis(),
-                    error = %error,
-                    "published generation failed background deep validation"
-                );
-            }
+        return;
+    }
+
+    let permit = match state
+        .deep_validation_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            warn!(
+                repo = %owner_repo,
+                source,
+                path = %generation_path.display(),
+                error = %error,
+                "skipping background deep validation because semaphore is closed"
+            );
+            return;
         }
-    });
+    };
+
+    let validation_started_at = Instant::now();
+    info!(
+        repo = %owner_repo,
+        source,
+        path = %generation_path.display(),
+        "starting background deep validation for published generation"
+    );
+    match check_ready_repo_background(&owner_repo, &generation_path, &source).await {
+        Ok(()) => {
+            info!(
+                repo = %owner_repo,
+                source,
+                path = %generation_path.display(),
+                elapsed_ms = validation_started_at.elapsed().as_millis(),
+                "finished background deep validation for published generation"
+            );
+        }
+        Err(error) => {
+            error!(
+                repo = %owner_repo,
+                source,
+                path = %generation_path.display(),
+                elapsed_ms = validation_started_at.elapsed().as_millis(),
+                error = %error,
+                "published generation failed background deep validation"
+            );
+        }
+    }
+    drop(permit);
 }
 
-fn spawn_mirror_deep_validation(
+async fn run_mirror_deep_validation(
     state: crate::AppState,
     owner_repo: String,
     mirror_path: PathBuf,
     source: String,
 ) {
-    tokio::spawn(async move {
-        let Some(_publish_guard) = try_acquire_local_repo_publish_guard(&state, &owner_repo).await
-        else {
-            info!(
+    let Some(_publish_guard) = try_acquire_local_repo_publish_guard(&state, &owner_repo).await
+    else {
+        info!(
+            repo = %owner_repo,
+            source,
+            path = %mirror_path.display(),
+            "skipping background deep validation for mirror because publish work is already in progress"
+        );
+        return;
+    };
+
+    if !state.cache_manager.has_repo_at(&mirror_path) {
+        return;
+    }
+
+    if !state
+        .wait_for_background_work_admission("mirror_deep_validation", Some(&owner_repo))
+        .await
+    {
+        info!(
+            repo = %owner_repo,
+            source,
+            path = %mirror_path.display(),
+            "abandoning background deep validation for mirror after repeated foreground clone/CPU pressure"
+        );
+        return;
+    }
+
+    let permit = match state
+        .deep_validation_semaphore
+        .clone()
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(error) => {
+            warn!(
                 repo = %owner_repo,
                 source,
                 path = %mirror_path.display(),
-                "skipping background deep validation for mirror because publish work is already in progress"
+                error = %error,
+                "skipping background deep validation for mirror because semaphore is closed"
             );
             return;
-        };
-
-        if !state.cache_manager.has_repo_at(&mirror_path) {
-            return;
         }
+    };
 
-        let validation_root = state.cache_manager.base_path.join(".validation-work");
-        if let Err(error) = std::fs::create_dir_all(&validation_root) {
+    let validation_root = state.cache_manager.base_path.join(".validation-work");
+    if let Err(error) = std::fs::create_dir_all(&validation_root) {
+        error!(
+            repo = %owner_repo,
+            source,
+            path = %validation_root.display(),
+            error = %error,
+            "failed to create validation-work directory for background mirror validation"
+        );
+        return;
+    }
+    let temp_root = match tempfile::Builder::new()
+        .prefix("mirror-validate-")
+        .tempdir_in(&validation_root)
+    {
+        Ok(dir) => dir,
+        Err(error) => {
             error!(
                 repo = %owner_repo,
                 source,
-                path = %validation_root.display(),
+                path = %mirror_path.display(),
                 error = %error,
-                "failed to create validation-work directory for background mirror validation"
+                "failed to create tempdir for background mirror validation"
             );
             return;
         }
-        let temp_root = match tempfile::Builder::new()
-            .prefix("mirror-validate-")
-            .tempdir_in(&validation_root)
-        {
-            Ok(dir) => dir,
-            Err(error) => {
-                error!(
-                    repo = %owner_repo,
-                    source,
-                    path = %mirror_path.display(),
-                    error = %error,
-                    "failed to create tempdir for background mirror validation"
-                );
-                return;
-            }
-        };
-        let snapshot_path = temp_root.path().join("snapshot.git");
-        info!(
+    };
+    let snapshot_path = temp_root.path().join("snapshot.git");
+    info!(
+        repo = %owner_repo,
+        source,
+        mirror = %mirror_path.display(),
+        snapshot = %snapshot_path.display(),
+        "creating local snapshot for background mirror validation"
+    );
+    if let Err(error) =
+        crate::git::commands::git_clone_bare_local(&mirror_path, &snapshot_path).await
+    {
+        error!(
             repo = %owner_repo,
             source,
             mirror = %mirror_path.display(),
             snapshot = %snapshot_path.display(),
-            "creating local snapshot for background mirror validation"
+            error = %error,
+            "failed to create local snapshot for background mirror validation"
         );
-        if let Err(error) =
-            crate::git::commands::git_clone_bare_local(&mirror_path, &snapshot_path).await
-        {
+        return;
+    }
+    drop(_publish_guard);
+
+    let validation_started_at = Instant::now();
+    info!(
+        repo = %owner_repo,
+        source,
+        mirror = %mirror_path.display(),
+        snapshot = %snapshot_path.display(),
+        "starting background deep validation for mirror snapshot"
+    );
+    match check_ready_repo_background(&owner_repo, &snapshot_path, &source).await {
+        Ok(()) => {
+            info!(
+                repo = %owner_repo,
+                source,
+                mirror = %mirror_path.display(),
+                snapshot = %snapshot_path.display(),
+                elapsed_ms = validation_started_at.elapsed().as_millis(),
+                "finished background deep validation for mirror snapshot"
+            );
+        }
+        Err(error) => {
             error!(
                 repo = %owner_repo,
                 source,
                 mirror = %mirror_path.display(),
                 snapshot = %snapshot_path.display(),
+                elapsed_ms = validation_started_at.elapsed().as_millis(),
                 error = %error,
-                "failed to create local snapshot for background mirror validation"
+                "mirror snapshot failed background deep validation"
             );
-            return;
         }
-        drop(_publish_guard);
-
-        let validation_started_at = Instant::now();
-        info!(
-            repo = %owner_repo,
-            source,
-            mirror = %mirror_path.display(),
-            snapshot = %snapshot_path.display(),
-            "starting background deep validation for mirror snapshot"
-        );
-        match check_ready_repo(&owner_repo, &snapshot_path, &source).await {
-            Ok(()) => {
-                info!(
-                    repo = %owner_repo,
-                    source,
-                    mirror = %mirror_path.display(),
-                    snapshot = %snapshot_path.display(),
-                    elapsed_ms = validation_started_at.elapsed().as_millis(),
-                    "finished background deep validation for mirror snapshot"
-                );
-            }
-            Err(error) => {
-                error!(
-                    repo = %owner_repo,
-                    source,
-                    mirror = %mirror_path.display(),
-                    snapshot = %snapshot_path.display(),
-                    elapsed_ms = validation_started_at.elapsed().as_millis(),
-                    error = %error,
-                    "mirror snapshot failed background deep validation"
-                );
-            }
-        }
-    });
+    }
+    drop(permit);
 }
 
 async fn ensure_bare_head_ref(repo_path: &Path) -> Result<()> {

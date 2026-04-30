@@ -1102,7 +1102,19 @@ pub async fn git_index_pack_to_idx(
 /// Run `git fsck --connectivity-only` in a bare repo.
 #[instrument(fields(repo = %repo_path.display()))]
 pub async fn git_fsck_connectivity_only(repo_path: &Path) -> Result<()> {
-    let mut cmd = Command::new("git");
+    git_fsck_connectivity_only_with_priority(repo_path, GitProcessPriority::Normal).await
+}
+
+#[instrument(fields(repo = %repo_path.display()))]
+pub async fn git_fsck_connectivity_only_background(repo_path: &Path) -> Result<()> {
+    git_fsck_connectivity_only_with_priority(repo_path, GitProcessPriority::Background).await
+}
+
+async fn git_fsck_connectivity_only_with_priority(
+    repo_path: &Path,
+    priority: GitProcessPriority,
+) -> Result<()> {
+    let mut cmd = git_command(priority);
     cmd.arg("-C")
         .arg(repo_path)
         .arg("fsck")
