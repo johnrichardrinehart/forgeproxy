@@ -40,6 +40,8 @@ forgeproxy_cutover_timeout_secs = 600
 # forgeproxy_ssh_host_key_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:shared/forgeproxy-ssh-host-key-AbCdEf"
 # forgeproxy_ssh_host_key_kms_key_arn = "arn:aws:kms:us-east-1:123456789012:key/11111111-2222-3333-4444-555555555555"
 valkey_instance_type      = "r6i.large"
+# valkey_service_name = "valkey"
+# valkey_reload_wait_timeout_secs = 600
 
 # Volume sizes (GB)
 forgeproxy_root_volume_gb = 50

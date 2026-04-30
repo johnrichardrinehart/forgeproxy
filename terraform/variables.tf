@@ -218,6 +218,23 @@ variable "valkey_instance_type" {
   description = "EC2 instance type for Valkey instance"
 }
 
+variable "valkey_service_name" {
+  type        = string
+  default     = "valkey"
+  description = "Systemd service name Terraform should restart on the valkey instance after TLS secret rotation."
+}
+
+variable "valkey_reload_wait_timeout_secs" {
+  type        = number
+  default     = 600
+  description = "Maximum seconds to wait for SSM readiness and valkey restart completion after TLS secret writes."
+
+  validation {
+    condition     = var.valkey_reload_wait_timeout_secs >= 60
+    error_message = "valkey_reload_wait_timeout_secs must be at least 60."
+  }
+}
+
 variable "forgeproxy_root_volume_gb" {
   type        = number
   default     = 50
