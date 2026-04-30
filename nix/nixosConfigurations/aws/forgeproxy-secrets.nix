@@ -209,6 +209,43 @@ let
     }
     EOF
   '';
+
+  awsCacheScrubSchedule = pkgs.writeShellScript "forgeproxy-cache-scrub-schedule" ''
+        set -euo pipefail
+
+        if ! systemctl cat forgeproxy-cache-scrub.timer >/dev/null 2>&1; then
+          exit 0
+        fi
+
+        _IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+        _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
+        CACHE_SCRUB_ON_CALENDAR=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# FORGEPROXY_CACHE_SCRUB_ON_CALENDAR=//p' | ${pkgs.coreutils}/bin/head -n1)
+        CACHE_SCRUB_INTERVAL_SECS=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# FORGEPROXY_CACHE_SCRUB_INTERVAL_SECS=//p' | ${pkgs.coreutils}/bin/head -n1)
+
+        if [ -z "''${CACHE_SCRUB_ON_CALENDAR:-}" ]; then
+          CACHE_SCRUB_ON_CALENDAR="*-*-* 00:00:00 UTC"
+        fi
+        if [ -z "''${CACHE_SCRUB_INTERVAL_SECS:-}" ]; then
+          CACHE_SCRUB_INTERVAL_SECS="86400"
+        fi
+
+        if ! [[ "$CACHE_SCRUB_INTERVAL_SECS" =~ ^[0-9]+$ ]]; then
+          echo "forgeproxy-cache-scrub-schedule: invalid FORGEPROXY_CACHE_SCRUB_INTERVAL_SECS=$CACHE_SCRUB_INTERVAL_SECS" >&2
+          exit 1
+        fi
+
+        mkdir -p /run/systemd/system/forgeproxy-cache-scrub.timer.d
+        cat > /run/systemd/system/forgeproxy-cache-scrub.timer.d/override.conf <<EOF
+    [Timer]
+    OnBootSec=
+    OnCalendar=$CACHE_SCRUB_ON_CALENDAR
+    OnUnitActiveSec=''${CACHE_SCRUB_INTERVAL_SECS}s
+    Persistent=true
+    EOF
+
+        systemctl daemon-reload
+        systemctl restart forgeproxy-cache-scrub.timer
+  '';
 in
 {
   services.forgeproxy-secrets = lib.mkDefault {
@@ -248,4 +285,18 @@ in
   };
 
   services.forgeproxy-nginx.sshProxy.enable = lib.mkDefault true;
+
+  systemd.services.forgeproxy-cache-scrub-schedule = {
+    description = "Apply forgeproxy cache scrub timer schedule from EC2 user-data";
+    after = [ "network-online.target" ];
+    wants = [ "network-online.target" ];
+    before = [ "forgeproxy-cache-scrub.timer" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+    };
+    script = ''
+      exec ${awsCacheScrubSchedule}
+    '';
+  };
 }
