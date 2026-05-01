@@ -93,7 +93,8 @@ let
       auth_token_env: "VALKEY_AUTH_TOKEN"
 
     auth:
-      ssh_cache_ttl: 300
+      ssh_user_lookup_cache_ttl: 30
+      ssh_repo_access_cache_ttl: 30
       http_cache_ttl: 120
       negative_cache_ttl: 60
 

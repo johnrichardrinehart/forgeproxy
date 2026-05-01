@@ -45,6 +45,8 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     s3_presigned_url_ttl                          = var.s3_presigned_url_ttl
     local_cache_max_percent                       = var.local_cache_max_percent
     eviction_policy                               = var.eviction_policy
+    auth_ssh_user_lookup_cache_ttl                = var.auth_ssh_user_lookup_cache_ttl
+    auth_ssh_repo_access_cache_ttl                = var.auth_ssh_repo_access_cache_ttl
     prepare_published_generation_indexes          = var.prepare_published_generation_indexes
     generation_coalescing_window_secs             = var.generation_coalescing_window_secs
     global_short_circuit_upstream_secs            = var.global_short_circuit_upstream_secs
@@ -384,8 +386,6 @@ resource "aws_secretsmanager_secret_version" "ghe_key_lookup_config" {
     ssh_target_endpoint  = var.ghe_key_lookup_ssh_target_endpoint
     ssh_port             = var.ghe_key_lookup_ssh_port
     ghe_url              = trimspace(var.ghe_key_lookup_ghe_url)
-    cache_ttl_pos        = var.ghe_key_lookup_cache_ttl_pos
-    cache_ttl_neg        = var.ghe_key_lookup_cache_ttl_neg
   })
 
   depends_on = [aws_secretsmanager_secret_version.bootstrap_secrets]

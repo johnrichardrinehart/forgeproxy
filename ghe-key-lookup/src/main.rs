@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::SystemTime,
-    time::{Duration, Instant},
-};
+use std::{path::PathBuf, sync::Arc, time::SystemTime};
 
 use anyhow::Context;
 use axum::{
@@ -17,7 +11,7 @@ use axum::{
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 // ── CLI (all fields optional — defaults live in `resolve()`) ──────────────────
 
@@ -77,14 +71,6 @@ struct Cli {
     /// Only used when --ssh-control-path is set [default: yes]
     #[arg(long)]
     ssh_control_persist: Option<String>,
-
-    /// Seconds to cache a positive result (key found) [default: 300]
-    #[arg(long)]
-    cache_ttl_pos: Option<u64>,
-
-    /// Seconds to cache a negative result (key not found); 0 disables [default: 30]
-    #[arg(long)]
-    cache_ttl_neg: Option<u64>,
 }
 
 // ── Config file (TOML) ────────────────────────────────────────────────────────
@@ -102,8 +88,6 @@ struct ConfigFile {
     ssh_port: Option<u16>,
     ssh_control_path: Option<String>,
     ssh_control_persist: Option<String>,
-    cache_ttl_pos: Option<u64>,
-    cache_ttl_neg: Option<u64>,
 }
 
 // ── Resolved config ───────────────────────────────────────────────────────────
@@ -123,8 +107,6 @@ struct ResolvedConfig {
     ssh_port: u16,
     ssh_control_path: String,
     ssh_control_persist: String,
-    cache_ttl_pos: u64,
-    cache_ttl_neg: u64,
 }
 
 /// Merge: CLI flags > config-file values > hardcoded defaults.
@@ -171,10 +153,6 @@ fn resolve(cli: Cli, file: ConfigFile) -> anyhow::Result<ResolvedConfig> {
             .ssh_control_persist
             .or(file.ssh_control_persist)
             .unwrap_or_else(|| "yes".to_owned()),
-
-        cache_ttl_pos: cli.cache_ttl_pos.or(file.cache_ttl_pos).unwrap_or(300),
-
-        cache_ttl_neg: cli.cache_ttl_neg.or(file.cache_ttl_neg).unwrap_or(30),
     }
     .validate_identity_source()
 }
@@ -204,27 +182,11 @@ impl ResolvedConfig {
     }
 }
 
-// ── Cache ─────────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-enum CacheValue {
-    Hit(Vec<KeyRow>),
-    Miss,
-}
-
-struct CacheEntry {
-    value: CacheValue,
-    expires_at: Instant,
-}
-
-type Cache = Mutex<HashMap<String, CacheEntry>>;
-
 // ── State ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<ResolvedConfig>,
-    cache: Arc<Cache>,
 }
 
 // ── Response types ────────────────────────────────────────────────────────────
@@ -280,11 +242,6 @@ async fn lookup_key(
             .into_response();
     }
 
-    if let Some(cached) = cache_get(&state.cache, &fp) {
-        debug!(fingerprint = %fp, "cache hit");
-        return respond(cached);
-    }
-
     match ssh_query(&state.config, &fp).await {
         Err(e) => {
             error!("SSH query failed: {e:#}");
@@ -294,66 +251,20 @@ async fn lookup_key(
             )
                 .into_response()
         }
-        Ok(rows) => {
-            let value = if rows.is_empty() {
-                cache_insert(
-                    &state.cache,
-                    fp,
-                    CacheValue::Miss,
-                    Duration::from_secs(state.config.cache_ttl_neg),
-                );
-                CacheValue::Miss
-            } else {
-                cache_insert(
-                    &state.cache,
-                    fp,
-                    CacheValue::Hit(rows.clone()),
-                    Duration::from_secs(state.config.cache_ttl_pos),
-                );
-                CacheValue::Hit(rows)
-            };
-            respond(value)
-        }
+        Ok(rows) => respond(rows),
     }
 }
 
-fn respond(value: CacheValue) -> axum::response::Response {
-    match value {
-        CacheValue::Hit(rows) => (StatusCode::OK, Json(rows)).into_response(),
-        CacheValue::Miss => (
+fn respond(rows: Vec<KeyRow>) -> axum::response::Response {
+    if rows.is_empty() {
+        (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"message": "Not Found"})),
         )
-            .into_response(),
+            .into_response()
+    } else {
+        (StatusCode::OK, Json(rows)).into_response()
     }
-}
-
-// ── Cache helpers ─────────────────────────────────────────────────────────────
-
-fn cache_get(cache: &Cache, key: &str) -> Option<CacheValue> {
-    let mut map = cache.lock().expect("cache lock poisoned");
-    match map.get(key) {
-        Some(entry) if entry.expires_at > Instant::now() => Some(entry.value.clone()),
-        Some(_) => {
-            map.remove(key);
-            None
-        }
-        None => None,
-    }
-}
-
-fn cache_insert(cache: &Cache, key: String, value: CacheValue, ttl: Duration) {
-    if ttl.is_zero() {
-        return;
-    }
-    let mut map = cache.lock().expect("cache lock poisoned");
-    map.insert(
-        key,
-        CacheEntry {
-            value,
-            expires_at: Instant::now() + ttl,
-        },
-    );
 }
 
 // ── SSH + SQL ─────────────────────────────────────────────────────────────────
@@ -738,8 +649,6 @@ async fn main() -> anyhow::Result<()> {
         listen = %config.listen,
         ssh_target_endpoint = %config.ssh_target_endpoint,
         ghe_url = %config.ghe_url,
-        cache_ttl_pos = config.cache_ttl_pos,
-        cache_ttl_neg = config.cache_ttl_neg,
         "starting ghe-key-lookup",
     );
 
@@ -747,7 +656,6 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         config: Arc::new(config),
-        cache: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let app = Router::new()
@@ -854,7 +762,6 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
         // ghe_url defaults to https://<ssh_target_endpoint>
         assert_eq!(resolved.ghe_url, "https://ghe.example.com");
         assert_eq!(resolved.listen, "0.0.0.0:3000");
-        assert_eq!(resolved.cache_ttl_pos, 300);
     }
 
     #[test]
@@ -879,25 +786,6 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
     }
 
     #[test]
-    fn resolve_cli_overrides_file() {
-        let file = ConfigFile {
-            cache_ttl_pos: Some(600),
-            ..minimal_file()
-        };
-        let cli = Cli::parse_from(["ghe-key-lookup", "--cache-ttl-pos", "999"]);
-        assert_eq!(resolve(cli, file).unwrap().cache_ttl_pos, 999);
-    }
-
-    #[test]
-    fn resolve_file_used_when_cli_absent() {
-        let file = ConfigFile {
-            cache_ttl_pos: Some(600),
-            ..minimal_file()
-        };
-        assert_eq!(resolve(empty_cli(), file).unwrap().cache_ttl_pos, 600);
-    }
-
-    #[test]
     fn resolve_required_field_missing_errors() {
         let file = ConfigFile {
             ssh_target_endpoint: Some("ghe.example.com".to_owned()),
@@ -914,7 +802,6 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
             identity_file        = "/run/secrets/key"
             ssh_target_endpoint  = "ghe.example.com"
             ghe_url              = "https://ghe.corp.example.com"
-            cache_ttl_pos        = 600
             ssh_control_path     = "/run/ghe-key-lookup/ctrl"
             ssh_control_persist  = "120"
         "#;
@@ -922,7 +809,6 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
         let resolved = resolve(empty_cli(), file).unwrap();
         assert_eq!(resolved.ssh_target_endpoint, "ghe.example.com");
         assert_eq!(resolved.ghe_url, "https://ghe.corp.example.com");
-        assert_eq!(resolved.cache_ttl_pos, 600);
         assert_eq!(resolved.ssh_control_path, "/run/ghe-key-lookup/ctrl");
         assert_eq!(
             resolved.identity_keyring_key.as_deref(),
@@ -954,8 +840,6 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
             ssh_port: 122,
             ssh_control_path: "".to_owned(),
             ssh_control_persist: "yes".to_owned(),
-            cache_ttl_pos: 300,
-            cache_ttl_neg: 30,
         }
     }
 
@@ -1014,76 +898,5 @@ id\tkey\ttitle\tcreated_at\tverified\tread_only\tlast_used\tuser_id\trepository_
         assert!(!args.iter().any(|a| a == "-i"));
         assert!(!args.iter().any(|a| a == "/run/secrets/key"));
         assert!(args.contains(&"admin@ghe.example.com".to_owned()));
-    }
-
-    // ── Cache tests ───────────────────────────────────────────────────────────
-
-    fn make_cache() -> Arc<Cache> {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
-
-    #[test]
-    fn cache_miss_on_empty() {
-        assert!(cache_get(&make_cache(), "abc123").is_none());
-    }
-
-    #[test]
-    fn cache_hit_within_ttl() {
-        let cache = make_cache();
-        cache_insert(
-            &cache,
-            "abc123".to_owned(),
-            CacheValue::Miss,
-            Duration::from_secs(60),
-        );
-        assert!(matches!(
-            cache_get(&cache, "abc123"),
-            Some(CacheValue::Miss)
-        ));
-    }
-
-    #[test]
-    fn cache_miss_after_ttl_expires() {
-        let cache = make_cache();
-        cache_insert(
-            &cache,
-            "abc123".to_owned(),
-            CacheValue::Miss,
-            Duration::from_secs(1),
-        );
-        {
-            let mut map = cache.lock().unwrap();
-            map.get_mut("abc123").unwrap().expires_at = Instant::now() - Duration::from_secs(1);
-        }
-        assert!(cache_get(&cache, "abc123").is_none());
-        assert!(cache.lock().unwrap().get("abc123").is_none());
-    }
-
-    #[test]
-    fn cache_zero_ttl_skips_insert() {
-        let cache = make_cache();
-        cache_insert(
-            &cache,
-            "abc123".to_owned(),
-            CacheValue::Miss,
-            Duration::ZERO,
-        );
-        assert!(cache_get(&cache, "abc123").is_none());
-    }
-
-    #[test]
-    fn cache_positive_hit_stores_rows() {
-        let rows = parse_mysql_output(SAMPLE_OUTPUT, "https://ghe.example.com").unwrap();
-        let cache = make_cache();
-        cache_insert(
-            &cache,
-            "abc123".to_owned(),
-            CacheValue::Hit(rows),
-            Duration::from_secs(300),
-        );
-        match cache_get(&cache, "abc123") {
-            Some(CacheValue::Hit(cached)) => assert_eq!(cached[0].login, "octocat"),
-            _ => panic!("expected a cache hit"),
-        }
     }
 }

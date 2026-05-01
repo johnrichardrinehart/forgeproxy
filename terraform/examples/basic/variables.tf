@@ -276,16 +276,16 @@ variable "ghe_key_lookup_ssh_port" {
   description = "SSH port used by ghe-key-lookup to query GHE admin console."
 }
 
-variable "ghe_key_lookup_cache_ttl_pos" {
-  type        = number
-  default     = 300
-  description = "Positive lookup cache TTL in seconds for ghe-key-lookup."
-}
-
-variable "ghe_key_lookup_cache_ttl_neg" {
+variable "auth_ssh_user_lookup_cache_ttl" {
   type        = number
   default     = 30
-  description = "Negative lookup cache TTL in seconds for ghe-key-lookup."
+  description = "Valkey cache TTL in seconds for forgeproxy SSH fingerprint-to-username mappings."
+}
+
+variable "auth_ssh_repo_access_cache_ttl" {
+  type        = number
+  default     = 30
+  description = "Valkey cache TTL in seconds for forgeproxy SSH username/repo access decisions."
 }
 
 

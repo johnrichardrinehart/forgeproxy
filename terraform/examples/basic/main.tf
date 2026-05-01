@@ -55,8 +55,6 @@ module "forgeproxy" {
   ghe_key_lookup_ghe_url             = var.ghe_key_lookup_ghe_url
   ghe_key_lookup_ssh_user            = var.ghe_key_lookup_ssh_user
   ghe_key_lookup_ssh_port            = var.ghe_key_lookup_ssh_port
-  ghe_key_lookup_cache_ttl_pos       = var.ghe_key_lookup_cache_ttl_pos
-  ghe_key_lookup_cache_ttl_neg       = var.ghe_key_lookup_cache_ttl_neg
 
   vpc_cidr            = var.vpc_cidr
   public_subnet_cidr  = var.public_subnet_cidr
@@ -71,6 +69,8 @@ module "forgeproxy" {
 
   local_cache_max_percent                       = var.local_cache_max_percent
   eviction_policy                               = var.eviction_policy
+  auth_ssh_user_lookup_cache_ttl                = var.auth_ssh_user_lookup_cache_ttl
+  auth_ssh_repo_access_cache_ttl                = var.auth_ssh_repo_access_cache_ttl
   config_reload_enabled                         = var.config_reload_enabled
   config_reload_interval_secs                   = var.config_reload_interval_secs
   background_work_enabled                       = var.background_work_enabled
