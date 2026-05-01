@@ -31,6 +31,8 @@ let
         s3_presigned_url_ttl                       = 60
         local_cache_max_percent                    = 0.80
         eviction_policy                            = "lfu"
+        auth_ssh_user_lookup_cache_ttl            = 30
+        auth_ssh_repo_access_cache_ttl            = 30
         prepare_published_generation_indexes       = false
         generation_coalescing_window_secs          = 60
         global_short_circuit_upstream_secs         = 0

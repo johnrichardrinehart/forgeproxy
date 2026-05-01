@@ -36,7 +36,7 @@ pub async fn resolve_user_by_fingerprint(
             &state.valkey,
             &cache_key,
             username,
-            state.config().auth.ssh_cache_ttl,
+            state.config().auth.ssh_user_lookup_cache_ttl,
         )
         .await?;
     } else {
@@ -85,7 +85,7 @@ pub async fn check_ssh_repo_access(
         &state.valkey,
         &cache_key,
         perm_str,
-        state.config().auth.ssh_cache_ttl,
+        state.config().auth.ssh_repo_access_cache_ttl,
     )
     .await?;
 

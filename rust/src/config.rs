@@ -544,9 +544,12 @@ fn default_valkey_auth_env() -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AuthConfig {
-    /// Positive SSH auth cache TTL in seconds.
-    #[serde(default = "default_ssh_cache_ttl")]
-    pub ssh_cache_ttl: u64,
+    /// SSH fingerprint -> username cache TTL in seconds.
+    #[serde(default = "default_ssh_user_lookup_cache_ttl")]
+    pub ssh_user_lookup_cache_ttl: u64,
+    /// SSH username+repo permission cache TTL in seconds.
+    #[serde(default = "default_ssh_repo_access_cache_ttl")]
+    pub ssh_repo_access_cache_ttl: u64,
     /// Positive HTTP auth cache TTL in seconds.
     #[serde(default = "default_http_cache_ttl")]
     pub http_cache_ttl: u64,
@@ -561,7 +564,8 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            ssh_cache_ttl: default_ssh_cache_ttl(),
+            ssh_user_lookup_cache_ttl: default_ssh_user_lookup_cache_ttl(),
+            ssh_repo_access_cache_ttl: default_ssh_repo_access_cache_ttl(),
             http_cache_ttl: default_http_cache_ttl(),
             negative_cache_ttl: default_negative_cache_ttl(),
             webhook_secret_env: default_webhook_secret_env(),
@@ -569,8 +573,12 @@ impl Default for AuthConfig {
     }
 }
 
-fn default_ssh_cache_ttl() -> u64 {
-    300
+fn default_ssh_user_lookup_cache_ttl() -> u64 {
+    30
+}
+
+fn default_ssh_repo_access_cache_ttl() -> u64 {
+    30
 }
 
 fn default_http_cache_ttl() -> u64 {
@@ -1275,7 +1283,8 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
         ConfigSchemaNode::Proxy => &["ssh_listen", "http_listen"],
         ConfigSchemaNode::Valkey => &["endpoint", "tls", "ca_cert_file", "auth_token_env"],
         ConfigSchemaNode::Auth => &[
-            "ssh_cache_ttl",
+            "ssh_user_lookup_cache_ttl",
+            "ssh_repo_access_cache_ttl",
             "http_cache_ttl",
             "negative_cache_ttl",
             "webhook_secret_env",

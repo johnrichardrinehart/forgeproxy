@@ -22,8 +22,6 @@ let
       ssh_port = cfg.sshPort;
       ssh_control_path = cfg.sshControlPath;
       ssh_control_persist = cfg.sshControlPersist;
-      cache_ttl_pos = cfg.cacheTtlPos;
-      cache_ttl_neg = cfg.cacheTtlNeg;
     }
     // lib.optionalAttrs (cfg.identityFile != null) {
       identity_file = toString cfg.identityFile;
@@ -142,18 +140,6 @@ in
         seconds; "no" disables lingering (master exits with last client).
         Only used when sshControlPath is non-empty.
       '';
-    };
-
-    cacheTtlPos = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 300;
-      description = "Seconds to cache a positive result (key found).";
-    };
-
-    cacheTtlNeg = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 30;
-      description = "Seconds to cache a negative result (key not found). Set to 0 to disable.";
     };
 
     logLevel = lib.mkOption {

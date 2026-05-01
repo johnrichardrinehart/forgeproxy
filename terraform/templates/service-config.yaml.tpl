@@ -48,6 +48,8 @@ valkey:
   auth_token_env: "VALKEY_AUTH_TOKEN"
 
 auth:
+  ssh_user_lookup_cache_ttl: ${auth_ssh_user_lookup_cache_ttl}
+  ssh_repo_access_cache_ttl: ${auth_ssh_repo_access_cache_ttl}
   webhook_secret_env: "FORGE_WEBHOOK_SECRET"
 
 clone:

@@ -62,8 +62,8 @@ ghe_key_lookup_ssh_target_endpoint   = "ghe.example.com"
 ghe_key_lookup_ghe_url               = "https://ghe.example.com"
 ghe_key_lookup_ssh_user              = "admin"
 ghe_key_lookup_ssh_port              = 122
-ghe_key_lookup_cache_ttl_pos         = 300
-ghe_key_lookup_cache_ttl_neg         = 30
+auth_ssh_user_lookup_cache_ttl       = 30
+auth_ssh_repo_access_cache_ttl       = 30
 
 # Network configuration
 vpc_cidr           = "10.0.0.0/16"
