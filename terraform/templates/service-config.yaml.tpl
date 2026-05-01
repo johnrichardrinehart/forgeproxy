@@ -109,6 +109,36 @@ storage:
     use_fips: ${s3_use_fips}
     presigned_url_ttl: ${s3_presigned_url_ttl}
 
+repo_update:
+  mode: "${repo_update_mode}"
+  large_repo_size_bytes_threshold: ${repo_update_large_repo_size_bytes_threshold}
+  large_repo_ref_count_threshold: ${repo_update_large_repo_ref_count_threshold}
+  failure_score_threshold: ${repo_update_failure_score_threshold}
+  delta_workspace_max_physical_ratio: ${repo_update_delta_workspace_max_physical_ratio}
+
+%{ if length(repo_update_overrides) > 0 ~}
+repo_overrides:
+%{ for repo, override in repo_update_overrides ~}
+  "${repo}":
+    repo_update:
+%{ if override.mode != null ~}
+      mode: "${override.mode}"
+%{ endif ~}
+%{ if override.large_repo_size_bytes_threshold != null ~}
+      large_repo_size_bytes_threshold: ${override.large_repo_size_bytes_threshold}
+%{ endif ~}
+%{ if override.large_repo_ref_count_threshold != null ~}
+      large_repo_ref_count_threshold: ${override.large_repo_ref_count_threshold}
+%{ endif ~}
+%{ if override.failure_score_threshold != null ~}
+      failure_score_threshold: ${override.failure_score_threshold}
+%{ endif ~}
+%{ if override.delta_workspace_max_physical_ratio != null ~}
+      delta_workspace_max_physical_ratio: ${override.delta_workspace_max_physical_ratio}
+%{ endif ~}
+%{ endfor ~}
+%{ endif ~}
+
 bundles:
   # Used for bundle generation, background bitmap/MIDX preparation, and request-time pack-cache deltas.
   max_concurrent_generations: ${bundle_max_concurrent_generations}

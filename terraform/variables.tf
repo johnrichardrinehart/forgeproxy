@@ -642,6 +642,87 @@ variable "local_upload_pack_first_byte_secs" {
   description = "Request path: seconds a client may wait for first byte from local git upload-pack before proxying upstream. Zero disables this stage budget."
 }
 
+variable "repo_update_mode" {
+  type        = string
+  default     = "auto"
+  description = "Global default repo update mode. 'auto' uses deploy-time thresholds plus learned per-repo Valkey state; forced modes bypass learned selection."
+
+  validation {
+    condition     = contains(["auto", "delta_workspace", "direct_mirror"], var.repo_update_mode)
+    error_message = "repo_update_mode must be one of: auto, delta_workspace, direct_mirror."
+  }
+}
+
+variable "repo_update_large_repo_size_bytes_threshold" {
+  type        = number
+  default     = 1073741824
+  description = "Global default mirror size threshold where auto mode selects direct_mirror."
+
+  validation {
+    condition     = var.repo_update_large_repo_size_bytes_threshold > 0
+    error_message = "repo_update_large_repo_size_bytes_threshold must be greater than 0."
+  }
+}
+
+variable "repo_update_large_repo_ref_count_threshold" {
+  type        = number
+  default     = 10000
+  description = "Global default ref-count threshold where auto mode selects direct_mirror."
+
+  validation {
+    condition     = var.repo_update_large_repo_ref_count_threshold > 0
+    error_message = "repo_update_large_repo_ref_count_threshold must be greater than 0."
+  }
+}
+
+variable "repo_update_failure_score_threshold" {
+  type        = number
+  default     = 3
+  description = "Global default learned per-repo failure score threshold where auto mode selects direct_mirror."
+
+  validation {
+    condition     = var.repo_update_failure_score_threshold > 0
+    error_message = "repo_update_failure_score_threshold must be greater than 0."
+  }
+}
+
+variable "repo_update_delta_workspace_max_physical_ratio" {
+  type        = number
+  default     = 0.25
+  description = "Global default delta-workspace-to-mirror physical size ratio above which auto mode treats the delta path as unhealthy."
+
+  validation {
+    condition     = var.repo_update_delta_workspace_max_physical_ratio > 0
+    error_message = "repo_update_delta_workspace_max_physical_ratio must be greater than 0."
+  }
+}
+
+variable "repo_update_overrides" {
+  type = map(object({
+    mode                               = optional(string)
+    large_repo_size_bytes_threshold    = optional(number)
+    large_repo_ref_count_threshold     = optional(number)
+    failure_score_threshold            = optional(number)
+    delta_workspace_max_physical_ratio = optional(number)
+  }))
+  default     = {}
+  description = "Sparse per-repo adaptive update overrides. Omitted fields inherit global repo_update defaults; learned Valkey state is not reset by deploys."
+
+  validation {
+    condition = alltrue([
+      for repo, override in var.repo_update_overrides :
+      length(regexall("^[^/\\s]+/.+[^/\\s]$", repo)) > 0
+      && !strcontains(repo, "..")
+      && (override.mode == null || contains(["auto", "delta_workspace", "direct_mirror"], override.mode))
+      && (override.large_repo_size_bytes_threshold == null || override.large_repo_size_bytes_threshold > 0)
+      && (override.large_repo_ref_count_threshold == null || override.large_repo_ref_count_threshold > 0)
+      && (override.failure_score_threshold == null || override.failure_score_threshold > 0)
+      && (override.delta_workspace_max_physical_ratio == null || override.delta_workspace_max_physical_ratio > 0)
+    ])
+    error_message = "repo_update_overrides keys must be owner/repo slugs and override values must be valid positive thresholds or valid modes."
+  }
+}
+
 variable "delegated_repositories" {
   type        = list(string)
   default     = []

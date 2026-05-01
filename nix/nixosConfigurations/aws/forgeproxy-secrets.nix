@@ -30,20 +30,43 @@ let
         '[.[] | select(startswith($p))][0]'
     }
 
+    write_secret_file_atomic() {
+      local secret_id="$1"
+      local destination="$2"
+      local destination_base
+      local destination_dir
+      local tmp
+
+      destination_base=$(${pkgs.coreutils}/bin/basename "$destination")
+      destination_dir=$(${pkgs.coreutils}/bin/dirname "$destination")
+      tmp=$(${pkgs.coreutils}/bin/mktemp "$destination_dir/.$destination_base.XXXXXX")
+
+      if ! ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+        --secret-id "$secret_id" \
+        --query 'SecretString' --output text > "$tmp"; then
+        ${pkgs.coreutils}/bin/rm -f "$tmp"
+        return 1
+      fi
+      if ! ${pkgs.coreutils}/bin/chmod 0644 "$tmp"; then
+        ${pkgs.coreutils}/bin/rm -f "$tmp"
+        return 1
+      fi
+      if ! ${pkgs.coreutils}/bin/mv -f "$tmp" "$destination"; then
+        ${pkgs.coreutils}/bin/rm -f "$tmp"
+        return 1
+      fi
+    }
+
     # ── Write config.yaml from Secrets Manager ────────────────────────
     # /run/forgeproxy is writable via RuntimeDirectory=forgeproxy;
     # /etc is read-only under ProtectSystem=strict.
-    ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-      --secret-id "$(resolve service-config)" \
-      --query 'SecretString' --output text > /run/forgeproxy/config.yaml
+    write_secret_file_atomic "$(resolve service-config)" /run/forgeproxy/config.yaml
 
     OTEL_COLLECTOR_CONFIG_SECRET=$(resolve otel-collector-config)
     if [ "$OTEL_COLLECTOR_CONFIG_SECRET" = "null" ]; then
       rm -f /run/forgeproxy/otel-collector-config.yaml
     else
-      ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
-        --secret-id "$OTEL_COLLECTOR_CONFIG_SECRET" \
-        --query 'SecretString' --output text > /run/forgeproxy/otel-collector-config.yaml
+      write_secret_file_atomic "$OTEL_COLLECTOR_CONFIG_SECRET" /run/forgeproxy/otel-collector-config.yaml
     fi
 
     # ── Write Valkey CA cert (for TLS verification) ─────────────────────

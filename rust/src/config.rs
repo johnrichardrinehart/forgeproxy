@@ -98,6 +98,8 @@ pub struct Config {
     #[serde(default)]
     pub fetch_schedule: FetchScheduleConfig,
     #[serde(default)]
+    pub repo_update: RepoUpdateConfig,
+    #[serde(default)]
     pub bundles: BundleConfig,
     #[serde(default)]
     pub pack_cache: PackCacheConfig,
@@ -877,6 +879,79 @@ fn default_fetch_interval() -> u64 {
     300
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive repo update policy
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoUpdateMode {
+    #[default]
+    Auto,
+    DeltaWorkspace,
+    DirectMirror,
+}
+
+impl RepoUpdateMode {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::DeltaWorkspace => "delta_workspace",
+            Self::DirectMirror => "direct_mirror",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RepoUpdateConfig {
+    /// Global default update policy. `auto` combines these deploy-time defaults
+    /// with per-repo learned state stored in Valkey.
+    #[serde(default)]
+    pub mode: RepoUpdateMode,
+    /// Mirror size at or above which `auto` uses direct-to-mirror updates.
+    #[serde(default = "default_large_repo_size_bytes_threshold")]
+    pub large_repo_size_bytes_threshold: u64,
+    /// Ref count at or above which `auto` uses direct-to-mirror updates.
+    #[serde(default = "default_large_repo_ref_count_threshold")]
+    pub large_repo_ref_count_threshold: u64,
+    /// Learned per-repo failure score at or above which `auto` uses
+    /// direct-to-mirror updates.
+    #[serde(default = "default_repo_update_failure_score_threshold")]
+    pub failure_score_threshold: u64,
+    /// Delta workspace physical size divided by mirror size above which the
+    /// delta path is treated as unhealthy.
+    #[serde(default = "default_delta_workspace_max_physical_ratio")]
+    pub delta_workspace_max_physical_ratio: f64,
+}
+
+impl Default for RepoUpdateConfig {
+    fn default() -> Self {
+        Self {
+            mode: RepoUpdateMode::Auto,
+            large_repo_size_bytes_threshold: default_large_repo_size_bytes_threshold(),
+            large_repo_ref_count_threshold: default_large_repo_ref_count_threshold(),
+            failure_score_threshold: default_repo_update_failure_score_threshold(),
+            delta_workspace_max_physical_ratio: default_delta_workspace_max_physical_ratio(),
+        }
+    }
+}
+
+fn default_large_repo_size_bytes_threshold() -> u64 {
+    1024 * 1024 * 1024
+}
+
+fn default_large_repo_ref_count_threshold() -> u64 {
+    10_000
+}
+
+fn default_repo_update_failure_score_threshold() -> u64 {
+    3
+}
+
+fn default_delta_workspace_max_physical_ratio() -> f64 {
+    0.25
+}
+
 fn default_delta_threshold() -> u64 {
     50
 }
@@ -1187,12 +1262,24 @@ fn default_presigned_url_ttl() -> u64 {
 // Per-repo overrides
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RepoOverride {
     /// Override fetch interval (seconds) for this repo.
     pub fetch_interval: Option<u64>,
     /// Force-disable bundle generation for this repo.
     pub disable_bundles: Option<bool>,
+    /// Per-repo sparse override for the adaptive repo update policy. Omitted
+    /// fields inherit the global `repo_update` defaults.
+    pub repo_update: Option<RepoUpdateOverride>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RepoUpdateOverride {
+    pub mode: Option<RepoUpdateMode>,
+    pub large_repo_size_bytes_threshold: Option<u64>,
+    pub large_repo_ref_count_threshold: Option<u64>,
+    pub failure_score_threshold: Option<u64>,
+    pub delta_workspace_max_physical_ratio: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,6 +1299,7 @@ enum ConfigSchemaNode {
     Auth,
     Clone,
     FetchSchedule,
+    RepoUpdate,
     Bundles,
     PackCache,
     Prewarm,
@@ -1227,6 +1315,7 @@ enum ConfigSchemaNode {
     Trace,
     Logging,
     RepoOverride,
+    RepoUpdateOverride,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1249,6 +1338,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "auth",
             "clone",
             "fetch_schedule",
+            "repo_update",
             "bundles",
             "pack_cache",
             "prewarm",
@@ -1324,6 +1414,13 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "max_interval",
             "rolling_window",
         ],
+        ConfigSchemaNode::RepoUpdate => &[
+            "mode",
+            "large_repo_size_bytes_threshold",
+            "large_repo_ref_count_threshold",
+            "failure_score_threshold",
+            "delta_workspace_max_physical_ratio",
+        ],
         ConfigSchemaNode::Bundles => &[
             "min_clone_count_for_bundles",
             "bundle_lock_ttl",
@@ -1372,7 +1469,14 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
         ConfigSchemaNode::Journald => &["enabled"],
         ConfigSchemaNode::Trace => &["enabled", "sample_ratio"],
         ConfigSchemaNode::Logging => &["level"],
-        ConfigSchemaNode::RepoOverride => &["fetch_interval", "disable_bundles"],
+        ConfigSchemaNode::RepoOverride => &["fetch_interval", "disable_bundles", "repo_update"],
+        ConfigSchemaNode::RepoUpdateOverride => &[
+            "mode",
+            "large_repo_size_bytes_threshold",
+            "large_repo_ref_count_threshold",
+            "failure_score_threshold",
+            "delta_workspace_max_physical_ratio",
+        ],
     }
 }
 
@@ -1397,6 +1501,9 @@ fn schema_child(node: ConfigSchemaNode, key: &str) -> ConfigSchemaChild {
         (ConfigSchemaNode::Root, "fetch_schedule") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::FetchSchedule)
         }
+        (ConfigSchemaNode::Root, "repo_update") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::RepoUpdate)
+        }
         (ConfigSchemaNode::Root, "bundles") => ConfigSchemaChild::Object(ConfigSchemaNode::Bundles),
         (ConfigSchemaNode::Root, "pack_cache") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::PackCache)
@@ -1410,6 +1517,9 @@ fn schema_child(node: ConfigSchemaNode, key: &str) -> ConfigSchemaChild {
         (ConfigSchemaNode::Root, "logging") => ConfigSchemaChild::Object(ConfigSchemaNode::Logging),
         (ConfigSchemaNode::Root, "repo_overrides") => {
             ConfigSchemaChild::DynamicObjectValues(ConfigSchemaNode::RepoOverride)
+        }
+        (ConfigSchemaNode::RepoOverride, "repo_update") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::RepoUpdateOverride)
         }
         (ConfigSchemaNode::UpstreamCredentials, "orgs") => {
             ConfigSchemaChild::DynamicObjectValues(ConfigSchemaNode::OrgCredential)
@@ -1564,6 +1674,50 @@ fn validate_config(config: &Config) -> Result<()> {
         "background_work.max_defer_secs must be greater than 0"
     );
     anyhow::ensure!(
+        config.repo_update.large_repo_size_bytes_threshold > 0,
+        "repo_update.large_repo_size_bytes_threshold must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.repo_update.large_repo_ref_count_threshold > 0,
+        "repo_update.large_repo_ref_count_threshold must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.repo_update.failure_score_threshold > 0,
+        "repo_update.failure_score_threshold must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.repo_update.delta_workspace_max_physical_ratio > 0.0,
+        "repo_update.delta_workspace_max_physical_ratio must be greater than 0"
+    );
+    for (repo, override_cfg) in &config.repo_overrides {
+        if let Some(repo_update) = override_cfg.repo_update.as_ref() {
+            anyhow::ensure!(
+                repo_update
+                    .large_repo_size_bytes_threshold
+                    .is_none_or(|value| value > 0),
+                "repo_overrides.{repo}.repo_update.large_repo_size_bytes_threshold must be greater than 0"
+            );
+            anyhow::ensure!(
+                repo_update
+                    .large_repo_ref_count_threshold
+                    .is_none_or(|value| value > 0),
+                "repo_overrides.{repo}.repo_update.large_repo_ref_count_threshold must be greater than 0"
+            );
+            anyhow::ensure!(
+                repo_update
+                    .failure_score_threshold
+                    .is_none_or(|value| value > 0),
+                "repo_overrides.{repo}.repo_update.failure_score_threshold must be greater than 0"
+            );
+            anyhow::ensure!(
+                repo_update
+                    .delta_workspace_max_physical_ratio
+                    .is_none_or(|value| value > 0.0),
+                "repo_overrides.{repo}.repo_update.delta_workspace_max_physical_ratio must be greater than 0"
+            );
+        }
+    }
+    anyhow::ensure!(
         config.health.check_timeout_secs > 0,
         "health.check_timeout_secs must be greater than 0"
     );
@@ -1667,7 +1821,9 @@ fn validate_config(config: &Config) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendType, BundleConfig, parse_config_str, parse_config_str_with_warnings};
+    use super::{
+        BackendType, BundleConfig, RepoUpdateMode, parse_config_str, parse_config_str_with_warnings,
+    };
 
     #[test]
     fn bundle_execution_policy_defaults_single_core() {
@@ -1768,6 +1924,35 @@ mod tests {
         );
         let config = parse_config_str(&config).unwrap();
         assert!(config.clone.prepare_published_generation_indexes);
+    }
+
+    #[test]
+    fn repo_update_config_accepts_global_defaults_and_per_repo_overrides() {
+        let config = parse_config_str(include_str!("../../config.example.yaml")).unwrap();
+        assert_eq!(config.repo_update.mode, RepoUpdateMode::Auto);
+        assert_eq!(config.repo_update.large_repo_ref_count_threshold, 10_000);
+        let override_cfg = config
+            .repo_overrides
+            .get("org/monorepo")
+            .and_then(|repo_override| repo_override.repo_update.as_ref())
+            .unwrap();
+        assert_eq!(override_cfg.mode, Some(RepoUpdateMode::DirectMirror));
+        assert_eq!(override_cfg.large_repo_ref_count_threshold, Some(5_000));
+    }
+
+    #[test]
+    fn rejects_invalid_repo_update_thresholds() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "  failure_score_threshold: 3\n",
+            "  failure_score_threshold: 0\n",
+        );
+        assert!(parse_config_str(&config).is_err());
+
+        let config = include_str!("../../config.example.yaml").replace(
+            "  delta_workspace_max_physical_ratio: 0.25\n",
+            "  delta_workspace_max_physical_ratio: 0\n",
+        );
+        assert!(parse_config_str(&config).is_err());
     }
 
     #[test]
