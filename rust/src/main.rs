@@ -231,6 +231,9 @@ pub struct RecentAdvertisedRefs {
     pub advertised_refs: crate::coordination::registry::RequestAdvertisedRefs,
 }
 
+const RECENT_ADVERTISED_REFS_TTL_SECS: u64 = 60;
+const MAX_RECENT_ADVERTISED_REFS_ENTRIES: usize = 4096;
+
 impl AppState {
     pub fn config(&self) -> Arc<Config> {
         self.config.load()
@@ -378,7 +381,9 @@ impl AppState {
         session_id: impl Into<String>,
         advertised_refs: crate::coordination::registry::RequestAdvertisedRefs,
     ) {
-        self.recent_advertised_refs.lock().await.insert(
+        let mut recent = self.recent_advertised_refs.lock().await;
+        prune_recent_advertised_refs_locked(&mut recent);
+        recent.insert(
             format!("{}|{}", owner_repo.into(), client_fingerprint.as_ref()),
             RecentAdvertisedRefs {
                 captured_at: Instant::now(),
@@ -386,6 +391,7 @@ impl AppState {
                 advertised_refs,
             },
         );
+        prune_recent_advertised_refs_locked(&mut recent);
     }
 
     pub async fn merge_recent_advertised_refs(
@@ -398,6 +404,7 @@ impl AppState {
         let cache_key = format!("{}|{}", owner_repo.into(), client_fingerprint.as_ref());
         let session_id = session_id.into();
         let mut recent = self.recent_advertised_refs.lock().await;
+        prune_recent_advertised_refs_locked(&mut recent);
         let entry = recent
             .entry(cache_key)
             .or_insert_with(|| RecentAdvertisedRefs {
@@ -416,6 +423,7 @@ impl AppState {
         if advertised_refs.ls_refs_response.is_some() {
             entry.advertised_refs.ls_refs_response = advertised_refs.ls_refs_response;
         }
+        prune_recent_advertised_refs_locked(&mut recent);
     }
 
     pub async fn recent_advertised_refs(
@@ -423,17 +431,33 @@ impl AppState {
         owner_repo: &str,
         client_fingerprint: &str,
     ) -> Option<RecentAdvertisedRefs> {
-        self.recent_advertised_refs
-            .lock()
-            .await
+        let mut recent = self.recent_advertised_refs.lock().await;
+        prune_recent_advertised_refs_locked(&mut recent);
+        recent
             .get(&format!("{owner_repo}|{client_fingerprint}"))
-            .and_then(|recent_advertised_refs| {
-                if recent_advertised_refs.captured_at.elapsed() > Duration::from_secs(60) {
-                    None
-                } else {
-                    Some(recent_advertised_refs.clone())
-                }
-            })
+            .cloned()
+    }
+}
+
+fn prune_recent_advertised_refs_locked(
+    recent: &mut std::collections::HashMap<String, RecentAdvertisedRefs>,
+) {
+    let ttl = Duration::from_secs(RECENT_ADVERTISED_REFS_TTL_SECS);
+    recent.retain(|_, value| value.captured_at.elapsed() <= ttl);
+    if recent.len() <= MAX_RECENT_ADVERTISED_REFS_ENTRIES {
+        return;
+    }
+
+    let mut keys_by_age = recent
+        .iter()
+        .map(|(key, value)| (key.clone(), value.captured_at))
+        .collect::<Vec<_>>();
+    keys_by_age.sort_by_key(|(_, captured_at)| *captured_at);
+    let drop_count = keys_by_age
+        .len()
+        .saturating_sub(MAX_RECENT_ADVERTISED_REFS_ENTRIES);
+    for (key, _) in keys_by_age.into_iter().take(drop_count) {
+        recent.remove(&key);
     }
 }
 

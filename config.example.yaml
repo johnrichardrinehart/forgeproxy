@@ -97,6 +97,8 @@ pack_cache:
   max_concurrent_request_deltas: 1
   max_concurrent_background_warmings: 1
   min_response_bytes: 67108864
+  recent_entry_max_age_secs: 21600
+  max_recent_repos: 2048
 prewarm:
   enabled: false
   repos: []

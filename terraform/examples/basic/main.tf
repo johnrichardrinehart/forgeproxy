@@ -105,6 +105,8 @@ module "forgeproxy" {
   pack_cache_max_concurrent_request_deltas      = var.pack_cache_max_concurrent_request_deltas
   pack_cache_max_concurrent_background_warmings = var.pack_cache_max_concurrent_background_warmings
   pack_cache_min_response_bytes                 = var.pack_cache_min_response_bytes
+  pack_cache_recent_entry_max_age_secs          = var.pack_cache_recent_entry_max_age_secs
+  pack_cache_max_recent_repos                   = var.pack_cache_max_recent_repos
   prewarm_enabled                               = var.prewarm_enabled
   prewarm_repos                                 = var.prewarm_repos
   prewarm_max_concurrent                        = var.prewarm_max_concurrent

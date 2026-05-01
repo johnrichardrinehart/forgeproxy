@@ -979,6 +979,13 @@ pub struct PackCacheConfig {
     /// not justify cache bookkeeping.
     #[serde(default = "default_pack_cache_min_response_bytes")]
     pub min_response_bytes: u64,
+    /// Maximum age (seconds) for in-memory recent pack-cache index entries
+    /// before they are ignored and reclaimed from memory.
+    #[serde(default = "default_pack_cache_recent_entry_max_age_secs")]
+    pub recent_entry_max_age_secs: u64,
+    /// Maximum repositories tracked in the in-memory recent pack-cache index.
+    #[serde(default = "default_pack_cache_max_recent_repos")]
+    pub max_recent_repos: usize,
 }
 
 impl Default for PackCacheConfig {
@@ -996,6 +1003,8 @@ impl Default for PackCacheConfig {
             max_concurrent_background_warmings:
                 default_pack_cache_max_concurrent_background_warmings(),
             min_response_bytes: default_pack_cache_min_response_bytes(),
+            recent_entry_max_age_secs: default_pack_cache_recent_entry_max_age_secs(),
+            max_recent_repos: default_pack_cache_max_recent_repos(),
         }
     }
 }
@@ -1018,6 +1027,14 @@ fn default_pack_cache_max_concurrent_background_warmings() -> usize {
 
 fn default_pack_cache_min_response_bytes() -> u64 {
     64 * 1024 * 1024
+}
+
+fn default_pack_cache_recent_entry_max_age_secs() -> u64 {
+    6 * 60 * 60
+}
+
+fn default_pack_cache_max_recent_repos() -> usize {
+    2048
 }
 
 impl Default for BundleConfig {
@@ -1310,6 +1327,8 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "max_concurrent_request_deltas",
             "max_concurrent_background_warmings",
             "min_response_bytes",
+            "recent_entry_max_age_secs",
+            "max_recent_repos",
         ],
         ConfigSchemaNode::Prewarm => &["enabled", "repos", "max_concurrent", "force_open_secs"],
         ConfigSchemaNode::Health => &["check_timeout_secs"],
@@ -1578,6 +1597,14 @@ fn validate_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.pack_cache.max_concurrent_background_warmings > 0,
         "pack_cache.max_concurrent_background_warmings must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.pack_cache.recent_entry_max_age_secs > 0,
+        "pack_cache.recent_entry_max_age_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.pack_cache.max_recent_repos > 0,
+        "pack_cache.max_recent_repos must be greater than 0"
     );
     anyhow::ensure!(
         config.prewarm.max_concurrent > 0,
