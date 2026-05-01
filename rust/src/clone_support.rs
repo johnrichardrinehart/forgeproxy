@@ -179,6 +179,8 @@ pub async fn spawn_local_upload_pack_with_lease_timeout(
     let mut cmd = Command::new("git");
     cmd.arg("-c")
         .arg(format!("pack.threads={pack_threads}"))
+        .arg("-c")
+        .arg("uploadpack.allowFilter=true")
         .arg("upload-pack");
     if mode == LocalUploadPackMode::StatelessRpc {
         cmd.arg("--stateless-rpc");

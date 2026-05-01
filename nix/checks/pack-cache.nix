@@ -538,5 +538,20 @@ pkgs.testers.runNixOSTest {
             )
         wait_for_count_growth("entries", counts_before["entries"])
         assert_no_pack_corruption_logs()
+
+    with subtest("Blobless and treeless clones are served by local upload-pack"):
+        client.succeed(
+            "rm -rf /tmp/pack-cache-blobless /tmp/pack-cache-treeless && "
+            "git clone --filter=blob:none --no-checkout https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-blobless && "
+            "git -C /tmp/pack-cache-blobless rev-parse HEAD >/dev/null && "
+            "git clone --filter=tree:0 --no-checkout https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-treeless && "
+            "git -C /tmp/pack-cache-treeless rev-parse HEAD >/dev/null"
+        )
+
+        proxy.wait_until_succeeds(
+            "journalctl -u forgeproxy --no-pager | "
+            "grep -F '\"message\":\"clone served\"' | "
+            "grep -F '\"path\":\"local_upload_pack\"'"
+        )
   '';
 }
