@@ -1264,9 +1264,14 @@ async fn handle_webhook(
 
 /// `GET /healthz`
 async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let instance_id = state
+        .runtime_resource_attributes
+        .service_instance_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
     let (status, body) = state
         .health_worker
-        .run(state.config(), state.prewarm_status())
+        .run(state.config(), state.prewarm_status(), instance_id)
         .await;
     (status, axum::Json(body)).into_response()
 }
@@ -1289,9 +1294,14 @@ async fn handle_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     }
 
+    let instance_id = state
+        .runtime_resource_attributes
+        .service_instance_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
     let (status, body) = state
         .health_worker
-        .run(state.config(), state.prewarm_status())
+        .run(state.config(), state.prewarm_status(), instance_id)
         .await;
     (status, axum::Json(body)).into_response()
 }
