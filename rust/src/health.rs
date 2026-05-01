@@ -310,37 +310,43 @@ fn token_expiration_from_headers(headers: &HeaderMap) -> Result<Option<DateTime<
 }
 
 async fn check_disk(config: &Config) -> CheckResult {
-    let cache_path = &config.storage.local.path;
-
-    let path = cache_path.clone();
-    let max_percent = config.storage.local.max_percent;
-
-    let result = tokio::task::spawn_blocking(move || disk_usage(&path, max_percent)).await;
-
-    match result {
-        Ok(Ok((usage, capacity, budget))) => {
-            if usage.physical_bytes > budget {
+    match disk_health_summary(
+        "/",
+        &config.storage.local.path,
+        config.health.disk_min_available_percent,
+    ) {
+        Ok(summary) => {
+            let any_low = summary
+                .iter()
+                .any(|fs| fs.available_percent < config.health.disk_min_available_percent);
+            let detail = summary
+                .iter()
+                .map(|fs| {
+                    format!(
+                        "{}(path={}, cap={}, used={}, avail={}, avail_pct={:.1}%)",
+                        fs.name,
+                        fs.path,
+                        fs.capacity_bytes,
+                        fs.used_bytes,
+                        fs.available_bytes,
+                        fs.available_percent
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            if any_low {
                 CheckResult::unhealthy(format!(
-                    "cache physical_usage {} bytes exceeds configured budget {budget}; apparent_usage {} bytes",
-                    usage.physical_bytes, usage.apparent_bytes,
+                    "filesystem available space below {:.1}% threshold: {detail}",
+                    config.health.disk_min_available_percent
                 ))
             } else {
-                let pct = if capacity > 0 {
-                    (usage.physical_bytes as f64 / capacity as f64) * 100.0
-                } else {
-                    0.0
-                };
-                CheckResult {
-                    ok: true,
-                    detail: Some(format!(
-                        "physical_usage {} / {budget} budget ({pct:.1}% of filesystem); apparent_usage {}",
-                        usage.physical_bytes, usage.apparent_bytes,
-                    )),
-                }
+                CheckResult::healthy_with_detail(format!(
+                    "filesystem free-space check passed (threshold {:.1}%): {detail}",
+                    config.health.disk_min_available_percent
+                ))
             }
         }
-        Ok(Err(e)) => CheckResult::unhealthy(format!("disk check failed: {e}")),
-        Err(e) => CheckResult::unhealthy(format!("disk check task failed: {e}")),
+        Err(error) => CheckResult::unhealthy(format!("disk check failed: {error}")),
     }
 }
 
@@ -376,17 +382,65 @@ fn worker_unavailable_response(detail: &str, instance_id: String) -> (StatusCode
     )
 }
 
-/// Compute (cache_usage, filesystem_capacity, configured_budget_bytes)
-/// for the path's mount.
-fn disk_usage(
-    path: &str,
-    max_percent: f64,
-) -> anyhow::Result<(crate::cache::manager::DiskUsage, u64, u64)> {
-    let dir = std::path::Path::new(path);
-    let used = crate::cache::manager::dir_usage(dir)?;
-    let capacity = crate::cache::capacity::filesystem_capacity_bytes(dir)?;
-    let budget = crate::cache::capacity::percent_of_bytes(capacity, max_percent);
-    Ok((used, capacity, budget))
+#[derive(Debug, Clone)]
+struct FilesystemHealthSample {
+    name: String,
+    path: String,
+    capacity_bytes: u64,
+    used_bytes: u64,
+    available_bytes: u64,
+    available_percent: f64,
+}
+
+fn disk_health_summary(
+    root_path: &str,
+    cache_path: &str,
+    _min_available_percent: f64,
+) -> anyhow::Result<Vec<FilesystemHealthSample>> {
+    use std::path::Path;
+
+    let mut samples = Vec::new();
+    let root = Path::new(root_path);
+    samples.push(sample_filesystem("root", root)?);
+
+    let cache = Path::new(cache_path);
+    if cache != root && !same_filesystem(root, cache)? {
+        samples.push(sample_filesystem("cache", cache)?);
+    }
+
+    Ok(samples)
+}
+
+fn sample_filesystem(name: &str, path: &std::path::Path) -> anyhow::Result<FilesystemHealthSample> {
+    let usage = crate::cache::capacity::filesystem_usage_bytes(path)?;
+    let available_percent = if usage.capacity_bytes == 0 {
+        0.0
+    } else {
+        (usage.available_bytes as f64 / usage.capacity_bytes as f64) * 100.0
+    };
+    Ok(FilesystemHealthSample {
+        name: name.to_string(),
+        path: path.display().to_string(),
+        capacity_bytes: usage.capacity_bytes,
+        used_bytes: usage.used_bytes,
+        available_bytes: usage.available_bytes,
+        available_percent,
+    })
+}
+
+#[cfg(unix)]
+fn same_filesystem(a: &std::path::Path, b: &std::path::Path) -> anyhow::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let a_dev = std::fs::metadata(a)?.dev();
+    let b_dev = std::fs::metadata(b)?.dev();
+    Ok(a_dev == b_dev)
+}
+
+#[cfg(not(unix))]
+fn same_filesystem(a: &std::path::Path, b: &std::path::Path) -> anyhow::Result<bool> {
+    let a = std::fs::canonicalize(a)?;
+    let b = std::fs::canonicalize(b)?;
+    Ok(a == b)
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +659,9 @@ mod tests {
             prewarm: PrewarmStatus {
                 complete: true,
                 issues: Vec::new(),
-                notes: vec!["startup pre-warm exceeded timeout; force-opened readiness".to_string()],
+                notes: vec![
+                    "startup pre-warm exceeded timeout; force-opened readiness".to_string(),
+                ],
             }
             .as_check_result(),
         };

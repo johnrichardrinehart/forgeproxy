@@ -77,6 +77,7 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     prewarm_max_concurrent                        = var.prewarm_max_concurrent
     prewarm_force_open_secs                       = var.prewarm_force_open_secs
     health_check_timeout_secs                     = var.health_check_timeout_secs
+    health_disk_min_available_percent             = var.health_disk_min_available_percent
     bundle_max_concurrent_generations             = var.bundle_max_concurrent_generations
     bundle_pack_threads                           = var.bundle_pack_threads
     bundle_max_incremental_bundles                = var.bundle_max_incremental_bundles

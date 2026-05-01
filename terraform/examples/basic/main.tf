@@ -112,6 +112,7 @@ module "forgeproxy" {
   prewarm_max_concurrent                        = var.prewarm_max_concurrent
   prewarm_force_open_secs                       = var.prewarm_force_open_secs
   health_check_timeout_secs                     = var.health_check_timeout_secs
+  health_disk_min_available_percent             = var.health_disk_min_available_percent
 
   s3_bundle_prefix     = var.s3_bundle_prefix
   s3_use_fips          = var.s3_use_fips

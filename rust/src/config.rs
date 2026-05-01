@@ -265,23 +265,31 @@ fn default_prewarm_force_open_secs() -> u64 {
 // Health
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HealthConfig {
     /// Per-check timeout for `/healthz` and `/readyz` probe checks.
     #[serde(default = "default_health_check_timeout_secs")]
     pub check_timeout_secs: u64,
+    /// Minimum filesystem free space percentage required by disk health checks.
+    #[serde(default = "default_health_disk_min_available_percent")]
+    pub disk_min_available_percent: f64,
 }
 
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
             check_timeout_secs: default_health_check_timeout_secs(),
+            disk_min_available_percent: default_health_disk_min_available_percent(),
         }
     }
 }
 
 fn default_health_check_timeout_secs() -> u64 {
     5
+}
+
+fn default_health_disk_min_available_percent() -> f64 {
+    5.0
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,7 +1339,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "max_recent_repos",
         ],
         ConfigSchemaNode::Prewarm => &["enabled", "repos", "max_concurrent", "force_open_secs"],
-        ConfigSchemaNode::Health => &["check_timeout_secs"],
+        ConfigSchemaNode::Health => &["check_timeout_secs", "disk_min_available_percent"],
         ConfigSchemaNode::Storage => &["local", "s3"],
         ConfigSchemaNode::LocalStorage => &[
             "path",
@@ -1549,6 +1557,11 @@ fn validate_config(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.health.check_timeout_secs > 0,
         "health.check_timeout_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.health.disk_min_available_percent >= 0.0
+            && config.health.disk_min_available_percent <= 100.0,
+        "health.disk_min_available_percent must be in range [0.0, 100.0]"
     );
     anyhow::ensure!(
         config.bundles.max_concurrent_generations > 0,

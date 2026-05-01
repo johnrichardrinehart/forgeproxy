@@ -106,6 +106,7 @@ prewarm:
   force_open_secs: 1500
 health:
   check_timeout_secs: 5
+  disk_min_available_percent: 5.0
 storage:
   local:
     path: "/var/cache/forgeproxy"

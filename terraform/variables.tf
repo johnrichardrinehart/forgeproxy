@@ -864,6 +864,20 @@ variable "health_check_timeout_secs" {
   }
 }
 
+variable "health_disk_min_available_percent" {
+  type        = number
+  default     = 5.0
+  description = "Minimum filesystem free-space percentage required for /healthz to report disk as healthy."
+
+  validation {
+    condition = (
+      var.health_disk_min_available_percent >= 0.0 &&
+      var.health_disk_min_available_percent <= 100.0
+    )
+    error_message = "health_disk_min_available_percent must be in range [0.0, 100.0]."
+  }
+}
+
 variable "eviction_policy" {
   type        = string
   default     = "lfu"

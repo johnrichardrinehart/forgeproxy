@@ -93,6 +93,7 @@ prewarm:
 
 health:
   check_timeout_secs: ${health_check_timeout_secs}
+  disk_min_available_percent: ${health_disk_min_available_percent}
 
 storage:
   local:
