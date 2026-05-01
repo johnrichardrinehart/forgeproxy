@@ -535,6 +535,28 @@ variable "pack_cache_min_response_bytes" {
   description = "Minimum upload-pack response size to store in the pack response cache."
 }
 
+variable "pack_cache_recent_entry_max_age_secs" {
+  type        = number
+  default     = 21600
+  description = "Maximum age (seconds) for in-memory recent pack-cache entries before they are evicted from the in-memory compatibility index."
+
+  validation {
+    condition     = var.pack_cache_recent_entry_max_age_secs > 0
+    error_message = "pack_cache_recent_entry_max_age_secs must be greater than 0."
+  }
+}
+
+variable "pack_cache_max_recent_repos" {
+  type        = number
+  default     = 2048
+  description = "Maximum repositories tracked in the in-memory recent pack-cache compatibility index."
+
+  validation {
+    condition     = var.pack_cache_max_recent_repos > 0
+    error_message = "pack_cache_max_recent_repos must be greater than 0."
+  }
+}
+
 variable "prewarm_enabled" {
   type        = bool
   default     = false

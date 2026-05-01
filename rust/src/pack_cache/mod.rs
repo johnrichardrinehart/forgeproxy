@@ -658,6 +658,12 @@ impl PackCache {
                     );
                 }
                 Err(_) => {
+                    debug!(
+                        owner_repo = %key.owner_repo,
+                        key = %key.as_str(),
+                        wait_timeout_secs = self.config.wait_for_inflight_secs,
+                        "pack cache inflight wait timed out; bypassing cache for request"
+                    );
                     crate::metrics::inc_pack_cache_inflight_wait(
                         &self.metrics,
                         protocol.clone(),
@@ -674,6 +680,15 @@ impl PackCache {
             return Ok(PackCacheLookup::BypassAfterWait);
         }
 
+        let compatible_candidates = self.lookup_recent_compatible_keys(&key).len();
+        debug!(
+            owner_repo = %key.owner_repo,
+            key = %key.as_str(),
+            compatible_candidates,
+            full_tip = key.base.as_ref().is_some_and(|base| base.full_tip),
+            request_wants = key.base.as_ref().map(|base| base.request_wants.len()).unwrap_or(0),
+            "pack cache miss reserved for generation"
+        );
         crate::metrics::inc_pack_cache_request(&self.metrics, protocol, "miss", "reserved");
         match self.open_writer(key.clone()).await {
             Ok(writer) => Ok(PackCacheLookup::Generate(Box::new(writer))),
@@ -1034,6 +1049,8 @@ impl PackCache {
             );
         }
 
+        retain_existing_recent_entries(&self.root, &self.config, &mut recent);
+        trim_recent_repos_to_limit(&self.root, self.config.max_recent_repos, &mut recent);
         record_recent_entries_metric(&self.metrics, &recent);
         *self.recent_pack_cache_keys.lock().unwrap() = recent;
         Ok(())
@@ -1260,7 +1277,8 @@ impl PackCacheWriter {
                 );
             }
             let mut recent = self.recent_pack_cache_keys.lock().unwrap();
-            retain_existing_recent_entries(&self.root, &mut recent);
+            retain_existing_recent_entries(&self.root, &self.config, &mut recent);
+            trim_recent_repos_to_limit(&self.root, self.config.max_recent_repos, &mut recent);
             record_recent_entries_metric(&self.metrics, &recent);
             self.record_pack_cache_usage_metric();
         }
@@ -1853,12 +1871,62 @@ fn record_metadata_hit_if_present(root: &Path, key: &str) -> Result<()> {
 
 fn retain_existing_recent_entries(
     root: &Path,
+    config: &PackCacheConfig,
     recent: &mut HashMap<String, Vec<PackCacheRecentEntry>>,
 ) {
     recent.retain(|_, entries| {
-        entries.retain(|entry| cache_entry_artifact_exists(root, entry.key.as_str()));
+        entries.retain(|entry| {
+            cache_entry_artifact_exists(root, entry.key.as_str())
+                && !recent_entry_is_stale(
+                    root,
+                    entry.key.as_str(),
+                    config.recent_entry_max_age_secs,
+                )
+        });
         !entries.is_empty()
     });
+}
+
+fn recent_entry_is_stale(root: &Path, key: &str, max_age_secs: u64) -> bool {
+    let path = metadata_path(root, key);
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return true;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    modified.elapsed().unwrap_or_default().as_secs() > max_age_secs
+}
+
+fn trim_recent_repos_to_limit(
+    root: &Path,
+    max_recent_repos: usize,
+    recent: &mut HashMap<String, Vec<PackCacheRecentEntry>>,
+) {
+    if recent.len() <= max_recent_repos {
+        return;
+    }
+
+    let mut repos_by_recency = recent
+        .iter()
+        .map(|(owner_repo, entries)| {
+            let freshest_modified = entries
+                .iter()
+                .map(|entry| {
+                    std::fs::metadata(metadata_path(root, entry.key.as_str()))
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(UNIX_EPOCH)
+                })
+                .max()
+                .unwrap_or(UNIX_EPOCH);
+            (owner_repo.clone(), freshest_modified)
+        })
+        .collect::<Vec<_>>();
+    repos_by_recency.sort_by_key(|(_, modified)| *modified);
+    let drop_count = repos_by_recency.len().saturating_sub(max_recent_repos);
+    for (owner_repo, _) in repos_by_recency.into_iter().take(drop_count) {
+        recent.remove(&owner_repo);
+    }
 }
 
 #[derive(Debug)]

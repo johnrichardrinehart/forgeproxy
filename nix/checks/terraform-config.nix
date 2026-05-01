@@ -56,6 +56,8 @@ let
         pack_cache_max_concurrent_request_deltas   = 1
         pack_cache_max_concurrent_background_warmings = 1
         pack_cache_min_response_bytes              = 67108864
+        pack_cache_recent_entry_max_age_secs       = 21600
+        pack_cache_max_recent_repos                = 2048
         prewarm_enabled                            = false
         prewarm_repos                              = []
         prewarm_max_concurrent                     = 2

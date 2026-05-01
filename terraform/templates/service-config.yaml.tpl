@@ -82,6 +82,8 @@ pack_cache:
   max_concurrent_request_deltas: ${pack_cache_max_concurrent_request_deltas}
   max_concurrent_background_warmings: ${pack_cache_max_concurrent_background_warmings}
   min_response_bytes: ${pack_cache_min_response_bytes}
+  recent_entry_max_age_secs: ${pack_cache_recent_entry_max_age_secs}
+  max_recent_repos: ${pack_cache_max_recent_repos}
 
 prewarm:
   enabled: ${prewarm_enabled}
