@@ -2064,26 +2064,6 @@ struct PackCacheDeltaBuild {
     pack_objects_elapsed: Duration,
 }
 
-fn spawn_pack_cache_warming(
-    state: crate::AppState,
-    owner_repo: String,
-    published_path: PathBuf,
-    published_lease: PublishedGenerationLease,
-    source: String,
-) {
-    if !state.pack_cache.enabled() {
-        return;
-    }
-
-    tokio::spawn(run_pack_cache_warming(
-        state,
-        owner_repo,
-        published_path,
-        published_lease,
-        source,
-    ));
-}
-
 pub async fn warm_current_published_generation_pack_cache(
     state: &crate::AppState,
     owner_repo: &str,
@@ -2266,15 +2246,27 @@ async fn run_pack_cache_warming(
                     &owner_repo,
                     failure.reason,
                 );
-                warn!(
-                    repo = %owner_repo,
-                    source,
-                    path = %published_path.display(),
-                    elapsed_ms = started_at.elapsed().as_millis(),
-                    reason = failure.reason,
-                    error = %failure.error,
-                    "pack cache stitching failed for published generation"
-                );
+                if failure.reason == "stale_generation" {
+                    info!(
+                        repo = %owner_repo,
+                        source,
+                        path = %published_path.display(),
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        reason = failure.reason,
+                        error = %failure.error,
+                        "skipping pack cache stitching for stale published generation"
+                    );
+                } else {
+                    warn!(
+                        repo = %owner_repo,
+                        source,
+                        path = %published_path.display(),
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        reason = failure.reason,
+                        error = %failure.error,
+                        "pack cache stitching failed for published generation"
+                    );
+                }
             }
         }
     }
@@ -2368,6 +2360,25 @@ async fn warm_pack_cache_for_generation(
     published_path: &Path,
     prev_entry: crate::pack_cache::PackCacheRecentEntry,
 ) -> std::result::Result<(), PackCacheStitchFailure> {
+    let current_target = state
+        .cache_manager
+        .current_repo_target(owner_repo)
+        .map_err(|error| PackCacheStitchFailure::new("resolve_current_generation", error))?;
+    if current_target.as_deref() != Some(published_path) {
+        crate::metrics::inc_pack_cache_stale_generation(&state.metrics, owner_repo, "stitch");
+        return Err(PackCacheStitchFailure::new(
+            "stale_generation",
+            anyhow::anyhow!(
+                "published generation changed before stitch warming started: expected={}, current={}",
+                published_path.display(),
+                current_target
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string())
+            ),
+        ));
+    }
+
     let new_key = state
         .pack_cache
         .key_for_warming(owner_repo, published_path, &prev_entry.request_template)

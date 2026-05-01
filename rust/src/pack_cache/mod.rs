@@ -6,6 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, warn};
@@ -49,6 +50,8 @@ pub struct PackCache {
     artifact_lifecycle: Arc<std::sync::Mutex<()>>,
     active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
+    packstore_midx_refresh_gate: Arc<Semaphore>,
+    packstore_midx_refresh_requested: Arc<AtomicBool>,
     metrics: MetricsRegistry,
 }
 
@@ -274,6 +277,8 @@ pub struct PackCacheWriter {
     artifact_lifecycle: Arc<std::sync::Mutex<()>>,
     active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
+    packstore_midx_refresh_gate: Arc<Semaphore>,
+    packstore_midx_refresh_requested: Arc<AtomicBool>,
     notify: Arc<Notify>,
     metrics: MetricsRegistry,
     completed: bool,
@@ -378,6 +383,8 @@ impl PackCache {
             artifact_lifecycle: Arc::new(std::sync::Mutex::new(())),
             active_readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recent_pack_cache_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            packstore_midx_refresh_gate: Arc::new(Semaphore::new(1)),
+            packstore_midx_refresh_requested: Arc::new(AtomicBool::new(false)),
             metrics,
         }
     }
@@ -933,6 +940,8 @@ impl PackCache {
             artifact_lifecycle: Arc::clone(&self.artifact_lifecycle),
             active_readers: Arc::clone(&self.active_readers),
             recent_pack_cache_keys: Arc::clone(&self.recent_pack_cache_keys),
+            packstore_midx_refresh_gate: Arc::clone(&self.packstore_midx_refresh_gate),
+            packstore_midx_refresh_requested: Arc::clone(&self.packstore_midx_refresh_requested),
             notify,
             metrics: self.metrics.clone(),
             completed: false,
@@ -1365,11 +1374,44 @@ impl PackCacheWriter {
         let idx_path = self.pack_index_path_for_id(pack_id);
         crate::git::commands::git_index_pack_to_idx(&pack_path, &idx_path, self.index_pack_threads)
             .await?;
-        self.refresh_packstore_midx().await?;
+        self.request_packstore_midx_refresh().await?;
         crate::metrics::observe_pack_cache_artifact_generation(
             &self.metrics,
             self.started_at.elapsed(),
         );
+        Ok(())
+    }
+
+    async fn request_packstore_midx_refresh(&self) -> Result<()> {
+        if self
+            .packstore_midx_refresh_requested
+            .swap(true, Ordering::AcqRel)
+        {
+            crate::metrics::inc_pack_cache_packstore_midx_refresh(&self.metrics, "coalesced");
+            return Ok(());
+        }
+
+        loop {
+            let _permit = self
+                .packstore_midx_refresh_gate
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("packstore midx refresh semaphore closed"))?;
+            crate::metrics::inc_pack_cache_packstore_midx_refresh(&self.metrics, "started");
+            self.packstore_midx_refresh_requested
+                .store(false, Ordering::Release);
+            self.refresh_packstore_midx().await?;
+            crate::metrics::inc_pack_cache_packstore_midx_refresh(&self.metrics, "ok");
+
+            if !self
+                .packstore_midx_refresh_requested
+                .swap(false, Ordering::AcqRel)
+            {
+                break;
+            }
+            crate::metrics::inc_pack_cache_packstore_midx_refresh(&self.metrics, "drain");
+        }
+
         Ok(())
     }
 
