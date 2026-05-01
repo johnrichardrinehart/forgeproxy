@@ -23,6 +23,7 @@ pub struct HealthResponse {
     pub status: HealthStatus,
     pub version: String,
     pub git_revision: String,
+    pub instance_id: String,
     pub checks: HealthChecks,
 }
 
@@ -83,6 +84,7 @@ pub struct HealthState {
 struct HealthWorkerRequest {
     config: Arc<Config>,
     prewarm: PrewarmStatus,
+    instance_id: String,
     response_tx: oneshot::Sender<(StatusCode, HealthResponse)>,
 }
 
@@ -125,15 +127,19 @@ impl HealthWorker {
                     .expect("failed to build health worker runtime");
                 runtime.block_on(async move {
                     while let Some(request) = request_rx.recv().await {
-                        let state = HealthState {
-                            config: request.config,
-                            valkey: valkey.clone(),
-                            http_client: http_client.clone(),
-                            prewarm: request.prewarm,
-                        };
-                        let _ = request
-                            .response_tx
-                            .send(compute_health_response(&state).await);
+                        let valkey = valkey.clone();
+                        let http_client = http_client.clone();
+                        tokio::spawn(async move {
+                            let state = HealthState {
+                                config: request.config,
+                                valkey,
+                                http_client,
+                                prewarm: request.prewarm,
+                            };
+                            let _ = request
+                                .response_tx
+                                .send(compute_health_response(&state, request.instance_id).await);
+                        });
                     }
                 });
             })
@@ -145,6 +151,7 @@ impl HealthWorker {
         &self,
         config: Arc<Config>,
         prewarm: PrewarmStatus,
+        instance_id: String,
     ) -> (StatusCode, HealthResponse) {
         let timeout = health_worker_response_timeout(config.health.check_timeout_secs);
         let (response_tx, response_rx) = oneshot::channel();
@@ -153,17 +160,23 @@ impl HealthWorker {
             .send(HealthWorkerRequest {
                 config,
                 prewarm,
+                instance_id: instance_id.clone(),
                 response_tx,
             })
             .await
             .is_err()
         {
-            return worker_unavailable_response("health worker queue is unavailable");
+            return worker_unavailable_response("health worker queue is unavailable", instance_id);
         }
         match tokio::time::timeout(timeout, response_rx).await {
             Ok(Ok(response)) => response,
-            Ok(Err(_)) => worker_unavailable_response("health worker dropped response"),
-            Err(_) => worker_unavailable_response("health worker timed out before responding"),
+            Ok(Err(_)) => {
+                worker_unavailable_response("health worker dropped response", instance_id.clone())
+            }
+            Err(_) => worker_unavailable_response(
+                "health worker timed out before responding",
+                instance_id,
+            ),
         }
     }
 }
@@ -334,7 +347,7 @@ where
     }
 }
 
-fn worker_unavailable_response(detail: &str) -> (StatusCode, HealthResponse) {
+fn worker_unavailable_response(detail: &str, instance_id: String) -> (StatusCode, HealthResponse) {
     let checks = HealthChecks {
         valkey: CheckResult::unhealthy(detail),
         ghe: CheckResult::unhealthy(detail),
@@ -347,6 +360,7 @@ fn worker_unavailable_response(detail: &str) -> (StatusCode, HealthResponse) {
             status: HealthStatus::Unhealthy,
             version: crate::build_info::VERSION.to_string(),
             git_revision: crate::build_info::git_revision().to_string(),
+            instance_id,
             checks,
         },
     )
@@ -382,7 +396,10 @@ fn aggregate_status(checks: &HealthChecks) -> HealthStatus {
     }
 }
 
-async fn compute_health_response(state: &HealthState) -> (StatusCode, HealthResponse) {
+async fn compute_health_response(
+    state: &HealthState,
+    instance_id: String,
+) -> (StatusCode, HealthResponse) {
     let timeout = Duration::from_secs(state.config.health.check_timeout_secs);
     let (valkey, ghe, disk) = tokio::join!(
         run_check_with_timeout("valkey", timeout, check_valkey(&state.valkey)),
@@ -405,6 +422,7 @@ async fn compute_health_response(state: &HealthState) -> (StatusCode, HealthResp
         status,
         version: crate::build_info::VERSION.to_string(),
         git_revision: crate::build_info::git_revision().to_string(),
+        instance_id,
         checks,
     };
 
