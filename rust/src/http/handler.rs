@@ -632,7 +632,7 @@ async fn handle_info_refs(
 
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status();
-        warn!(%status, "upstream forge returned error for info/refs");
+        debug!(%status, "upstream forge returned error for info/refs");
         return forward_upstream_response(upstream_resp).await;
     }
 
