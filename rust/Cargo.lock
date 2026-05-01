@@ -1616,6 +1616,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-metrics",
  "tokio-stream",
  "tokio-util",
  "tower",
@@ -4388,6 +4389,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-metrics"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9e81d53caf955549b1dec7af4ac2149e94cc25ed97b4a545151140281e2f528"
+dependencies = [
+ "futures-util",
+ "pin-project-lite",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

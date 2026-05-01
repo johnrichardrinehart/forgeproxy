@@ -1,7 +1,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use prometheus_client::collector::Collector;
@@ -397,6 +397,11 @@ pub struct RepoUpdateProfileLabels {
     pub repo: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BackgroundTaskLabels {
+    pub task: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum AuthState {
     Anonymous,
@@ -629,6 +634,10 @@ pub struct Metrics {
     pub repo_update_profile_mirror_size_bytes: Family<RepoUpdateProfileLabels, Gauge>,
     pub repo_update_profile_ref_count: Family<RepoUpdateProfileLabels, Gauge>,
     pub repo_update_profile_failure_score: Family<RepoUpdateProfileLabels, Gauge>,
+
+    // -- background task runtime --
+    pub background_task_poll_seconds_total: Family<BackgroundTaskLabels, Counter<f64, AtomicU64>>,
+    pub background_task_polls_total: Family<BackgroundTaskLabels, Counter>,
 }
 
 impl Metrics {
@@ -1192,6 +1201,21 @@ impl Metrics {
             repo_update_profile_failure_score.clone(),
         );
 
+        let background_task_poll_seconds_total =
+            Family::<BackgroundTaskLabels, Counter<f64, AtomicU64>>::default();
+        registry.register(
+            "forgeproxy_background_task_poll_seconds",
+            "Tokio poll time consumed by instrumented persistent background tasks",
+            background_task_poll_seconds_total.clone(),
+        );
+
+        let background_task_polls_total = Family::<BackgroundTaskLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_background_task_polls",
+            "Tokio poll count for instrumented persistent background tasks",
+            background_task_polls_total.clone(),
+        );
+
         Self {
             clone_total,
             clone_served_total,
@@ -1266,6 +1290,8 @@ impl Metrics {
             repo_update_profile_mirror_size_bytes,
             repo_update_profile_ref_count,
             repo_update_profile_failure_score,
+            background_task_poll_seconds_total,
+            background_task_polls_total,
         }
     }
 }
@@ -2063,6 +2089,32 @@ pub fn set_repo_update_profile(
         .set(failure_score.min(i64::MAX as u64) as i64);
 }
 
+pub fn inc_background_task_poll_metrics(
+    metrics: &MetricsRegistry,
+    task: &str,
+    poll_seconds: f64,
+    poll_count: u64,
+) {
+    let labels = BackgroundTaskLabels {
+        task: task.to_string(),
+    };
+    let poll_seconds_counter = metrics
+        .metrics
+        .background_task_poll_seconds_total
+        .get_or_create(&labels);
+    if poll_seconds > 0.0 {
+        poll_seconds_counter.inc_by(poll_seconds);
+    }
+
+    let poll_count_counter = metrics
+        .metrics
+        .background_task_polls_total
+        .get_or_create(&labels);
+    if poll_count > 0 {
+        poll_count_counter.inc_by(poll_count);
+    }
+}
+
 pub struct ActiveConnectionGuard {
     metrics: MetricsRegistry,
     protocol: Protocol,
@@ -2190,6 +2242,25 @@ mod tests {
         ));
         assert!(encoded.contains("# TYPE forgeproxy_upstream_api_rate_limit_remaining gauge"));
         assert!(encoded.contains("forgeproxy_upstream_api_rate_limit_remaining 42"));
+    }
+
+    #[test]
+    fn background_task_poll_metrics_preserve_fractional_seconds() {
+        let metrics = MetricsRegistry::new();
+
+        inc_background_task_poll_metrics(&metrics, "config_reload", 0.125, 3);
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(encoded.contains(
+            "# HELP forgeproxy_background_task_poll_seconds Tokio poll time consumed by instrumented persistent background tasks"
+        ));
+        assert!(encoded.contains("# TYPE forgeproxy_background_task_poll_seconds counter"));
+        assert!(encoded.contains(
+            "forgeproxy_background_task_poll_seconds_total{task=\"config_reload\"} 0.125"
+        ));
+        assert!(
+            encoded.contains("forgeproxy_background_task_polls_total{task=\"config_reload\"} 3")
+        );
     }
 
     #[test]
