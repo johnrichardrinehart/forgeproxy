@@ -322,6 +322,10 @@ impl AppState {
     }
 
     pub fn finish_prewarm(&self, issues: Vec<String>) {
+        self.finish_prewarm_with_notes(issues, Vec::new());
+    }
+
+    pub fn finish_prewarm_with_notes(&self, issues: Vec<String>, notes: Vec<String>) {
         {
             let mut status = self
                 .prewarm_status
@@ -329,6 +333,7 @@ impl AppState {
                 .expect("prewarm status lock poisoned");
             status.complete = true;
             status.issues = issues;
+            status.notes = notes;
         }
         self.mark_prewarm_ready();
     }
@@ -1643,6 +1648,7 @@ async fn build_app_state(
         prewarm_status: Arc::new(RwLock::new(crate::health::PrewarmStatus {
             complete: !config.prewarm.enabled,
             issues: Vec::new(),
+            notes: Vec::new(),
         })),
     };
     state.refresh_live_metrics();
@@ -1698,22 +1704,26 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
             async move {
                 let started_at = Instant::now();
                 let warmed = crate::coordination::registry::prewarm_repo(&state, &owner_repo).await;
-                if warmed.initialized_locally
-                    && state.pack_cache.enabled()
-                    && let Err(error) =
-                        crate::coordination::registry::warm_current_published_generation_pack_cache(
-                            &state,
-                            &owner_repo,
-                            "startup prewarm",
-                        )
-                        .await
-                {
-                    tracing::warn!(
-                        repo = %owner_repo,
-                        error = %error,
-                        error_chain = %format!("{error:#}"),
-                        "startup pre-warm could not run pack-cache warming"
-                    );
+                if warmed.initialized_locally && state.pack_cache.enabled() {
+                    let warm_state = state.clone();
+                    let warm_repo = owner_repo.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::coordination::registry::warm_current_published_generation_pack_cache(
+                                &warm_state,
+                                &warm_repo,
+                                "startup prewarm",
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                repo = %warm_repo,
+                                error = %error,
+                                error_chain = %format!("{error:#}"),
+                                "startup pre-warm could not run pack-cache warming"
+                            );
+                        }
+                    });
                 }
                 (owner_repo, started_at.elapsed(), warmed)
             }
@@ -1724,6 +1734,7 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
     .await;
 
     let mut issues = Vec::new();
+    let mut notes = Vec::new();
     match prewarm_results {
         Ok(results) => {
             for (owner_repo, elapsed, warmed) in results {
@@ -1747,20 +1758,28 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
             }
         }
         Err(_) => {
-            issues.push(format!(
+            notes.push(format!(
                 "startup repository pre-warm exceeded {} seconds; force-opening readiness",
                 force_open_secs
             ));
             tracing::warn!(
                 force_open_secs,
-                "repository pre-warm timed out; force-opening readiness and reporting degraded health"
+                "repository pre-warm timed out; force-opening readiness"
             );
         }
     }
 
-    state.finish_prewarm(issues.clone());
+    state.finish_prewarm_with_notes(issues.clone(), notes.clone());
     if issues.is_empty() {
-        tracing::info!("repository pre-warm complete; readiness gate opened");
+        if notes.is_empty() {
+            tracing::info!("repository pre-warm complete; readiness gate opened");
+        } else {
+            tracing::warn!(
+                note_count = notes.len(),
+                notes = %notes.join("; "),
+                "repository pre-warm force-opened readiness without marking /healthz degraded"
+            );
+        }
     } else {
         tracing::warn!(
             issue_count = issues.len(),
