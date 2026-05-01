@@ -58,6 +58,13 @@ impl CheckResult {
         }
     }
 
+    fn healthy_with_detail(detail: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            detail: Some(detail.into()),
+        }
+    }
+
     fn unhealthy(detail: impl Into<String>) -> Self {
         Self {
             ok: false,
@@ -97,6 +104,7 @@ pub struct HealthWorker {
 pub struct PrewarmStatus {
     pub complete: bool,
     pub issues: Vec<String>,
+    pub notes: Vec<String>,
 }
 
 impl PrewarmStatus {
@@ -105,10 +113,12 @@ impl PrewarmStatus {
             return CheckResult::unhealthy("startup repository pre-warm is still running");
         }
 
-        if self.issues.is_empty() {
-            CheckResult::healthy()
-        } else {
+        if !self.issues.is_empty() {
             CheckResult::unhealthy(self.issues.join("; "))
+        } else if !self.notes.is_empty() {
+            CheckResult::healthy_with_detail(self.notes.join("; "))
+        } else {
+            CheckResult::healthy()
         }
     }
 }
@@ -578,11 +588,30 @@ mod tests {
             prewarm: PrewarmStatus {
                 complete: true,
                 issues: vec!["foo/bar: upstream fetch failed".to_string()],
+                notes: Vec::new(),
             }
             .as_check_result(),
         };
 
         assert_eq!(aggregate_status(&checks), HealthStatus::Degraded);
+    }
+
+    #[test]
+    fn completed_prewarm_with_notes_remains_ok() {
+        let checks = HealthChecks {
+            valkey: CheckResult::healthy(),
+            ghe: CheckResult::healthy(),
+            disk: CheckResult::healthy(),
+            prewarm: PrewarmStatus {
+                complete: true,
+                issues: Vec::new(),
+                notes: vec!["startup pre-warm exceeded timeout; force-opened readiness".to_string()],
+            }
+            .as_check_result(),
+        };
+
+        assert_eq!(aggregate_status(&checks), HealthStatus::Ok);
+        assert!(checks.prewarm.ok);
     }
 
     #[tokio::test]
