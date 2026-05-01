@@ -125,6 +125,23 @@ request_wait_for_active_local_catch_up_secs = 360
 request_time_s3_restore_secs = 0
 generation_publish_secs = 0
 local_upload_pack_first_byte_secs = 0
+# Adaptive repo update defaults. Deploying these values does not reset learned
+# per-repo Valkey state; auto mode still uses observed size/ref/failure signals
+# unless a repo override or forced global mode is configured.
+# Auto mode selects direct_mirror when any threshold is crossed: size OR ref
+# count OR learned failure score. The physical ratio is a delta-workspace health
+# limit comparing temporary workspace disk use to persistent mirror disk use.
+repo_update_mode = "auto"
+repo_update_large_repo_size_bytes_threshold = 1073741824
+repo_update_large_repo_ref_count_threshold = 10000
+repo_update_failure_score_threshold = 3
+repo_update_delta_workspace_max_physical_ratio = 0.25
+repo_update_overrides = {
+  # "foo/deployment" = {
+  #   mode = "direct_mirror"
+  #   large_repo_ref_count_threshold = 5000
+  # }
+}
 delegated_repositories = []
 local_upload_pack_threads = 2
 pack_cache_on_demand_composite_total_secs = 0

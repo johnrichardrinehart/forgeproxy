@@ -52,6 +52,22 @@ pub struct FetchSchedule {
     pub last_delta_bytes: u64,
 }
 
+/// Runtime-learned adaptive update state for a repository. This is persisted
+/// in Valkey and intentionally not rendered into deployment config.
+#[derive(Debug, Clone, Default)]
+pub struct RepoUpdateProfile {
+    pub mirror_size_bytes: u64,
+    pub ref_count: u64,
+    pub pack_count: u64,
+    pub failure_score: u64,
+    pub alternates_failures: u64,
+    pub upstream_fallbacks: u64,
+    pub missed_want_failures: u64,
+    pub last_fetch_duration_ms: u64,
+    pub last_fetch_bytes: u64,
+    pub last_selected_mode: String,
+}
+
 // ---------------------------------------------------------------------------
 // Key helpers
 // ---------------------------------------------------------------------------
@@ -64,6 +80,11 @@ pub(crate) fn repo_key(owner_repo: &str) -> String {
 fn fetch_schedule_key(owner_repo: &str) -> String {
     let normalized = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     format!("forgeproxy:repo:{normalized}:fetch_schedule")
+}
+
+fn repo_update_profile_key(owner_repo: &str) -> String {
+    let normalized = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    format!("forgeproxy:repo:{normalized}:repo_update_profile")
 }
 
 fn clone_hydration_semaphore_key(owner_repo: &str) -> String {
@@ -290,6 +311,85 @@ pub async fn set_fetch_schedule(
         .context("HSET fetch_schedule")?;
     debug!(%owner_repo, "fetch schedule written");
     Ok(())
+}
+
+async fn get_repo_update_profile(
+    pool: &fred::clients::Pool,
+    owner_repo: &str,
+) -> Result<RepoUpdateProfile> {
+    let key = repo_update_profile_key(owner_repo);
+    let map: HashMap<String, String> = pool
+        .hgetall(&key)
+        .await
+        .context("HGETALL repo_update_profile")?;
+    if map.is_empty() {
+        return Ok(RepoUpdateProfile::default());
+    }
+
+    Ok(RepoUpdateProfile {
+        mirror_size_bytes: parse_u64_field(&map, "mirror_size_bytes"),
+        ref_count: parse_u64_field(&map, "ref_count"),
+        pack_count: parse_u64_field(&map, "pack_count"),
+        failure_score: parse_u64_field(&map, "failure_score"),
+        alternates_failures: parse_u64_field(&map, "alternates_failures"),
+        upstream_fallbacks: parse_u64_field(&map, "upstream_fallbacks"),
+        missed_want_failures: parse_u64_field(&map, "missed_want_failures"),
+        last_fetch_duration_ms: parse_u64_field(&map, "last_fetch_duration_ms"),
+        last_fetch_bytes: parse_u64_field(&map, "last_fetch_bytes"),
+        last_selected_mode: map.get("last_selected_mode").cloned().unwrap_or_default(),
+    })
+}
+
+async fn set_repo_update_profile(
+    pool: &fred::clients::Pool,
+    owner_repo: &str,
+    profile: &RepoUpdateProfile,
+) -> Result<()> {
+    let key = repo_update_profile_key(owner_repo);
+    let pairs: Vec<(String, String)> = vec![
+        (
+            "mirror_size_bytes".into(),
+            profile.mirror_size_bytes.to_string(),
+        ),
+        ("ref_count".into(), profile.ref_count.to_string()),
+        ("pack_count".into(), profile.pack_count.to_string()),
+        ("failure_score".into(), profile.failure_score.to_string()),
+        (
+            "alternates_failures".into(),
+            profile.alternates_failures.to_string(),
+        ),
+        (
+            "upstream_fallbacks".into(),
+            profile.upstream_fallbacks.to_string(),
+        ),
+        (
+            "missed_want_failures".into(),
+            profile.missed_want_failures.to_string(),
+        ),
+        (
+            "last_fetch_duration_ms".into(),
+            profile.last_fetch_duration_ms.to_string(),
+        ),
+        (
+            "last_fetch_bytes".into(),
+            profile.last_fetch_bytes.to_string(),
+        ),
+        (
+            "last_selected_mode".into(),
+            profile.last_selected_mode.clone(),
+        ),
+    ];
+    let _: () = pool
+        .hset(&key, pairs)
+        .await
+        .context("HSET repo_update_profile")?;
+    Ok(())
+}
+
+fn parse_u64_field(map: &HashMap<String, String>, field: &str) -> u64 {
+    map.get(field)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
 }
 
 pub async fn try_ensure_repo_cloned_from_tee(
@@ -3297,6 +3397,208 @@ struct DeltaMirrorFetchResult {
     published_repo_path: PathBuf,
 }
 
+const DELTA_WORKSPACE_PHYSICAL_RATIO_MIN_MIRROR_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoUpdateExecutionMode {
+    DeltaWorkspace,
+    DirectMirror,
+}
+
+impl RepoUpdateExecutionMode {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::DeltaWorkspace => "delta_workspace",
+            Self::DirectMirror => "direct_mirror",
+        }
+    }
+}
+
+struct RepoUpdateModeDecision {
+    mode: RepoUpdateExecutionMode,
+    reason: &'static str,
+    profile: RepoUpdateProfile,
+    delta_workspace_max_physical_ratio: f64,
+}
+
+#[derive(Clone, Copy)]
+struct EffectiveRepoUpdatePolicy {
+    mode: crate::config::RepoUpdateMode,
+    large_repo_size_bytes_threshold: u64,
+    large_repo_ref_count_threshold: u64,
+    failure_score_threshold: u64,
+    delta_workspace_max_physical_ratio: f64,
+}
+
+fn effective_repo_update_policy(
+    config: &crate::config::Config,
+    owner_repo: &str,
+) -> EffectiveRepoUpdatePolicy {
+    let canonical_owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let override_cfg = config
+        .repo_overrides
+        .get(owner_repo)
+        .or_else(|| config.repo_overrides.get(&canonical_owner_repo))
+        .and_then(|repo_override| repo_override.repo_update.as_ref());
+    let global = &config.repo_update;
+
+    EffectiveRepoUpdatePolicy {
+        mode: override_cfg
+            .and_then(|repo_update| repo_update.mode)
+            .unwrap_or(global.mode),
+        large_repo_size_bytes_threshold: override_cfg
+            .and_then(|repo_update| repo_update.large_repo_size_bytes_threshold)
+            .unwrap_or(global.large_repo_size_bytes_threshold),
+        large_repo_ref_count_threshold: override_cfg
+            .and_then(|repo_update| repo_update.large_repo_ref_count_threshold)
+            .unwrap_or(global.large_repo_ref_count_threshold),
+        failure_score_threshold: override_cfg
+            .and_then(|repo_update| repo_update.failure_score_threshold)
+            .unwrap_or(global.failure_score_threshold),
+        delta_workspace_max_physical_ratio: override_cfg
+            .and_then(|repo_update| repo_update.delta_workspace_max_physical_ratio)
+            .unwrap_or(global.delta_workspace_max_physical_ratio),
+    }
+}
+
+async fn select_repo_update_mode(
+    state: &crate::AppState,
+    owner_repo: &str,
+    mirror_path: &Path,
+) -> Result<RepoUpdateModeDecision> {
+    let config = state.config();
+    let policy = effective_repo_update_policy(&config, owner_repo);
+    let mut profile = get_repo_update_profile(&state.valkey, owner_repo).await?;
+    refresh_repo_update_profile_from_mirror(&mut profile, mirror_path).await;
+    crate::metrics::set_repo_update_profile(
+        &state.metrics,
+        owner_repo,
+        profile.mirror_size_bytes,
+        profile.ref_count,
+        profile.failure_score,
+    );
+
+    let (mode, reason) = match policy.mode {
+        crate::config::RepoUpdateMode::DirectMirror => (
+            RepoUpdateExecutionMode::DirectMirror,
+            "forced_global_or_repo",
+        ),
+        crate::config::RepoUpdateMode::DeltaWorkspace => (
+            RepoUpdateExecutionMode::DeltaWorkspace,
+            "forced_global_or_repo",
+        ),
+        crate::config::RepoUpdateMode::Auto => {
+            if profile.ref_count >= policy.large_repo_ref_count_threshold {
+                (RepoUpdateExecutionMode::DirectMirror, "large_ref_count")
+            } else if profile.mirror_size_bytes >= policy.large_repo_size_bytes_threshold {
+                (RepoUpdateExecutionMode::DirectMirror, "large_mirror_size")
+            } else if profile.failure_score >= policy.failure_score_threshold {
+                (
+                    RepoUpdateExecutionMode::DirectMirror,
+                    "learned_failure_score",
+                )
+            } else {
+                (RepoUpdateExecutionMode::DeltaWorkspace, "auto_default")
+            }
+        }
+    };
+
+    if !profile.last_selected_mode.is_empty() && profile.last_selected_mode != mode.as_label() {
+        crate::metrics::inc_repo_update_mode_switch(
+            &state.metrics,
+            &profile.last_selected_mode,
+            mode.as_label(),
+            reason,
+        );
+    }
+    profile.last_selected_mode = mode.as_label().to_string();
+    set_repo_update_profile(&state.valkey, owner_repo, &profile).await?;
+    crate::metrics::inc_repo_update_selection(&state.metrics, mode.as_label(), reason, "selected");
+
+    Ok(RepoUpdateModeDecision {
+        mode,
+        reason,
+        profile,
+        delta_workspace_max_physical_ratio: policy.delta_workspace_max_physical_ratio,
+    })
+}
+
+async fn refresh_repo_update_profile_from_mirror(
+    profile: &mut RepoUpdateProfile,
+    mirror_path: &Path,
+) {
+    let mirror_path_for_usage = mirror_path.to_path_buf();
+    if let Ok(usage) = tokio::task::spawn_blocking(move || {
+        crate::cache::manager::dir_usage(&mirror_path_for_usage)
+    })
+    .await
+        && let Ok(usage) = usage
+    {
+        profile.mirror_size_bytes = usage.physical_bytes;
+    }
+    if let Ok(refs) = crate::git::commands::git_for_each_ref(mirror_path).await {
+        profile.ref_count = refs.len() as u64;
+    }
+    profile.pack_count = count_pack_files(mirror_path);
+}
+
+fn count_pack_files(repo_path: &Path) -> u64 {
+    let pack_dir = repo_path.join("objects").join("pack");
+    let Ok(entries) = std::fs::read_dir(pack_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+        .count() as u64
+}
+
+async fn record_repo_update_success(
+    state: &crate::AppState,
+    owner_repo: &str,
+    mode: RepoUpdateExecutionMode,
+    fetch_result: &crate::git::commands::FetchResult,
+    fetch_elapsed: Duration,
+) -> Result<()> {
+    let mut profile = get_repo_update_profile(&state.valkey, owner_repo).await?;
+    profile.failure_score = profile.failure_score.saturating_sub(1);
+    profile.last_fetch_duration_ms = fetch_elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    profile.last_fetch_bytes = fetch_result.bytes_received;
+    profile.last_selected_mode = mode.as_label().to_string();
+    set_repo_update_profile(&state.valkey, owner_repo, &profile).await?;
+    crate::metrics::set_repo_update_profile(
+        &state.metrics,
+        owner_repo,
+        profile.mirror_size_bytes,
+        profile.ref_count,
+        profile.failure_score,
+    );
+    Ok(())
+}
+
+async fn record_repo_update_failure(
+    state: &crate::AppState,
+    owner_repo: &str,
+    mode: RepoUpdateExecutionMode,
+    failure_kind: &str,
+) -> Result<()> {
+    let mut profile = get_repo_update_profile(&state.valkey, owner_repo).await?;
+    profile.failure_score = profile.failure_score.saturating_add(1);
+    profile.last_selected_mode = mode.as_label().to_string();
+    if failure_kind == "alternates" {
+        profile.alternates_failures = profile.alternates_failures.saturating_add(1);
+    }
+    set_repo_update_profile(&state.valkey, owner_repo, &profile).await?;
+    crate::metrics::set_repo_update_profile(
+        &state.metrics,
+        owner_repo,
+        profile.mirror_size_bytes,
+        profile.ref_count,
+        profile.failure_score,
+    );
+    Ok(())
+}
+
 fn coalescable_generation_target(
     state: &crate::AppState,
     owner_repo: &str,
@@ -3344,6 +3646,27 @@ async fn fetch_delta_into_repo_mirror(
         bail!("repo mirror is not available for delta fetch");
     }
 
+    let decision = select_repo_update_mode(state, owner_repo, &mirror_path).await?;
+    info!(
+        repo = %owner_repo,
+        mode = decision.mode.as_label(),
+        reason = decision.reason,
+        mirror_size_bytes = decision.profile.mirror_size_bytes,
+        ref_count = decision.profile.ref_count,
+        failure_score = decision.profile.failure_score,
+        "selected repo update mode"
+    );
+    if decision.mode == RepoUpdateExecutionMode::DirectMirror {
+        return fetch_directly_into_repo_mirror(
+            state,
+            owner_repo,
+            clone_url,
+            request_refspecs,
+            priority,
+        )
+        .await;
+    }
+
     let delta_repo_path = state.cache_manager.create_delta_repo_path(owner_repo)?;
     let result = async {
         crate::git::commands::git_clone_bare_shared_local(&mirror_path, &delta_repo_path)
@@ -3355,10 +3678,24 @@ async fn fetch_delta_into_repo_mirror(
                     mirror_path.display()
                 )
             })?;
+        if let Err(error) = validate_delta_workspace(&mirror_path, &delta_repo_path).await {
+            crate::metrics::inc_repo_update_alternates_validation_failure(
+                &state.metrics,
+                "missing_or_invalid",
+            );
+            return Err(error);
+        }
+        validate_delta_workspace_physical_ratio(
+            &mirror_path,
+            &delta_repo_path,
+            decision.delta_workspace_max_physical_ratio,
+        )
+        .await?;
 
         let Some(fetch_permits) = acquire_fetch_permits(state, owner_repo, priority).await? else {
             bail!("no upstream fetch slots are available for {priority:?} delta fetch");
         };
+        let fetch_started_at = Instant::now();
         let (fetch_result, selected_fetched_refspecs) =
             if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
                 if priority == FetchPriority::RequestTime {
@@ -3408,6 +3745,7 @@ async fn fetch_delta_into_repo_mirror(
                 .await?;
                 (fetch_result, None)
             };
+        let fetch_elapsed = fetch_started_at.elapsed();
         drop(fetch_permits);
         {
             // Keep the writer-owned mirror stable from the moment we merge the
@@ -3473,6 +3811,14 @@ async fn fetch_delta_into_repo_mirror(
             if priority == FetchPriority::RequestTime {
                 crate::metrics::inc_request_time_catch_up(&state.metrics, "published");
             }
+            record_repo_update_success(
+                state,
+                owner_repo,
+                RepoUpdateExecutionMode::DeltaWorkspace,
+                &fetch_result,
+                fetch_elapsed,
+            )
+            .await?;
             let published_repo_path = state.cache_manager.repo_path(owner_repo);
             Ok::<PathBuf, anyhow::Error>(published_repo_path)
         }
@@ -3492,6 +3838,223 @@ async fn fetch_delta_into_repo_mirror(
                     delta_repo_path.display()
                 )
             })?;
+    }
+
+    if result.is_err() {
+        let _ = record_repo_update_failure(
+            state,
+            owner_repo,
+            RepoUpdateExecutionMode::DeltaWorkspace,
+            "delta_workspace",
+        )
+        .await;
+    }
+
+    result
+}
+
+async fn validate_delta_workspace(mirror_path: &Path, delta_repo_path: &Path) -> Result<()> {
+    let alternates_path = delta_repo_path
+        .join("objects")
+        .join("info")
+        .join("alternates");
+    let contents = tokio::fs::read_to_string(&alternates_path)
+        .await
+        .with_context(|| {
+            format!(
+                "delta workspace {} is missing required alternates file {}",
+                delta_repo_path.display(),
+                alternates_path.display()
+            )
+        })?;
+    let mirror_objects = mirror_path.join("objects");
+    let mirror_objects = mirror_objects
+        .canonicalize()
+        .unwrap_or_else(|_| mirror_objects.clone());
+    let valid = contents.lines().any(|line| {
+        let candidate = PathBuf::from(line.trim());
+        !line.trim().is_empty()
+            && candidate
+                .canonicalize()
+                .unwrap_or(candidate)
+                .eq(&mirror_objects)
+    });
+    if !valid {
+        bail!(
+            "delta workspace {} alternates do not reference mirror object database {}",
+            delta_repo_path.display(),
+            mirror_objects.display()
+        );
+    }
+    Ok(())
+}
+
+async fn validate_delta_workspace_physical_ratio(
+    mirror_path: &Path,
+    delta_repo_path: &Path,
+    max_ratio: f64,
+) -> Result<()> {
+    let mirror_path = mirror_path.to_path_buf();
+    let delta_repo_path = delta_repo_path.to_path_buf();
+    let (mirror_usage, delta_usage) = tokio::task::spawn_blocking(move || {
+        let mirror = crate::cache::manager::dir_usage(&mirror_path)?;
+        let delta = crate::cache::manager::dir_usage(&delta_repo_path)?;
+        Ok::<_, anyhow::Error>((mirror, delta))
+    })
+    .await
+    .context("delta workspace physical ratio task join failed")??;
+    if !delta_workspace_physical_ratio_exceeded(
+        mirror_usage.physical_bytes,
+        delta_usage.physical_bytes,
+        max_ratio,
+    ) {
+        return Ok(());
+    }
+    let ratio = delta_usage.physical_bytes as f64 / mirror_usage.physical_bytes as f64;
+    bail!(
+        "delta workspace physical usage ratio {:.3} exceeds configured maximum {:.3} (delta={} mirror={})",
+        ratio,
+        max_ratio,
+        delta_usage.physical_bytes,
+        mirror_usage.physical_bytes
+    );
+}
+
+fn delta_workspace_physical_ratio_exceeded(
+    mirror_physical_bytes: u64,
+    delta_physical_bytes: u64,
+    max_ratio: f64,
+) -> bool {
+    if mirror_physical_bytes < DELTA_WORKSPACE_PHYSICAL_RATIO_MIN_MIRROR_BYTES {
+        return false;
+    }
+    delta_physical_bytes as f64 / mirror_physical_bytes as f64 > max_ratio
+}
+
+async fn fetch_directly_into_repo_mirror(
+    state: &crate::AppState,
+    owner_repo: &str,
+    clone_url: &str,
+    request_refspecs: Option<&[String]>,
+    priority: FetchPriority,
+) -> Result<DeltaMirrorFetchResult> {
+    if state.config().clone.max_concurrent_upstream_fetches == 0 {
+        bail!("upstream fetch semaphore is disabled");
+    }
+
+    let mirror_path = require_existing_repo_mirror(state, owner_repo).await?;
+    let Some(fetch_permits) = acquire_fetch_permits(state, owner_repo, priority).await? else {
+        bail!("no upstream fetch slots are available for {priority:?} direct mirror fetch");
+    };
+
+    let fetch_started_at = Instant::now();
+    let result = async {
+        let _repo_generation_guard = acquire_local_repo_publish_guard(state, owner_repo).await;
+        let fetch_started_at = Instant::now();
+        let (fetch_result, selected_fetched_refspecs) =
+            if let Some(refspecs) = request_refspecs.filter(|refspecs| !refspecs.is_empty()) {
+                if priority == FetchPriority::RequestTime {
+                    crate::metrics::inc_request_time_catch_up(&state.metrics, "selected_fetch");
+                }
+                info!(
+                    repo = %owner_repo,
+                    fetch_priority = priority.as_label(),
+                    refspec_count = refspecs.len(),
+                    "direct mirror catch-up is fetching only refs needed for the current wants"
+                );
+                let selected_fetch = git_fetch_refspecs_allow_missing_remote_refs_with_context(
+                    &mirror_path,
+                    clone_url,
+                    &[],
+                    refspecs,
+                    false,
+                    Some(priority.as_label()),
+                )
+                .await?;
+                if selected_fetch.fetched_refspecs.is_empty() {
+                    bail!(
+                        "all selected direct mirror catch-up refs disappeared from the remote before fetch"
+                    );
+                }
+                (selected_fetch.fetch_result, Some(selected_fetch.fetched_refspecs))
+            } else {
+                if priority == FetchPriority::RequestTime {
+                    crate::metrics::inc_request_time_catch_up(&state.metrics, "full_fetch");
+                }
+                let fetch_result = crate::git::commands::git_fetch_with_context(
+                    &mirror_path,
+                    clone_url,
+                    &[],
+                    Some(priority.as_label()),
+                )
+                .await?;
+                (fetch_result, None)
+            };
+        let fetch_elapsed = fetch_started_at.elapsed();
+
+        drop(fetch_permits);
+        ensure_bare_head_ref(&mirror_path).await?;
+        let mirror_validation_started_at = Instant::now();
+        info!(
+            repo = %owner_repo,
+            source = "direct mirror fetch",
+            path = %mirror_path.display(),
+            selected_refspec_count = selected_fetched_refspecs.as_ref().map_or(0, Vec::len),
+            "starting quick mirror verification before publishing a generation"
+        );
+        quick_check_ready_repo(&mirror_path, "direct mirror fetch", None).await?;
+        info!(
+            repo = %owner_repo,
+            source = "direct mirror fetch",
+            path = %mirror_path.display(),
+            elapsed_ms = mirror_validation_started_at.elapsed().as_millis(),
+            "finished quick mirror verification before publishing a generation"
+        );
+        let published_repo_path = publish_repo_mirror_generation_inner(
+            state,
+            owner_repo,
+            "direct mirror fetch",
+            priority != FetchPriority::RequestTime,
+        )
+        .await?;
+        if priority == FetchPriority::RequestTime {
+            crate::metrics::inc_request_time_catch_up(&state.metrics, "published");
+        }
+        crate::metrics::observe_direct_mirror_fetch(
+            &state.metrics,
+            RepoUpdateExecutionMode::DirectMirror.as_label(),
+            fetch_elapsed,
+            fetch_result.bytes_received,
+        );
+        record_repo_update_success(
+            state,
+            owner_repo,
+            RepoUpdateExecutionMode::DirectMirror,
+            &fetch_result,
+            fetch_elapsed,
+        )
+        .await?;
+        Ok(DeltaMirrorFetchResult {
+            fetch_result,
+            published_repo_path,
+        })
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = record_repo_update_failure(
+            state,
+            owner_repo,
+            RepoUpdateExecutionMode::DirectMirror,
+            "direct_mirror",
+        )
+        .await;
+        crate::metrics::observe_direct_mirror_fetch(
+            &state.metrics,
+            RepoUpdateExecutionMode::DirectMirror.as_label(),
+            fetch_started_at.elapsed(),
+            0,
+        );
     }
 
     result
@@ -6152,6 +6715,24 @@ mod tests {
             IdleLocalUploadPackGate::Busy
         );
         assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[test]
+    fn delta_workspace_ratio_guard_ignores_tiny_mirrors() {
+        assert!(!delta_workspace_physical_ratio_exceeded(
+            96 * 1024,
+            96 * 1024,
+            0.25
+        ));
+    }
+
+    #[test]
+    fn delta_workspace_ratio_guard_rejects_large_expansion() {
+        assert!(delta_workspace_physical_ratio_exceeded(
+            128 * 1024 * 1024,
+            64 * 1024 * 1024,
+            0.25
+        ));
     }
 
     fn git_stdout(repo: &Path, args: &[&str]) -> String {

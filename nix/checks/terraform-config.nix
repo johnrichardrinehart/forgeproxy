@@ -41,6 +41,12 @@ let
         request_time_s3_restore_secs               = 0
         generation_publish_secs                    = 0
         local_upload_pack_first_byte_secs          = 0
+        repo_update_mode                           = "auto"
+        repo_update_large_repo_size_bytes_threshold = 1073741824
+        repo_update_large_repo_ref_count_threshold = 10000
+        repo_update_failure_score_threshold        = 3
+        repo_update_delta_workspace_max_physical_ratio = 0.25
+        repo_update_overrides                      = {}
         max_concurrent_upstream_clones             = 7
         max_concurrent_local_upload_packs          = 4
         max_concurrent_local_upload_packs_per_repo = 1

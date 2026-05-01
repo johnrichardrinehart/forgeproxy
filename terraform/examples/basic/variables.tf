@@ -401,6 +401,48 @@ variable "local_upload_pack_first_byte_secs" {
   description = "Request path: seconds a client may wait for first byte from local git upload-pack before proxying upstream. Zero disables this stage budget."
 }
 
+variable "repo_update_mode" {
+  type        = string
+  default     = "auto"
+  description = "Global default repo update mode. 'auto' uses deploy-time thresholds plus learned per-repo Valkey state."
+}
+
+variable "repo_update_large_repo_size_bytes_threshold" {
+  type        = number
+  default     = 1073741824
+  description = "Global default mirror size threshold where auto mode selects direct_mirror."
+}
+
+variable "repo_update_large_repo_ref_count_threshold" {
+  type        = number
+  default     = 10000
+  description = "Global default ref-count threshold where auto mode selects direct_mirror."
+}
+
+variable "repo_update_failure_score_threshold" {
+  type        = number
+  default     = 3
+  description = "Global default learned per-repo failure score threshold where auto mode selects direct_mirror."
+}
+
+variable "repo_update_delta_workspace_max_physical_ratio" {
+  type        = number
+  default     = 0.25
+  description = "Global default delta-workspace-to-mirror physical size ratio above which auto mode treats the delta path as unhealthy."
+}
+
+variable "repo_update_overrides" {
+  type = map(object({
+    mode                               = optional(string)
+    large_repo_size_bytes_threshold    = optional(number)
+    large_repo_ref_count_threshold     = optional(number)
+    failure_score_threshold            = optional(number)
+    delta_workspace_max_physical_ratio = optional(number)
+  }))
+  default     = {}
+  description = "Sparse per-repo adaptive update overrides. Omitted fields inherit global repo_update defaults; learned Valkey state is not reset by deploys."
+}
+
 variable "delegated_repositories" {
   type        = list(string)
   default     = []

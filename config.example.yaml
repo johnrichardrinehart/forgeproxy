@@ -78,6 +78,26 @@ fetch_schedule:
   backoff_factor: 2
   max_interval: 86400
   rolling_window: 1800
+# Deploy-time defaults for how an already-cached mirror is refreshed before a
+# new published generation is materialized. In `auto`, forgeproxy combines
+# these defaults with learned per-repo state stored in Valkey, such as observed
+# mirror size, ref count, failure score, and prior alternates failures.
+#
+# Terraform/config deploys overwrite only this default policy and explicit
+# repo_overrides. They do not erase the learned Valkey state, so a repo can
+# keep selecting direct_mirror at runtime even when this default remains auto.
+# The auto-mode direct_mirror condition is any-of: mirror size >= size
+# threshold, OR ref count >= ref threshold, OR learned failure score >= score
+# threshold. delta_workspace_max_physical_ratio is a delta-path health limit:
+# a temporary workspace using more than this fraction of the mirror's physical
+# disk usage is treated as evidence that the workspace is no longer cheap. The
+# runtime ignores this ratio for tiny mirrors where fixed Git overhead dominates.
+repo_update:
+  mode: "auto"
+  large_repo_size_bytes_threshold: 1073741824
+  large_repo_ref_count_threshold: 10000
+  failure_score_threshold: 3
+  delta_workspace_max_physical_ratio: 0.25
 bundles:
   min_clone_count_for_bundles: 2
   bundle_lock_ttl: 300
@@ -142,3 +162,10 @@ repo_overrides:
   "org/monorepo":
     fetch_interval: 900
     disable_bundles: false
+    # Per-repo overrides are sparse. Omit repo_update entirely to inherit the
+    # global defaults above while still allowing learned state to steer auto.
+    # Set mode to direct_mirror or delta_workspace only when operator knowledge
+    # should override the runtime classifier for this repo.
+    repo_update:
+      mode: "direct_mirror"
+      large_repo_ref_count_threshold: 5000

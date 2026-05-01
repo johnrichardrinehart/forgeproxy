@@ -368,6 +368,35 @@ pub struct RequestTimeCatchUpLabels {
     pub result: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RepoUpdateSelectionLabels {
+    pub mode: String,
+    pub reason: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RepoUpdateModeSwitchLabels {
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RepoUpdateModeLabels {
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RepoUpdateAlternatesFailureLabels {
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RepoUpdateProfileLabels {
+    pub repo: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum AuthState {
     Anonymous,
@@ -589,6 +618,17 @@ pub struct Metrics {
     pub bundle_manifest_entries: Family<BundleManifestEntriesLabels, Gauge>,
     pub generation_coalescing_total: Family<GenerationCoalescingLabels, Counter>,
     pub request_time_catch_up_total: Family<RequestTimeCatchUpLabels, Counter>,
+
+    // -- adaptive repo update policy --
+    pub repo_update_selection_total: Family<RepoUpdateSelectionLabels, Counter>,
+    pub repo_update_mode_switch_total: Family<RepoUpdateModeSwitchLabels, Counter>,
+    pub repo_update_direct_mirror_fetch_duration_seconds: Family<RepoUpdateModeLabels, Histogram>,
+    pub repo_update_direct_mirror_fetch_bytes: Family<RepoUpdateModeLabels, Counter>,
+    pub repo_update_alternates_validation_failures_total:
+        Family<RepoUpdateAlternatesFailureLabels, Counter>,
+    pub repo_update_profile_mirror_size_bytes: Family<RepoUpdateProfileLabels, Gauge>,
+    pub repo_update_profile_ref_count: Family<RepoUpdateProfileLabels, Gauge>,
+    pub repo_update_profile_failure_score: Family<RepoUpdateProfileLabels, Gauge>,
 }
 
 impl Metrics {
@@ -1089,6 +1129,69 @@ impl Metrics {
             request_time_catch_up_total.clone(),
         );
 
+        let repo_update_selection_total = Family::<RepoUpdateSelectionLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_repo_update_selection",
+            "Adaptive repo update mode selections by selected mode, reason, and result",
+            repo_update_selection_total.clone(),
+        );
+
+        let repo_update_mode_switch_total =
+            Family::<RepoUpdateModeSwitchLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_repo_update_mode_switch",
+            "Adaptive repo update mode switches by previous mode, selected mode, and reason",
+            repo_update_mode_switch_total.clone(),
+        );
+
+        let repo_update_direct_mirror_fetch_duration_seconds =
+            Family::<RepoUpdateModeLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.1, 2.0, 18))
+            });
+        registry.register(
+            "forgeproxy_repo_update_direct_mirror_fetch_duration_seconds",
+            "Direct-to-mirror upstream fetch latency in seconds",
+            repo_update_direct_mirror_fetch_duration_seconds.clone(),
+        );
+
+        let repo_update_direct_mirror_fetch_bytes =
+            Family::<RepoUpdateModeLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_repo_update_direct_mirror_fetch_bytes",
+            "Bytes received by direct-to-mirror upstream fetches",
+            repo_update_direct_mirror_fetch_bytes.clone(),
+        );
+
+        let repo_update_alternates_validation_failures_total =
+            Family::<RepoUpdateAlternatesFailureLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_repo_update_alternates_validation_failures",
+            "Delta workspace alternates validation failures by reason",
+            repo_update_alternates_validation_failures_total.clone(),
+        );
+
+        let repo_update_profile_mirror_size_bytes =
+            Family::<RepoUpdateProfileLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_repo_update_profile_mirror_size_bytes",
+            "Learned adaptive update profile mirror size by repo",
+            repo_update_profile_mirror_size_bytes.clone(),
+        );
+
+        let repo_update_profile_ref_count = Family::<RepoUpdateProfileLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_repo_update_profile_ref_count",
+            "Learned adaptive update profile ref count by repo",
+            repo_update_profile_ref_count.clone(),
+        );
+
+        let repo_update_profile_failure_score = Family::<RepoUpdateProfileLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_repo_update_profile_failure_score",
+            "Learned adaptive update profile failure score by repo",
+            repo_update_profile_failure_score.clone(),
+        );
+
         Self {
             clone_total,
             clone_served_total,
@@ -1155,6 +1258,14 @@ impl Metrics {
             bundle_manifest_entries,
             generation_coalescing_total,
             request_time_catch_up_total,
+            repo_update_selection_total,
+            repo_update_mode_switch_total,
+            repo_update_direct_mirror_fetch_duration_seconds,
+            repo_update_direct_mirror_fetch_bytes,
+            repo_update_alternates_validation_failures_total,
+            repo_update_profile_mirror_size_bytes,
+            repo_update_profile_ref_count,
+            repo_update_profile_failure_score,
         }
     }
 }
@@ -1864,6 +1975,92 @@ pub fn inc_request_time_catch_up(metrics: &MetricsRegistry, result: &str) {
             result: result.to_string(),
         })
         .inc();
+}
+
+pub fn inc_repo_update_selection(
+    metrics: &MetricsRegistry,
+    mode: &str,
+    reason: &str,
+    result: &str,
+) {
+    metrics
+        .metrics
+        .repo_update_selection_total
+        .get_or_create(&RepoUpdateSelectionLabels {
+            mode: mode.to_string(),
+            reason: reason.to_string(),
+            result: result.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_repo_update_mode_switch(metrics: &MetricsRegistry, from: &str, to: &str, reason: &str) {
+    metrics
+        .metrics
+        .repo_update_mode_switch_total
+        .get_or_create(&RepoUpdateModeSwitchLabels {
+            from: from.to_string(),
+            to: to.to_string(),
+            reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn observe_direct_mirror_fetch(
+    metrics: &MetricsRegistry,
+    mode: &str,
+    elapsed: Duration,
+    bytes: u64,
+) {
+    let labels = RepoUpdateModeLabels {
+        mode: mode.to_string(),
+    };
+    metrics
+        .metrics
+        .repo_update_direct_mirror_fetch_duration_seconds
+        .get_or_create(&labels)
+        .observe(elapsed.as_secs_f64());
+    metrics
+        .metrics
+        .repo_update_direct_mirror_fetch_bytes
+        .get_or_create(&labels)
+        .inc_by(bytes);
+}
+
+pub fn inc_repo_update_alternates_validation_failure(metrics: &MetricsRegistry, reason: &str) {
+    metrics
+        .metrics
+        .repo_update_alternates_validation_failures_total
+        .get_or_create(&RepoUpdateAlternatesFailureLabels {
+            reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn set_repo_update_profile(
+    metrics: &MetricsRegistry,
+    owner_repo: &str,
+    mirror_size_bytes: u64,
+    ref_count: u64,
+    failure_score: u64,
+) {
+    let repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let labels = RepoUpdateProfileLabels { repo };
+    metrics
+        .metrics
+        .repo_update_profile_mirror_size_bytes
+        .get_or_create(&labels)
+        .set(mirror_size_bytes.min(i64::MAX as u64) as i64);
+    metrics
+        .metrics
+        .repo_update_profile_ref_count
+        .get_or_create(&labels)
+        .set(ref_count.min(i64::MAX as u64) as i64);
+    metrics
+        .metrics
+        .repo_update_profile_failure_score
+        .get_or_create(&labels)
+        .set(failure_score.min(i64::MAX as u64) as i64);
 }
 
 pub struct ActiveConnectionGuard {
