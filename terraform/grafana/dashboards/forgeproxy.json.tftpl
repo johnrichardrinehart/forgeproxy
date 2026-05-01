@@ -886,6 +886,16 @@
           "expr": "histogram_quantile(0.95, sum by (le, result) (rate(forgeproxy_pack_cache_on_demand_composite_delta_objects_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p95 delta objects {{result}}",
           "refId": "E"
+        },
+        {
+          "expr": "sum by (result) (rate(forgeproxy_pack_cache_packstore_midx_refresh_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "packstore MIDX refresh {{result}} / min",
+          "refId": "F"
+        },
+        {
+          "expr": "sum by (stage) (rate(forgeproxy_pack_cache_stale_generation_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "stale generation {{stage}} / min",
+          "refId": "G"
         }
       ],
       "fieldConfig": {

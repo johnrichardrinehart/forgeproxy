@@ -312,6 +312,17 @@ pub struct PackCacheStitchFailureLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheStaleGenerationLabels {
+    pub owner_repo: String,
+    pub stage: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCachePackstoreMidxRefreshLabels {
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PackCacheOnDemandCompositeStageLabels {
     pub protocol: Protocol,
     pub owner_repo: String,
@@ -559,6 +570,9 @@ pub struct Metrics {
     pub pack_cache_stitch_attempts_total: Family<PackCacheStitchLabels, Counter>,
     pub pack_cache_stitch_duration_seconds: Family<PackCacheStitchLabels, Histogram>,
     pub pack_cache_stitch_failures_total: Family<PackCacheStitchFailureLabels, Counter>,
+    pub pack_cache_stale_generation_total: Family<PackCacheStaleGenerationLabels, Counter>,
+    pub pack_cache_packstore_midx_refresh_total:
+        Family<PackCachePackstoreMidxRefreshLabels, Counter>,
     pub pack_cache_on_demand_composite_stage_duration_seconds:
         Family<PackCacheOnDemandCompositeStageLabels, Histogram>,
     pub pack_cache_on_demand_composite_candidate_count:
@@ -978,6 +992,20 @@ impl Metrics {
             "Pack response cache proactive stitching failures by repo and reason",
             pack_cache_stitch_failures_total.clone(),
         );
+        let pack_cache_stale_generation_total =
+            Family::<PackCacheStaleGenerationLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_stale_generation",
+            "Pack cache warming operations skipped because their published generation became stale",
+            pack_cache_stale_generation_total.clone(),
+        );
+        let pack_cache_packstore_midx_refresh_total =
+            Family::<PackCachePackstoreMidxRefreshLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_packstore_midx_refresh",
+            "Packstore MIDX refresh requests and coalescing outcomes",
+            pack_cache_packstore_midx_refresh_total.clone(),
+        );
 
         let pack_cache_on_demand_composite_stage_duration_seconds =
             Family::<PackCacheOnDemandCompositeStageLabels, Histogram>::new_with_constructor(
@@ -1115,6 +1143,8 @@ impl Metrics {
             pack_cache_stitch_attempts_total,
             pack_cache_stitch_duration_seconds,
             pack_cache_stitch_failures_total,
+            pack_cache_stale_generation_total,
+            pack_cache_packstore_midx_refresh_total,
             pack_cache_on_demand_composite_stage_duration_seconds,
             pack_cache_on_demand_composite_candidate_count,
             pack_cache_on_demand_composite_delta_objects,
@@ -1665,6 +1695,28 @@ pub fn inc_pack_cache_stitch_failure(metrics: &MetricsRegistry, owner_repo: &str
         .get_or_create(&PackCacheStitchFailureLabels {
             owner_repo,
             reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_pack_cache_stale_generation(metrics: &MetricsRegistry, owner_repo: &str, stage: &str) {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    metrics
+        .metrics
+        .pack_cache_stale_generation_total
+        .get_or_create(&PackCacheStaleGenerationLabels {
+            owner_repo,
+            stage: stage.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_pack_cache_packstore_midx_refresh(metrics: &MetricsRegistry, result: &str) {
+    metrics
+        .metrics
+        .pack_cache_packstore_midx_refresh_total
+        .get_or_create(&PackCachePackstoreMidxRefreshLabels {
+            result: result.to_string(),
         })
         .inc();
 }
