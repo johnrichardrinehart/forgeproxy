@@ -21,6 +21,7 @@ mod ssh;
 mod storage;
 mod tee_hydration;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -40,6 +41,9 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tokio::signal;
 use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
+use tokio_metrics::TaskMonitor;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -839,15 +843,56 @@ async fn run_ssh_server(state: AppState, shutdown_rx: watch::Receiver<bool>) -> 
 
 async fn run_bundle_lifecycle(state: AppState) -> Result<()> {
     let state = Arc::new(state);
-    let lifecycle_handle =
-        tokio::spawn(async move { bundleuri::lifecycle::run_bundle_lifecycle(state).await });
-    let _ = lifecycle_handle.await;
+    bundleuri::lifecycle::run_bundle_lifecycle(state).await;
     Ok(())
 }
 
 async fn run_node_heartbeat(state: AppState) -> Result<()> {
     coordination::node::run_heartbeat(state.valkey.clone(), state.node_id.clone()).await;
     Ok(())
+}
+
+struct BackgroundTaskMonitor {
+    task: &'static str,
+    monitor: TaskMonitor,
+}
+
+fn spawn_monitored_background_task<F>(
+    task: &'static str,
+    future: F,
+) -> (JoinHandle<()>, BackgroundTaskMonitor)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let monitor = TaskMonitor::new();
+    let handle = tokio::spawn(monitor.instrument(future));
+    (handle, BackgroundTaskMonitor { task, monitor })
+}
+
+async fn run_background_task_metrics_sampler(
+    metrics: MetricsRegistry,
+    monitors: Vec<BackgroundTaskMonitor>,
+) {
+    let mut intervals = monitors
+        .into_iter()
+        .map(|monitor| (monitor.task, monitor.monitor.intervals()))
+        .collect::<Vec<_>>();
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tick.tick().await;
+        for (task, intervals) in &mut intervals {
+            if let Some(interval) = intervals.next() {
+                crate::metrics::inc_background_task_poll_metrics(
+                    &metrics,
+                    task,
+                    interval.total_poll_duration.as_secs_f64(),
+                    interval.total_poll_count,
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1371,11 +1416,15 @@ async fn main() -> Result<()> {
         }
     });
 
-    let telemetry_handle = tokio::spawn({
-        let s = Arc::new(state.clone());
-        let buf = telemetry_buffer.clone();
-        async move { cache::telemetry::run_telemetry_flusher(s, buf).await }
-    });
+    let mut background_task_monitors = Vec::new();
+
+    let (telemetry_handle, telemetry_monitor) =
+        spawn_monitored_background_task("telemetry_flusher", {
+            let s = Arc::new(state.clone());
+            let buf = telemetry_buffer.clone();
+            async move { cache::telemetry::run_telemetry_flusher(s, buf).await }
+        });
+    background_task_monitors.push(telemetry_monitor);
 
     let http_handle = tokio::spawn({
         let s = state.clone();
@@ -1397,7 +1446,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let bundle_handle = tokio::spawn({
+    let (bundle_handle, bundle_monitor) = spawn_monitored_background_task("bundle_lifecycle", {
         let s = state.clone();
         async move {
             if let Err(e) = run_bundle_lifecycle(s).await {
@@ -1405,48 +1454,62 @@ async fn main() -> Result<()> {
             }
         }
     });
+    background_task_monitors.push(bundle_monitor);
 
-    let tee_cleanup_handle = tokio::spawn({
-        let base_path = state.cache_manager.base_path.clone();
-        let interval =
-            std::time::Duration::from_secs(state.config().clone.tee_cleanup_interval_secs);
-        let retention = std::time::Duration::from_secs(state.config().clone.tee_retention_secs);
-        async move {
-            if let Err(e) =
-                crate::tee_hydration::run_tee_cleanup_loop(base_path, interval, retention).await
-            {
-                tracing::error!(error = %e, "tee cleanup janitor failed");
+    let (tee_cleanup_handle, tee_cleanup_monitor) =
+        spawn_monitored_background_task("tee_cleanup", {
+            let base_path = state.cache_manager.base_path.clone();
+            let interval =
+                std::time::Duration::from_secs(state.config().clone.tee_cleanup_interval_secs);
+            let retention = std::time::Duration::from_secs(state.config().clone.tee_retention_secs);
+            async move {
+                if let Err(e) =
+                    crate::tee_hydration::run_tee_cleanup_loop(base_path, interval, retention).await
+                {
+                    tracing::error!(error = %e, "tee cleanup janitor failed");
+                }
             }
-        }
-    });
+        });
+    background_task_monitors.push(tee_cleanup_monitor);
 
-    let metrics_refresh_handle = tokio::spawn({
-        let s = state.clone();
-        async move {
-            if let Err(e) = run_metrics_refresh_loop(s).await {
-                tracing::error!(error = %e, "cache metrics refresh loop failed");
+    let (metrics_refresh_handle, metrics_refresh_monitor) =
+        spawn_monitored_background_task("metrics_refresh", {
+            let s = state.clone();
+            async move {
+                if let Err(e) = run_metrics_refresh_loop(s).await {
+                    tracing::error!(error = %e, "cache metrics refresh loop failed");
+                }
             }
-        }
-    });
+        });
+    background_task_monitors.push(metrics_refresh_monitor);
 
-    let config_reload_handle = tokio::spawn({
-        let s = state.clone();
-        let path = config_path.clone();
-        async move {
-            if let Err(e) = run_config_reload_loop(path, s, config_contents).await {
-                tracing::error!(error = %e, "config reload loop failed");
+    let (config_reload_handle, config_reload_monitor) =
+        spawn_monitored_background_task("config_reload", {
+            let s = state.clone();
+            let path = config_path.clone();
+            async move {
+                if let Err(e) = run_config_reload_loop(path, s, config_contents).await {
+                    tracing::error!(error = %e, "config reload loop failed");
+                }
             }
-        }
-    });
+        });
+    background_task_monitors.push(config_reload_monitor);
 
-    let heartbeat_handle = tokio::spawn({
-        let s = state.clone();
-        async move {
-            if let Err(e) = run_node_heartbeat(s).await {
-                tracing::error!(error = %e, "node heartbeat failed");
+    let (heartbeat_handle, heartbeat_monitor) =
+        spawn_monitored_background_task("node_heartbeat", {
+            let s = state.clone();
+            async move {
+                if let Err(e) = run_node_heartbeat(s).await {
+                    tracing::error!(error = %e, "node heartbeat failed");
+                }
             }
-        }
-    });
+        });
+    background_task_monitors.push(heartbeat_monitor);
+
+    let background_task_metrics_handle = tokio::spawn(run_background_task_metrics_sampler(
+        state.metrics.clone(),
+        background_task_monitors,
+    ));
 
     // ---- Await shutdown ----
     // Wait for a shutdown signal or for any task to exit unexpectedly.
@@ -1459,6 +1522,7 @@ async fn main() -> Result<()> {
         heartbeat_handle.abort_handle(),
         prewarm_handle.abort_handle(),
         telemetry_handle.abort_handle(),
+        background_task_metrics_handle.abort_handle(),
     ];
     let abort_handles = abort_handles.to_vec();
     tokio::pin!(
@@ -1469,7 +1533,8 @@ async fn main() -> Result<()> {
         metrics_refresh_handle,
         config_reload_handle,
         heartbeat_handle,
-        telemetry_handle
+        telemetry_handle,
+        background_task_metrics_handle
     );
     tokio::select! {
         _ = wait_for_shutdown_signal() => {
@@ -1501,9 +1566,12 @@ async fn main() -> Result<()> {
                 &mut http_handle,
                 &mut ssh_handle,
                 &mut bundle_handle,
+                &mut tee_cleanup_handle,
+                &mut metrics_refresh_handle,
                 &mut config_reload_handle,
                 &mut heartbeat_handle,
-                &mut telemetry_handle
+                &mut telemetry_handle,
+                &mut background_task_metrics_handle
             );
         } => {
             for h in &abort_handles { h.abort(); }

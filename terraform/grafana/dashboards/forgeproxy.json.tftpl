@@ -1504,6 +1504,39 @@
             "tooltip": { "mode": "multi", "sort": "desc" },
             "legend": { "displayMode": "list", "placement": "bottom" }
           }
+        },
+        {
+          "id": 82,
+          "type": "timeseries",
+          "title": "Background Task Poll vCPU",
+          "description": "Approximate vCPU consumed in Tokio poll() by each instrumented persistent forgeproxy background task. This excludes child process CPU and time spent blocked in awaited I/O.",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 107 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum by (task) (rate(forgeproxy_background_task_poll_seconds_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{task}}",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "gradientMode": "none",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
         }
       ]
     },
