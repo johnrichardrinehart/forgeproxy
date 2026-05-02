@@ -114,8 +114,6 @@ pub async fn fetch_ref_advertisement(
                 .get_or_create(&CloneUpstreamBytesLabels {
                     protocol: Protocol::Ssh,
                     phase: ClonePhase::InfoRefs,
-                    username: metric_username.to_string(),
-                    repo: owner_repo.to_string(),
                 })
                 .inc_by(stripped.len() as u64);
 

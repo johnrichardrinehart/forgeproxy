@@ -65,8 +65,6 @@ impl CloneCompletion {
                 path: self.serve_outcome.path,
                 reason: self.serve_outcome.reason,
                 cache_status: self.cache_status.clone(),
-                client: &self.metric_username,
-                repo: &self.metric_repo,
             },
         );
         info!(

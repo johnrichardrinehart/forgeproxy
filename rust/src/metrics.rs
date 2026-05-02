@@ -85,8 +85,6 @@ impl Collector for OptionalGaugeCollector {
 pub struct CloneLabels {
     pub protocol: Protocol,
     pub cache_status: CacheStatus,
-    pub username: String,
-    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -96,8 +94,6 @@ pub struct CloneServedLabels {
     pub path: String,
     pub reason: String,
     pub cache_status: CacheStatus,
-    pub client: String,
-    pub repo: String,
 }
 
 pub struct CloneServedRecord<'a> {
@@ -106,8 +102,6 @@ pub struct CloneServedRecord<'a> {
     pub path: &'a str,
     pub reason: &'a str,
     pub cache_status: CacheStatus,
-    pub client: &'a str,
-    pub repo: &'a str,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -126,15 +120,12 @@ pub enum CacheStatus {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct CloneDurationLabels {
     pub protocol: Protocol,
-    pub username: String,
-    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct UploadPackDurationLabels {
     pub protocol: Protocol,
     pub source: CloneSource,
-    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -142,7 +133,6 @@ pub struct UploadPackFirstByteLabels {
     pub protocol: Protocol,
     pub source: String,
     pub cache_status: CacheStatus,
-    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -174,8 +164,6 @@ pub struct ActiveCloneDetailLabels {
 pub struct CloneUpstreamBytesLabels {
     pub protocol: Protocol,
     pub phase: ClonePhase,
-    pub username: String,
-    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -183,8 +171,6 @@ pub struct CloneDownstreamBytesLabels {
     pub protocol: Protocol,
     pub phase: ClonePhase,
     pub source: CloneSource,
-    pub username: String,
-    pub repo: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -654,7 +640,7 @@ impl Metrics {
         let clone_served_total = Family::<CloneServedLabels, Counter>::default();
         registry.register(
             "forgeproxy_clone_served",
-            "Clone upload-pack completions and direct-upstream handoffs by serving authority, path, reason, client, and repository",
+            "Clone upload-pack completions and direct-upstream handoffs by serving authority, path, reason, and cache status",
             clone_served_total.clone(),
         );
 
@@ -691,7 +677,7 @@ impl Metrics {
             });
         registry.register(
             "forgeproxy_upload_pack_first_byte_seconds",
-            "Upload-pack latency to first downstream byte in seconds by protocol, source, cache status, and repo",
+            "Upload-pack latency to first downstream byte in seconds by protocol, source, and cache status",
             upload_pack_first_byte_seconds.clone(),
         );
 
@@ -1334,7 +1320,7 @@ pub fn record_clone_completion(
     protocol: Protocol,
     cache_status: CacheStatus,
     username: &str,
-    repo: &str,
+    _repo: &str,
     elapsed: Duration,
 ) {
     metrics
@@ -1343,8 +1329,6 @@ pub fn record_clone_completion(
         .get_or_create(&CloneLabels {
             protocol: protocol.clone(),
             cache_status: cache_status.clone(),
-            username: username.to_string(),
-            repo: repo.to_string(),
         })
         .inc();
     metrics
@@ -1360,11 +1344,7 @@ pub fn record_clone_completion(
     metrics
         .metrics
         .clone_duration_seconds
-        .get_or_create(&CloneDurationLabels {
-            protocol,
-            username: username.to_string(),
-            repo: repo.to_string(),
-        })
+        .get_or_create(&CloneDurationLabels { protocol })
         .observe(elapsed.as_secs_f64());
 }
 
@@ -1378,8 +1358,6 @@ pub fn record_clone_served(metrics: &MetricsRegistry, record: CloneServedRecord<
             path: record.path.to_string(),
             reason: record.reason.to_string(),
             cache_status: record.cache_status,
-            client: record.client.to_string(),
-            repo: record.repo.to_string(),
         })
         .inc();
 }
@@ -1417,17 +1395,13 @@ pub fn observe_upload_pack_duration(
     metrics: &MetricsRegistry,
     protocol: Protocol,
     source: CloneSource,
-    repo: &str,
+    _repo: &str,
     elapsed: Duration,
 ) {
     metrics
         .metrics
         .upload_pack_duration_seconds
-        .get_or_create(&UploadPackDurationLabels {
-            protocol,
-            source,
-            repo: repo.to_string(),
-        })
+        .get_or_create(&UploadPackDurationLabels { protocol, source })
         .observe(elapsed.as_secs_f64());
 }
 
@@ -1436,7 +1410,7 @@ pub fn observe_upload_pack_first_byte(
     protocol: Protocol,
     source: &str,
     cache_status: CacheStatus,
-    repo: &str,
+    _repo: &str,
     elapsed: Duration,
 ) {
     metrics
@@ -1446,7 +1420,6 @@ pub fn observe_upload_pack_first_byte(
             protocol,
             source: source.to_string(),
             cache_status,
-            repo: repo.to_string(),
         })
         .observe(elapsed.as_secs_f64());
 }
@@ -2363,14 +2336,17 @@ mod tests {
         assert!(encoded.contains("# HELP forgeproxy_upload_pack_duration_seconds"));
         assert!(encoded.lines().any(|line| {
             line.starts_with("forgeproxy_upload_pack_duration_seconds_sum{")
-                && line.contains("repo=\"acme/widgets\"")
+                && line.contains("protocol=\"https\"")
+                && line.contains("source=\"local\"")
+                && !line.contains("repo=")
                 && line.contains(" 0.25")
         }));
         assert!(encoded.lines().any(|line| {
             line.starts_with("forgeproxy_upload_pack_first_byte_seconds_sum{")
                 && line.contains("cache_status=\"warm\"")
-                && line.contains("repo=\"acme/widgets\"")
+                && line.contains("protocol=\"https\"")
                 && line.contains("source=\"local_upload_pack\"")
+                && !line.contains("repo=")
                 && line.contains(" 0.125")
         }));
         assert!(encoded.lines().any(
@@ -2549,8 +2525,6 @@ mod tests {
                 path: "pack_cache",
                 reason: "pack_cache_hit",
                 cache_status: CacheStatus::Hot,
-                client: "octocat",
-                repo: "acme/widgets",
             },
         );
 
@@ -2559,6 +2533,8 @@ mod tests {
             line.starts_with("forgeproxy_clone_total{")
                 && line.contains("protocol=\"ssh\"")
                 && line.contains("cache_status=\"hot\"")
+                && !line.contains("username=")
+                && !line.contains("repo=")
         }));
         assert!(encoded.lines().any(|line| {
             line.starts_with("forgeproxy_clone_summary_total{")
@@ -2572,8 +2548,9 @@ mod tests {
                 && line.contains("served_by=\"forgeproxy\"")
                 && line.contains("path=\"pack_cache\"")
                 && line.contains("reason=\"pack_cache_hit\"")
-                && line.contains("client=\"octocat\"")
-                && line.contains("repo=\"acme/widgets\"")
+                && line.contains("cache_status=\"hot\"")
+                && !line.contains("client=")
+                && !line.contains("repo=")
         }));
     }
 

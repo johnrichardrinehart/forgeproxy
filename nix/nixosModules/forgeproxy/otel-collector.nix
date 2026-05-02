@@ -372,7 +372,11 @@ let
               "        - job_name: forgeproxy" \
               "          metrics_path: /metrics" \
               "          static_configs:" \
-              "            - targets: [\"''${scrape_target}\"]"
+              "            - targets: [\"''${scrape_target}\"]" \
+              "        - job_name: otelcol" \
+              "          metrics_path: /metrics" \
+              "          static_configs:" \
+              "            - targets: [\"127.0.0.1:8888\"]"
           fi
 
           if [[ "$host_metrics_enabled" == "true" ]]; then
@@ -520,8 +524,10 @@ let
         printf '\n%s\n' \
           "service:" \
           "  telemetry:" \
+          "    logs:" \
+          "      level: info" \
           "    metrics:" \
-          "      level: none"
+          "      level: basic"
 
         if (( ''${#extensions[@]} > 0 )); then
           printf '  extensions: '
