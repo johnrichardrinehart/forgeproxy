@@ -391,46 +391,83 @@ pub async fn git_clone_bare_shared_local(source: &Path, dest: &Path) -> Result<(
     Ok(())
 }
 
+/// Result of preparing published-generation index metadata.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PublishedGenerationIndexOutcome {
+    Prepared,
+    NoPackFiles,
+    UsesAlternates,
+}
+
 /// Prepare a bare generation so local `git upload-pack` can use object lookup
-/// and reachability bitmaps through the multi-pack-index path.
+/// through the multi-pack-index path.
 ///
 /// Avoid a full `git repack -a -d`, which rewrites all pack data on every
 /// published generation. MIDX writes keep existing packs in place and only
-/// rebuild the index/bitmap metadata that upload-pack needs for fast serving.
+/// rebuild the index metadata that upload-pack needs for fast serving.
 #[instrument(fields(repo = %repo_path.display(), pack_threads))]
-pub async fn git_prepare_published_generation_indexes(
+pub async fn git_prepare_published_generation_midx(
     repo_path: &Path,
     pack_threads: usize,
-) -> Result<()> {
+) -> Result<PublishedGenerationIndexOutcome> {
     if !repo_has_pack_files(repo_path)? {
         info!(
             repo = %repo_path.display(),
-            "skipping published generation bitmap/MIDX indexes because the repo has no pack files"
+            "skipping published generation MIDX because the repo has no pack files"
         );
-        return Ok(());
+        return Ok(PublishedGenerationIndexOutcome::NoPackFiles);
     }
 
     let started_at = std::time::Instant::now();
 
     run_git_multi_pack_index_write(repo_path, false, pack_threads).await?;
+
+    info!(
+        repo = %repo_path.display(),
+        pack_threads,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "prepared published generation MIDX"
+    );
+    Ok(PublishedGenerationIndexOutcome::Prepared)
+}
+
+/// Prepare reachability bitmaps through the multi-pack-index path.
+///
+/// This is the expensive pass. Callers should run
+/// [`git_prepare_published_generation_midx`] first so upload-pack still gets
+/// cheap object lookup metadata even when the bitmap policy skips this step.
+#[instrument(fields(repo = %repo_path.display(), pack_threads))]
+pub async fn git_prepare_published_generation_bitmap(
+    repo_path: &Path,
+    pack_threads: usize,
+) -> Result<PublishedGenerationIndexOutcome> {
+    if !repo_has_pack_files(repo_path)? {
+        info!(
+            repo = %repo_path.display(),
+            "skipping published generation bitmap because the repo has no pack files"
+        );
+        return Ok(PublishedGenerationIndexOutcome::NoPackFiles);
+    }
+
     if repo_uses_object_alternates(repo_path)? {
         info!(
             repo = %repo_path.display(),
             pack_threads,
-            elapsed_ms = started_at.elapsed().as_millis(),
-            "prepared published generation MIDX without bitmap because the object database uses alternates"
+            "skipping published generation bitmap because the object database uses alternates"
         );
-        return Ok(());
+        return Ok(PublishedGenerationIndexOutcome::UsesAlternates);
     }
+
+    let started_at = std::time::Instant::now();
     run_git_multi_pack_index_write(repo_path, true, pack_threads).await?;
 
     info!(
         repo = %repo_path.display(),
         pack_threads,
         elapsed_ms = started_at.elapsed().as_millis(),
-        "prepared published generation bitmap/MIDX indexes"
+        "prepared published generation bitmap"
     );
-    Ok(())
+    Ok(PublishedGenerationIndexOutcome::Prepared)
 }
 
 fn repo_uses_object_alternates(repo_path: &Path) -> Result<bool> {
@@ -2922,7 +2959,7 @@ fatal: couldn't find remote ref refs/tags/tmp-lock
     }
 
     #[tokio::test]
-    async fn git_prepare_published_generation_indexes_writes_midx_bitmap() {
+    async fn git_prepare_published_generation_midx_and_bitmap() {
         let tempdir = tempfile::tempdir().unwrap();
         let work_path = tempdir.path().join("work");
         let bare_path = tempdir.path().join("repo.git");
@@ -3004,9 +3041,18 @@ fatal: couldn't find remote ref refs/tags/tmp-lock
                 .success()
         );
 
-        git_prepare_published_generation_indexes(&bare_path, 1)
-            .await
-            .unwrap();
+        assert_eq!(
+            git_prepare_published_generation_midx(&bare_path, 1)
+                .await
+                .unwrap(),
+            PublishedGenerationIndexOutcome::Prepared
+        );
+        assert_eq!(
+            git_prepare_published_generation_bitmap(&bare_path, 1)
+                .await
+                .unwrap(),
+            PublishedGenerationIndexOutcome::Prepared
+        );
 
         let pack_dir = bare_path.join("objects").join("pack");
         assert!(pack_dir.join("multi-pack-index").is_file());

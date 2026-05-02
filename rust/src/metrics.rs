@@ -392,6 +392,21 @@ pub struct RepoUpdateProfileLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PublishedGenerationIndexDecisionLabels {
+    pub stage: String,
+    pub policy: String,
+    pub decision: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PublishedGenerationIndexDurationLabels {
+    pub stage: String,
+    pub policy: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct BackgroundTaskLabels {
     pub task: String,
 }
@@ -628,6 +643,12 @@ pub struct Metrics {
     pub repo_update_profile_mirror_size_bytes: Family<RepoUpdateProfileLabels, Gauge>,
     pub repo_update_profile_ref_count: Family<RepoUpdateProfileLabels, Gauge>,
     pub repo_update_profile_failure_score: Family<RepoUpdateProfileLabels, Gauge>,
+
+    // -- published generation index preparation --
+    pub published_generation_index_decision_total:
+        Family<PublishedGenerationIndexDecisionLabels, Counter>,
+    pub published_generation_index_duration_seconds:
+        Family<PublishedGenerationIndexDurationLabels, Histogram>,
 
     // -- background task runtime --
     pub background_task_poll_seconds_total: Family<BackgroundTaskLabels, Counter<f64, AtomicU64>>,
@@ -1195,6 +1216,24 @@ impl Metrics {
             repo_update_profile_failure_score.clone(),
         );
 
+        let published_generation_index_decision_total =
+            Family::<PublishedGenerationIndexDecisionLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_published_generation_index_decision",
+            "Published generation MIDX and bitmap preparation decisions by stage, policy, and reason",
+            published_generation_index_decision_total.clone(),
+        );
+
+        let published_generation_index_duration_seconds =
+            Family::<PublishedGenerationIndexDurationLabels, Histogram>::new_with_constructor(
+                || Histogram::new(exponential_buckets(0.05, 2.0, 18)),
+            );
+        registry.register(
+            "forgeproxy_published_generation_index_duration_seconds",
+            "Published generation MIDX and bitmap preparation duration in seconds",
+            published_generation_index_duration_seconds.clone(),
+        );
+
         let background_task_poll_seconds_total =
             Family::<BackgroundTaskLabels, Counter<f64, AtomicU64>>::default();
         registry.register(
@@ -1284,6 +1323,8 @@ impl Metrics {
             repo_update_profile_mirror_size_bytes,
             repo_update_profile_ref_count,
             repo_update_profile_failure_score,
+            published_generation_index_decision_total,
+            published_generation_index_duration_seconds,
             background_task_poll_seconds_total,
             background_task_polls_total,
         }
@@ -2157,6 +2198,43 @@ pub fn set_repo_update_profile(
         .repo_update_profile_failure_score
         .get_or_create(&labels)
         .set(failure_score.min(i64::MAX as u64) as i64);
+}
+
+pub fn inc_published_generation_index_decision(
+    metrics: &MetricsRegistry,
+    stage: &str,
+    policy: &str,
+    decision: &str,
+    reason: &str,
+) {
+    metrics
+        .metrics
+        .published_generation_index_decision_total
+        .get_or_create(&PublishedGenerationIndexDecisionLabels {
+            stage: stage.to_string(),
+            policy: policy.to_string(),
+            decision: decision.to_string(),
+            reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn observe_published_generation_index_duration(
+    metrics: &MetricsRegistry,
+    stage: &str,
+    policy: &str,
+    result: &str,
+    elapsed: Duration,
+) {
+    metrics
+        .metrics
+        .published_generation_index_duration_seconds
+        .get_or_create(&PublishedGenerationIndexDurationLabels {
+            stage: stage.to_string(),
+            policy: policy.to_string(),
+            result: result.to_string(),
+        })
+        .observe(elapsed.as_secs_f64());
 }
 
 pub fn inc_background_task_poll_metrics(

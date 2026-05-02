@@ -1016,10 +1016,54 @@ variable "cache_scrub_interval_secs" {
   }
 }
 
-variable "prepare_published_generation_indexes" {
+variable "prepare_published_generation_midx" {
   type        = bool
-  default     = false
-  description = "Prepare published generation bitmap and multi-pack-index support in the background after exposing them to clone readers."
+  default     = true
+  description = "Prepare published generation multi-pack-index support in the background after exposing generations to clone readers."
+}
+
+variable "published_generation_bitmap_policy" {
+  type        = string
+  default     = "adaptive"
+  description = "Policy for the expensive published-generation MIDX bitmap pass: never, always, or adaptive."
+
+  validation {
+    condition     = contains(["never", "always", "adaptive"], var.published_generation_bitmap_policy)
+    error_message = "published_generation_bitmap_policy must be one of: never, always, adaptive."
+  }
+}
+
+variable "published_generation_bitmap_min_mirror_size_bytes" {
+  type        = number
+  default     = 524288000
+  description = "Minimum learned mirror size in bytes before adaptive published-generation bitmap generation may run."
+
+  validation {
+    condition     = var.published_generation_bitmap_min_mirror_size_bytes > 0
+    error_message = "published_generation_bitmap_min_mirror_size_bytes must be greater than 0."
+  }
+}
+
+variable "published_generation_bitmap_churn_bytes_threshold" {
+  type        = number
+  default     = 52428800
+  description = "Fetch-cycle byte churn at or above which adaptive published-generation bitmap generation is skipped."
+
+  validation {
+    condition     = var.published_generation_bitmap_churn_bytes_threshold > 0
+    error_message = "published_generation_bitmap_churn_bytes_threshold must be greater than 0."
+  }
+}
+
+variable "published_generation_bitmap_max_interval_ratio" {
+  type        = number
+  default     = 0.5
+  description = "Skip adaptive published-generation bitmap generation when the last bitmap runtime exceeds this fraction of the current fetch interval."
+
+  validation {
+    condition     = var.published_generation_bitmap_max_interval_ratio > 0
+    error_message = "published_generation_bitmap_max_interval_ratio must be greater than 0."
+  }
 }
 
 variable "bundle_pack_threads" {

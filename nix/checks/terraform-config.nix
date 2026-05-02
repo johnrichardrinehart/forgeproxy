@@ -33,7 +33,11 @@ let
         eviction_policy                            = "lfu"
         auth_ssh_user_lookup_cache_ttl            = 30
         auth_ssh_repo_access_cache_ttl            = 30
-        prepare_published_generation_indexes       = false
+        prepare_published_generation_midx          = true
+        published_generation_bitmap_policy         = "adaptive"
+        published_generation_bitmap_min_mirror_size_bytes = 524288000
+        published_generation_bitmap_churn_bytes_threshold = 52428800
+        published_generation_bitmap_max_interval_ratio = 0.5
         generation_coalescing_window_secs          = 60
         global_short_circuit_upstream_secs         = 0
         request_wait_for_local_catch_up_secs       = 30

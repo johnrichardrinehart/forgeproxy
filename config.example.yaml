@@ -58,7 +58,11 @@ clone:
   index_pack_threads: 2
   max_concurrent_tee_captures: 8
   max_concurrent_tee_captures_per_repo_per_instance: 2
-  prepare_published_generation_indexes: false
+  prepare_published_generation_midx: true
+  published_generation_bitmap_policy: "adaptive"
+  published_generation_bitmap_min_mirror_size_bytes: 524288000
+  published_generation_bitmap_churn_bytes_threshold: 52428800
+  published_generation_bitmap_max_interval_ratio: 0.5
   generation_coalescing_window_secs: 60
   # Coarse worst-case request-path budget before proxying upstream. Zero disables it.
   global_short_circuit_upstream_secs: 0
