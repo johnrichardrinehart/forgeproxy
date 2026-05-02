@@ -90,6 +90,7 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     bundle_pack_threads                            = var.bundle_pack_threads
     bundle_max_incremental_bundles                 = var.bundle_max_incremental_bundles
     metrics_enabled                                = var.metrics_enabled
+    metrics_top_heavy_repo_limit                   = var.metrics_top_heavy_repo_limit
     metrics_refresh_interval_secs                  = var.metrics_refresh_interval_secs
     logs_enabled                                   = var.logs_enabled
     traces_enabled                                 = var.traces_enabled

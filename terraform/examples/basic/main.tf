@@ -125,6 +125,7 @@ module "forgeproxy" {
   s3_presigned_url_ttl = var.s3_presigned_url_ttl
 
   metrics_enabled                      = var.metrics_enabled
+  metrics_top_heavy_repo_limit         = var.metrics_top_heavy_repo_limit
   metrics_refresh_interval_secs        = var.metrics_refresh_interval_secs
   prepare_published_generation_indexes = var.prepare_published_generation_indexes
   bundle_pack_threads                  = var.bundle_pack_threads

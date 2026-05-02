@@ -1,7 +1,8 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use prometheus_client::collector::Collector;
@@ -14,6 +15,8 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
 use crate::config::BackendType;
+
+const OTHER_REPO_LABEL: &str = "other";
 
 // ---------------------------------------------------------------------------
 // OptionalGauge — omitted from /metrics until explicitly set
@@ -288,6 +291,11 @@ pub struct PackCacheWarmingDurationLabels {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PackCacheStitchLabels {
+    pub owner_repo: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheStitchDurationLabels {
     pub owner_repo: String,
 }
 
@@ -588,7 +596,7 @@ pub struct Metrics {
     pub pack_cache_warming_duration_seconds: Family<PackCacheWarmingDurationLabels, Histogram>,
     pub pack_cache_artifact_generation_duration_seconds: Histogram,
     pub pack_cache_stitch_attempts_total: Family<PackCacheStitchLabels, Counter>,
-    pub pack_cache_stitch_duration_seconds: Family<PackCacheStitchLabels, Histogram>,
+    pub pack_cache_stitch_duration_seconds: Family<PackCacheStitchDurationLabels, Histogram>,
     pub pack_cache_stitch_failures_total: Family<PackCacheStitchFailureLabels, Counter>,
     pub pack_cache_stale_generation_total: Family<PackCacheStaleGenerationLabels, Counter>,
     pub pack_cache_packstore_midx_refresh_total:
@@ -991,7 +999,7 @@ impl Metrics {
             });
         registry.register(
             "forgeproxy_pack_cache_warming_duration_seconds",
-            "Pack response cache proactive warming duration by repo, kind, and result",
+            "Pack response cache proactive warming duration by top heavy repo, kind, and result; non-top repos are labeled other",
             pack_cache_warming_duration_seconds.clone(),
         );
 
@@ -1011,12 +1019,12 @@ impl Metrics {
         );
 
         let pack_cache_stitch_duration_seconds =
-            Family::<PackCacheStitchLabels, Histogram>::new_with_constructor(|| {
+            Family::<PackCacheStitchDurationLabels, Histogram>::new_with_constructor(|| {
                 Histogram::new(exponential_buckets(0.01, 2.0, 16))
             });
         registry.register(
             "forgeproxy_pack_cache_stitch_duration_seconds",
-            "Pack response cache proactive stitching latency in seconds",
+            "Pack response cache proactive stitching latency in seconds by top heavy repo; non-top repos are labeled other",
             pack_cache_stitch_duration_seconds.clone(),
         );
 
@@ -1048,7 +1056,7 @@ impl Metrics {
             );
         registry.register(
             "forgeproxy_pack_cache_on_demand_composite_stage_duration_seconds",
-            "Request-time pack response cache composite stage latency in seconds",
+            "Request-time pack response cache composite stage latency in seconds by top heavy repo; non-top repos are labeled other",
             pack_cache_on_demand_composite_stage_duration_seconds.clone(),
         );
 
@@ -1058,7 +1066,7 @@ impl Metrics {
             );
         registry.register(
             "forgeproxy_pack_cache_on_demand_composite_candidate_count",
-            "Request-time pack response cache composite base candidates by result",
+            "Request-time pack response cache composite base candidates by top heavy repo and result; non-top repos are labeled other",
             pack_cache_on_demand_composite_candidate_count.clone(),
         );
 
@@ -1068,7 +1076,7 @@ impl Metrics {
             );
         registry.register(
             "forgeproxy_pack_cache_on_demand_composite_delta_objects",
-            "Request-time pack response cache composite missing object counts by result",
+            "Request-time pack response cache composite missing object counts by top heavy repo and result; non-top repos are labeled other",
             pack_cache_on_demand_composite_delta_objects.clone(),
         );
 
@@ -1078,7 +1086,7 @@ impl Metrics {
             );
         registry.register(
             "forgeproxy_pack_cache_on_demand_composite_delta_bytes",
-            "Request-time pack response cache composite delta pack bytes by result",
+            "Request-time pack response cache composite delta pack bytes by top heavy repo and result; non-top repos are labeled other",
             pack_cache_on_demand_composite_delta_bytes.clone(),
         );
 
@@ -1292,6 +1300,7 @@ pub struct MetricsRegistry {
     pub registry: Arc<Registry>,
     pub metrics: Arc<Metrics>,
     pub backend_label: Arc<str>,
+    top_heavy_repos: Arc<RwLock<HashSet<String>>>,
 }
 
 impl MetricsRegistry {
@@ -1311,8 +1320,88 @@ impl MetricsRegistry {
             registry: Arc::new(registry),
             metrics: Arc::new(metrics),
             backend_label: Arc::<str>::from(backend_label),
+            top_heavy_repos: Arc::new(RwLock::new(HashSet::new())),
         }
     }
+}
+
+fn pack_cache_histogram_repo_label(metrics: &MetricsRegistry, owner_repo: &str) -> String {
+    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    if metrics
+        .top_heavy_repos
+        .read()
+        .map(|top_heavy_repos| top_heavy_repos.contains(&owner_repo))
+        .unwrap_or(false)
+    {
+        owner_repo
+    } else {
+        OTHER_REPO_LABEL.to_string()
+    }
+}
+
+fn top_heavy_repos(
+    apparent_sizes: &[(String, u64)],
+    physical_sizes: &[(String, u64)],
+    limit: usize,
+) -> HashSet<String> {
+    let mut weights = HashMap::<String, u64>::new();
+    for (repo, size_bytes) in apparent_sizes.iter().chain(physical_sizes.iter()) {
+        let repo = crate::repo_identity::canonicalize_owner_repo(repo);
+        weights
+            .entry(repo)
+            .and_modify(|existing| *existing = (*existing).max(*size_bytes))
+            .or_insert(*size_bytes);
+    }
+
+    let mut weighted_repos = weights.into_iter().collect::<Vec<_>>();
+    weighted_repos.sort_unstable_by(|(left_repo, left_weight), (right_repo, right_weight)| {
+        right_weight
+            .cmp(left_weight)
+            .then_with(|| left_repo.cmp(right_repo))
+    });
+    weighted_repos
+        .into_iter()
+        .take(limit)
+        .map(|(repo, _)| repo)
+        .collect()
+}
+
+fn replace_top_heavy_repos(
+    metrics: &MetricsRegistry,
+    apparent_sizes: &[(String, u64)],
+    physical_sizes: &[(String, u64)],
+    limit: usize,
+) {
+    let next = top_heavy_repos(apparent_sizes, physical_sizes, limit);
+    let Ok(mut current) = metrics.top_heavy_repos.write() else {
+        return;
+    };
+    if *current == next {
+        return;
+    }
+    *current = next;
+
+    // These histograms include a bounded top-heavy repo label. Clearing them
+    // when the top-N set changes prevents stale repos from accumulating beyond
+    // the intended cardinality cap.
+    metrics.metrics.pack_cache_warming_duration_seconds.clear();
+    metrics.metrics.pack_cache_stitch_duration_seconds.clear();
+    metrics
+        .metrics
+        .pack_cache_on_demand_composite_stage_duration_seconds
+        .clear();
+    metrics
+        .metrics
+        .pack_cache_on_demand_composite_candidate_count
+        .clear();
+    metrics
+        .metrics
+        .pack_cache_on_demand_composite_delta_objects
+        .clear();
+    metrics
+        .metrics
+        .pack_cache_on_demand_composite_delta_bytes
+        .clear();
 }
 
 pub fn record_clone_completion(
@@ -1545,7 +1634,15 @@ pub fn replace_mirror_usage_bytes(
     metrics: &MetricsRegistry,
     apparent_sizes: &[(String, u64)],
     physical_sizes: &[(String, u64)],
+    top_heavy_repo_limit: usize,
 ) {
+    replace_top_heavy_repos(
+        metrics,
+        apparent_sizes,
+        physical_sizes,
+        top_heavy_repo_limit,
+    );
+
     metrics.metrics.mirror_apparent_usage_bytes.clear();
     for (repo, size_bytes) in apparent_sizes {
         metrics
@@ -1756,7 +1853,7 @@ pub fn observe_pack_cache_warming_duration(
     result: &str,
     elapsed: Duration,
 ) {
-    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let owner_repo = pack_cache_histogram_repo_label(metrics, owner_repo);
     metrics
         .metrics
         .pack_cache_warming_duration_seconds
@@ -1789,11 +1886,11 @@ pub fn observe_pack_cache_stitch_duration(
     owner_repo: &str,
     elapsed: Duration,
 ) {
-    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let owner_repo = pack_cache_histogram_repo_label(metrics, owner_repo);
     metrics
         .metrics
         .pack_cache_stitch_duration_seconds
-        .get_or_create(&PackCacheStitchLabels { owner_repo })
+        .get_or_create(&PackCacheStitchDurationLabels { owner_repo })
         .observe(elapsed.as_secs_f64());
 }
 
@@ -1839,7 +1936,7 @@ pub fn observe_pack_cache_on_demand_composite_stage(
     result: &str,
     elapsed: Duration,
 ) {
-    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let owner_repo = pack_cache_histogram_repo_label(metrics, owner_repo);
     metrics
         .metrics
         .pack_cache_on_demand_composite_stage_duration_seconds
@@ -1859,7 +1956,7 @@ pub fn observe_pack_cache_on_demand_composite_candidate_count(
     result: &str,
     count: usize,
 ) {
-    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let owner_repo = pack_cache_histogram_repo_label(metrics, owner_repo);
     metrics
         .metrics
         .pack_cache_on_demand_composite_candidate_count
@@ -1878,7 +1975,7 @@ pub fn observe_pack_cache_on_demand_composite_delta_objects(
     result: &str,
     count: usize,
 ) {
-    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let owner_repo = pack_cache_histogram_repo_label(metrics, owner_repo);
     metrics
         .metrics
         .pack_cache_on_demand_composite_delta_objects
@@ -1897,7 +1994,7 @@ pub fn observe_pack_cache_on_demand_composite_delta_bytes(
     result: &str,
     bytes: usize,
 ) {
-    let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    let owner_repo = pack_cache_histogram_repo_label(metrics, owner_repo);
     metrics
         .metrics
         .pack_cache_on_demand_composite_delta_bytes
@@ -2257,6 +2354,7 @@ mod tests {
                 ("acme/widgets".to_string(), 8),
                 ("acme/legacy".to_string(), 5),
             ],
+            100,
         );
         replace_cache_subtree_usage_bytes(
             &metrics,
@@ -2282,6 +2380,7 @@ mod tests {
             &metrics,
             &[("acme/widgets".to_string(), 9)],
             &[("acme/widgets".to_string(), 6)],
+            100,
         );
         replace_cache_subtree_usage_bytes(
             &metrics,
@@ -2380,6 +2479,12 @@ mod tests {
     #[test]
     fn on_demand_composite_stage_metrics_encode_expected_labels() {
         let metrics = MetricsRegistry::new();
+        replace_mirror_usage_bytes(
+            &metrics,
+            &[("acme/widgets.git".to_string(), 200)],
+            &[("acme/widgets.git".to_string(), 200)],
+            100,
+        );
 
         observe_pack_cache_on_demand_composite_stage(
             &metrics,
@@ -2410,6 +2515,13 @@ mod tests {
             "composite",
             1024,
         );
+        observe_pack_cache_on_demand_composite_delta_bytes(
+            &metrics,
+            Protocol::Ssh,
+            "small/repo.git",
+            "composite",
+            256,
+        );
 
         let encoded = encode_metrics(&metrics.registry);
         assert!(encoded.lines().any(|line| {
@@ -2439,11 +2551,50 @@ mod tests {
                 && line.contains("result=\"composite\"")
                 && (line.ends_with(" 1024") || line.ends_with(" 1024.0"))
         }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_on_demand_composite_delta_bytes_sum{")
+                && line.contains("owner_repo=\"other\"")
+                && line.contains("result=\"composite\"")
+                && (line.ends_with(" 256") || line.ends_with(" 256.0"))
+        }));
+        assert!(!encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_on_demand_composite_delta_bytes_sum{")
+                && line.contains("owner_repo=\"small/repo\"")
+        }));
+    }
+
+    #[test]
+    fn pack_cache_histogram_repo_bucket_uses_configured_top_n_heavy_repos() {
+        let metrics = MetricsRegistry::new();
+        let limit = 3;
+        let sizes = (0..=limit)
+            .map(|index| (format!("acme/repo-{index}.git"), (limit + 1 - index) as u64))
+            .collect::<Vec<_>>();
+        replace_mirror_usage_bytes(&metrics, &sizes, &sizes, limit);
+
+        assert_eq!(
+            pack_cache_histogram_repo_label(&metrics, "acme/repo-0.git"),
+            "acme/repo-0"
+        );
+        assert_eq!(
+            pack_cache_histogram_repo_label(&metrics, "acme/repo-2.git"),
+            "acme/repo-2"
+        );
+        assert_eq!(
+            pack_cache_histogram_repo_label(&metrics, "acme/repo-3.git"),
+            OTHER_REPO_LABEL
+        );
     }
 
     #[test]
     fn pack_cache_diagnostic_metrics_encode_expected_labels() {
         let metrics = MetricsRegistry::new();
+        replace_mirror_usage_bytes(
+            &metrics,
+            &[("acme/widgets.git".to_string(), 200)],
+            &[("acme/widgets.git".to_string(), 200)],
+            100,
+        );
 
         inc_pack_cache_key_bypass(&metrics, Protocol::Https, "acme/widgets.git", "filtered");
         inc_pack_cache_warming_skip(&metrics, "acme/widgets.git", "no_recent_full_tip");
@@ -2456,6 +2607,15 @@ mod tests {
             "ok",
             Duration::from_secs(3),
         );
+        observe_pack_cache_warming_duration(
+            &metrics,
+            "small/repo.git",
+            "base",
+            "ok",
+            Duration::from_secs(1),
+        );
+        observe_pack_cache_stitch_duration(&metrics, "acme/widgets.git", Duration::from_secs(2));
+        observe_pack_cache_stitch_duration(&metrics, "small/repo.git", Duration::from_secs(1));
         replace_pack_cache_recent_entries(&metrics, &[("acme/widgets.git".to_string(), 4, 2)]);
 
         let encoded = encode_metrics(&metrics.registry);
@@ -2489,6 +2649,23 @@ mod tests {
                 && line.contains("kind=\"base\"")
                 && line.contains("owner_repo=\"acme/widgets\"")
                 && line.contains("result=\"ok\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_warming_duration_seconds_count{")
+                && line.contains("kind=\"base\"")
+                && line.contains("owner_repo=\"other\"")
+                && line.contains("result=\"ok\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_stitch_duration_seconds_count{")
+                && line.contains("owner_repo=\"acme/widgets\"")
+                && line.ends_with(" 1")
+        }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_pack_cache_stitch_duration_seconds_count{")
+                && line.contains("owner_repo=\"other\"")
                 && line.ends_with(" 1")
         }));
         assert!(encoded.lines().any(|line| {
