@@ -677,8 +677,6 @@ async fn handle_info_refs(
         .get_or_create(&CloneUpstreamBytesLabels {
             protocol: Protocol::Https,
             phase: ClonePhase::InfoRefs,
-            username: metric_username.clone(),
-            repo: repo_slug.clone(),
         })
         .inc_by(upstream_bytes.len() as u64);
     state
@@ -689,8 +687,6 @@ async fn handle_info_refs(
             protocol: Protocol::Https,
             phase: ClonePhase::InfoRefs,
             source: CloneSource::Upstream,
-            username: metric_username,
-            repo: repo_slug.clone(),
         })
         .inc_by(modified_body.len() as u64);
 
@@ -1826,8 +1822,6 @@ async fn serve_http_pack_cache_hit_response(
             protocol: Protocol::Https,
             phase: ClonePhase::UploadPack,
             source: CloneSource::Local,
-            username: completion.metric_username.clone(),
-            repo: completion.metric_repo.clone(),
         })
         .clone();
     let active_clone_guard = state.begin_active_clone(
@@ -2174,8 +2168,6 @@ async fn serve_local_upload_pack(
             protocol: Protocol::Https,
             phase: ClonePhase::UploadPack,
             source: CloneSource::Local,
-            username: completion.metric_username.clone(),
-            repo: completion.metric_repo.clone(),
         })
         .clone();
     let active_clone_guard = state.begin_active_clone(
@@ -2444,8 +2436,6 @@ async fn proxy_upload_pack_to_upstream(
                             path: "nginx_upstream_fallback",
                             reason: metric_reason,
                             cache_status: completion.cache_status.clone(),
-                            client: &completion.metric_username,
-                            repo: &completion.metric_repo,
                         },
                     );
                     return Err(AppError::UpstreamFallback {
@@ -2542,8 +2532,6 @@ async fn proxy_upload_pack_to_upstream(
             .get_or_create(&CloneUpstreamBytesLabels {
                 protocol: Protocol::Https,
                 phase: ClonePhase::UploadPack,
-                username: completion.metric_username.clone(),
-                repo: owner_repo.clone(),
             })
             .clone()
     });
@@ -2556,8 +2544,6 @@ async fn proxy_upload_pack_to_upstream(
                 protocol: Protocol::Https,
                 phase: ClonePhase::UploadPack,
                 source: CloneSource::Upstream,
-                username: completion.metric_username.clone(),
-                repo: owner_repo.clone(),
             })
             .clone()
     });
@@ -3058,7 +3044,6 @@ mod tests {
             line.starts_with("forgeproxy_upload_pack_first_byte_seconds_count{")
                 && line.contains("cache_status=\"warm\"")
                 && line.contains("protocol=\"https\"")
-                && line.contains("repo=\"acme/widgets\"")
                 && line.contains("source=\"pack_cache\"")
                 && line.ends_with(" 1")
         }));

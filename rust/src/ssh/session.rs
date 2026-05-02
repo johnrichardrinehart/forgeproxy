@@ -543,8 +543,6 @@ async fn replay_ssh_pack_cache_hit(
             protocol: Protocol::Ssh,
             phase: ClonePhase::UploadPack,
             source: CloneSource::Local,
-            username: completion.metric_username.clone(),
-            repo: completion.metric_repo.clone(),
         })
         .clone();
     let _active_clone_guard = state.begin_active_clone(
@@ -983,8 +981,6 @@ async fn serve_local_upload_pack_once(
             protocol: Protocol::Ssh,
             phase: ClonePhase::UploadPack,
             source: CloneSource::Local,
-            username: completion.metric_username.clone(),
-            repo: completion.metric_repo.clone(),
         })
         .clone();
     let _active_clone_guard = state.begin_active_clone(
@@ -2127,8 +2123,6 @@ impl Handler for SshSession {
                                         protocol: Protocol::Ssh,
                                         phase: ClonePhase::UploadPack,
                                         source: CloneSource::Local,
-                                        username: metric_username.clone(),
-                                        repo: repo_for_stream.clone(),
                                     })
                                     .clone();
 
@@ -2396,8 +2390,6 @@ impl Handler for SshSession {
                                         protocol: Protocol::Ssh,
                                         phase: ClonePhase::InfoRefs,
                                         source: CloneSource::Upstream,
-                                        username: metric_username,
-                                        repo: repo_bg.clone(),
                                     })
                                     .inc_by(advert.len() as u64);
                                 // Forward the initial protocol-v2 advertisement
@@ -2859,8 +2851,6 @@ async fn proxy_upstream_upload_pack(
                 .get_or_create(&CloneUpstreamBytesLabels {
                     protocol: Protocol::Ssh,
                     phase: ClonePhase::UploadPack,
-                    username: metric_username.clone(),
-                    repo: owner_repo.clone(),
                 })
                 .clone();
             let downstream_counter = state
@@ -2871,8 +2861,6 @@ async fn proxy_upstream_upload_pack(
                     protocol: Protocol::Ssh,
                     phase: ClonePhase::UploadPack,
                     source: CloneSource::Upstream,
-                    username: metric_username.clone(),
-                    repo: owner_repo.clone(),
                 })
                 .clone();
             let mut had_error = false;

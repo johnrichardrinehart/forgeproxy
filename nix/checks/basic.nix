@@ -670,6 +670,10 @@ pkgs.testers.runNixOSTest {
         assert 'targets: ["127.0.0.1:8080"]' in rendered, rendered
         assert "scrape_interval: 5s" in rendered, rendered
         assert "scrape_timeout: 5s" in rendered, rendered
+        assert "job_name: otelcol" in rendered, rendered
+        assert 'targets: ["127.0.0.1:8888"]' in rendered, rendered
+        assert "      level: info" in rendered, rendered
+        assert "      level: basic" in rendered, rendered
         assert "hostmetrics:" in rendered, rendered
         assert 'receivers: ["prometheus", "hostmetrics"]' in rendered, rendered
         assert 'endpoint: "http://127.0.0.1:4318/v1/metrics"' in rendered, rendered
