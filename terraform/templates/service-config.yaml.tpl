@@ -147,6 +147,7 @@ bundles:
 
 observability:
   metrics:
+    top_heavy_repo_limit: ${metrics_top_heavy_repo_limit}
     prometheus:
       enabled: ${metrics_enabled}
       refresh_interval_secs: ${metrics_refresh_interval_secs}

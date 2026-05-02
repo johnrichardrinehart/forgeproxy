@@ -108,6 +108,7 @@ org_creds = [
 
 # OpenTelemetry configuration (optional)
 metrics_enabled = true
+metrics_top_heavy_repo_limit = 100
 metrics_refresh_interval_secs = 60
 config_reload_enabled = true
 config_reload_interval_secs = 60

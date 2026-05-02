@@ -143,6 +143,9 @@ storage:
     presigned_url_ttl: 60
 observability:
   metrics:
+    # Pack-cache histograms keep per-repo labels only for the top N heaviest
+    # mirrored repositories; all other repos are labeled owner_repo="other".
+    top_heavy_repo_limit: 100
     prometheus:
       enabled: true
       refresh_interval_secs: 60

@@ -366,6 +366,7 @@ impl AppState {
                     &self.metrics,
                     &snapshot.mirror_apparent_sizes,
                     &snapshot.mirror_physical_sizes,
+                    self.config().observability.metrics.top_heavy_repo_limit,
                 );
                 crate::metrics::replace_cache_subtree_usage_bytes(
                     &self.metrics,

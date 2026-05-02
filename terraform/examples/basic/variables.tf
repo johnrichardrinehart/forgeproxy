@@ -708,6 +708,17 @@ variable "metrics_enabled" {
   description = "Expose forgeproxy application metrics locally at /metrics for scraping."
 }
 
+variable "metrics_top_heavy_repo_limit" {
+  type        = number
+  default     = 100
+  description = "Maximum number of heavy repositories that keep distinct owner_repo labels on pack-cache histograms; all other repos are aggregated as owner_repo=other."
+
+  validation {
+    condition     = var.metrics_top_heavy_repo_limit > 0
+    error_message = "metrics_top_heavy_repo_limit must be greater than 0."
+  }
+}
+
 variable "metrics_refresh_interval_secs" {
   type        = number
   default     = 60

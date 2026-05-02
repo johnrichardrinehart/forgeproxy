@@ -308,10 +308,25 @@ pub struct ObservabilityConfig {
     pub traces: TraceConfig,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MetricsConfig {
+    #[serde(default = "default_metrics_top_heavy_repo_limit")]
+    pub top_heavy_repo_limit: usize,
     #[serde(default)]
     pub prometheus: PrometheusConfig,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            top_heavy_repo_limit: default_metrics_top_heavy_repo_limit(),
+            prometheus: PrometheusConfig::default(),
+        }
+    }
+}
+
+fn default_metrics_top_heavy_repo_limit() -> usize {
+    100
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1463,7 +1478,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "presigned_url_ttl",
         ],
         ConfigSchemaNode::Observability => &["metrics", "logs", "traces"],
-        ConfigSchemaNode::Metrics => &["prometheus"],
+        ConfigSchemaNode::Metrics => &["top_heavy_repo_limit", "prometheus"],
         ConfigSchemaNode::Prometheus => &["enabled", "refresh_interval_secs"],
         ConfigSchemaNode::LogSignal => &["journald"],
         ConfigSchemaNode::Journald => &["enabled"],
@@ -1791,6 +1806,10 @@ fn validate_config(config: &Config) -> Result<()> {
         "observability.traces.sample_ratio must be in range [0.0, 1.0]"
     );
     anyhow::ensure!(
+        config.observability.metrics.top_heavy_repo_limit > 0,
+        "observability.metrics.top_heavy_repo_limit must be greater than 0"
+    );
+    anyhow::ensure!(
         config
             .observability
             .metrics
@@ -1958,8 +1977,30 @@ mod tests {
     #[test]
     fn rejects_non_positive_metrics_refresh_interval() {
         let config = include_str!("../../config.example.yaml").replace(
-            "  metrics:\n    prometheus:\n      enabled: true\n",
-            "  metrics:\n    prometheus:\n      enabled: true\n      refresh_interval_secs: 0\n",
+            "      refresh_interval_secs: 60\n",
+            "      refresh_interval_secs: 0\n",
+        );
+        assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn metrics_config_accepts_top_heavy_repo_limit() {
+        let config = parse_config_str(include_str!("../../config.example.yaml")).unwrap();
+        assert_eq!(config.observability.metrics.top_heavy_repo_limit, 100);
+
+        let config = include_str!("../../config.example.yaml").replace(
+            "    top_heavy_repo_limit: 100\n",
+            "    top_heavy_repo_limit: 17\n",
+        );
+        let config = parse_config_str(&config).unwrap();
+        assert_eq!(config.observability.metrics.top_heavy_repo_limit, 17);
+    }
+
+    #[test]
+    fn rejects_zero_metrics_top_heavy_repo_limit() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "    top_heavy_repo_limit: 100\n",
+            "    top_heavy_repo_limit: 0\n",
         );
         assert!(parse_config_str(&config).is_err());
     }
@@ -2034,8 +2075,8 @@ mod tests {
     #[test]
     fn rejects_legacy_metrics_otlp_shape() {
         let config = include_str!("../../config.example.yaml").replace(
-            "  metrics:\n    prometheus:\n      enabled: true\n",
-            "  metrics:\n    prometheus:\n      enabled: true\n    otlp:\n      enabled: true\n      endpoint: \"https://ingest.metrics.foo.dev/vm/insert/0/opentelemetry/api/v1/push\"\n      protocol: \"http/protobuf\"\n      export_interval_secs: 60\n      auth:\n        basic:\n          username: \"foo\"\n          password: \"bar\"\n",
+            "    prometheus:\n      enabled: true\n",
+            "    prometheus:\n      enabled: true\n    otlp:\n      enabled: true\n      endpoint: \"https://ingest.metrics.foo.dev/vm/insert/0/opentelemetry/api/v1/push\"\n      protocol: \"http/protobuf\"\n      export_interval_secs: 60\n      auth:\n        basic:\n          username: \"foo\"\n          password: \"bar\"\n",
         );
         let (_parsed, warnings) = parse_config_str_with_warnings(&config).unwrap();
         assert_eq!(

@@ -76,6 +76,7 @@ let
         bundle_pack_threads                        = 4
         bundle_max_incremental_bundles             = 1
         metrics_enabled                            = true
+        metrics_top_heavy_repo_limit               = 100
         metrics_refresh_interval_secs              = 60
         logs_enabled                               = true
         traces_enabled                             = false
