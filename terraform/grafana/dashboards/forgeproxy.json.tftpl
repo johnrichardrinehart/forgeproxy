@@ -801,6 +801,11 @@
           "expr": "sum by (reason) (rate(forgeproxy_repo_update_alternates_validation_failures_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
           "legendFormat": "Alternates failure {{reason}}",
           "refId": "J"
+        },
+        {
+          "expr": "sum by (stage, policy, decision, reason) (rate(forgeproxy_published_generation_index_decision_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Index {{stage}} {{policy}} {{decision}} {{reason}}",
+          "refId": "K"
         }
       ],
       "fieldConfig": {
@@ -849,6 +854,11 @@
           "expr": "histogram_quantile(0.95, sum by (le, mode) (rate(forgeproxy_repo_update_direct_mirror_fetch_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "direct mirror fetch p95 {{mode}}",
           "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, stage, policy, result) (rate(forgeproxy_published_generation_index_duration_seconds_bucket{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "index p95 {{stage}} {{policy}} {{result}}",
+          "refId": "D"
         }
       ],
       "fieldConfig": {

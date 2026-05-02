@@ -681,10 +681,24 @@ pub struct CloneConfig {
     /// pack into a staging generation.
     #[serde(default)]
     pub hydration_mode: HydrationMode,
-    /// Whether staged published generations should be repacked with bitmap and
-    /// multi-pack-index support before they are exposed to clone readers.
+    /// Whether staged published generations should receive a multi-pack-index
+    /// after they are exposed to clone readers.
+    #[serde(default = "default_prepare_published_generation_midx")]
+    pub prepare_published_generation_midx: bool,
+    /// Policy for the expensive published-generation MIDX bitmap pass.
     #[serde(default)]
-    pub prepare_published_generation_indexes: bool,
+    pub published_generation_bitmap_policy: PublishedGenerationBitmapPolicy,
+    /// Mirror size at or above which adaptive bitmap generation may run.
+    #[serde(default = "default_published_generation_bitmap_min_mirror_size_bytes")]
+    pub published_generation_bitmap_min_mirror_size_bytes: u64,
+    /// Byte churn per fetch cycle at or above which adaptive bitmap generation
+    /// is skipped.
+    #[serde(default = "default_published_generation_bitmap_churn_bytes_threshold")]
+    pub published_generation_bitmap_churn_bytes_threshold: u64,
+    /// Skip adaptive bitmap generation when the last successful bitmap runtime
+    /// exceeded this fraction of the current fetch interval.
+    #[serde(default = "default_published_generation_bitmap_max_interval_ratio")]
+    pub published_generation_bitmap_max_interval_ratio: f64,
     /// Optional window during which lower-priority refreshes may keep serving
     /// the current published generation instead of publishing another one.
     #[serde(default)]
@@ -755,7 +769,14 @@ impl Default for CloneConfig {
             index_pack_threads: default_index_pack_threads(),
             max_concurrent_deep_validations: default_max_concurrent_deep_validations(),
             hydration_mode: HydrationMode::default(),
-            prepare_published_generation_indexes: false,
+            prepare_published_generation_midx: default_prepare_published_generation_midx(),
+            published_generation_bitmap_policy: PublishedGenerationBitmapPolicy::Adaptive,
+            published_generation_bitmap_min_mirror_size_bytes:
+                default_published_generation_bitmap_min_mirror_size_bytes(),
+            published_generation_bitmap_churn_bytes_threshold:
+                default_published_generation_bitmap_churn_bytes_threshold(),
+            published_generation_bitmap_max_interval_ratio:
+                default_published_generation_bitmap_max_interval_ratio(),
             generation_coalescing_window_secs: 0,
             global_short_circuit_upstream_secs: 0,
             request_wait_for_local_catch_up_secs: default_request_wait_for_local_catch_up_secs(),
@@ -777,6 +798,25 @@ pub enum HydrationMode {
     FollowOnFetch,
     #[default]
     PublishFromCapture,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishedGenerationBitmapPolicy {
+    Never,
+    Always,
+    #[default]
+    Adaptive,
+}
+
+impl PublishedGenerationBitmapPolicy {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::Always => "always",
+            Self::Adaptive => "adaptive",
+        }
+    }
 }
 
 fn default_lock_ttl() -> u64 {
@@ -853,6 +893,22 @@ fn default_max_concurrent_deep_validations() -> usize {
 
 fn default_local_upload_pack_threads() -> usize {
     DEFAULT_INDEX_PACK_THREADS
+}
+
+fn default_prepare_published_generation_midx() -> bool {
+    true
+}
+
+fn default_published_generation_bitmap_min_mirror_size_bytes() -> u64 {
+    500 * 1024 * 1024
+}
+
+fn default_published_generation_bitmap_churn_bytes_threshold() -> u64 {
+    50 * 1024 * 1024
+}
+
+fn default_published_generation_bitmap_max_interval_ratio() -> f64 {
+    0.5
 }
 
 // ---------------------------------------------------------------------------
@@ -1410,7 +1466,11 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "index_pack_threads",
             "max_concurrent_deep_validations",
             "hydration_mode",
-            "prepare_published_generation_indexes",
+            "prepare_published_generation_midx",
+            "published_generation_bitmap_policy",
+            "published_generation_bitmap_min_mirror_size_bytes",
+            "published_generation_bitmap_churn_bytes_threshold",
+            "published_generation_bitmap_max_interval_ratio",
             "generation_coalescing_window_secs",
             "global_short_circuit_upstream_secs",
             "request_wait_for_local_catch_up_secs",
@@ -1770,6 +1830,30 @@ fn validate_config(config: &Config) -> Result<()> {
         "clone.max_concurrent_deep_validations must be greater than 0"
     );
     anyhow::ensure!(
+        config.clone.prepare_published_generation_midx
+            || config.clone.published_generation_bitmap_policy
+                == PublishedGenerationBitmapPolicy::Never,
+        "clone.prepare_published_generation_midx must be true when clone.published_generation_bitmap_policy is not never"
+    );
+    anyhow::ensure!(
+        config
+            .clone
+            .published_generation_bitmap_min_mirror_size_bytes
+            > 0,
+        "clone.published_generation_bitmap_min_mirror_size_bytes must be greater than 0"
+    );
+    anyhow::ensure!(
+        config
+            .clone
+            .published_generation_bitmap_churn_bytes_threshold
+            > 0,
+        "clone.published_generation_bitmap_churn_bytes_threshold must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.clone.published_generation_bitmap_max_interval_ratio > 0.0,
+        "clone.published_generation_bitmap_max_interval_ratio must be greater than 0"
+    );
+    anyhow::ensure!(
         config.pack_cache.max_percent > 0.0 && config.pack_cache.max_percent <= 1.0,
         "pack_cache.max_percent must be in range (0.0, 1.0]"
     );
@@ -1936,13 +2020,86 @@ mod tests {
     }
 
     #[test]
-    fn clone_config_accepts_published_generation_index_preparation() {
-        let config = include_str!("../../config.example.yaml").replace(
-            "  prepare_published_generation_indexes: false\n",
-            "  prepare_published_generation_indexes: true\n",
-        );
+    fn clone_config_accepts_published_generation_midx_toggle() {
+        let config = include_str!("../../config.example.yaml")
+            .replace(
+                "  prepare_published_generation_midx: true\n",
+                "  prepare_published_generation_midx: false\n",
+            )
+            .replace(
+                "  published_generation_bitmap_policy: \"adaptive\"\n",
+                "  published_generation_bitmap_policy: \"never\"\n",
+            );
         let config = parse_config_str(&config).unwrap();
-        assert!(config.clone.prepare_published_generation_indexes);
+        assert!(!config.clone.prepare_published_generation_midx);
+    }
+
+    #[test]
+    fn clone_config_defaults_midx_to_enabled_for_adaptive_bitmap_policy() {
+        let config = include_str!("../../config.example.yaml")
+            .replace("  prepare_published_generation_midx: true\n", "");
+        let config = parse_config_str(&config).unwrap();
+        assert!(config.clone.prepare_published_generation_midx);
+        assert_eq!(
+            config.clone.published_generation_bitmap_policy,
+            super::PublishedGenerationBitmapPolicy::Adaptive
+        );
+    }
+
+    #[test]
+    fn clone_config_accepts_adaptive_published_generation_bitmap_policy() {
+        let config = include_str!("../../config.example.yaml")
+            .replace(
+                "  published_generation_bitmap_policy: \"adaptive\"\n",
+                "  published_generation_bitmap_policy: \"always\"\n",
+            )
+            .replace(
+                "  published_generation_bitmap_min_mirror_size_bytes: 524288000\n",
+                "  published_generation_bitmap_min_mirror_size_bytes: 1073741824\n",
+            )
+            .replace(
+                "  published_generation_bitmap_churn_bytes_threshold: 52428800\n",
+                "  published_generation_bitmap_churn_bytes_threshold: 104857600\n",
+            )
+            .replace(
+                "  published_generation_bitmap_max_interval_ratio: 0.5\n",
+                "  published_generation_bitmap_max_interval_ratio: 0.25\n",
+            );
+        let config = parse_config_str(&config).unwrap();
+        assert_eq!(
+            config.clone.published_generation_bitmap_policy,
+            super::PublishedGenerationBitmapPolicy::Always
+        );
+        assert_eq!(
+            config
+                .clone
+                .published_generation_bitmap_min_mirror_size_bytes,
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            config
+                .clone
+                .published_generation_bitmap_churn_bytes_threshold,
+            100 * 1024 * 1024
+        );
+        assert_eq!(
+            config.clone.published_generation_bitmap_max_interval_ratio,
+            0.25
+        );
+    }
+
+    #[test]
+    fn rejects_bitmap_policy_without_published_generation_midx() {
+        let config = include_str!("../../config.example.yaml")
+            .replace(
+                "  prepare_published_generation_midx: true\n",
+                "  prepare_published_generation_midx: false\n",
+            )
+            .replace(
+                "  published_generation_bitmap_policy: \"adaptive\"\n",
+                "  published_generation_bitmap_policy: \"always\"\n",
+            );
+        assert!(parse_config_str(&config).is_err());
     }
 
     #[test]

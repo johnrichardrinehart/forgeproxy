@@ -381,7 +381,7 @@ curl -k http://127.0.0.1:8080/healthz
 
 3. **Monitoring**: Configure OTLP egress or optional direct scraping
    - Set `metrics_enabled`, `metrics_refresh_interval_secs`, `logs_enabled`, `traces_enabled`, and `traces_sample_ratio` to control forgeproxy's local observability behavior
-   - Set `prepare_published_generation_indexes = true` when benchmarking bitmap/MIDX-backed published generations
+   - Set `prepare_published_generation_midx = true` and tune `published_generation_bitmap_policy` when benchmarking MIDX or bitmap-backed published generations
    - Set `otlp_metrics`, `otlp_logs`, and `otlp_traces` to describe the real external destinations for each signal
    - Set `host_metrics_enabled = true` if you also want the on-instance Collector to emit host CPU, disk, filesystem, load, memory, network, and paging metrics
    - The on-instance Collector reads its exporter configuration from the separate `forgeproxy/otel-collector-config` secret

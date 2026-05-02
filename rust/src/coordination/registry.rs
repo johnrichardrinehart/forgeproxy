@@ -65,6 +65,7 @@ pub struct RepoUpdateProfile {
     pub missed_want_failures: u64,
     pub last_fetch_duration_ms: u64,
     pub last_fetch_bytes: u64,
+    pub last_bitmap_ms: u64,
     pub last_selected_mode: String,
 }
 
@@ -336,6 +337,7 @@ async fn get_repo_update_profile(
         missed_want_failures: parse_u64_field(&map, "missed_want_failures"),
         last_fetch_duration_ms: parse_u64_field(&map, "last_fetch_duration_ms"),
         last_fetch_bytes: parse_u64_field(&map, "last_fetch_bytes"),
+        last_bitmap_ms: parse_u64_field(&map, "last_bitmap_ms"),
         last_selected_mode: map.get("last_selected_mode").cloned().unwrap_or_default(),
     })
 }
@@ -374,6 +376,7 @@ async fn set_repo_update_profile(
             "last_fetch_bytes".into(),
             profile.last_fetch_bytes.to_string(),
         ),
+        ("last_bitmap_ms".into(), profile.last_bitmap_ms.to_string()),
         (
             "last_selected_mode".into(),
             profile.last_selected_mode.clone(),
@@ -1976,7 +1979,7 @@ async fn publish_ready_repo(
     Ok(staged_repo_path.to_path_buf())
 }
 
-/// Write MIDX and bitmap indexes on a just-published generation.
+/// Write optional MIDX and bitmap indexes on a just-published generation.
 ///
 /// This runs in the background pipeline after publish so the generation is
 /// immediately available to `git upload-pack` readers.
@@ -1986,7 +1989,15 @@ async fn run_published_generation_index_preparation(
     published_path: PathBuf,
     source: String,
 ) {
-    if !state.config().clone.prepare_published_generation_indexes {
+    let clone_config = state.config().clone.clone();
+    if !clone_config.prepare_published_generation_midx {
+        crate::metrics::inc_published_generation_index_decision(
+            &state.metrics,
+            "midx",
+            "disabled",
+            "skip",
+            "config_disabled",
+        );
         return;
     }
     let started_at = Instant::now();
@@ -1995,7 +2006,7 @@ async fn run_published_generation_index_preparation(
         source,
         path = %published_path.display(),
         pack_threads = state.bundle_pack_threads,
-        "starting background bitmap/MIDX preparation for published generation"
+        "starting background MIDX preparation for published generation"
     );
 
     if !state
@@ -2009,7 +2020,167 @@ async fn run_published_generation_index_preparation(
             repo = %owner_repo,
             source,
             path = %published_path.display(),
-            "abandoning background bitmap/MIDX preparation after repeated foreground clone/CPU pressure"
+            "abandoning background MIDX preparation after repeated foreground clone/CPU pressure"
+        );
+        crate::metrics::inc_published_generation_index_decision(
+            &state.metrics,
+            "midx",
+            "enabled",
+            "skip",
+            "background_busy",
+        );
+        return;
+    }
+
+    if !try_confirm_idle_local_upload_pack_gate(&state, &owner_repo, &source) {
+        crate::metrics::inc_published_generation_index_decision(
+            &state.metrics,
+            "midx",
+            "enabled",
+            "skip",
+            "local_upload_pack_busy",
+        );
+        return;
+    }
+
+    let midx_started_at = Instant::now();
+    let midx_result = crate::git::commands::git_prepare_published_generation_midx(
+        &published_path,
+        state.bundle_pack_threads,
+    )
+    .await;
+
+    match midx_result {
+        Ok(outcome) => {
+            let (decision, reason) = published_generation_index_outcome_labels(outcome);
+            crate::metrics::inc_published_generation_index_decision(
+                &state.metrics,
+                "midx",
+                "enabled",
+                decision,
+                reason,
+            );
+            crate::metrics::observe_published_generation_index_duration(
+                &state.metrics,
+                "midx",
+                "enabled",
+                reason,
+                midx_started_at.elapsed(),
+            );
+            info!(
+                repo = %owner_repo,
+                source,
+                path = %published_path.display(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                outcome = reason,
+                "finished background MIDX preparation for published generation"
+            );
+            if outcome != crate::git::commands::PublishedGenerationIndexOutcome::Prepared {
+                crate::metrics::inc_published_generation_index_decision(
+                    &state.metrics,
+                    "bitmap",
+                    clone_config.published_generation_bitmap_policy.as_label(),
+                    "skip",
+                    reason,
+                );
+                return;
+            }
+        }
+        Err(error) => {
+            crate::metrics::inc_published_generation_index_decision(
+                &state.metrics,
+                "midx",
+                "enabled",
+                "error",
+                "git_failed",
+            );
+            crate::metrics::observe_published_generation_index_duration(
+                &state.metrics,
+                "midx",
+                "enabled",
+                "error",
+                midx_started_at.elapsed(),
+            );
+            warn!(
+                repo = %owner_repo,
+                source,
+                path = %published_path.display(),
+                elapsed_ms = started_at.elapsed().as_millis(),
+                error = %error,
+                "background MIDX preparation failed for published generation"
+            );
+            return;
+        }
+    }
+
+    let bitmap_decision =
+        match should_generate_published_generation_bitmap(&state, &owner_repo, &published_path)
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                crate::metrics::inc_published_generation_index_decision(
+                    &state.metrics,
+                    "bitmap",
+                    clone_config.published_generation_bitmap_policy.as_label(),
+                    "error",
+                    "policy_failed",
+                );
+                warn!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    error = %error,
+                    "failed to evaluate published generation bitmap policy"
+                );
+                return;
+            }
+        };
+
+    if !bitmap_decision.generate {
+        crate::metrics::inc_published_generation_index_decision(
+            &state.metrics,
+            "bitmap",
+            bitmap_decision.policy,
+            "skip",
+            bitmap_decision.reason,
+        );
+        info!(
+            repo = %owner_repo,
+            source,
+            path = %published_path.display(),
+            policy = bitmap_decision.policy,
+            reason = bitmap_decision.reason,
+            mirror_size_bytes = bitmap_decision.mirror_size_bytes,
+            rolling_avg_delta_bytes = bitmap_decision.rolling_avg_delta_bytes,
+            last_delta_bytes = bitmap_decision.last_delta_bytes,
+            current_interval_secs = bitmap_decision.current_interval_secs,
+            last_bitmap_ms = bitmap_decision.last_bitmap_ms,
+            "skipping published generation bitmap preparation"
+        );
+        return;
+    }
+
+    if !state
+        .wait_for_background_work_admission(
+            "published_generation_bitmap_preparation",
+            Some(&owner_repo),
+        )
+        .await
+    {
+        crate::metrics::inc_published_generation_index_decision(
+            &state.metrics,
+            "bitmap",
+            bitmap_decision.policy,
+            "skip",
+            "background_busy",
+        );
+        info!(
+            repo = %owner_repo,
+            source,
+            path = %published_path.display(),
+            policy = bitmap_decision.policy,
+            "abandoning background bitmap preparation after repeated foreground clone/CPU pressure"
         );
         return;
     }
@@ -2022,49 +2193,241 @@ async fn run_published_generation_index_preparation(
     {
         Ok(permit) => permit,
         Err(error) => {
+            crate::metrics::inc_published_generation_index_decision(
+                &state.metrics,
+                "bitmap",
+                bitmap_decision.policy,
+                "skip",
+                "semaphore_closed",
+            );
             warn!(
                 repo = %owner_repo,
                 source,
                 path = %published_path.display(),
                 error = %error,
-                "skipping background bitmap/MIDX preparation because semaphore is closed"
+                "skipping background bitmap preparation because semaphore is closed"
             );
             return;
         }
     };
 
     if !try_confirm_idle_local_upload_pack_gate(&state, &owner_repo, &source) {
+        crate::metrics::inc_published_generation_index_decision(
+            &state.metrics,
+            "bitmap",
+            bitmap_decision.policy,
+            "skip",
+            "local_upload_pack_busy",
+        );
+        drop(permit);
         return;
     }
 
-    let result = crate::git::commands::git_prepare_published_generation_indexes(
+    crate::metrics::inc_published_generation_index_decision(
+        &state.metrics,
+        "bitmap",
+        bitmap_decision.policy,
+        "run",
+        bitmap_decision.reason,
+    );
+    let bitmap_started_at = Instant::now();
+    let bitmap_result = crate::git::commands::git_prepare_published_generation_bitmap(
         &published_path,
         state.bundle_pack_threads,
     )
     .await;
     drop(permit);
 
-    match result {
-        Ok(()) => {
+    match bitmap_result {
+        Ok(outcome) => {
+            let (decision, reason) = published_generation_index_outcome_labels(outcome);
+            crate::metrics::inc_published_generation_index_decision(
+                &state.metrics,
+                "bitmap",
+                bitmap_decision.policy,
+                decision,
+                reason,
+            );
+            crate::metrics::observe_published_generation_index_duration(
+                &state.metrics,
+                "bitmap",
+                bitmap_decision.policy,
+                reason,
+                bitmap_started_at.elapsed(),
+            );
+            if outcome == crate::git::commands::PublishedGenerationIndexOutcome::Prepared
+                && let Err(error) = record_published_generation_bitmap_duration(
+                    &state,
+                    &owner_repo,
+                    bitmap_started_at.elapsed(),
+                )
+                .await
+            {
+                warn!(
+                    repo = %owner_repo,
+                    source,
+                    path = %published_path.display(),
+                    error = %error,
+                    "failed to record published generation bitmap duration"
+                );
+            }
             info!(
                 repo = %owner_repo,
                 source,
                 path = %published_path.display(),
-                elapsed_ms = started_at.elapsed().as_millis(),
-                "finished background bitmap/MIDX preparation for published generation"
+                policy = bitmap_decision.policy,
+                outcome = reason,
+                elapsed_ms = bitmap_started_at.elapsed().as_millis(),
+                "finished background bitmap preparation for published generation"
             );
         }
         Err(error) => {
+            crate::metrics::inc_published_generation_index_decision(
+                &state.metrics,
+                "bitmap",
+                bitmap_decision.policy,
+                "error",
+                "git_failed",
+            );
+            crate::metrics::observe_published_generation_index_duration(
+                &state.metrics,
+                "bitmap",
+                bitmap_decision.policy,
+                "error",
+                bitmap_started_at.elapsed(),
+            );
             warn!(
                 repo = %owner_repo,
                 source,
                 path = %published_path.display(),
-                elapsed_ms = started_at.elapsed().as_millis(),
+                policy = bitmap_decision.policy,
+                elapsed_ms = bitmap_started_at.elapsed().as_millis(),
                 error = %error,
-                "background bitmap/MIDX preparation failed for published generation"
+                "background bitmap preparation failed for published generation"
             );
         }
     }
+}
+
+fn published_generation_index_outcome_labels(
+    outcome: crate::git::commands::PublishedGenerationIndexOutcome,
+) -> (&'static str, &'static str) {
+    match outcome {
+        crate::git::commands::PublishedGenerationIndexOutcome::Prepared => ("ok", "prepared"),
+        crate::git::commands::PublishedGenerationIndexOutcome::NoPackFiles => {
+            ("skip", "no_pack_files")
+        }
+        crate::git::commands::PublishedGenerationIndexOutcome::UsesAlternates => {
+            ("skip", "alternates")
+        }
+    }
+}
+
+struct PublishedGenerationBitmapDecision {
+    generate: bool,
+    policy: &'static str,
+    reason: &'static str,
+    mirror_size_bytes: u64,
+    rolling_avg_delta_bytes: u64,
+    last_delta_bytes: u64,
+    current_interval_secs: u64,
+    last_bitmap_ms: u64,
+}
+
+async fn should_generate_published_generation_bitmap(
+    state: &crate::AppState,
+    owner_repo: &str,
+    published_path: &Path,
+) -> Result<PublishedGenerationBitmapDecision> {
+    let clone_config = state.config().clone.clone();
+    let policy = clone_config.published_generation_bitmap_policy;
+    let policy_label = policy.as_label();
+
+    if policy == crate::config::PublishedGenerationBitmapPolicy::Never {
+        return Ok(PublishedGenerationBitmapDecision {
+            generate: false,
+            policy: policy_label,
+            reason: "policy_never",
+            mirror_size_bytes: 0,
+            rolling_avg_delta_bytes: 0,
+            last_delta_bytes: 0,
+            current_interval_secs: 0,
+            last_bitmap_ms: 0,
+        });
+    }
+
+    if policy == crate::config::PublishedGenerationBitmapPolicy::Always {
+        return Ok(PublishedGenerationBitmapDecision {
+            generate: true,
+            policy: policy_label,
+            reason: "policy_always",
+            mirror_size_bytes: 0,
+            rolling_avg_delta_bytes: 0,
+            last_delta_bytes: 0,
+            current_interval_secs: 0,
+            last_bitmap_ms: 0,
+        });
+    }
+
+    let mut profile = get_repo_update_profile(&state.valkey, owner_repo).await?;
+    refresh_repo_update_profile_from_mirror(&mut profile, published_path).await;
+    set_repo_update_profile(&state.valkey, owner_repo, &profile).await?;
+    crate::metrics::set_repo_update_profile(
+        &state.metrics,
+        owner_repo,
+        profile.mirror_size_bytes,
+        profile.ref_count,
+        profile.failure_score,
+    );
+
+    let schedule = get_fetch_schedule(&state.valkey, owner_repo)
+        .await?
+        .unwrap_or_default();
+    let rolling_avg_delta_bytes = schedule.rolling_avg_delta;
+    let last_delta_bytes = schedule.last_delta_bytes;
+    let current_interval_secs = schedule.current_interval;
+    let last_bitmap_ms = profile.last_bitmap_ms;
+
+    let reason = if profile.mirror_size_bytes
+        < clone_config.published_generation_bitmap_min_mirror_size_bytes
+    {
+        "small_mirror"
+    } else if rolling_avg_delta_bytes
+        >= clone_config.published_generation_bitmap_churn_bytes_threshold
+        || last_delta_bytes >= clone_config.published_generation_bitmap_churn_bytes_threshold
+    {
+        "high_churn"
+    } else if last_bitmap_ms > 0
+        && current_interval_secs > 0
+        && (last_bitmap_ms as f64)
+            > (current_interval_secs.saturating_mul(1000) as f64
+                * clone_config.published_generation_bitmap_max_interval_ratio)
+    {
+        "time_guard"
+    } else {
+        "adaptive_selected"
+    };
+
+    Ok(PublishedGenerationBitmapDecision {
+        generate: reason == "adaptive_selected",
+        policy: policy_label,
+        reason,
+        mirror_size_bytes: profile.mirror_size_bytes,
+        rolling_avg_delta_bytes,
+        last_delta_bytes,
+        current_interval_secs,
+        last_bitmap_ms,
+    })
+}
+
+async fn record_published_generation_bitmap_duration(
+    state: &crate::AppState,
+    owner_repo: &str,
+    elapsed: Duration,
+) -> Result<()> {
+    let mut profile = get_repo_update_profile(&state.valkey, owner_repo).await?;
+    profile.last_bitmap_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    set_repo_update_profile(&state.valkey, owner_repo, &profile).await
 }
 
 fn try_confirm_idle_local_upload_pack_gate(
@@ -2079,7 +2442,7 @@ fn try_confirm_idle_local_upload_pack_gate(
                 repo = %owner_repo,
                 source,
                 max_concurrent_local_upload_packs = state.config().clone.max_concurrent_local_upload_packs,
-                "skipping background bitmap/MIDX preparation because upload-pack semaphore size exceeds git maintenance gate capacity"
+                "skipping background git index preparation because upload-pack semaphore size exceeds git maintenance gate capacity"
             );
             return false;
         }
@@ -2094,7 +2457,7 @@ fn try_confirm_idle_local_upload_pack_gate(
                 repo = %owner_repo,
                 source,
                 permits = permit_count,
-                "confirmed local upload-pack is idle before background bitmap/MIDX preparation"
+                "confirmed local upload-pack is idle before background git index preparation"
             );
             true
         }
@@ -2102,7 +2465,7 @@ fn try_confirm_idle_local_upload_pack_gate(
             info!(
                 repo = %owner_repo,
                 source,
-                "skipping background bitmap/MIDX preparation because local upload-pack admission is busy"
+                "skipping background git index preparation because local upload-pack admission is busy"
             );
             false
         }
@@ -2110,7 +2473,7 @@ fn try_confirm_idle_local_upload_pack_gate(
             warn!(
                 repo = %owner_repo,
                 source,
-                "skipping background bitmap/MIDX preparation because local upload-pack semaphore is closed"
+                "skipping background git index preparation because local upload-pack semaphore is closed"
             );
             false
         }

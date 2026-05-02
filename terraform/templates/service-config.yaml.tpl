@@ -53,7 +53,11 @@ auth:
   webhook_secret_env: "FORGE_WEBHOOK_SECRET"
 
 clone:
-  prepare_published_generation_indexes: ${prepare_published_generation_indexes}
+  prepare_published_generation_midx: ${prepare_published_generation_midx}
+  published_generation_bitmap_policy: "${published_generation_bitmap_policy}"
+  published_generation_bitmap_min_mirror_size_bytes: ${published_generation_bitmap_min_mirror_size_bytes}
+  published_generation_bitmap_churn_bytes_threshold: ${published_generation_bitmap_churn_bytes_threshold}
+  published_generation_bitmap_max_interval_ratio: ${published_generation_bitmap_max_interval_ratio}
   generation_coalescing_window_secs: ${generation_coalescing_window_secs}
   global_short_circuit_upstream_secs: ${global_short_circuit_upstream_secs}
   request_wait_for_local_catch_up_secs: ${request_wait_for_local_catch_up_secs}
