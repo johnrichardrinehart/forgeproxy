@@ -11,6 +11,9 @@ background_work:
   max_defer_retries: ${background_work_max_defer_retries}
   max_defer_secs: ${background_work_max_defer_secs}
 
+adaptive_tuning:
+  ${indent(2, yamlencode(adaptive_tuning))}
+
 upstream:
   hostname: "${upstream_hostname}"
   api_url: "${upstream_api_url}"
@@ -68,13 +71,31 @@ clone:
   # Request path: every local disk serve acquires these before spawning git upload-pack.
   # Higher values improve parallel clone/fetch throughput but allow more concurrent pack-objects CPU.
   max_concurrent_upstream_clones: ${max_concurrent_upstream_clones}
+  max_concurrent_upstream_fetches: ${max_concurrent_upstream_fetches}
+  reserved_request_time_upstream_fetches: ${reserved_request_time_upstream_fetches}
+  max_concurrent_upstream_clones_per_repo_per_instance: ${max_concurrent_upstream_clones_per_repo_per_instance}
+  max_concurrent_upstream_clones_per_repo_across_instances: ${max_concurrent_upstream_clones_per_repo_across_instances}
   max_concurrent_local_upload_packs: ${max_concurrent_local_upload_packs}
   max_concurrent_local_upload_packs_per_repo: ${max_concurrent_local_upload_packs_per_repo}
+  max_concurrent_tee_captures: ${max_concurrent_tee_captures}
+  max_concurrent_tee_captures_per_repo_per_instance: ${max_concurrent_tee_captures_per_repo_per_instance}
   max_concurrent_deep_validations: ${max_concurrent_deep_validations}
   # Request path: local git upload-pack inherits this as pack.threads for pack generation.
   local_upload_pack_threads: ${local_upload_pack_threads}
   # Request-adjacent CPU: tee imports and pack-cache indexing use this git index-pack thread cap.
   index_pack_threads: ${index_pack_threads}
+
+fetch_schedule:
+  enabled: ${fetch_schedule_enabled}
+  evaluation_interval_secs: ${fetch_schedule_evaluation_interval_secs}
+  min_interval_secs: ${fetch_schedule_min_interval_secs}
+  max_interval_secs: ${fetch_schedule_max_interval_secs}
+  candidate_limit_per_tick: ${fetch_schedule_candidate_limit_per_tick}
+  max_refreshes_per_tick: ${fetch_schedule_max_refreshes_per_tick}
+  request_probability_window_secs: ${fetch_schedule_request_probability_window_secs}
+  churn_window_secs: ${fetch_schedule_churn_window_secs}
+  stale_after_secs: ${fetch_schedule_stale_after_secs}
+  jitter_percent: ${fetch_schedule_jitter_percent}
 
 pack_cache:
   enabled: ${pack_cache_enabled}

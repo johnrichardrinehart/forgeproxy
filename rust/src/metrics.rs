@@ -14,6 +14,9 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
+use crate::adaptive_tuning::{
+    AdaptiveObservationCounters, EffectivePolicy, HostPressure, RecommendationSet,
+};
 use crate::config::BackendType;
 
 const OTHER_REPO_LABEL: &str = "other";
@@ -363,6 +366,17 @@ pub struct RequestTimeCatchUpLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BackgroundRefreshLabels {
+    pub result: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BackgroundRefreshEffectivenessLabels {
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RepoUpdateSelectionLabels {
     pub mode: String,
     pub reason: String,
@@ -409,6 +423,37 @@ pub struct PublishedGenerationIndexDurationLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct BackgroundTaskLabels {
     pub task: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AdaptiveKnobLabels {
+    pub knob: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AdaptiveRecommendationLabels {
+    pub controller: String,
+    pub mode: String,
+    pub knob: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AdaptiveDecisionLabels {
+    pub controller: String,
+    pub mode: String,
+    pub decision: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AdaptivePressureLabels {
+    pub signal: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AdaptiveShadowDeltaLabels {
+    pub controller: String,
+    pub knob: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -632,6 +677,9 @@ pub struct Metrics {
     pub bundle_manifest_entries: Family<BundleManifestEntriesLabels, Gauge>,
     pub generation_coalescing_total: Family<GenerationCoalescingLabels, Counter>,
     pub request_time_catch_up_total: Family<RequestTimeCatchUpLabels, Counter>,
+    pub background_refresh_total: Family<BackgroundRefreshLabels, Counter>,
+    pub background_refresh_effectiveness_total:
+        Family<BackgroundRefreshEffectivenessLabels, Counter>,
 
     // -- adaptive repo update policy --
     pub repo_update_selection_total: Family<RepoUpdateSelectionLabels, Counter>,
@@ -653,6 +701,13 @@ pub struct Metrics {
     // -- background task runtime --
     pub background_task_poll_seconds_total: Family<BackgroundTaskLabels, Counter<f64, AtomicU64>>,
     pub background_task_polls_total: Family<BackgroundTaskLabels, Counter>,
+
+    // -- adaptive runtime tuning --
+    pub adaptive_effective_value: Family<AdaptiveKnobLabels, Gauge>,
+    pub adaptive_recommended_value: Family<AdaptiveRecommendationLabels, Gauge>,
+    pub adaptive_decisions_total: Family<AdaptiveDecisionLabels, Counter>,
+    pub adaptive_pressure: Family<AdaptivePressureLabels, Gauge<f64, AtomicU64>>,
+    pub adaptive_shadow_delta: Family<AdaptiveShadowDeltaLabels, Gauge>,
 }
 
 impl Metrics {
@@ -1152,6 +1207,19 @@ impl Metrics {
             "Request-time local catch-up decisions by result",
             request_time_catch_up_total.clone(),
         );
+        let background_refresh_total = Family::<BackgroundRefreshLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_background_refresh",
+            "Background refresh scheduler decisions and outcomes by result and reason",
+            background_refresh_total.clone(),
+        );
+        let background_refresh_effectiveness_total =
+            Family::<BackgroundRefreshEffectivenessLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_background_refresh_effectiveness",
+            "Background refresh effectiveness signals from request-path outcomes",
+            background_refresh_effectiveness_total.clone(),
+        );
 
         let repo_update_selection_total = Family::<RepoUpdateSelectionLabels, Counter>::default();
         registry.register(
@@ -1249,6 +1317,41 @@ impl Metrics {
             background_task_polls_total.clone(),
         );
 
+        let adaptive_effective_value = Family::<AdaptiveKnobLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_adaptive_effective_value",
+            "Current effective adaptive runtime tuning value by knob",
+            adaptive_effective_value.clone(),
+        );
+
+        let adaptive_recommended_value = Family::<AdaptiveRecommendationLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_adaptive_recommended_value",
+            "Recommended adaptive runtime tuning value by controller, mode, and knob",
+            adaptive_recommended_value.clone(),
+        );
+
+        let adaptive_decisions_total = Family::<AdaptiveDecisionLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_adaptive_decisions",
+            "Adaptive runtime tuning controller decisions by controller, mode, decision, and reason",
+            adaptive_decisions_total.clone(),
+        );
+
+        let adaptive_pressure = Family::<AdaptivePressureLabels, Gauge<f64, AtomicU64>>::default();
+        registry.register(
+            "forgeproxy_adaptive_pressure",
+            "Resource and SLO pressure signals consumed by adaptive runtime tuning",
+            adaptive_pressure.clone(),
+        );
+
+        let adaptive_shadow_delta = Family::<AdaptiveShadowDeltaLabels, Gauge>::default();
+        registry.register(
+            "forgeproxy_adaptive_shadow_delta",
+            "Difference between shadow recommendation and active effective value by knob",
+            adaptive_shadow_delta.clone(),
+        );
+
         Self {
             clone_total,
             clone_served_total,
@@ -1315,6 +1418,8 @@ impl Metrics {
             bundle_manifest_entries,
             generation_coalescing_total,
             request_time_catch_up_total,
+            background_refresh_total,
+            background_refresh_effectiveness_total,
             repo_update_selection_total,
             repo_update_mode_switch_total,
             repo_update_direct_mirror_fetch_duration_seconds,
@@ -1327,6 +1432,11 @@ impl Metrics {
             published_generation_index_duration_seconds,
             background_task_poll_seconds_total,
             background_task_polls_total,
+            adaptive_effective_value,
+            adaptive_recommended_value,
+            adaptive_decisions_total,
+            adaptive_pressure,
+            adaptive_shadow_delta,
         }
     }
 }
@@ -1341,6 +1451,7 @@ pub struct MetricsRegistry {
     pub registry: Arc<Registry>,
     pub metrics: Arc<Metrics>,
     pub backend_label: Arc<str>,
+    pub adaptive_observations: Arc<AdaptiveObservationCounters>,
     top_heavy_repos: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -1361,6 +1472,7 @@ impl MetricsRegistry {
             registry: Arc::new(registry),
             metrics: Arc::new(metrics),
             backend_label: Arc::<str>::from(backend_label),
+            adaptive_observations: Arc::new(AdaptiveObservationCounters::default()),
             top_heavy_repos: Arc::new(RwLock::new(HashSet::new())),
         }
     }
@@ -1450,9 +1562,12 @@ pub fn record_clone_completion(
     protocol: Protocol,
     cache_status: CacheStatus,
     username: &str,
-    _repo: &str,
+    repo: &str,
     elapsed: Duration,
 ) {
+    metrics
+        .adaptive_observations
+        .observe_clone_latency_for_repo(repo, elapsed);
     metrics
         .metrics
         .clone_total
@@ -1540,9 +1655,12 @@ pub fn observe_upload_pack_first_byte(
     protocol: Protocol,
     source: &str,
     cache_status: CacheStatus,
-    _repo: &str,
+    repo: &str,
     elapsed: Duration,
 ) {
+    metrics
+        .adaptive_observations
+        .observe_first_byte_latency_for_repo(repo, elapsed);
     metrics
         .metrics
         .upload_pack_first_byte_seconds
@@ -1739,7 +1857,15 @@ pub fn inc_hydration_skipped(metrics: &MetricsRegistry, reason: HydrationSkipRea
         .inc();
 }
 
-pub fn inc_upstream_fallback(metrics: &MetricsRegistry, protocol: Protocol, reason: &str) {
+pub fn inc_upstream_fallback_for_repo(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    reason: &str,
+    repo: &str,
+) {
+    metrics
+        .adaptive_observations
+        .inc_upstream_fallback_for_repo(repo);
     metrics
         .metrics
         .upstream_fallback
@@ -1750,7 +1876,15 @@ pub fn inc_upstream_fallback(metrics: &MetricsRegistry, protocol: Protocol, reas
         .inc();
 }
 
-pub fn inc_short_circuit_upstream(metrics: &MetricsRegistry, protocol: Protocol, stage: &str) {
+pub fn inc_short_circuit_upstream_for_repo(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    stage: &str,
+    repo: &str,
+) {
+    metrics
+        .adaptive_observations
+        .inc_upstream_fallback_for_repo(repo);
     metrics
         .metrics
         .short_circuit_upstream_total
@@ -2114,6 +2248,27 @@ pub fn inc_request_time_catch_up(metrics: &MetricsRegistry, result: &str) {
         .inc();
 }
 
+pub fn inc_background_refresh(metrics: &MetricsRegistry, result: &str, reason: &str) {
+    metrics
+        .metrics
+        .background_refresh_total
+        .get_or_create(&BackgroundRefreshLabels {
+            result: result.to_string(),
+            reason: reason.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_background_refresh_effectiveness(metrics: &MetricsRegistry, result: &str) {
+    metrics
+        .metrics
+        .background_refresh_effectiveness_total
+        .get_or_create(&BackgroundRefreshEffectivenessLabels {
+            result: result.to_string(),
+        })
+        .inc();
+}
+
 pub fn inc_repo_update_selection(
     metrics: &MetricsRegistry,
     mode: &str,
@@ -2261,6 +2416,153 @@ pub fn inc_background_task_poll_metrics(
     if poll_count > 0 {
         poll_count_counter.inc_by(poll_count);
     }
+}
+
+pub fn record_adaptive_effective_policy(metrics: &MetricsRegistry, policy: EffectivePolicy) {
+    for (knob, value) in adaptive_policy_values(policy) {
+        metrics
+            .metrics
+            .adaptive_effective_value
+            .get_or_create(&AdaptiveKnobLabels {
+                knob: knob.to_string(),
+            })
+            .set(value.min(i64::MAX as usize) as i64);
+    }
+}
+
+pub fn record_adaptive_recommendation(
+    metrics: &MetricsRegistry,
+    mode: &str,
+    recommendation: &RecommendationSet,
+    current: EffectivePolicy,
+) {
+    metrics
+        .metrics
+        .adaptive_decisions_total
+        .get_or_create(&AdaptiveDecisionLabels {
+            controller: recommendation.controller.clone(),
+            mode: mode.to_string(),
+            decision: recommendation.decision.clone(),
+            reason: recommendation.reason.clone(),
+        })
+        .inc();
+
+    for (knob, value) in adaptive_policy_values(recommendation.policy) {
+        metrics
+            .metrics
+            .adaptive_recommended_value
+            .get_or_create(&AdaptiveRecommendationLabels {
+                controller: recommendation.controller.clone(),
+                mode: mode.to_string(),
+                knob: knob.to_string(),
+            })
+            .set(value.min(i64::MAX as usize) as i64);
+    }
+
+    if mode == "shadow" {
+        let current_values = adaptive_policy_values(current);
+        for ((knob, recommended), (_, effective)) in adaptive_policy_values(recommendation.policy)
+            .into_iter()
+            .zip(current_values.into_iter())
+        {
+            metrics
+                .metrics
+                .adaptive_shadow_delta
+                .get_or_create(&AdaptiveShadowDeltaLabels {
+                    controller: recommendation.controller.clone(),
+                    knob: knob.to_string(),
+                })
+                .set(recommended as i64 - effective as i64);
+        }
+    }
+}
+
+pub fn record_adaptive_pressure(metrics: &MetricsRegistry, pressure: HostPressure) {
+    for (signal, value) in [
+        ("cpu_busy_fraction", pressure.cpu_busy_fraction),
+        ("disk_busy_fraction", pressure.disk_busy_fraction),
+        (
+            "memory_available_percent",
+            pressure.memory_available_percent,
+        ),
+    ] {
+        if let Some(value) = value {
+            metrics
+                .metrics
+                .adaptive_pressure
+                .get_or_create(&AdaptivePressureLabels {
+                    signal: signal.to_string(),
+                })
+                .set(value.max(0.0));
+        }
+    }
+}
+
+fn adaptive_policy_values(policy: EffectivePolicy) -> Vec<(&'static str, usize)> {
+    vec![
+        (
+            "upstream_clone_concurrency",
+            policy.upstream_clone_concurrency,
+        ),
+        (
+            "upstream_fetch_concurrency",
+            policy.upstream_fetch_concurrency,
+        ),
+        (
+            "upstream_clone_per_repo_per_instance",
+            policy.upstream_clone_per_repo_per_instance,
+        ),
+        (
+            "upstream_clone_per_repo_across_instances",
+            policy.upstream_clone_per_repo_across_instances,
+        ),
+        ("tee_capture_concurrency", policy.tee_capture_concurrency),
+        ("tee_capture_per_repo", policy.tee_capture_per_repo),
+        (
+            "local_upload_pack_concurrency",
+            policy.local_upload_pack_concurrency,
+        ),
+        (
+            "local_upload_pack_per_repo",
+            policy.local_upload_pack_per_repo,
+        ),
+        (
+            "deep_validation_concurrency",
+            policy.deep_validation_concurrency,
+        ),
+        ("prewarm_concurrency", policy.prewarm_concurrency),
+        (
+            "bundle_generation_concurrency",
+            policy.bundle_generation_concurrency,
+        ),
+        (
+            "pack_cache_request_delta_concurrency",
+            policy.pack_cache_request_delta_concurrency,
+        ),
+        (
+            "pack_cache_background_warming_concurrency",
+            policy.pack_cache_background_warming_concurrency,
+        ),
+        ("bundle_pack_threads", policy.bundle_pack_threads),
+        (
+            "local_upload_pack_threads",
+            policy.local_upload_pack_threads,
+        ),
+        ("index_pack_threads", policy.index_pack_threads),
+        (
+            "request_wait_for_local_catch_up_secs",
+            policy.request_wait_for_local_catch_up_secs,
+        ),
+        (
+            "request_time_s3_restore_secs",
+            policy.request_time_s3_restore_secs,
+        ),
+        ("generation_publish_secs", policy.generation_publish_secs),
+        (
+            "local_upload_pack_first_byte_secs",
+            policy.local_upload_pack_first_byte_secs,
+        ),
+    ]
 }
 
 pub struct ActiveConnectionGuard {
@@ -2507,7 +2809,12 @@ mod tests {
         inc_bundle_list_request(&metrics, "acme/widgets", "served");
         inc_hydration_skipped(&metrics, HydrationSkipReason::SemaphoreSaturated);
         inc_request_time_catch_up(&metrics, "selected_fetch");
-        inc_short_circuit_upstream(&metrics, Protocol::Https, "local_catch_up");
+        inc_short_circuit_upstream_for_repo(
+            &metrics,
+            Protocol::Https,
+            "local_catch_up",
+            "acme/widgets",
+        );
 
         let encoded = encode_metrics(&metrics.registry);
         assert!(encoded.contains("# HELP forgeproxy_upload_pack_duration_seconds"));

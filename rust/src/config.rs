@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_INDEX_PACK_THREADS: usize = 2;
 
@@ -85,6 +85,8 @@ pub struct Config {
     pub config_reload: ConfigReloadConfig,
     #[serde(default)]
     pub background_work: BackgroundWorkConfig,
+    #[serde(default)]
+    pub adaptive_tuning: AdaptiveTuningConfig,
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub backend_type: BackendType,
@@ -192,6 +194,289 @@ fn default_background_work_max_defer_retries() -> u32 {
 
 fn default_background_work_max_defer_secs() -> u64 {
     30 * 60
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive runtime tuning
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AdaptiveTuningConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: AdaptiveTuningMode,
+    #[serde(default = "default_adaptive_evaluation_interval_secs")]
+    pub evaluation_interval_secs: u64,
+    #[serde(default = "default_adaptive_cpu_poll_interval_secs")]
+    pub cpu_poll_interval_secs: u64,
+    #[serde(default = "default_adaptive_warmup_interval_secs")]
+    pub warmup_interval_secs: u64,
+    #[serde(default = "default_adaptive_min_sample_count")]
+    pub min_sample_count: u64,
+    #[serde(default)]
+    pub slo: AdaptiveTuningSloConfig,
+    #[serde(default)]
+    pub resource_pressure: AdaptiveTuningResourcePressureConfig,
+    #[serde(default)]
+    pub bounds: AdaptiveTuningBoundsConfig,
+    #[serde(default = "default_adaptive_recommendation_ttl_secs")]
+    pub recommendation_ttl_secs: u64,
+    #[serde(default = "default_adaptive_recommendation_max_staleness_secs")]
+    pub recommendation_max_staleness_secs: u64,
+}
+
+impl Default for AdaptiveTuningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: AdaptiveTuningMode::Active,
+            evaluation_interval_secs: default_adaptive_evaluation_interval_secs(),
+            cpu_poll_interval_secs: default_adaptive_cpu_poll_interval_secs(),
+            warmup_interval_secs: default_adaptive_warmup_interval_secs(),
+            min_sample_count: default_adaptive_min_sample_count(),
+            slo: AdaptiveTuningSloConfig::default(),
+            resource_pressure: AdaptiveTuningResourcePressureConfig::default(),
+            bounds: AdaptiveTuningBoundsConfig::default(),
+            recommendation_ttl_secs: default_adaptive_recommendation_ttl_secs(),
+            recommendation_max_staleness_secs: default_adaptive_recommendation_max_staleness_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdaptiveTuningMode {
+    #[default]
+    Active,
+    Shadow,
+    Disabled,
+}
+
+impl AdaptiveTuningMode {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Shadow => "shadow",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AdaptiveTuningSloConfig {
+    #[serde(default = "default_adaptive_clone_latency_slo_secs")]
+    pub clone_latency_secs: f64,
+    #[serde(default = "default_adaptive_first_byte_latency_slo_secs")]
+    pub first_byte_latency_secs: f64,
+    #[serde(default = "default_adaptive_fallback_rate_slo")]
+    pub fallback_rate: f64,
+}
+
+impl Default for AdaptiveTuningSloConfig {
+    fn default() -> Self {
+        Self {
+            clone_latency_secs: default_adaptive_clone_latency_slo_secs(),
+            first_byte_latency_secs: default_adaptive_first_byte_latency_slo_secs(),
+            fallback_rate: default_adaptive_fallback_rate_slo(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AdaptiveTuningResourcePressureConfig {
+    #[serde(default = "default_adaptive_cpu_busy_high_watermark")]
+    pub cpu_busy_high_watermark: f64,
+    #[serde(default = "default_adaptive_disk_busy_high_watermark")]
+    pub disk_busy_high_watermark: f64,
+    #[serde(default = "default_adaptive_memory_available_min_percent")]
+    pub memory_available_min_percent: f64,
+}
+
+impl Default for AdaptiveTuningResourcePressureConfig {
+    fn default() -> Self {
+        Self {
+            cpu_busy_high_watermark: default_adaptive_cpu_busy_high_watermark(),
+            disk_busy_high_watermark: default_adaptive_disk_busy_high_watermark(),
+            memory_available_min_percent: default_adaptive_memory_available_min_percent(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AdaptiveTuningKnobBoundsConfig {
+    #[serde(default = "default_adaptive_knob_min")]
+    pub min: usize,
+    #[serde(default = "default_adaptive_knob_max")]
+    pub max: usize,
+    #[serde(default = "default_adaptive_knob_max_increase_step")]
+    pub max_increase_step: usize,
+    #[serde(default = "default_adaptive_knob_max_decrease_step")]
+    pub max_decrease_step: usize,
+}
+
+impl Default for AdaptiveTuningKnobBoundsConfig {
+    fn default() -> Self {
+        Self {
+            min: default_adaptive_knob_min(),
+            max: default_adaptive_knob_max(),
+            max_increase_step: default_adaptive_knob_max_increase_step(),
+            max_decrease_step: default_adaptive_knob_max_decrease_step(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AdaptiveTuningBoundsConfig {
+    #[serde(default)]
+    pub upstream_clone_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub upstream_fetch_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub upstream_clone_per_repo_per_instance: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub upstream_clone_per_repo_across_instances: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub tee_capture_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub tee_capture_per_repo: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub local_upload_pack_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub local_upload_pack_per_repo: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub deep_validation_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub prewarm_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub bundle_generation_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub pack_cache_request_delta_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub pack_cache_background_warming_concurrency: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub bundle_pack_threads: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub local_upload_pack_threads: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default)]
+    pub index_pack_threads: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default = "default_adaptive_duration_secs_bounds")]
+    pub request_wait_for_local_catch_up_secs: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default = "default_adaptive_duration_secs_bounds")]
+    pub request_time_s3_restore_secs: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default = "default_adaptive_duration_secs_bounds")]
+    pub generation_publish_secs: AdaptiveTuningKnobBoundsConfig,
+    #[serde(default = "default_adaptive_first_byte_duration_secs_bounds")]
+    pub local_upload_pack_first_byte_secs: AdaptiveTuningKnobBoundsConfig,
+}
+
+impl Default for AdaptiveTuningBoundsConfig {
+    fn default() -> Self {
+        Self {
+            upstream_clone_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            upstream_fetch_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            upstream_clone_per_repo_per_instance: AdaptiveTuningKnobBoundsConfig::default(),
+            upstream_clone_per_repo_across_instances: AdaptiveTuningKnobBoundsConfig::default(),
+            tee_capture_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            tee_capture_per_repo: AdaptiveTuningKnobBoundsConfig::default(),
+            local_upload_pack_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            local_upload_pack_per_repo: AdaptiveTuningKnobBoundsConfig::default(),
+            deep_validation_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            prewarm_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            bundle_generation_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            pack_cache_request_delta_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            pack_cache_background_warming_concurrency: AdaptiveTuningKnobBoundsConfig::default(),
+            bundle_pack_threads: AdaptiveTuningKnobBoundsConfig::default(),
+            local_upload_pack_threads: AdaptiveTuningKnobBoundsConfig::default(),
+            index_pack_threads: AdaptiveTuningKnobBoundsConfig::default(),
+            request_wait_for_local_catch_up_secs: default_adaptive_duration_secs_bounds(),
+            request_time_s3_restore_secs: default_adaptive_duration_secs_bounds(),
+            generation_publish_secs: default_adaptive_duration_secs_bounds(),
+            local_upload_pack_first_byte_secs: default_adaptive_first_byte_duration_secs_bounds(),
+        }
+    }
+}
+
+fn default_adaptive_duration_secs_bounds() -> AdaptiveTuningKnobBoundsConfig {
+    AdaptiveTuningKnobBoundsConfig {
+        min: 0,
+        max: 600,
+        max_increase_step: 5,
+        max_decrease_step: 10,
+    }
+}
+
+fn default_adaptive_first_byte_duration_secs_bounds() -> AdaptiveTuningKnobBoundsConfig {
+    AdaptiveTuningKnobBoundsConfig {
+        min: 0,
+        max: 120,
+        max_increase_step: 2,
+        max_decrease_step: 5,
+    }
+}
+
+fn default_adaptive_evaluation_interval_secs() -> u64 {
+    60
+}
+
+fn default_adaptive_warmup_interval_secs() -> u64 {
+    300
+}
+
+fn default_adaptive_min_sample_count() -> u64 {
+    20
+}
+
+fn default_adaptive_recommendation_ttl_secs() -> u64 {
+    300
+}
+
+fn default_adaptive_recommendation_max_staleness_secs() -> u64 {
+    300
+}
+
+fn default_adaptive_clone_latency_slo_secs() -> f64 {
+    30.0
+}
+
+fn default_adaptive_first_byte_latency_slo_secs() -> f64 {
+    5.0
+}
+
+fn default_adaptive_fallback_rate_slo() -> f64 {
+    0.05
+}
+
+fn default_adaptive_cpu_busy_high_watermark() -> f64 {
+    0.85
+}
+
+fn default_adaptive_disk_busy_high_watermark() -> f64 {
+    0.85
+}
+
+fn default_adaptive_cpu_poll_interval_secs() -> u64 {
+    10
+}
+
+fn default_adaptive_memory_available_min_percent() -> f64 {
+    10.0
+}
+
+fn default_adaptive_knob_min() -> usize {
+    1
+}
+
+fn default_adaptive_knob_max() -> usize {
+    64
+}
+
+fn default_adaptive_knob_max_increase_step() -> usize {
+    1
+}
+
+fn default_adaptive_knob_max_decrease_step() -> usize {
+    2
 }
 
 // ---------------------------------------------------------------------------
@@ -917,37 +1202,47 @@ fn default_published_generation_bitmap_max_interval_ratio() -> f64 {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FetchScheduleConfig {
-    /// Default interval (seconds) between background re-fetches.
-    #[serde(default = "default_fetch_interval")]
-    pub default_interval: u64,
-    /// Number of new commits that qualifies as a "large delta".
-    #[serde(default = "default_delta_threshold")]
-    pub delta_threshold: u64,
-    /// Multiplicative backoff factor when a repo is idle.
-    #[serde(default = "default_backoff_factor")]
-    pub backoff_factor: f64,
-    /// Upper bound (seconds) on the fetch interval after back-off.
-    #[serde(default = "default_max_interval")]
-    pub max_interval: u64,
-    /// Rolling window (seconds) for evaluating clone frequency.
-    #[serde(default = "default_rolling_window")]
-    pub rolling_window: u64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_fetch_evaluation_interval")]
+    pub evaluation_interval_secs: u64,
+    #[serde(default = "default_fetch_min_interval")]
+    pub min_interval_secs: u64,
+    #[serde(default = "default_fetch_max_interval")]
+    pub max_interval_secs: u64,
+    #[serde(default = "default_fetch_candidate_limit_per_tick")]
+    pub candidate_limit_per_tick: usize,
+    #[serde(default = "default_fetch_max_refreshes_per_tick")]
+    pub max_refreshes_per_tick: usize,
+    #[serde(default = "default_fetch_request_probability_window")]
+    pub request_probability_window_secs: u64,
+    #[serde(default = "default_fetch_churn_window")]
+    pub churn_window_secs: u64,
+    #[serde(default = "default_fetch_stale_after")]
+    pub stale_after_secs: u64,
+    #[serde(default = "default_fetch_jitter_percent")]
+    pub jitter_percent: u64,
 }
 
 impl Default for FetchScheduleConfig {
     fn default() -> Self {
         Self {
-            default_interval: default_fetch_interval(),
-            delta_threshold: default_delta_threshold(),
-            backoff_factor: default_backoff_factor(),
-            max_interval: default_max_interval(),
-            rolling_window: default_rolling_window(),
+            enabled: default_true(),
+            evaluation_interval_secs: default_fetch_evaluation_interval(),
+            min_interval_secs: default_fetch_min_interval(),
+            max_interval_secs: default_fetch_max_interval(),
+            candidate_limit_per_tick: default_fetch_candidate_limit_per_tick(),
+            max_refreshes_per_tick: default_fetch_max_refreshes_per_tick(),
+            request_probability_window_secs: default_fetch_request_probability_window(),
+            churn_window_secs: default_fetch_churn_window(),
+            stale_after_secs: default_fetch_stale_after(),
+            jitter_percent: default_fetch_jitter_percent(),
         }
     }
 }
 
-fn default_fetch_interval() -> u64 {
-    300
+fn default_fetch_evaluation_interval() -> u64 {
+    30
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,20 +1318,36 @@ fn default_delta_workspace_max_physical_ratio() -> f64 {
     0.25
 }
 
-fn default_delta_threshold() -> u64 {
-    50
+fn default_fetch_min_interval() -> u64 {
+    300
 }
 
-fn default_backoff_factor() -> f64 {
-    2.0
+fn default_fetch_max_interval() -> u64 {
+    86_400
 }
 
-fn default_max_interval() -> u64 {
-    3600
+fn default_fetch_candidate_limit_per_tick() -> usize {
+    128
 }
 
-fn default_rolling_window() -> u64 {
-    3600
+fn default_fetch_max_refreshes_per_tick() -> usize {
+    16
+}
+
+fn default_fetch_request_probability_window() -> u64 {
+    900
+}
+
+fn default_fetch_churn_window() -> u64 {
+    1800
+}
+
+fn default_fetch_stale_after() -> u64 {
+    1800
+}
+
+fn default_fetch_jitter_percent() -> u64 {
+    15
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,6 +1672,11 @@ pub struct RepoUpdateOverride {
 enum ConfigSchemaNode {
     Root,
     BackgroundWork,
+    AdaptiveTuning,
+    AdaptiveTuningSlo,
+    AdaptiveTuningResourcePressure,
+    AdaptiveTuningBounds,
+    AdaptiveTuningKnobBounds,
     ConfigReload,
     Upstream,
     UpstreamCredentials,
@@ -1401,6 +1717,7 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
         ConfigSchemaNode::Root => &[
             "config_reload",
             "background_work",
+            "adaptive_tuning",
             "upstream",
             "backend_type",
             "upstream_credentials",
@@ -1429,6 +1746,54 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "max_defer_retries",
             "max_defer_secs",
         ],
+        ConfigSchemaNode::AdaptiveTuning => &[
+            "enabled",
+            "mode",
+            "evaluation_interval_secs",
+            "cpu_poll_interval_secs",
+            "warmup_interval_secs",
+            "min_sample_count",
+            "slo",
+            "resource_pressure",
+            "bounds",
+            "recommendation_ttl_secs",
+            "recommendation_max_staleness_secs",
+        ],
+        ConfigSchemaNode::AdaptiveTuningSlo => &[
+            "clone_latency_secs",
+            "first_byte_latency_secs",
+            "fallback_rate",
+        ],
+        ConfigSchemaNode::AdaptiveTuningResourcePressure => &[
+            "cpu_busy_high_watermark",
+            "disk_busy_high_watermark",
+            "memory_available_min_percent",
+        ],
+        ConfigSchemaNode::AdaptiveTuningBounds => &[
+            "upstream_clone_concurrency",
+            "upstream_fetch_concurrency",
+            "upstream_clone_per_repo_per_instance",
+            "upstream_clone_per_repo_across_instances",
+            "tee_capture_concurrency",
+            "tee_capture_per_repo",
+            "local_upload_pack_concurrency",
+            "local_upload_pack_per_repo",
+            "deep_validation_concurrency",
+            "prewarm_concurrency",
+            "bundle_generation_concurrency",
+            "pack_cache_request_delta_concurrency",
+            "pack_cache_background_warming_concurrency",
+            "bundle_pack_threads",
+            "local_upload_pack_threads",
+            "index_pack_threads",
+            "request_wait_for_local_catch_up_secs",
+            "request_time_s3_restore_secs",
+            "generation_publish_secs",
+            "local_upload_pack_first_byte_secs",
+        ],
+        ConfigSchemaNode::AdaptiveTuningKnobBounds => {
+            &["min", "max", "max_increase_step", "max_decrease_step"]
+        }
         ConfigSchemaNode::ConfigReload => &["enabled", "interval_secs"],
         ConfigSchemaNode::Upstream => &[
             "hostname",
@@ -1483,11 +1848,16 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "ssh_upload_pack_close_grace_secs",
         ],
         ConfigSchemaNode::FetchSchedule => &[
-            "default_interval",
-            "delta_threshold",
-            "backoff_factor",
-            "max_interval",
-            "rolling_window",
+            "enabled",
+            "evaluation_interval_secs",
+            "min_interval_secs",
+            "max_interval_secs",
+            "candidate_limit_per_tick",
+            "max_refreshes_per_tick",
+            "request_probability_window_secs",
+            "churn_window_secs",
+            "stale_after_secs",
+            "jitter_percent",
         ],
         ConfigSchemaNode::RepoUpdate => &[
             "mode",
@@ -1563,6 +1933,41 @@ fn schema_child(node: ConfigSchemaNode, key: &str) -> ConfigSchemaChild {
         (ConfigSchemaNode::Root, "background_work") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::BackgroundWork)
         }
+        (ConfigSchemaNode::Root, "adaptive_tuning") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuning)
+        }
+        (ConfigSchemaNode::AdaptiveTuning, "slo") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningSlo)
+        }
+        (ConfigSchemaNode::AdaptiveTuning, "resource_pressure") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningResourcePressure)
+        }
+        (ConfigSchemaNode::AdaptiveTuning, "bounds") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningBounds)
+        }
+        (
+            ConfigSchemaNode::AdaptiveTuningBounds,
+            "upstream_clone_concurrency"
+            | "upstream_fetch_concurrency"
+            | "upstream_clone_per_repo_per_instance"
+            | "upstream_clone_per_repo_across_instances"
+            | "tee_capture_concurrency"
+            | "tee_capture_per_repo"
+            | "local_upload_pack_concurrency"
+            | "local_upload_pack_per_repo"
+            | "deep_validation_concurrency"
+            | "prewarm_concurrency"
+            | "bundle_generation_concurrency"
+            | "pack_cache_request_delta_concurrency"
+            | "pack_cache_background_warming_concurrency"
+            | "bundle_pack_threads"
+            | "local_upload_pack_threads"
+            | "index_pack_threads"
+            | "request_wait_for_local_catch_up_secs"
+            | "request_time_s3_restore_secs"
+            | "generation_publish_secs"
+            | "local_upload_pack_first_byte_secs",
+        ) => ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningKnobBounds),
         (ConfigSchemaNode::Root, "upstream") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::Upstream)
         }
@@ -1748,6 +2153,43 @@ fn validate_config(config: &Config) -> Result<()> {
         config.background_work.max_defer_secs > 0,
         "background_work.max_defer_secs must be greater than 0"
     );
+    validate_adaptive_tuning_config(&config.adaptive_tuning)?;
+    anyhow::ensure!(
+        config.fetch_schedule.evaluation_interval_secs > 0,
+        "fetch_schedule.evaluation_interval_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.fetch_schedule.min_interval_secs > 0,
+        "fetch_schedule.min_interval_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.fetch_schedule.max_interval_secs >= config.fetch_schedule.min_interval_secs,
+        "fetch_schedule.max_interval_secs must be greater than or equal to fetch_schedule.min_interval_secs"
+    );
+    anyhow::ensure!(
+        config.fetch_schedule.candidate_limit_per_tick > 0,
+        "fetch_schedule.candidate_limit_per_tick must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.fetch_schedule.max_refreshes_per_tick > 0,
+        "fetch_schedule.max_refreshes_per_tick must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.fetch_schedule.request_probability_window_secs > 0,
+        "fetch_schedule.request_probability_window_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.fetch_schedule.churn_window_secs > 0,
+        "fetch_schedule.churn_window_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.fetch_schedule.stale_after_secs > 0,
+        "fetch_schedule.stale_after_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.fetch_schedule.jitter_percent <= 90,
+        "fetch_schedule.jitter_percent must be less than or equal to 90"
+    );
     anyhow::ensure!(
         config.repo_update.large_repo_size_bytes_threshold > 0,
         "repo_update.large_repo_size_bytes_threshold must be greater than 0"
@@ -1922,10 +2364,164 @@ fn validate_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn validate_adaptive_tuning_config(config: &AdaptiveTuningConfig) -> Result<()> {
+    anyhow::ensure!(
+        config.evaluation_interval_secs > 0,
+        "adaptive_tuning.evaluation_interval_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.cpu_poll_interval_secs > 0,
+        "adaptive_tuning.cpu_poll_interval_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.cpu_poll_interval_secs <= config.evaluation_interval_secs,
+        "adaptive_tuning.cpu_poll_interval_secs must be less than or equal to adaptive_tuning.evaluation_interval_secs"
+    );
+    anyhow::ensure!(
+        config.warmup_interval_secs > 0,
+        "adaptive_tuning.warmup_interval_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.min_sample_count > 0,
+        "adaptive_tuning.min_sample_count must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.recommendation_ttl_secs > 0,
+        "adaptive_tuning.recommendation_ttl_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.recommendation_max_staleness_secs > 0,
+        "adaptive_tuning.recommendation_max_staleness_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.slo.clone_latency_secs > 0.0,
+        "adaptive_tuning.slo.clone_latency_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        config.slo.first_byte_latency_secs > 0.0,
+        "adaptive_tuning.slo.first_byte_latency_secs must be greater than 0"
+    );
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&config.slo.fallback_rate),
+        "adaptive_tuning.slo.fallback_rate must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&config.resource_pressure.cpu_busy_high_watermark),
+        "adaptive_tuning.resource_pressure.cpu_busy_high_watermark must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&config.resource_pressure.disk_busy_high_watermark),
+        "adaptive_tuning.resource_pressure.disk_busy_high_watermark must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        (0.0..=100.0).contains(&config.resource_pressure.memory_available_min_percent),
+        "adaptive_tuning.resource_pressure.memory_available_min_percent must be between 0 and 100"
+    );
+
+    for (path, bounds) in [
+        (
+            "adaptive_tuning.bounds.upstream_clone_concurrency",
+            config.bounds.upstream_clone_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.upstream_fetch_concurrency",
+            config.bounds.upstream_fetch_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.upstream_clone_per_repo_per_instance",
+            config.bounds.upstream_clone_per_repo_per_instance,
+        ),
+        (
+            "adaptive_tuning.bounds.upstream_clone_per_repo_across_instances",
+            config.bounds.upstream_clone_per_repo_across_instances,
+        ),
+        (
+            "adaptive_tuning.bounds.tee_capture_concurrency",
+            config.bounds.tee_capture_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.tee_capture_per_repo",
+            config.bounds.tee_capture_per_repo,
+        ),
+        (
+            "adaptive_tuning.bounds.local_upload_pack_concurrency",
+            config.bounds.local_upload_pack_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.local_upload_pack_per_repo",
+            config.bounds.local_upload_pack_per_repo,
+        ),
+        (
+            "adaptive_tuning.bounds.deep_validation_concurrency",
+            config.bounds.deep_validation_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.prewarm_concurrency",
+            config.bounds.prewarm_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.bundle_generation_concurrency",
+            config.bounds.bundle_generation_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.pack_cache_request_delta_concurrency",
+            config.bounds.pack_cache_request_delta_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.pack_cache_background_warming_concurrency",
+            config.bounds.pack_cache_background_warming_concurrency,
+        ),
+        (
+            "adaptive_tuning.bounds.bundle_pack_threads",
+            config.bounds.bundle_pack_threads,
+        ),
+        (
+            "adaptive_tuning.bounds.local_upload_pack_threads",
+            config.bounds.local_upload_pack_threads,
+        ),
+        (
+            "adaptive_tuning.bounds.index_pack_threads",
+            config.bounds.index_pack_threads,
+        ),
+        (
+            "adaptive_tuning.bounds.request_wait_for_local_catch_up_secs",
+            config.bounds.request_wait_for_local_catch_up_secs,
+        ),
+        (
+            "adaptive_tuning.bounds.request_time_s3_restore_secs",
+            config.bounds.request_time_s3_restore_secs,
+        ),
+        (
+            "adaptive_tuning.bounds.generation_publish_secs",
+            config.bounds.generation_publish_secs,
+        ),
+        (
+            "adaptive_tuning.bounds.local_upload_pack_first_byte_secs",
+            config.bounds.local_upload_pack_first_byte_secs,
+        ),
+    ] {
+        anyhow::ensure!(
+            bounds.max >= bounds.min,
+            "{path}.max must be greater than or equal to min"
+        );
+        anyhow::ensure!(
+            bounds.max_increase_step > 0,
+            "{path}.max_increase_step must be greater than 0"
+        );
+        anyhow::ensure!(
+            bounds.max_decrease_step > 0,
+            "{path}.max_decrease_step must be greater than 0"
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendType, BundleConfig, RepoUpdateMode, parse_config_str, parse_config_str_with_warnings,
+        BackendType, BundleConfig, ConfigSchemaChild, ConfigSchemaNode, RepoUpdateMode,
+        parse_config_str, parse_config_str_with_warnings, schema_allowed_fields, schema_child,
     };
 
     #[test]
@@ -1971,6 +2567,50 @@ mod tests {
         assert_eq!(config.background_work.max_defer_retries, 10);
         assert_eq!(config.background_work.max_defer_secs, 1800);
         assert!(config.repository_is_delegated("org/problem-repo.git"));
+    }
+
+    #[test]
+    fn config_example_lists_all_schema_fields() {
+        let example: serde_yml::Value =
+            serde_yml::from_str(include_str!("../../config.example.yaml")).unwrap();
+        assert_example_node_has_all_schema_fields(&example, ConfigSchemaNode::Root, "root");
+    }
+
+    fn assert_example_node_has_all_schema_fields(
+        value: &serde_yml::Value,
+        node: ConfigSchemaNode,
+        path: &str,
+    ) {
+        let mapping = value
+            .as_mapping()
+            .unwrap_or_else(|| panic!("config.example.yaml `{path}` must be an object"));
+        for field in schema_allowed_fields(node) {
+            let key = serde_yml::Value::String((*field).to_string());
+            let child_value = mapping.get(&key).unwrap_or_else(|| {
+                panic!("config.example.yaml missing `{path}.{field}`");
+            });
+            let child_path = format!("{path}.{field}");
+            match schema_child(node, field) {
+                ConfigSchemaChild::None => {}
+                ConfigSchemaChild::Object(child_node) => {
+                    assert_example_node_has_all_schema_fields(child_value, child_node, &child_path);
+                }
+                ConfigSchemaChild::DynamicObjectValues(child_node) => {
+                    let child_mapping = child_value.as_mapping().unwrap_or_else(|| {
+                        panic!("config.example.yaml `{child_path}` must be an object");
+                    });
+                    for (dynamic_key, dynamic_value) in child_mapping {
+                        let dynamic_label =
+                            dynamic_key.as_str().unwrap_or("<non-string-dynamic-key>");
+                        assert_example_node_has_all_schema_fields(
+                            dynamic_value,
+                            child_node,
+                            &format!("{child_path}.{dynamic_label}"),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2256,28 +2896,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_ghe_alias() {
-        let config = include_str!("../../config.example.yaml").replace("upstream:", "ghe:");
+    fn rejects_unknown_upstream_section_alias() {
+        let config = include_str!("../../config.example.yaml")
+            .replace("upstream:", "test_sentinel_unknown_upstream_section:");
         assert!(parse_config_str(&config).is_err());
     }
 
     #[test]
-    fn rejects_legacy_concurrency_aliases() {
+    fn warns_on_unknown_concurrency_fields() {
         let config = include_str!("../../config.example.yaml")
             .replace(
-                "max_concurrent_upstream_clones",
-                "max_concurrent_ghe_clones",
+                "  max_concurrent_upstream_clones: 5\n",
+                "  test_sentinel_unknown_configuration_field_clones: 5\n",
             )
             .replace(
-                "max_concurrent_upstream_fetches",
-                "max_concurrent_ghe_fetches",
+                "  max_concurrent_upstream_fetches: 10\n",
+                "  test_sentinel_unknown_configuration_field_fetches: 10\n",
             );
         let (parsed, warnings) = parse_config_str_with_warnings(&config).unwrap();
         assert_eq!(
             warnings,
             vec![
-                "unknown config field `clone.max_concurrent_ghe_clones`".to_string(),
-                "unknown config field `clone.max_concurrent_ghe_fetches`".to_string(),
+                "unknown config field `clone.test_sentinel_unknown_configuration_field_clones`"
+                    .to_string(),
+                "unknown config field `clone.test_sentinel_unknown_configuration_field_fetches`"
+                    .to_string(),
             ]
         );
         assert_eq!(

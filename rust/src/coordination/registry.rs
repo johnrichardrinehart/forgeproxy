@@ -10,9 +10,12 @@ use base64::Engine;
 use fred::interfaces::{ClientLike, HashesInterface, KeysInterface};
 use fred::types::CustomCommand;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{OwnedMutexGuard, TryAcquireError};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::adaptive_tuning::{
+    CachedResizableGate, IdleGateState, ResizableGate, ResizableGatePermit,
+};
 use crate::short_circuit::{RequestBudget, duration_from_secs, min_timeout};
 
 /// Metadata about a cached repository.
@@ -69,6 +72,57 @@ pub struct RepoUpdateProfile {
     pub last_selected_mode: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoRefreshScheduleState {
+    version: u64,
+    updated_at_ts: i64,
+    next_eligible_ts: i64,
+    adaptive_interval_secs: u64,
+    request_count_window: u64,
+    request_fallback_count_window: u64,
+    request_catch_up_success_window: u64,
+    request_catch_up_timeout_window: u64,
+    request_catch_up_fast_success_window: u64,
+    last_request_ts: i64,
+    background_paused_until_ts: i64,
+    last_background_success_ts: i64,
+    last_background_failure_ts: i64,
+    last_background_fetch_bytes: u64,
+    last_background_fetch_duration_ms: u64,
+    last_background_refs_changed: u64,
+    consecutive_failures: u64,
+    no_op_fetch_count: u64,
+    last_selected_mode: String,
+    last_skip_reason: String,
+}
+
+impl Default for RepoRefreshScheduleState {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            updated_at_ts: 0,
+            next_eligible_ts: 0,
+            adaptive_interval_secs: 0,
+            request_count_window: 0,
+            request_fallback_count_window: 0,
+            request_catch_up_success_window: 0,
+            request_catch_up_timeout_window: 0,
+            request_catch_up_fast_success_window: 0,
+            last_request_ts: 0,
+            background_paused_until_ts: 0,
+            last_background_success_ts: 0,
+            last_background_failure_ts: 0,
+            last_background_fetch_bytes: 0,
+            last_background_fetch_duration_ms: 0,
+            last_background_refs_changed: 0,
+            consecutive_failures: 0,
+            no_op_fetch_count: 0,
+            last_selected_mode: String::new(),
+            last_skip_reason: String::new(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key helpers
 // ---------------------------------------------------------------------------
@@ -86,6 +140,16 @@ fn fetch_schedule_key(owner_repo: &str) -> String {
 fn repo_update_profile_key(owner_repo: &str) -> String {
     let normalized = crate::repo_identity::canonicalize_owner_repo(owner_repo);
     format!("forgeproxy:repo:{normalized}:repo_update_profile")
+}
+
+fn repo_refresh_schedule_key(owner_repo: &str) -> String {
+    let normalized = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    format!("forgeproxy:repo:{normalized}:refresh_schedule")
+}
+
+fn repo_refresh_lease_key(owner_repo: &str) -> String {
+    let normalized = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+    format!("forgeproxy:repo:{normalized}:refresh_lease")
 }
 
 fn clone_hydration_semaphore_key(owner_repo: &str) -> String {
@@ -389,9 +453,144 @@ async fn set_repo_update_profile(
     Ok(())
 }
 
+async fn get_repo_refresh_schedule_state(
+    pool: &fred::clients::Pool,
+    owner_repo: &str,
+) -> Result<RepoRefreshScheduleState> {
+    let key = repo_refresh_schedule_key(owner_repo);
+    let map: HashMap<String, String> = pool
+        .hgetall(&key)
+        .await
+        .context("HGETALL refresh_schedule")?;
+    if map.is_empty() {
+        return Ok(RepoRefreshScheduleState::default());
+    }
+    let version = parse_u64_field(&map, "version");
+    if version == 0 || version > 1 {
+        return Ok(RepoRefreshScheduleState::default());
+    }
+    Ok(RepoRefreshScheduleState {
+        version,
+        updated_at_ts: parse_i64_field(&map, "updated_at_ts"),
+        next_eligible_ts: parse_i64_field(&map, "next_eligible_ts"),
+        adaptive_interval_secs: parse_u64_field(&map, "adaptive_interval_secs"),
+        request_count_window: parse_u64_field(&map, "request_count_window"),
+        request_fallback_count_window: parse_u64_field(&map, "request_fallback_count_window"),
+        request_catch_up_success_window: parse_u64_field(&map, "request_catch_up_success_window"),
+        request_catch_up_timeout_window: parse_u64_field(&map, "request_catch_up_timeout_window"),
+        request_catch_up_fast_success_window: parse_u64_field(
+            &map,
+            "request_catch_up_fast_success_window",
+        ),
+        last_request_ts: parse_i64_field(&map, "last_request_ts"),
+        background_paused_until_ts: parse_i64_field(&map, "background_paused_until_ts"),
+        last_background_success_ts: parse_i64_field(&map, "last_background_success_ts"),
+        last_background_failure_ts: parse_i64_field(&map, "last_background_failure_ts"),
+        last_background_fetch_bytes: parse_u64_field(&map, "last_background_fetch_bytes"),
+        last_background_fetch_duration_ms: parse_u64_field(
+            &map,
+            "last_background_fetch_duration_ms",
+        ),
+        last_background_refs_changed: parse_u64_field(&map, "last_background_refs_changed"),
+        consecutive_failures: parse_u64_field(&map, "consecutive_failures"),
+        no_op_fetch_count: parse_u64_field(&map, "no_op_fetch_count"),
+        last_selected_mode: map.get("last_selected_mode").cloned().unwrap_or_default(),
+        last_skip_reason: map.get("last_skip_reason").cloned().unwrap_or_default(),
+    })
+}
+
+async fn set_repo_refresh_schedule_state(
+    pool: &fred::clients::Pool,
+    owner_repo: &str,
+    state: &RepoRefreshScheduleState,
+) -> Result<()> {
+    let key = repo_refresh_schedule_key(owner_repo);
+    let pairs: Vec<(String, String)> = vec![
+        ("version".into(), state.version.to_string()),
+        ("updated_at_ts".into(), state.updated_at_ts.to_string()),
+        (
+            "next_eligible_ts".into(),
+            state.next_eligible_ts.to_string(),
+        ),
+        (
+            "adaptive_interval_secs".into(),
+            state.adaptive_interval_secs.to_string(),
+        ),
+        (
+            "request_count_window".into(),
+            state.request_count_window.to_string(),
+        ),
+        (
+            "request_fallback_count_window".into(),
+            state.request_fallback_count_window.to_string(),
+        ),
+        (
+            "request_catch_up_success_window".into(),
+            state.request_catch_up_success_window.to_string(),
+        ),
+        (
+            "request_catch_up_timeout_window".into(),
+            state.request_catch_up_timeout_window.to_string(),
+        ),
+        (
+            "request_catch_up_fast_success_window".into(),
+            state.request_catch_up_fast_success_window.to_string(),
+        ),
+        ("last_request_ts".into(), state.last_request_ts.to_string()),
+        (
+            "background_paused_until_ts".into(),
+            state.background_paused_until_ts.to_string(),
+        ),
+        (
+            "last_background_success_ts".into(),
+            state.last_background_success_ts.to_string(),
+        ),
+        (
+            "last_background_failure_ts".into(),
+            state.last_background_failure_ts.to_string(),
+        ),
+        (
+            "last_background_fetch_bytes".into(),
+            state.last_background_fetch_bytes.to_string(),
+        ),
+        (
+            "last_background_fetch_duration_ms".into(),
+            state.last_background_fetch_duration_ms.to_string(),
+        ),
+        (
+            "last_background_refs_changed".into(),
+            state.last_background_refs_changed.to_string(),
+        ),
+        (
+            "consecutive_failures".into(),
+            state.consecutive_failures.to_string(),
+        ),
+        (
+            "no_op_fetch_count".into(),
+            state.no_op_fetch_count.to_string(),
+        ),
+        (
+            "last_selected_mode".into(),
+            state.last_selected_mode.clone(),
+        ),
+        ("last_skip_reason".into(), state.last_skip_reason.clone()),
+    ];
+    let _: () = pool
+        .hset(&key, pairs)
+        .await
+        .context("HSET refresh_schedule")?;
+    Ok(())
+}
+
 fn parse_u64_field(map: &HashMap<String, String>, field: &str) -> u64 {
     map.get(field)
         .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn parse_i64_field(map: &HashMap<String, String>, field: &str) -> i64 {
+    map.get(field)
+        .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0)
 }
 
@@ -455,8 +654,8 @@ async fn ensure_repo_cloned_from_upstream_with_refspecs(
 }
 
 pub struct CloneHydrationPermits {
-    _global_clone_permit: OwnedSemaphorePermit,
-    _local_repo_permit: OwnedSemaphorePermit,
+    _global_clone_permit: ResizableGatePermit,
+    _local_repo_permit: ResizableGatePermit,
     distributed_repo_permit: crate::coordination::locks::SemaphoreLease,
 }
 
@@ -480,13 +679,13 @@ impl CloneHydrationPermitFailure {
 }
 
 pub struct TeeCapturePermits {
-    _global_tee_capture_permit: OwnedSemaphorePermit,
-    _local_repo_tee_capture_permit: OwnedSemaphorePermit,
+    _global_tee_capture_permit: ResizableGatePermit,
+    _local_repo_tee_capture_permit: ResizableGatePermit,
 }
 
 struct FetchPermits {
-    _global_fetch_permit: OwnedSemaphorePermit,
-    _low_priority_fetch_permit: Option<OwnedSemaphorePermit>,
+    _global_fetch_permit: ResizableGatePermit,
+    _low_priority_fetch_permit: Option<ResizableGatePermit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,17 +733,11 @@ pub async fn try_acquire_clone_hydration_permits(
     owner_repo: &str,
 ) -> Result<std::result::Result<CloneHydrationPermits, CloneHydrationPermitFailure>> {
     let owner_repo = normalize_owner_repo(owner_repo);
-    if state.config().clone.max_concurrent_upstream_clones == 0
-        || state
-            .config()
-            .clone
-            .max_concurrent_upstream_clones_per_repo_per_instance
-            == 0
-        || state
-            .config()
-            .clone
-            .max_concurrent_upstream_clones_per_repo_across_instances
-            == 0
+    let policy = state.effective_policy.snapshot();
+    let repo_policy = state.effective_policy.repo_policy(&owner_repo);
+    if policy.upstream_clone_concurrency == 0
+        || repo_policy.upstream_clone_per_repo_per_instance == 0
+        || repo_policy.upstream_clone_per_repo_across_instances == 0
     {
         return Ok(Err(CloneHydrationPermitFailure::Disabled));
     }
@@ -569,10 +762,7 @@ pub async fn try_acquire_clone_hydration_permits(
         &state.valkey,
         &distributed_permit_key,
         &state.node_id,
-        state
-            .config()
-            .clone
-            .max_concurrent_upstream_clones_per_repo_across_instances,
+        repo_policy.upstream_clone_per_repo_across_instances,
         state.config().clone.lock_ttl,
         Some(&state.metrics),
     )
@@ -593,17 +783,11 @@ pub async fn acquire_clone_hydration_permits(
     owner_repo: &str,
 ) -> Result<Option<CloneHydrationPermits>> {
     let owner_repo = normalize_owner_repo(owner_repo);
-    if state.config().clone.max_concurrent_upstream_clones == 0
-        || state
-            .config()
-            .clone
-            .max_concurrent_upstream_clones_per_repo_per_instance
-            == 0
-        || state
-            .config()
-            .clone
-            .max_concurrent_upstream_clones_per_repo_across_instances
-            == 0
+    let policy = state.effective_policy.snapshot();
+    let repo_policy = state.effective_policy.repo_policy(&owner_repo);
+    if policy.upstream_clone_concurrency == 0
+        || repo_policy.upstream_clone_per_repo_per_instance == 0
+        || repo_policy.upstream_clone_per_repo_across_instances == 0
     {
         return Ok(None);
     }
@@ -620,10 +804,7 @@ pub async fn acquire_clone_hydration_permits(
         &state.valkey,
         &distributed_permit_key,
         &state.node_id,
-        state
-            .config()
-            .clone
-            .max_concurrent_upstream_clones_per_repo_across_instances,
+        repo_policy.upstream_clone_per_repo_across_instances,
         state.config().clone.lock_ttl,
         Some(&state.metrics),
     )
@@ -659,12 +840,12 @@ async fn acquire_fetch_permits(
     let low_priority_fetch_permit = match priority {
         FetchPriority::RequestTime => None,
         FetchPriority::Background | FetchPriority::TeeConvergence => {
-            if state.low_priority_fetch_limit == 0 {
+            if state.low_priority_fetch_limit() == 0 {
                 info!(
                     repo = %owner_repo,
                     ?priority,
                     reserved_request_time_fetches = state.config().clone.reserved_request_time_upstream_fetches,
-                    max_concurrent_fetches = state.config().clone.max_concurrent_upstream_fetches,
+                    max_concurrent_fetches = state.effective_policy.snapshot().upstream_fetch_concurrency,
                     "skipping lower-priority upstream fetch because all fetch slots are reserved for request-time catch-up"
                 );
                 return Ok(None);
@@ -703,20 +884,17 @@ async fn acquire_fetch_permits(
 async fn acquire_local_repo_tee_capture_permit(
     state: &crate::AppState,
     owner_repo: &str,
-) -> Result<Option<OwnedSemaphorePermit>> {
+) -> Result<Option<ResizableGatePermit>> {
+    let limit = state
+        .effective_policy
+        .repo_policy(owner_repo)
+        .tee_capture_per_repo;
     let semaphore = {
         let mut semaphores = state.repo_tee_capture_semaphores.lock().await;
         semaphores
             .entry(owner_repo.to_string())
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(
-                    state
-                        .config()
-                        .clone
-                        .max_concurrent_tee_captures_per_repo_per_instance,
-                ))
-            })
-            .clone()
+            .or_insert_with(|| CachedResizableGate::for_limit(limit))
+            .gate_for_limit(limit)
     };
 
     match semaphore.try_acquire_owned() {
@@ -809,20 +987,17 @@ async fn promote_initial_repo_clone(temp_repo_path: &Path, mirror_path: &Path) -
 async fn try_acquire_local_repo_clone_permit(
     state: &crate::AppState,
     owner_repo: &str,
-) -> Result<Option<OwnedSemaphorePermit>> {
+) -> Result<Option<ResizableGatePermit>> {
+    let limit = state
+        .effective_policy
+        .repo_policy(owner_repo)
+        .upstream_clone_per_repo_per_instance;
     let semaphore = {
         let mut semaphores = state.repo_clone_semaphores.lock().await;
         semaphores
             .entry(owner_repo.to_string())
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(
-                    state
-                        .config()
-                        .clone
-                        .max_concurrent_upstream_clones_per_repo_per_instance,
-                ))
-            })
-            .clone()
+            .or_insert_with(|| crate::adaptive_tuning::CachedResizableGate::for_limit(limit))
+            .gate_for_limit(limit)
     };
 
     match semaphore.try_acquire_owned() {
@@ -835,20 +1010,17 @@ async fn try_acquire_local_repo_clone_permit(
 async fn acquire_local_repo_clone_permit_waiting(
     state: &crate::AppState,
     owner_repo: &str,
-) -> Result<OwnedSemaphorePermit> {
+) -> Result<ResizableGatePermit> {
+    let limit = state
+        .effective_policy
+        .repo_policy(owner_repo)
+        .upstream_clone_per_repo_per_instance;
     let semaphore = {
         let mut semaphores = state.repo_clone_semaphores.lock().await;
         semaphores
             .entry(owner_repo.to_string())
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(
-                    state
-                        .config()
-                        .clone
-                        .max_concurrent_upstream_clones_per_repo_per_instance,
-                ))
-            })
-            .clone()
+            .or_insert_with(|| crate::adaptive_tuning::CachedResizableGate::for_limit(limit))
+            .gate_for_limit(limit)
     };
 
     semaphore
@@ -1249,6 +1421,15 @@ async fn try_ensure_repo_cloned_inner(
 ) -> Result<()> {
     let repo_clean = crate::repo_identity::canonical_repo_leaf(repo);
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
+    if let Err(error) = note_request_time_catch_up_signal(
+        state,
+        &owner_repo,
+        RequestCatchUpOutcome::ObservedRequest,
+    )
+    .await
+    {
+        debug!(repo = %owner_repo, error = %error, "failed to persist request-time refresh signal");
+    }
     repair_published_without_mirror_invariant(state, &owner_repo).await?;
     let node_id = state.node_id.clone();
     let had_local_repo_at_start = state.cache_manager.has_repo(&owner_repo);
@@ -2005,7 +2186,7 @@ async fn run_published_generation_index_preparation(
         repo = %owner_repo,
         source,
         path = %published_path.display(),
-        pack_threads = state.bundle_pack_threads,
+        pack_threads = state.bundle_pack_threads(),
         "starting background MIDX preparation for published generation"
     );
 
@@ -2046,7 +2227,7 @@ async fn run_published_generation_index_preparation(
     let midx_started_at = Instant::now();
     let midx_result = crate::git::commands::git_prepare_published_generation_midx(
         &published_path,
-        state.bundle_pack_threads,
+        state.bundle_pack_threads(),
     )
     .await;
 
@@ -2233,7 +2414,7 @@ async fn run_published_generation_index_preparation(
     let bitmap_started_at = Instant::now();
     let bitmap_result = crate::git::commands::git_prepare_published_generation_bitmap(
         &published_path,
-        state.bundle_pack_threads,
+        state.bundle_pack_threads(),
     )
     .await;
     drop(permit);
@@ -2435,23 +2616,26 @@ fn try_confirm_idle_local_upload_pack_gate(
     owner_repo: &str,
     source: &str,
 ) -> bool {
-    let permit_count = match u32::try_from(state.config().clone.max_concurrent_local_upload_packs) {
+    let permit_count = match u32::try_from(
+        state
+            .effective_policy
+            .snapshot()
+            .local_upload_pack_concurrency,
+    ) {
         Ok(permit_count) => permit_count,
         Err(_) => {
             warn!(
                 repo = %owner_repo,
                 source,
-                max_concurrent_local_upload_packs = state.config().clone.max_concurrent_local_upload_packs,
+                max_concurrent_local_upload_packs = state.effective_policy.snapshot().local_upload_pack_concurrency,
                 "skipping background git index preparation because upload-pack semaphore size exceeds git maintenance gate capacity"
             );
             return false;
         }
     };
 
-    match confirm_idle_local_upload_pack_semaphore(
-        state.local_upload_pack_semaphore.clone(),
-        permit_count,
-    ) {
+    match confirm_idle_local_upload_pack_semaphore(&state.local_upload_pack_semaphore, permit_count)
+    {
         IdleLocalUploadPackGate::Idle => {
             debug!(
                 repo = %owner_repo,
@@ -2488,16 +2672,13 @@ enum IdleLocalUploadPackGate {
 }
 
 fn confirm_idle_local_upload_pack_semaphore(
-    semaphore: Arc<Semaphore>,
+    semaphore: &Arc<ResizableGate>,
     permit_count: u32,
 ) -> IdleLocalUploadPackGate {
-    match semaphore.try_acquire_many_owned(permit_count) {
-        Ok(permit) => {
-            drop(permit);
-            IdleLocalUploadPackGate::Idle
-        }
-        Err(TryAcquireError::NoPermits) => IdleLocalUploadPackGate::Busy,
-        Err(TryAcquireError::Closed) => IdleLocalUploadPackGate::Closed,
+    match semaphore.try_confirm_idle(permit_count) {
+        IdleGateState::Idle => IdleLocalUploadPackGate::Idle,
+        IdleGateState::Busy => IdleLocalUploadPackGate::Busy,
+        IdleGateState::Closed => IdleLocalUploadPackGate::Closed,
     }
 }
 
@@ -2930,7 +3111,7 @@ async fn build_pack_cache_delta(
             crate::git::commands::git_pack_objects_exact_background(
                 published_path,
                 object_ids,
-                state.bundle_pack_threads,
+                state.bundle_pack_threads(),
             )
             .await
         }
@@ -2938,7 +3119,7 @@ async fn build_pack_cache_delta(
             crate::git::commands::git_pack_objects_exact(
                 published_path,
                 object_ids,
-                state.bundle_pack_threads,
+                state.bundle_pack_threads(),
             )
             .await
         }
@@ -2956,7 +3137,7 @@ async fn build_pack_cache_delta(
 fn semaphore_for_pack_cache_delta(
     state: &crate::AppState,
     priority: PackCacheDeltaPriority,
-) -> std::sync::Arc<tokio::sync::Semaphore> {
+) -> std::sync::Arc<ResizableGate> {
     select_pack_cache_delta_semaphore(
         &state.pack_cache_warming_semaphore,
         &state.request_pack_delta_semaphore,
@@ -2965,10 +3146,10 @@ fn semaphore_for_pack_cache_delta(
 }
 
 fn select_pack_cache_delta_semaphore(
-    background: &std::sync::Arc<tokio::sync::Semaphore>,
-    request: &std::sync::Arc<tokio::sync::Semaphore>,
+    background: &std::sync::Arc<ResizableGate>,
+    request: &std::sync::Arc<ResizableGate>,
     priority: PackCacheDeltaPriority,
-) -> std::sync::Arc<tokio::sync::Semaphore> {
+) -> std::sync::Arc<ResizableGate> {
     match priority {
         PackCacheDeltaPriority::Background => background.clone(),
         PackCacheDeltaPriority::Request => request.clone(),
@@ -5104,7 +5285,7 @@ async fn hydrate_repo_from_tee_capture(
         );
         return Ok(TeeHydrationOutcome::NotHydrated);
     }
-    crate::git::commands::git_index_pack(repo_path, &pack_path, state.index_pack_threads).await?;
+    crate::git::commands::git_index_pack(repo_path, &pack_path, state.index_pack_threads()).await?;
     if state.cache_manager.has_repo(owner_repo) && !allow_existing_repo_publish {
         info!(
             repo = %owner_repo,
@@ -6649,16 +6830,16 @@ pub async fn wait_for_local_catch_up(
     request_refspecs: Option<Vec<String>>,
     budget: Option<RequestBudget>,
 ) -> Result<LocalServeDecision> {
+    let repo_clean = crate::repo_identity::canonical_repo_leaf(repo);
+    let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
     let quick_timeout =
-        Duration::from_secs(state.config().clone.request_wait_for_local_catch_up_secs);
+        Duration::from_secs(state.request_wait_for_local_catch_up_secs(Some(&owner_repo)));
     let active_timeout = Duration::from_secs(
         state
             .config()
             .clone
             .request_wait_for_active_local_catch_up_secs,
     );
-    let repo_clean = crate::repo_identity::canonical_repo_leaf(repo);
-    let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
 
     let initial_decision =
         classify_local_wants_satisfaction_without_request_restore(state, &owner_repo, wants)
@@ -6733,13 +6914,13 @@ pub async fn wait_for_local_catch_up(
     if should_start_refresh && !has_published_repo && !has_repo_mirror {
         timeout = min_timeout(
             timeout,
-            duration_from_secs(state.config().clone.request_time_s3_restore_secs),
+            duration_from_secs(state.request_time_s3_restore_secs(Some(&owner_repo))),
         );
     }
     if should_start_refresh && has_repo_mirror {
         timeout = min_timeout(
             timeout,
-            duration_from_secs(state.config().clone.generation_publish_secs),
+            duration_from_secs(state.generation_publish_secs(Some(&owner_repo))),
         );
     }
     let Some(timeout) = timeout else {
@@ -6804,6 +6985,21 @@ pub async fn wait_for_local_catch_up(
         if matches!(decision, LocalServeDecision::SatisfiesWants { .. }) {
             if using_active_wait {
                 crate::metrics::inc_request_time_catch_up(&state.metrics, "active_wait_completed");
+            } else {
+                crate::metrics::inc_background_refresh_effectiveness(
+                    &state.metrics,
+                    "likely_saved_request_without_request_catch_up",
+                );
+            }
+            let fast_cutoff_ms = quick_timeout.as_millis();
+            let outcome = if started_at.elapsed().as_millis() <= fast_cutoff_ms {
+                RequestCatchUpOutcome::CatchUpCompletedFast
+            } else {
+                RequestCatchUpOutcome::CatchUpCompletedSlow
+            };
+            if let Err(error) = note_request_time_catch_up_signal(state, &owner_repo, outcome).await
+            {
+                debug!(repo = %owner_repo, error = %error, "failed to persist successful catch-up signal");
             }
             info!(
                 repo = %owner_repo,
@@ -6846,13 +7042,39 @@ pub async fn wait_for_local_catch_up(
     if using_active_wait {
         crate::metrics::inc_request_time_catch_up(&state.metrics, "active_wait_timeout");
     }
+    if let Ok(refresh_state) = get_repo_refresh_schedule_state(&state.valkey, &owner_repo).await {
+        let now = chrono::Utc::now().timestamp();
+        let recent_window = state.config().fetch_schedule.stale_after_secs as i64;
+        if refresh_state.last_background_success_ts > 0
+            && now.saturating_sub(refresh_state.last_background_success_ts) <= recent_window
+        {
+            crate::metrics::inc_background_refresh_effectiveness(
+                &state.metrics,
+                "timed_out_despite_recent_background_refresh",
+            );
+        }
+    }
     info!(
         repo = %owner_repo,
         elapsed_ms = started_at.elapsed().as_millis(),
         "local published-generation catch-up timed out; falling back to upstream proxy"
     );
     crate::metrics::inc_request_time_catch_up(&state.metrics, "timeout");
-    crate::metrics::inc_short_circuit_upstream(&state.metrics, protocol, "local_catch_up");
+    if let Err(error) = note_request_time_catch_up_signal(
+        state,
+        &owner_repo,
+        RequestCatchUpOutcome::CatchUpTimedOut,
+    )
+    .await
+    {
+        debug!(repo = %owner_repo, error = %error, "failed to persist request-time fallback signal");
+    }
+    crate::metrics::inc_short_circuit_upstream_for_repo(
+        &state.metrics,
+        protocol,
+        "local_catch_up",
+        &owner_repo,
+    );
     Ok(last_decision)
 }
 
@@ -7015,6 +7237,373 @@ pub async fn list_all_repos(pool: &fred::clients::Pool) -> Result<Vec<String>> {
     Ok(repos)
 }
 
+#[derive(Debug, Clone)]
+struct RefreshCandidate {
+    owner_repo: String,
+    score: f64,
+    eligible: bool,
+    state: RepoRefreshScheduleState,
+}
+
+fn compute_adaptive_interval_secs(
+    cfg: &crate::config::FetchScheduleConfig,
+    state: &RepoRefreshScheduleState,
+) -> u64 {
+    let mut interval = if state.adaptive_interval_secs == 0 {
+        cfg.min_interval_secs
+    } else {
+        state.adaptive_interval_secs
+    };
+    if state.request_fallback_count_window > 0 {
+        interval = interval.saturating_div(2).max(cfg.min_interval_secs);
+    }
+    interval = interval.saturating_mul(1 + state.no_op_fetch_count.min(4));
+    interval = interval.saturating_mul(1 + state.consecutive_failures.min(4));
+    interval.clamp(cfg.min_interval_secs, cfg.max_interval_secs)
+}
+
+fn apply_interval_jitter(base_secs: u64, jitter_percent: u64, owner_repo: &str) -> u64 {
+    if jitter_percent == 0 || base_secs == 0 {
+        return base_secs;
+    }
+    let hash = owner_repo.bytes().fold(0_u64, |acc, b| {
+        acc.wrapping_mul(131).wrapping_add(u64::from(b))
+    });
+    let jitter = (hash % (2 * jitter_percent + 1)).saturating_sub(jitter_percent) as i64;
+    let adjusted = (base_secs as i64)
+        .saturating_add((base_secs as i64).saturating_mul(jitter) / 100)
+        .max(1);
+    adjusted as u64
+}
+
+async fn try_acquire_repo_refresh_lease(
+    pool: &fred::clients::Pool,
+    owner_repo: &str,
+    lease_ttl_secs: u64,
+    node_id: &str,
+) -> Result<bool> {
+    let key = repo_refresh_lease_key(owner_repo);
+    let response: Option<String> = pool
+        .custom(
+            CustomCommand::new_static("SET", None::<u16>, false),
+            vec![
+                key,
+                node_id.to_string(),
+                "EX".to_string(),
+                lease_ttl_secs.to_string(),
+                "NX".to_string(),
+            ],
+        )
+        .await
+        .context("SET refresh lease NX EX")?;
+    Ok(response.is_some())
+}
+
+#[derive(Clone, Copy)]
+enum RequestCatchUpOutcome {
+    ObservedRequest,
+    CatchUpCompletedFast,
+    CatchUpCompletedSlow,
+    CatchUpTimedOut,
+}
+
+async fn note_request_time_catch_up_signal(
+    state: &crate::AppState,
+    owner_repo: &str,
+    outcome: RequestCatchUpOutcome,
+) -> Result<()> {
+    let cfg = state.config().fetch_schedule.clone();
+    let mut refresh_state = get_repo_refresh_schedule_state(&state.valkey, owner_repo).await?;
+    let now = chrono::Utc::now().timestamp();
+    refresh_state.updated_at_ts = now;
+    refresh_state.last_request_ts = now;
+    refresh_state.request_count_window = refresh_state.request_count_window.saturating_add(1);
+    match outcome {
+        RequestCatchUpOutcome::ObservedRequest => {}
+        RequestCatchUpOutcome::CatchUpCompletedFast => {
+            refresh_state.request_catch_up_success_window = refresh_state
+                .request_catch_up_success_window
+                .saturating_add(1);
+            refresh_state.request_catch_up_fast_success_window = refresh_state
+                .request_catch_up_fast_success_window
+                .saturating_add(1);
+        }
+        RequestCatchUpOutcome::CatchUpCompletedSlow => {
+            refresh_state.request_catch_up_success_window = refresh_state
+                .request_catch_up_success_window
+                .saturating_add(1);
+        }
+        RequestCatchUpOutcome::CatchUpTimedOut => {
+            refresh_state.request_fallback_count_window = refresh_state
+                .request_fallback_count_window
+                .saturating_add(1);
+            refresh_state.request_catch_up_timeout_window = refresh_state
+                .request_catch_up_timeout_window
+                .saturating_add(1);
+            refresh_state.adaptive_interval_secs = cfg.min_interval_secs;
+            refresh_state.next_eligible_ts = now;
+            refresh_state.background_paused_until_ts = 0;
+        }
+    }
+    set_repo_refresh_schedule_state(&state.valkey, owner_repo, &refresh_state).await
+}
+
+pub async fn run_repo_refresh_scheduler(state: crate::AppState) -> Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_secs(
+        state.config().fetch_schedule.evaluation_interval_secs,
+    ));
+    loop {
+        ticker.tick().await;
+        let cfg = state.config().fetch_schedule.clone();
+        if !cfg.enabled {
+            continue;
+        }
+        if let Some(reason) = state.background_work_defer_reason(1).await {
+            info!(
+                reason = reason.reason,
+                detail = %reason.detail,
+                "repo refresh scheduler deferred due to background pressure"
+            );
+            continue;
+        }
+        let mut repos = list_all_repos(&state.valkey).await.unwrap_or_default();
+        repos.extend(
+            state
+                .config()
+                .prewarm
+                .repos
+                .iter()
+                .map(|repo| crate::repo_identity::canonicalize_owner_repo(repo)),
+        );
+        repos.sort();
+        repos.dedup();
+        let now = chrono::Utc::now().timestamp();
+        let mut candidates = Vec::new();
+        for owner_repo in repos {
+            let schedule_state =
+                get_repo_refresh_schedule_state(&state.valkey, &owner_repo).await?;
+            let interval = compute_adaptive_interval_secs(&cfg, &schedule_state);
+            let jittered_interval =
+                apply_interval_jitter(interval, cfg.jitter_percent, &owner_repo);
+            let next_eligible = if schedule_state.next_eligible_ts == 0 {
+                now
+            } else {
+                schedule_state.next_eligible_ts
+            };
+            let age_since_success = if schedule_state.last_background_success_ts > 0 {
+                now.saturating_sub(schedule_state.last_background_success_ts)
+            } else {
+                cfg.stale_after_secs as i64
+            };
+            let request_score = (schedule_state.request_count_window as f64 * 0.35)
+                + (schedule_state.request_fallback_count_window as f64 * 12.0)
+                + (schedule_state.request_catch_up_timeout_window as f64 * 10.0);
+            let churn_score = (schedule_state.last_background_fetch_bytes as f64
+                / (cfg.churn_window_secs.max(1) as f64))
+                .min(5.0);
+            let stale_score = age_since_success as f64 / cfg.stale_after_secs.max(1) as f64;
+            let penalty =
+                (schedule_state.no_op_fetch_count + schedule_state.consecutive_failures) as f64;
+            let cheap_request_penalty = if schedule_state.request_catch_up_fast_success_window
+                > schedule_state.request_fallback_count_window
+                    + schedule_state.request_catch_up_timeout_window
+            {
+                3.0
+            } else {
+                0.0
+            };
+            let profile = get_repo_update_profile(&state.valkey, &owner_repo).await?;
+            let update_cost_score = if profile.failure_score > 0 {
+                2.0
+            } else if profile.ref_count > 5_000 || profile.mirror_size_bytes > 512 * 1024 * 1024 {
+                1.0
+            } else {
+                0.0
+            };
+            let expected_benefit_score =
+                request_score + stale_score + update_cost_score + churn_score
+                    - cheap_request_penalty;
+            let score = expected_benefit_score - penalty;
+            let eligible = now >= next_eligible;
+            let paused = schedule_state.background_paused_until_ts > now;
+            crate::metrics::inc_background_refresh(
+                &state.metrics,
+                "candidate_evaluated",
+                if paused {
+                    "paused"
+                } else if eligible {
+                    "eligible"
+                } else {
+                    "not_yet_eligible"
+                },
+            );
+            debug!(
+                repo = %owner_repo,
+                request_score,
+                churn_score,
+                stale_score,
+                expected_benefit_score,
+                update_cost_score,
+                cheap_request_penalty,
+                penalty,
+                interval_secs = interval,
+                jittered_interval_secs = jittered_interval,
+                next_eligible_ts = next_eligible,
+                paused_until_ts = schedule_state.background_paused_until_ts,
+                selected_mode = schedule_state.last_selected_mode,
+                decision = if paused {
+                    "paused"
+                } else if eligible {
+                    "eligible"
+                } else {
+                    "defer"
+                },
+                "repo refresh candidate scoring"
+            );
+            candidates.push(RefreshCandidate {
+                owner_repo,
+                score,
+                eligible: eligible && !paused,
+                state: schedule_state,
+            });
+        }
+        candidates.sort_by(|a, b| {
+            b.eligible
+                .cmp(&a.eligible)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
+        if candidates.len() > cfg.candidate_limit_per_tick {
+            candidates.truncate(cfg.candidate_limit_per_tick);
+        }
+        let mut started_refreshes = 0usize;
+        for candidate in candidates {
+            if !candidate.eligible {
+                continue;
+            }
+            if started_refreshes >= cfg.max_refreshes_per_tick {
+                crate::metrics::inc_background_refresh(
+                    &state.metrics,
+                    "skipped",
+                    "tick_refresh_limit",
+                );
+                break;
+            }
+            if candidate.score <= 0.0 {
+                crate::metrics::inc_background_refresh(
+                    &state.metrics,
+                    "skipped",
+                    "non_positive_score",
+                );
+                continue;
+            }
+            let owner_repo = candidate.owner_repo.as_str();
+            if !try_acquire_repo_refresh_lease(
+                &state.valkey,
+                owner_repo,
+                cfg.evaluation_interval_secs.max(30),
+                &state.node_id,
+            )
+            .await?
+            {
+                crate::metrics::inc_background_refresh(
+                    &state.metrics,
+                    "skipped",
+                    "lease_contention",
+                );
+                info!(repo = %owner_repo, "repo refresh skipped due to lease contention");
+                continue;
+            }
+            crate::metrics::inc_background_refresh(&state.metrics, "started", "selected");
+            let Some((owner, repo)) = owner_repo.split_once('/') else {
+                continue;
+            };
+            let clone_url = clone_url(&state, owner, repo, None);
+            info!(repo = %owner_repo, score = candidate.score, "starting background repo refresh");
+            let started = Instant::now();
+            let result = fetch_delta_into_repo_mirror(
+                &state,
+                owner_repo,
+                &clone_url,
+                None,
+                FetchPriority::Background,
+            )
+            .await;
+            let mut next_state = candidate.state.clone();
+            let new_interval = compute_adaptive_interval_secs(&cfg, &next_state);
+            let jittered = apply_interval_jitter(new_interval, cfg.jitter_percent, owner_repo);
+            let completion_ts = chrono::Utc::now().timestamp();
+            next_state.adaptive_interval_secs = new_interval;
+            next_state.next_eligible_ts = completion_ts.saturating_add(jittered as i64);
+            next_state.updated_at_ts = completion_ts;
+            match result {
+                Ok(fetch) => {
+                    next_state.last_background_success_ts = completion_ts;
+                    next_state.last_background_fetch_bytes = fetch.fetch_result.bytes_received;
+                    next_state.last_background_refs_changed =
+                        fetch.fetch_result.refs_updated as u64;
+                    next_state.last_background_fetch_duration_ms =
+                        started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    next_state.last_selected_mode = String::from("background");
+                    next_state.consecutive_failures = 0;
+                    if fetch.fetch_result.bytes_received == 0
+                        && fetch.fetch_result.refs_updated == 0
+                    {
+                        next_state.no_op_fetch_count =
+                            next_state.no_op_fetch_count.saturating_add(1);
+                        if next_state.no_op_fetch_count >= 3
+                            && next_state.request_fallback_count_window == 0
+                            && next_state.request_catch_up_timeout_window == 0
+                        {
+                            let cooldown = cfg
+                                .stale_after_secs
+                                .max(cfg.min_interval_secs.saturating_mul(8));
+                            next_state.background_paused_until_ts =
+                                completion_ts.saturating_add(cooldown as i64);
+                            info!(
+                                repo = %owner_repo,
+                                no_op_streak = next_state.no_op_fetch_count,
+                                cooldown_secs = cooldown,
+                                "pausing low-benefit background refresh after repeated no-op fetches"
+                            );
+                        }
+                    } else {
+                        next_state.no_op_fetch_count = 0;
+                        next_state.background_paused_until_ts = 0;
+                    }
+                    next_state.request_count_window /= 2;
+                    next_state.request_fallback_count_window /= 2;
+                    next_state.request_catch_up_success_window /= 2;
+                    next_state.request_catch_up_timeout_window /= 2;
+                    next_state.request_catch_up_fast_success_window /= 2;
+                    info!(
+                        repo = %owner_repo,
+                        bytes_fetched = fetch.fetch_result.bytes_received,
+                        refs_updated = fetch.fetch_result.refs_updated,
+                        interval_secs = next_state.adaptive_interval_secs,
+                        "background repo refresh completed"
+                    );
+                    crate::metrics::inc_background_refresh(&state.metrics, "succeeded", "ok");
+                }
+                Err(error) => {
+                    next_state.last_background_failure_ts = completion_ts;
+                    next_state.consecutive_failures =
+                        next_state.consecutive_failures.saturating_add(1);
+                    next_state.background_paused_until_ts = 0;
+                    info!(
+                        repo = %owner_repo,
+                        error = %error,
+                        interval_secs = next_state.adaptive_interval_secs,
+                        "background repo refresh failed"
+                    );
+                    crate::metrics::inc_background_refresh(&state.metrics, "failed", "fetch_error");
+                }
+            }
+            set_repo_refresh_schedule_state(&state.valkey, owner_repo, &next_state).await?;
+            started_refreshes = started_refreshes.saturating_add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7059,10 +7648,10 @@ mod tests {
 
     #[test]
     fn idle_upload_pack_confirmation_releases_permits() {
-        let semaphore = Arc::new(Semaphore::new(2));
+        let semaphore = ResizableGate::new(2);
 
         assert_eq!(
-            confirm_idle_local_upload_pack_semaphore(semaphore.clone(), 2),
+            confirm_idle_local_upload_pack_semaphore(&semaphore, 2),
             IdleLocalUploadPackGate::Idle
         );
         assert_eq!(semaphore.available_permits(), 2);
@@ -7070,11 +7659,11 @@ mod tests {
 
     #[tokio::test]
     async fn idle_upload_pack_confirmation_reports_busy() {
-        let semaphore = Arc::new(Semaphore::new(2));
-        let _held = semaphore.clone().acquire_many_owned(1).await.unwrap();
+        let semaphore = ResizableGate::new(2);
+        let _held = semaphore.acquire_owned().await.unwrap();
 
         assert_eq!(
-            confirm_idle_local_upload_pack_semaphore(semaphore.clone(), 2),
+            confirm_idle_local_upload_pack_semaphore(&semaphore, 2),
             IdleLocalUploadPackGate::Busy
         );
         assert_eq!(semaphore.available_permits(), 1);
@@ -7787,8 +8376,8 @@ mod tests {
 
     #[test]
     fn request_delta_semaphore_is_independent_from_background_generation() {
-        let background = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let request = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let background = ResizableGate::new(1);
+        let request = ResizableGate::new(1);
         let _background_permit = background
             .clone()
             .try_acquire_owned()

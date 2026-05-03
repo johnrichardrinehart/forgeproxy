@@ -806,6 +806,21 @@
           "expr": "sum by (stage, policy, decision, reason) (rate(forgeproxy_published_generation_index_decision_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
           "legendFormat": "Index {{stage}} {{policy}} {{decision}} {{reason}}",
           "refId": "K"
+        },
+        {
+          "expr": "sum by (result) (rate(forgeproxy_request_time_catch_up_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Request catch-up {{result}}",
+          "refId": "L"
+        },
+        {
+          "expr": "sum by (result, reason) (rate(forgeproxy_background_refresh_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Background refresh {{result}} {{reason}}",
+          "refId": "M"
+        },
+        {
+          "expr": "sum by (result) (rate(forgeproxy_background_refresh_effectiveness_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Background effectiveness {{result}}",
+          "refId": "N"
         }
       ],
       "fieldConfig": {
@@ -1535,6 +1550,88 @@
               "custom": {
                 "lineWidth": 2,
                 "fillOpacity": 15,
+                "gradientMode": "none",
+                "showPoints": "never",
+                "spanNulls": false,
+                "axisBorderShow": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "multi", "sort": "desc" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 83,
+          "type": "stat",
+          "title": "Background Refresh Usefulness Ratio",
+          "description": "Estimated percent of request-path outcomes where recent background refresh likely avoided request-time catch-up, relative to explicit recent-background miss signals.",
+          "gridPos": { "h": 4, "w": 8, "x": 0, "y": 115 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "100 * sum(rate(forgeproxy_background_refresh_effectiveness_total{result=\"likely_saved_request_without_request_catch_up\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) / clamp_min(sum(rate(forgeproxy_background_refresh_effectiveness_total{result=~\"likely_saved_request_without_request_catch_up|timed_out_despite_recent_background_refresh\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])), 0.000001)",
+              "legendFormat": "usefulness %",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percent",
+              "decimals": 1,
+              "min": 0,
+              "max": 100,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "yellow", "value": 50 },
+                  { "color": "green", "value": 80 }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+            "colorMode": "background",
+            "graphMode": "area",
+            "textMode": "auto",
+            "justifyMode": "auto"
+          }
+        },
+        {
+          "id": 84,
+          "type": "timeseries",
+          "title": "Background Refresh Effectiveness Signals (Absolute)",
+          "description": "Absolute per-minute rates for recent request-path outcomes attributed to background refresh effectiveness.",
+          "gridPos": { "h": 4, "w": 16, "x": 8, "y": 115 },
+          "datasource": { "type": "prometheus", "uid": "$${datasource}" },
+          "targets": [
+            {
+              "expr": "sum(rate(forgeproxy_background_refresh_effectiveness_total{result=\"likely_saved_request_without_request_catch_up\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+              "legendFormat": "likely saved / min",
+              "refId": "A"
+            },
+            {
+              "expr": "sum(rate(forgeproxy_background_refresh_effectiveness_total{result=\"timed_out_despite_recent_background_refresh\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+              "legendFormat": "timed out despite recent refresh / min",
+              "refId": "B"
+            },
+            {
+              "expr": "sum(rate(forgeproxy_background_refresh_effectiveness_total{result=~\"likely_saved_request_without_request_catch_up|timed_out_despite_recent_background_refresh\", service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+              "legendFormat": "total considered / min",
+              "refId": "C"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "cpm",
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 10,
                 "gradientMode": "none",
                 "showPoints": "never",
                 "spanNulls": false,

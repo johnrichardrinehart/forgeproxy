@@ -73,8 +73,8 @@ pub async fn generate_full_bundle(
         .context("bundle generation semaphore closed")?;
     debug!(
         owner_repo,
-        pack_threads = state.bundle_pack_threads,
-        max_concurrent_generations = state.bundle_max_concurrency,
+        pack_threads = state.bundle_pack_threads(),
+        max_concurrent_generations = state.bundle_max_concurrency(),
         "acquired bundle generation permit"
     );
     commands::git_bundle_create(
@@ -82,7 +82,7 @@ pub async fn generate_full_bundle(
         &bundle_path,
         None,
         None,
-        state.bundle_pack_threads,
+        state.bundle_pack_threads(),
     )
     .await
     .with_context(|| format!("git bundle create (full) failed for {owner_repo}"))?;
@@ -155,15 +155,15 @@ pub async fn generate_filtered_bundle(
         .context("bundle generation semaphore closed")?;
     debug!(
         owner_repo,
-        pack_threads = state.bundle_pack_threads,
-        max_concurrent_generations = state.bundle_max_concurrency,
+        pack_threads = state.bundle_pack_threads(),
+        max_concurrent_generations = state.bundle_max_concurrency(),
         "acquired bundle generation permit"
     );
     commands::git_bundle_create_filtered(
         repo_path,
         &bundle_path,
         "blob:none",
-        state.bundle_pack_threads,
+        state.bundle_pack_threads(),
     )
     .await
     .with_context(|| format!("filtered bundle create failed for {owner_repo}"))?;
@@ -256,7 +256,7 @@ pub async fn generate_incremental_bundle(
         &bundle_path,
         Some(&refs),
         Some(&not_refs),
-        state.bundle_pack_threads,
+        state.bundle_pack_threads(),
     )
     .await
     .with_context(|| format!("git bundle create (incremental) failed for {owner_repo}"))?;

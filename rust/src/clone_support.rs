@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::TryAcquireError;
 use tracing::{info, warn};
 
 use crate::AppState;
+use crate::adaptive_tuning::{ResizableGate, ResizableGatePermit};
 use crate::coordination::registry::{
     LocalServeRepoLease, LocalServeRepoSource, RequestAdvertisedRefs, TeeCapturePermits,
 };
@@ -102,8 +103,8 @@ pub struct LocalUploadPackProcess {
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
     pub upload_pack_guard: crate::metrics::UploadPackGuard,
-    pub _global_upload_pack_permit: OwnedSemaphorePermit,
-    pub _repo_upload_pack_permit: OwnedSemaphorePermit,
+    pub _global_upload_pack_permit: ResizableGatePermit,
+    pub _repo_upload_pack_permit: ResizableGatePermit,
     pub _lease: LocalServeRepoLease,
 }
 
@@ -173,7 +174,7 @@ pub async fn spawn_local_upload_pack_with_lease_timeout(
     };
     let repo_path = repo_lease.repo_path().to_path_buf();
 
-    let pack_threads = state.config().clone.local_upload_pack_threads;
+    let pack_threads = state.local_upload_pack_threads();
     let mut cmd = Command::new("git");
     cmd.arg("-c")
         .arg(format!("pack.threads={pack_threads}"))
@@ -227,30 +228,27 @@ async fn acquire_local_repo_upload_pack_permit(
     state: &AppState,
     owner_repo: &str,
     timeout: Option<Duration>,
-) -> Result<Option<OwnedSemaphorePermit>> {
+) -> Result<Option<ResizableGatePermit>> {
+    let limit = state
+        .effective_policy
+        .repo_policy(owner_repo)
+        .local_upload_pack_per_repo;
     let semaphore = {
         let mut semaphores = state.repo_upload_pack_semaphores.lock().await;
         semaphores
             .entry(owner_repo.to_string())
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(
-                    state
-                        .config()
-                        .clone
-                        .max_concurrent_local_upload_packs_per_repo,
-                ))
-            })
-            .clone()
+            .or_insert_with(|| crate::adaptive_tuning::CachedResizableGate::for_limit(limit))
+            .gate_for_limit(limit)
     };
 
     acquire_owned_permit_with_timeout(semaphore, timeout, "repo upload-pack semaphore closed").await
 }
 
 async fn acquire_owned_permit_with_timeout(
-    semaphore: Arc<Semaphore>,
+    semaphore: Arc<ResizableGate>,
     timeout: Option<Duration>,
     closed_message: &'static str,
-) -> Result<Option<OwnedSemaphorePermit>> {
+) -> Result<Option<ResizableGatePermit>> {
     if timeout == Some(Duration::ZERO) {
         return match semaphore.try_acquire_owned() {
             Ok(permit) => Ok(Some(permit)),
@@ -380,11 +378,12 @@ impl UpstreamHydrationTracker {
                         &state.metrics,
                         crate::metrics::HydrationSkipReason::SemaphoreSaturated,
                     );
+                    let policy = state.effective_policy.snapshot();
                     info!(
                         repo = %owner_repo,
                         protocol = protocol_name,
-                        host_limit = state.config().clone.max_concurrent_tee_captures,
-                        per_repo_host_limit = state.config().clone.max_concurrent_tee_captures_per_repo_per_instance,
+                        host_limit = policy.tee_capture_concurrency,
+                        per_repo_host_limit = policy.tee_capture_per_repo,
                         "skipping tee hydration because the tee capture semaphore is saturated"
                     );
                     None
@@ -627,12 +626,10 @@ fn spawn_background_upstream_hydration(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use tokio::sync::Semaphore;
-
     use super::{LocalUploadPackMode, acquire_owned_permit_with_timeout};
+    use crate::adaptive_tuning::ResizableGate;
 
     #[test]
     fn local_upload_pack_mode_display_uses_lowercase_labels() {
@@ -645,8 +642,8 @@ mod tests {
 
     #[tokio::test]
     async fn upload_pack_permit_zero_timeout_returns_none_when_saturated() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let _held = semaphore.clone().acquire_owned().await.unwrap();
+        let semaphore = ResizableGate::new(1);
+        let _held = semaphore.acquire_owned().await.unwrap();
 
         let permit = acquire_owned_permit_with_timeout(
             semaphore,
@@ -661,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_pack_permit_zero_timeout_uses_available_permit() {
-        let semaphore = Arc::new(Semaphore::new(1));
+        let semaphore = ResizableGate::new(1);
 
         let permit = acquire_owned_permit_with_timeout(
             semaphore.clone(),

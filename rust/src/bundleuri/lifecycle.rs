@@ -364,7 +364,7 @@ pub(crate) async fn tick_with_summary(state: &AppState) -> Result<TickSummary> {
     let repos = crate::coordination::registry::list_all_repos(&state.valkey).await?;
     debug!(
         repo_count = repos.len(),
-        concurrency = state.bundle_max_concurrency,
+        concurrency = state.bundle_max_concurrency(),
         "lifecycle tick: scanning repos"
     );
     let mut summary = TickSummary::default();
@@ -373,7 +373,7 @@ pub(crate) async fn tick_with_summary(state: &AppState) -> Result<TickSummary> {
         let result = process_repo(state, &owner_repo).await;
         (owner_repo, result)
     }))
-    .buffer_unordered(state.bundle_max_concurrency);
+    .buffer_unordered(state.bundle_max_concurrency());
 
     while let Some((owner_repo, result)) = results.next().await {
         match result {
@@ -785,7 +785,7 @@ fn effective_interval(state: &AppState, owner_repo: &str, schedule_secs: u64) ->
     }
 
     if schedule_secs == 0 {
-        return config.fetch_schedule.default_interval;
+        return config.fetch_schedule.min_interval_secs;
     }
 
     schedule_secs
@@ -804,18 +804,6 @@ fn compute_ema(latest: f64, prev_avg: f64, alpha: f64) -> f64 {
 }
 
 /// Update the dynamic fetch schedule for a repo based on observed delta size.
-///
-/// Uses an Exponential Moving Average (EMA) over the configured
-/// `rolling_window` to smooth out delta observations before comparing against
-/// the threshold.  This prevents a single large/small fetch from whipsawing
-/// the interval.
-///
-/// - If the smoothed delta exceeds the configured threshold, the interval is
-///   reset to the default (aggressive) value.
-/// - If the smoothed delta is below the threshold, the interval is multiplied
-///   by the backoff factor, up to `max_interval`.
-///
-/// Returns the new interval duration.
 pub async fn update_fetch_schedule(
     state: &AppState,
     owner_repo: &str,
@@ -826,41 +814,32 @@ pub async fn update_fetch_schedule(
         .unwrap_or_default();
 
     let config = state.config();
-    let delta_threshold_cfg = config.fetch_schedule.delta_threshold;
-    let default_interval = config.fetch_schedule.default_interval;
-    let backoff_factor = config.fetch_schedule.backoff_factor;
-    let max_interval_cfg = config.fetch_schedule.max_interval;
-    let rolling_window = config.fetch_schedule.rolling_window;
+    let min_interval = config.fetch_schedule.min_interval_secs;
+    let max_interval = config.fetch_schedule.max_interval_secs;
 
     // Compute EMA of the delta bytes using the rolling window.
     let effective_interval = if current.current_interval == 0 {
-        default_interval
+        min_interval
     } else {
         current.current_interval
     };
 
-    let alpha = if rolling_window == 0 {
-        1.0
-    } else {
-        (effective_interval as f64 / rolling_window as f64).min(1.0)
-    };
+    let alpha = 0.5;
 
     let smoothed_delta = compute_ema(delta_bytes as f64, current.rolling_avg_delta as f64, alpha);
 
-    let new_interval = if smoothed_delta >= delta_threshold_cfg as f64 {
-        // Significant activity -- reset to the default (short) interval.
+    let new_interval = if delta_bytes > 0 {
         debug!(
             repo = %owner_repo,
             delta_bytes,
             smoothed_delta = smoothed_delta as u64,
-            new_interval_secs = default_interval,
-            "large smoothed delta; resetting fetch interval to default"
+            new_interval_secs = min_interval,
+            "background fetch observed churn; resetting fetch interval to minimum"
         );
-        default_interval
+        min_interval
     } else {
-        // Quiet repo -- back off.
-        let backed_off = (effective_interval as f64 * backoff_factor) as u64;
-        let clamped = backed_off.min(max_interval_cfg);
+        let backed_off = effective_interval.saturating_mul(2);
+        let clamped = backed_off.min(max_interval);
         debug!(
             repo = %owner_repo,
             delta_bytes,

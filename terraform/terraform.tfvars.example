@@ -130,6 +130,25 @@ request_wait_for_active_local_catch_up_secs = 360
 request_time_s3_restore_secs = 0
 generation_publish_secs = 0
 local_upload_pack_first_byte_secs = 0
+fetch_schedule_enabled = true
+fetch_schedule_evaluation_interval_secs = 30
+fetch_schedule_min_interval_secs = 300
+fetch_schedule_max_interval_secs = 86400
+fetch_schedule_candidate_limit_per_tick = 128
+fetch_schedule_max_refreshes_per_tick = 16
+fetch_schedule_request_probability_window_secs = 900
+fetch_schedule_churn_window_secs = 1800
+fetch_schedule_stale_after_secs = 1800
+fetch_schedule_jitter_percent = 15
+max_concurrent_upstream_clones = 4
+max_concurrent_upstream_fetches = 8
+reserved_request_time_upstream_fetches = 2
+max_concurrent_upstream_clones_per_repo_per_instance = 3
+max_concurrent_upstream_clones_per_repo_across_instances = 10
+max_concurrent_local_upload_packs = 4
+max_concurrent_local_upload_packs_per_repo = 1
+max_concurrent_tee_captures = 8
+max_concurrent_tee_captures_per_repo_per_instance = 2
 # Adaptive repo update defaults. Deploying these values does not reset learned
 # per-repo Valkey state; auto mode still uses observed size/ref/failure signals
 # unless a repo override or forced global mode is configured.
