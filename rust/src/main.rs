@@ -1,3 +1,4 @@
+mod adaptive_tuning;
 mod auth;
 mod background_work;
 mod build_info;
@@ -40,7 +41,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tokio::signal;
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_metrics::TaskMonitor;
@@ -48,6 +49,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use crate::adaptive_tuning::{CachedResizableGate, EffectivePolicyState, ResizableGate};
 use crate::config::Config;
 use crate::metrics::{
     ActiveCloneDetailLabels, ActiveCloneGuard, ActiveConnectionGuard, CacheStatus, CloneServedBy,
@@ -123,41 +125,33 @@ pub struct AppState {
     pub forge: Arc<dyn forge::ForgeBackend>,
     /// Upstream API rate-limit state shared across all callers.
     pub rate_limit: forge::rate_limit::RateLimitState,
+    /// Runtime-owned effective policy and dynamically resizable gates.
+    pub effective_policy: Arc<EffectivePolicyState>,
     /// Semaphore limiting concurrent full clones against upstream.
-    pub clone_semaphore: Arc<Semaphore>,
+    pub clone_semaphore: Arc<ResizableGate>,
     /// Semaphore limiting concurrent fetches against upstream.
-    pub fetch_semaphore: Arc<Semaphore>,
+    pub fetch_semaphore: Arc<ResizableGate>,
     /// Semaphore limiting lower-priority upstream fetches so request-time
     /// catch-up keeps reserved capacity.
-    pub low_priority_fetch_semaphore: Arc<Semaphore>,
-    pub low_priority_fetch_limit: usize,
+    pub low_priority_fetch_semaphore: Arc<ResizableGate>,
     /// Semaphore limiting simultaneous tee capture/import work on this host.
-    pub tee_capture_semaphore: Arc<Semaphore>,
+    pub tee_capture_semaphore: Arc<ResizableGate>,
     /// Semaphore limiting CPU-heavy background bundle/MIDX work. Request-time
     /// pack-cache delta generation has its own foreground semaphore.
-    pub bundle_generation_semaphore: Arc<Semaphore>,
+    pub bundle_generation_semaphore: Arc<ResizableGate>,
     /// Semaphore limiting background pack-cache warming work. This is separate
     /// from bundle/MIDX generation so both proactive lanes can make progress.
-    pub pack_cache_warming_semaphore: Arc<Semaphore>,
+    pub pack_cache_warming_semaphore: Arc<ResizableGate>,
     /// Semaphore limiting background deep validation (`git fsck
     /// --connectivity-only`) work.
-    pub deep_validation_semaphore: Arc<Semaphore>,
+    pub deep_validation_semaphore: Arc<ResizableGate>,
     /// Semaphore limiting request-time pack-cache delta generation. This is
     /// intentionally separate from background bundle generation so foreground
     /// clone misses do not queue behind proactive warming or index preparation.
-    pub request_pack_delta_semaphore: Arc<Semaphore>,
-    /// Resolved maximum number of repos to process concurrently during the
-    /// bundle lifecycle tick.
-    pub bundle_max_concurrency: usize,
-    /// Resolved `git pack-objects` thread budget per bundle generation and
-    /// request-time pack-cache composite delta.
-    pub bundle_pack_threads: usize,
-    /// Resolved request-adjacent `git index-pack` thread budget for tee imports
-    /// and pack-cache indexing.
-    pub index_pack_threads: usize,
+    pub request_pack_delta_semaphore: Arc<ResizableGate>,
     /// Per-repo local semaphore cache limiting concurrent hydrations for the
     /// same repository within this instance.
-    pub repo_clone_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
+    pub repo_clone_semaphores: Arc<Mutex<std::collections::HashMap<String, CachedResizableGate>>>,
     /// Per-repo local mutex cache serializing publish/prune and immediate
     /// generation mutation work while allowing clone/fetch hydration to run
     /// concurrently up to the configured per-repo limits.
@@ -167,13 +161,15 @@ pub struct AppState {
     pub repo_catch_up_mutexes: Arc<Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>>,
     /// Per-repo local semaphore cache limiting tee capture/import work for the
     /// same repository within this instance.
-    pub repo_tee_capture_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
+    pub repo_tee_capture_semaphores:
+        Arc<Mutex<std::collections::HashMap<String, CachedResizableGate>>>,
     /// Request path: semaphore limiting concurrent local upload-pack subprocesses
     /// on this instance.
-    pub local_upload_pack_semaphore: Arc<Semaphore>,
+    pub local_upload_pack_semaphore: Arc<ResizableGate>,
     /// Request path: per-repo local semaphore cache limiting concurrent local
     /// upload-pack subprocesses for the same repository within this instance.
-    pub repo_upload_pack_semaphores: Arc<Mutex<std::collections::HashMap<String, Arc<Semaphore>>>>,
+    pub repo_upload_pack_semaphores:
+        Arc<Mutex<std::collections::HashMap<String, CachedResizableGate>>>,
     /// Shared disk-backed upload-pack response cache.
     pub pack_cache: Arc<pack_cache::PackCache>,
     /// Per-repo refcounts for published reader generations currently in use by
@@ -296,6 +292,88 @@ impl AppState {
     pub fn active_clone_count(&self) -> i64 {
         self.active_forgeproxy_served_clones.load(Ordering::SeqCst)
             + self.active_upstream_served_clones.load(Ordering::SeqCst)
+    }
+
+    pub fn low_priority_fetch_limit(&self) -> usize {
+        self.effective_policy.low_priority_fetch_limit()
+    }
+
+    pub fn bundle_max_concurrency(&self) -> usize {
+        self.effective_policy
+            .snapshot()
+            .bundle_generation_concurrency
+    }
+
+    pub fn bundle_pack_threads(&self) -> usize {
+        self.effective_policy.snapshot().bundle_pack_threads
+    }
+
+    pub fn index_pack_threads(&self) -> usize {
+        self.effective_policy.snapshot().index_pack_threads
+    }
+
+    pub fn local_upload_pack_threads(&self) -> usize {
+        self.effective_policy.snapshot().local_upload_pack_threads
+    }
+
+    pub fn request_wait_for_local_catch_up_secs(&self, owner_repo: Option<&str>) -> u64 {
+        let value = owner_repo.map_or_else(
+            || {
+                self.effective_policy
+                    .snapshot()
+                    .request_wait_for_local_catch_up_secs
+            },
+            |owner_repo| {
+                self.effective_policy
+                    .repo_policy(owner_repo)
+                    .request_wait_for_local_catch_up_secs
+            },
+        );
+        policy_secs(value)
+    }
+
+    pub fn request_time_s3_restore_secs(&self, owner_repo: Option<&str>) -> u64 {
+        let value = owner_repo.map_or_else(
+            || {
+                self.effective_policy
+                    .snapshot()
+                    .request_time_s3_restore_secs
+            },
+            |owner_repo| {
+                self.effective_policy
+                    .repo_policy(owner_repo)
+                    .request_time_s3_restore_secs
+            },
+        );
+        policy_secs(value)
+    }
+
+    pub fn generation_publish_secs(&self, owner_repo: Option<&str>) -> u64 {
+        let value = owner_repo.map_or_else(
+            || self.effective_policy.snapshot().generation_publish_secs,
+            |owner_repo| {
+                self.effective_policy
+                    .repo_policy(owner_repo)
+                    .generation_publish_secs
+            },
+        );
+        policy_secs(value)
+    }
+
+    pub fn local_upload_pack_first_byte_secs(&self, owner_repo: Option<&str>) -> u64 {
+        let value = owner_repo.map_or_else(
+            || {
+                self.effective_policy
+                    .snapshot()
+                    .local_upload_pack_first_byte_secs
+            },
+            |owner_repo| {
+                self.effective_policy
+                    .repo_policy(owner_repo)
+                    .local_upload_pack_first_byte_secs
+            },
+        );
+        policy_secs(value)
     }
 
     pub async fn wait_for_background_work_admission(
@@ -447,6 +525,10 @@ impl AppState {
             .get(&format!("{owner_repo}|{client_fingerprint}"))
             .cloned()
     }
+}
+
+fn policy_secs(value: usize) -> u64 {
+    value.min(u64::MAX as usize) as u64
 }
 
 fn prune_recent_advertised_refs_locked(
@@ -1457,6 +1539,17 @@ async fn main() -> Result<()> {
     });
     background_task_monitors.push(bundle_monitor);
 
+    let (repo_refresh_scheduler_handle, repo_refresh_scheduler_monitor) =
+        spawn_monitored_background_task("repo_refresh_scheduler", {
+            let s = state.clone();
+            async move {
+                if let Err(e) = crate::coordination::registry::run_repo_refresh_scheduler(s).await {
+                    tracing::error!(error = %e, "repo refresh scheduler failed");
+                }
+            }
+        });
+    background_task_monitors.push(repo_refresh_scheduler_monitor);
+
     let (tee_cleanup_handle, tee_cleanup_monitor) =
         spawn_monitored_background_task("tee_cleanup", {
             let base_path = state.cache_manager.base_path.clone();
@@ -1507,6 +1600,25 @@ async fn main() -> Result<()> {
         });
     background_task_monitors.push(heartbeat_monitor);
 
+    let (adaptive_tuning_handle, adaptive_tuning_monitor) =
+        spawn_monitored_background_task("adaptive_tuning", {
+            let s = state.clone();
+            let deployment =
+                crate::adaptive_tuning::deployment_label(&s.runtime_resource_attributes);
+            let instance_id =
+                crate::adaptive_tuning::instance_id(&s.runtime_resource_attributes, &s.node_id);
+            let controller = crate::adaptive_tuning::RuntimeController::new(
+                Arc::clone(&s.effective_policy),
+                Arc::clone(&s.metrics.adaptive_observations),
+                deployment,
+                instance_id,
+            );
+            async move {
+                controller.run(s).await;
+            }
+        });
+    background_task_monitors.push(adaptive_tuning_monitor);
+
     let background_task_metrics_handle = tokio::spawn(run_background_task_metrics_sampler(
         state.metrics.clone(),
         background_task_monitors,
@@ -1517,10 +1629,12 @@ async fn main() -> Result<()> {
     // On shutdown, abort all remaining tasks so the process exits promptly.
     let abort_handles = [
         bundle_handle.abort_handle(),
+        repo_refresh_scheduler_handle.abort_handle(),
         tee_cleanup_handle.abort_handle(),
         metrics_refresh_handle.abort_handle(),
         config_reload_handle.abort_handle(),
         heartbeat_handle.abort_handle(),
+        adaptive_tuning_handle.abort_handle(),
         prewarm_handle.abort_handle(),
         telemetry_handle.abort_handle(),
         background_task_metrics_handle.abort_handle(),
@@ -1530,10 +1644,12 @@ async fn main() -> Result<()> {
         http_handle,
         ssh_handle,
         bundle_handle,
+        repo_refresh_scheduler_handle,
         tee_cleanup_handle,
         metrics_refresh_handle,
         config_reload_handle,
         heartbeat_handle,
+        adaptive_tuning_handle,
         telemetry_handle,
         background_task_metrics_handle
     );
@@ -1567,10 +1683,12 @@ async fn main() -> Result<()> {
                 &mut http_handle,
                 &mut ssh_handle,
                 &mut bundle_handle,
+                &mut repo_refresh_scheduler_handle,
                 &mut tee_cleanup_handle,
                 &mut metrics_refresh_handle,
                 &mut config_reload_handle,
                 &mut heartbeat_handle,
+                &mut adaptive_tuning_handle,
                 &mut telemetry_handle,
                 &mut background_task_metrics_handle
             );
@@ -1627,12 +1745,37 @@ async fn build_app_state(
     let rate_limit = forge::rate_limit::RateLimitState::with_metrics(metrics.clone());
     let clone_concurrency_limit = resolve_clone_concurrency_limit(&config);
     let bundle_execution_policy = config.bundles.execution_policy();
+    let fallback_policy = crate::adaptive_tuning::EffectivePolicy::from_config(
+        &config,
+        clone_concurrency_limit,
+        bundle_execution_policy,
+    )
+    .bounded(&config.adaptive_tuning.bounds);
+    let deployment = crate::adaptive_tuning::deployment_label(&runtime_resource_attributes);
+    let startup_instance_id =
+        crate::adaptive_tuning::instance_id(&runtime_resource_attributes, &node_id);
+    let effective_policy = if config.adaptive_tuning.enabled {
+        crate::adaptive_tuning::load_startup_recommendation(
+            &valkey,
+            &config,
+            &deployment,
+            &startup_instance_id,
+            fallback_policy,
+        )
+        .await
+    } else {
+        fallback_policy
+    };
     tracing::info!(
-        max_concurrent_generations = bundle_execution_policy.max_concurrent_generations,
-        pack_threads = bundle_execution_policy.pack_threads,
-        local_upload_pack_threads = config.clone.local_upload_pack_threads,
-        index_pack_threads = config.clone.index_pack_threads,
+        max_concurrent_generations = effective_policy.bundle_generation_concurrency,
+        pack_threads = effective_policy.bundle_pack_threads,
+        local_upload_pack_threads = effective_policy.local_upload_pack_threads,
+        index_pack_threads = effective_policy.index_pack_threads,
         "resolved git subprocess execution policy"
+    );
+    let effective_policy_state = EffectivePolicyState::new(
+        effective_policy,
+        config.clone.reserved_request_time_upstream_fetches,
     );
 
     let bundle_publisher_id = runtime_resource_attributes
@@ -1641,16 +1784,12 @@ async fn build_app_state(
         .or_else(|| runtime_resource_attributes.service_machine_id.clone())
         .unwrap_or_else(|| node_id.clone());
 
-    let low_priority_fetch_limit = config
-        .clone
-        .max_concurrent_upstream_fetches
-        .saturating_sub(config.clone.reserved_request_time_upstream_fetches);
-    let pack_cache = Arc::new(pack_cache::PackCache::new_with_index_pack_threads(
+    let pack_cache = Arc::new(pack_cache::PackCache::new_with_effective_policy(
         std::path::Path::new(&config.storage.local.path),
         config.pack_cache.clone(),
         config.storage.local.max_percent,
         metrics.clone(),
-        config.clone.index_pack_threads,
+        Arc::clone(&effective_policy_state),
     ));
     pack_cache.ensure_ready().await?;
 
@@ -1667,33 +1806,22 @@ async fn build_app_state(
         bundle_publisher_id,
         forge,
         rate_limit,
-        clone_semaphore: Arc::new(Semaphore::new(clone_concurrency_limit)),
-        fetch_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_upstream_fetches)),
-        low_priority_fetch_semaphore: Arc::new(Semaphore::new(low_priority_fetch_limit)),
-        low_priority_fetch_limit,
-        tee_capture_semaphore: Arc::new(Semaphore::new(config.clone.max_concurrent_tee_captures)),
-        bundle_generation_semaphore: Arc::new(Semaphore::new(
-            bundle_execution_policy.max_concurrent_generations,
-        )),
-        pack_cache_warming_semaphore: Arc::new(Semaphore::new(
-            config.pack_cache.max_concurrent_background_warmings,
-        )),
-        deep_validation_semaphore: Arc::new(Semaphore::new(
-            config.clone.max_concurrent_deep_validations,
-        )),
-        request_pack_delta_semaphore: Arc::new(Semaphore::new(
-            config.pack_cache.max_concurrent_request_deltas,
-        )),
-        bundle_max_concurrency: bundle_execution_policy.max_concurrent_generations,
-        bundle_pack_threads: bundle_execution_policy.pack_threads,
-        index_pack_threads: config.clone.index_pack_threads,
+        effective_policy: Arc::clone(&effective_policy_state),
+        clone_semaphore: Arc::clone(&effective_policy_state.clone_gate),
+        fetch_semaphore: Arc::clone(&effective_policy_state.fetch_gate),
+        low_priority_fetch_semaphore: Arc::clone(&effective_policy_state.low_priority_fetch_gate),
+        tee_capture_semaphore: Arc::clone(&effective_policy_state.tee_capture_gate),
+        bundle_generation_semaphore: Arc::clone(&effective_policy_state.bundle_generation_gate),
+        pack_cache_warming_semaphore: Arc::clone(
+            &effective_policy_state.pack_cache_background_warming_gate,
+        ),
+        deep_validation_semaphore: Arc::clone(&effective_policy_state.deep_validation_gate),
+        request_pack_delta_semaphore: Arc::clone(&effective_policy_state.request_pack_delta_gate),
         repo_clone_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_publish_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_catch_up_mutexes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         repo_tee_capture_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        local_upload_pack_semaphore: Arc::new(Semaphore::new(
-            config.clone.max_concurrent_local_upload_packs,
-        )),
+        local_upload_pack_semaphore: Arc::clone(&effective_policy_state.local_upload_pack_gate),
         repo_upload_pack_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         pack_cache,
         published_generation_leases: Arc::new(std::sync::Mutex::new(
@@ -1720,6 +1848,10 @@ async fn build_app_state(
             notes: Vec::new(),
         })),
     };
+    crate::metrics::record_adaptive_effective_policy(
+        &state.metrics,
+        state.effective_policy.snapshot(),
+    );
     state.refresh_live_metrics();
     Ok(state)
 }
@@ -1752,7 +1884,7 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
         .iter()
         .map(|repo| crate::repo_identity::canonicalize_owner_repo(repo))
         .collect::<Vec<_>>();
-    let max_concurrent = config.prewarm.max_concurrent;
+    let max_concurrent = state.effective_policy.snapshot().prewarm_concurrency;
     tracing::info!(
         repo_count = repos.len(),
         max_concurrent,
@@ -1765,12 +1897,29 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
         return Ok(());
     }
 
+    let prewarm_work_slots = repos.len().max(1);
     let force_open_secs = config.prewarm.force_open_secs;
     let prewarm_results = tokio::time::timeout(
         Duration::from_secs(force_open_secs),
         futures::stream::iter(repos.into_iter().map(|owner_repo| {
             let state = state.clone();
             async move {
+                let _prewarm_permit = match state
+                    .effective_policy
+                    .prewarm_gate
+                    .clone()
+                    .acquire_owned()
+                    .await
+                {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        let report = crate::coordination::registry::PrewarmRepoReport {
+                            initialized_locally: false,
+                            issues: vec!["prewarm semaphore closed".to_string()],
+                        };
+                        return (owner_repo, Duration::ZERO, report);
+                    }
+                };
                 let started_at = Instant::now();
                 let warmed = crate::coordination::registry::prewarm_repo(&state, &owner_repo).await;
                 if warmed.initialized_locally && state.pack_cache.enabled() {
@@ -1797,7 +1946,7 @@ async fn run_startup_prewarm(state: AppState) -> Result<()> {
                 (owner_repo, started_at.elapsed(), warmed)
             }
         }))
-        .buffer_unordered(max_concurrent)
+        .buffer_unordered(prewarm_work_slots)
         .collect::<Vec<_>>(),
     )
     .await;

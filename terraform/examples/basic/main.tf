@@ -82,6 +82,7 @@ module "forgeproxy" {
   background_work_retry_interval_secs            = var.background_work_retry_interval_secs
   background_work_max_defer_retries              = var.background_work_max_defer_retries
   background_work_max_defer_secs                 = var.background_work_max_defer_secs
+  adaptive_tuning                                = var.adaptive_tuning
   generation_coalescing_window_secs              = var.generation_coalescing_window_secs
   global_short_circuit_upstream_secs             = var.global_short_circuit_upstream_secs
   request_wait_for_local_catch_up_secs           = var.request_wait_for_local_catch_up_secs
@@ -96,29 +97,42 @@ module "forgeproxy" {
   repo_update_delta_workspace_max_physical_ratio = var.repo_update_delta_workspace_max_physical_ratio
   repo_update_overrides                          = var.repo_update_overrides
   delegated_repositories                         = var.delegated_repositories
-  max_concurrent_local_upload_packs              = var.max_concurrent_local_upload_packs
-  max_concurrent_local_upload_packs_per_repo     = var.max_concurrent_local_upload_packs_per_repo
-  local_upload_pack_threads                      = var.local_upload_pack_threads
-  index_pack_threads                             = var.index_pack_threads
-  pack_cache_enabled                             = var.pack_cache_enabled
-  pack_cache_max_percent                         = var.pack_cache_max_percent
-  pack_cache_high_water_mark                     = var.pack_cache_high_water_mark
-  pack_cache_low_water_mark                      = var.pack_cache_low_water_mark
-  pack_cache_eviction_policy                     = var.pack_cache_eviction_policy
-  pack_cache_wait_for_inflight_secs              = var.pack_cache_wait_for_inflight_secs
-  pack_cache_on_demand_composite_total_secs      = var.pack_cache_on_demand_composite_total_secs
-  pack_cache_request_delta_pack_secs             = var.pack_cache_request_delta_pack_secs
-  pack_cache_max_concurrent_request_deltas       = var.pack_cache_max_concurrent_request_deltas
-  pack_cache_max_concurrent_background_warmings  = var.pack_cache_max_concurrent_background_warmings
-  pack_cache_min_response_bytes                  = var.pack_cache_min_response_bytes
-  pack_cache_recent_entry_max_age_secs           = var.pack_cache_recent_entry_max_age_secs
-  pack_cache_max_recent_repos                    = var.pack_cache_max_recent_repos
-  prewarm_enabled                                = var.prewarm_enabled
-  prewarm_repos                                  = var.prewarm_repos
-  prewarm_max_concurrent                         = var.prewarm_max_concurrent
-  prewarm_force_open_secs                        = var.prewarm_force_open_secs
-  health_check_timeout_secs                      = var.health_check_timeout_secs
-  health_disk_min_available_percent              = var.health_disk_min_available_percent
+  max_concurrent_upstream_clones                 = var.max_concurrent_upstream_clones
+  max_concurrent_upstream_fetches                = var.max_concurrent_upstream_fetches
+  reserved_request_time_upstream_fetches         = var.reserved_request_time_upstream_fetches
+  max_concurrent_upstream_clones_per_repo_per_instance = (
+    var.max_concurrent_upstream_clones_per_repo_per_instance
+  )
+  max_concurrent_upstream_clones_per_repo_across_instances = (
+    var.max_concurrent_upstream_clones_per_repo_across_instances
+  )
+  max_concurrent_local_upload_packs          = var.max_concurrent_local_upload_packs
+  max_concurrent_local_upload_packs_per_repo = var.max_concurrent_local_upload_packs_per_repo
+  max_concurrent_tee_captures                = var.max_concurrent_tee_captures
+  max_concurrent_tee_captures_per_repo_per_instance = (
+    var.max_concurrent_tee_captures_per_repo_per_instance
+  )
+  local_upload_pack_threads                     = var.local_upload_pack_threads
+  index_pack_threads                            = var.index_pack_threads
+  pack_cache_enabled                            = var.pack_cache_enabled
+  pack_cache_max_percent                        = var.pack_cache_max_percent
+  pack_cache_high_water_mark                    = var.pack_cache_high_water_mark
+  pack_cache_low_water_mark                     = var.pack_cache_low_water_mark
+  pack_cache_eviction_policy                    = var.pack_cache_eviction_policy
+  pack_cache_wait_for_inflight_secs             = var.pack_cache_wait_for_inflight_secs
+  pack_cache_on_demand_composite_total_secs     = var.pack_cache_on_demand_composite_total_secs
+  pack_cache_request_delta_pack_secs            = var.pack_cache_request_delta_pack_secs
+  pack_cache_max_concurrent_request_deltas      = var.pack_cache_max_concurrent_request_deltas
+  pack_cache_max_concurrent_background_warmings = var.pack_cache_max_concurrent_background_warmings
+  pack_cache_min_response_bytes                 = var.pack_cache_min_response_bytes
+  pack_cache_recent_entry_max_age_secs          = var.pack_cache_recent_entry_max_age_secs
+  pack_cache_max_recent_repos                   = var.pack_cache_max_recent_repos
+  prewarm_enabled                               = var.prewarm_enabled
+  prewarm_repos                                 = var.prewarm_repos
+  prewarm_max_concurrent                        = var.prewarm_max_concurrent
+  prewarm_force_open_secs                       = var.prewarm_force_open_secs
+  health_check_timeout_secs                     = var.health_check_timeout_secs
+  health_disk_min_available_percent             = var.health_disk_min_available_percent
 
   s3_bundle_prefix     = var.s3_bundle_prefix
   s3_use_fips          = var.s3_use_fips

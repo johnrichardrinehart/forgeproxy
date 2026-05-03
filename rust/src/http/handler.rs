@@ -1891,15 +1891,17 @@ async fn serve_local_upload_pack(
             repo = %owner_repo,
             "short-circuiting to upstream before published generation lease was acquired"
         );
-        crate::metrics::inc_upstream_fallback(
+        crate::metrics::inc_upstream_fallback_for_repo(
             &state.metrics,
             Protocol::Https,
             "short_circuit_published_generation_lease",
+            &owner_repo,
         );
-        crate::metrics::inc_short_circuit_upstream(
+        crate::metrics::inc_short_circuit_upstream_for_repo(
             &state.metrics,
             Protocol::Https,
             "published_generation_lease",
+            &owner_repo,
         );
         return Ok(None);
     };
@@ -1932,15 +1934,17 @@ async fn serve_local_upload_pack(
                             repo = %owner_repo,
                             "short-circuiting to upstream before pack cache lookup completed"
                         );
-                        crate::metrics::inc_upstream_fallback(
+                        crate::metrics::inc_upstream_fallback_for_repo(
                             &state.metrics,
                             Protocol::Https,
                             "short_circuit_pack_cache_lookup",
+                            &owner_repo,
                         );
-                        crate::metrics::inc_short_circuit_upstream(
+                        crate::metrics::inc_short_circuit_upstream_for_repo(
                             &state.metrics,
                             Protocol::Https,
                             "pack_cache_lookup",
+                            &owner_repo,
                         );
                         return Ok(None);
                     }
@@ -2121,15 +2125,17 @@ async fn serve_local_upload_pack(
             repo = %owner_repo,
             "short-circuiting to upstream before local upload-pack permit was acquired"
         );
-        crate::metrics::inc_upstream_fallback(
+        crate::metrics::inc_upstream_fallback_for_repo(
             &state.metrics,
             Protocol::Https,
             "short_circuit_local_upload_pack_permit",
+            &owner_repo,
         );
-        crate::metrics::inc_short_circuit_upstream(
+        crate::metrics::inc_short_circuit_upstream_for_repo(
             &state.metrics,
             Protocol::Https,
             "local_upload_pack_permit",
+            &owner_repo,
         );
         if let Some(writer) = pack_cache_writer {
             writer.abort().await;
@@ -2325,7 +2331,7 @@ async fn serve_local_upload_pack(
     let Some(stream) = await_first_local_upload_pack_chunk(
         stream,
         budget.and_then(|budget| {
-            budget.stage_timeout_secs(state.config().clone.local_upload_pack_first_byte_secs)
+            budget.stage_timeout_secs(state.local_upload_pack_first_byte_secs(Some(&owner_repo)))
         }),
     )
     .await
@@ -2334,15 +2340,17 @@ async fn serve_local_upload_pack(
             repo = %owner_repo,
             "short-circuiting to upstream before local upload-pack produced a first byte"
         );
-        crate::metrics::inc_upstream_fallback(
+        crate::metrics::inc_upstream_fallback_for_repo(
             &state.metrics,
             Protocol::Https,
             "short_circuit_local_upload_pack_first_byte",
+            &owner_repo,
         );
-        crate::metrics::inc_short_circuit_upstream(
+        crate::metrics::inc_short_circuit_upstream_for_repo(
             &state.metrics,
             Protocol::Https,
             "local_upload_pack_first_byte",
+            &owner_repo,
         );
         return Ok(None);
     };
@@ -2423,10 +2431,11 @@ async fn proxy_upload_pack_to_upstream(
                         upstream_proxy_reason = behavior.reason,
                         "upstream upload-pack proxy is saturated; asking nginx to fall back to upstream"
                     );
-                    crate::metrics::inc_upstream_fallback(
+                    crate::metrics::inc_upstream_fallback_for_repo(
                         &state.metrics,
                         Protocol::Https,
                         metric_reason,
+                        &owner_repo,
                     );
                     crate::metrics::record_clone_served(
                         &state.metrics,

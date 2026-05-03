@@ -642,15 +642,17 @@ async fn serve_local_upload_pack_once(
                     repo = %owner_repo,
                     "short-circuiting SSH fetch to upstream before published generation lease was acquired"
                 );
-                crate::metrics::inc_upstream_fallback(
+                crate::metrics::inc_upstream_fallback_for_repo(
                     &state.metrics,
                     Protocol::Ssh,
                     "short_circuit_published_generation_lease",
+                    owner_repo,
                 );
-                crate::metrics::inc_short_circuit_upstream(
+                crate::metrics::inc_short_circuit_upstream_for_repo(
                     &state.metrics,
                     Protocol::Ssh,
                     "published_generation_lease",
+                    owner_repo,
                 );
                 return false;
             }
@@ -694,15 +696,17 @@ async fn serve_local_upload_pack_once(
                             repo = %owner_repo,
                             "short-circuiting SSH fetch to upstream before pack cache lookup completed"
                         );
-                        crate::metrics::inc_upstream_fallback(
+                        crate::metrics::inc_upstream_fallback_for_repo(
                             &state.metrics,
                             Protocol::Ssh,
                             "short_circuit_pack_cache_lookup",
+                            owner_repo,
                         );
-                        crate::metrics::inc_short_circuit_upstream(
+                        crate::metrics::inc_short_circuit_upstream_for_repo(
                             &state.metrics,
                             Protocol::Ssh,
                             "pack_cache_lookup",
+                            owner_repo,
                         );
                         return false;
                     }
@@ -907,15 +911,17 @@ async fn serve_local_upload_pack_once(
                 repo = %owner_repo,
                 "short-circuiting SSH fetch to upstream before local upload-pack permit was acquired"
             );
-            crate::metrics::inc_upstream_fallback(
+            crate::metrics::inc_upstream_fallback_for_repo(
                 &state.metrics,
                 Protocol::Ssh,
                 "short_circuit_local_upload_pack_permit",
+                owner_repo,
             );
-            crate::metrics::inc_short_circuit_upstream(
+            crate::metrics::inc_short_circuit_upstream_for_repo(
                 &state.metrics,
                 Protocol::Ssh,
                 "local_upload_pack_permit",
+                owner_repo,
             );
             if let Some(writer) = pack_cache_writer.take() {
                 writer.abort().await;
@@ -2792,10 +2798,11 @@ async fn proxy_upstream_upload_pack(
                     reason = reason.as_metric_reason(),
                     "upstream SSH upload-pack proxy is saturated; falling back to direct upstream stream without local hydration"
                 );
-                crate::metrics::inc_upstream_fallback(
+                crate::metrics::inc_upstream_fallback_for_repo(
                     &state.metrics,
                     Protocol::Ssh,
                     reason.as_metric_reason(),
+                    &owner_repo,
                 );
                 None
             }

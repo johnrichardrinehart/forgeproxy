@@ -45,7 +45,7 @@ pub struct PackCache {
     root: PathBuf,
     config: PackCacheConfig,
     local_cache_max_percent: f64,
-    index_pack_threads: usize,
+    index_pack_threads: IndexPackThreadSource,
     inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     artifact_lifecycle: Arc<std::sync::Mutex<()>>,
     active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
@@ -53,6 +53,21 @@ pub struct PackCache {
     packstore_midx_refresh_gate: Arc<Semaphore>,
     packstore_midx_refresh_requested: Arc<AtomicBool>,
     metrics: MetricsRegistry,
+}
+
+#[derive(Clone)]
+enum IndexPackThreadSource {
+    Static(usize),
+    Adaptive(Arc<crate::adaptive_tuning::EffectivePolicyState>),
+}
+
+impl IndexPackThreadSource {
+    fn get(&self) -> usize {
+        match self {
+            Self::Static(value) => *value,
+            Self::Adaptive(policy) => policy.snapshot().index_pack_threads,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,7 +280,7 @@ pub struct PackCacheWriter {
     root: PathBuf,
     config: PackCacheConfig,
     local_cache_max_percent: f64,
-    index_pack_threads: usize,
+    index_pack_threads: IndexPackThreadSource,
     tmp_pack_path: PathBuf,
     pack_writer: BufWriter<File>,
     pack_extractor: RawPackExtractor,
@@ -378,7 +393,7 @@ impl PackCache {
                 .join(PACK_CACHE_DIR),
             config,
             local_cache_max_percent,
-            index_pack_threads,
+            index_pack_threads: IndexPackThreadSource::Static(index_pack_threads),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             artifact_lifecycle: Arc::new(std::sync::Mutex::new(())),
             active_readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -387,6 +402,24 @@ impl PackCache {
             packstore_midx_refresh_requested: Arc::new(AtomicBool::new(false)),
             metrics,
         }
+    }
+
+    pub fn new_with_effective_policy(
+        base_path: &Path,
+        config: PackCacheConfig,
+        local_cache_max_percent: f64,
+        metrics: MetricsRegistry,
+        effective_policy: Arc<crate::adaptive_tuning::EffectivePolicyState>,
+    ) -> Self {
+        let mut cache = Self::new_with_index_pack_threads(
+            base_path,
+            config,
+            local_cache_max_percent,
+            metrics,
+            effective_policy.snapshot().index_pack_threads,
+        );
+        cache.index_pack_threads = IndexPackThreadSource::Adaptive(effective_policy);
+        cache
     }
 
     pub async fn ensure_ready(&self) -> Result<()> {
@@ -928,7 +961,7 @@ impl PackCache {
             root: self.root.clone(),
             config: self.config.clone(),
             local_cache_max_percent: self.local_cache_max_percent,
-            index_pack_threads: self.index_pack_threads,
+            index_pack_threads: self.index_pack_threads.clone(),
             tmp_pack_path,
             pack_writer: BufWriter::with_capacity(1024 * 1024, file),
             pack_extractor: RawPackExtractor::default(),
@@ -1372,8 +1405,12 @@ impl PackCacheWriter {
     ) -> Result<()> {
         let pack_path = self.pack_path_for_id(pack_id);
         let idx_path = self.pack_index_path_for_id(pack_id);
-        crate::git::commands::git_index_pack_to_idx(&pack_path, &idx_path, self.index_pack_threads)
-            .await?;
+        crate::git::commands::git_index_pack_to_idx(
+            &pack_path,
+            &idx_path,
+            self.index_pack_threads.get(),
+        )
+        .await?;
         self.request_packstore_midx_refresh().await?;
         crate::metrics::observe_pack_cache_artifact_generation(
             &self.metrics,

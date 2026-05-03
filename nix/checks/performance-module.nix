@@ -6,9 +6,10 @@
 
 let
   lib = inputs.nixpkgs.lib;
+  system = pkgs.stdenv.hostPlatform.system;
 
   performanceOnly = lib.nixosSystem {
-    system = pkgs.system;
+    inherit system;
     modules = [
       self.nixosModules.performance
       {
@@ -24,7 +25,7 @@ let
   };
 
   bbrPerformance = lib.nixosSystem {
-    system = pkgs.system;
+    inherit system;
     modules = [
       self.nixosModules.performance
       {
@@ -34,7 +35,7 @@ let
   };
 
   proxyHostDefault = lib.nixosSystem {
-    system = pkgs.system;
+    inherit system;
     modules = [
       self.nixosModules.proxy-host
       (
@@ -48,7 +49,7 @@ let
   };
 
   proxyHostDisabled = lib.nixosSystem {
-    system = pkgs.system;
+    inherit system;
     modules = [
       self.nixosModules.proxy-host
       (

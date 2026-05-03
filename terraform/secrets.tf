@@ -30,6 +30,7 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     background_work_retry_interval_secs               = var.background_work_retry_interval_secs
     background_work_max_defer_retries                 = var.background_work_max_defer_retries
     background_work_max_defer_secs                    = var.background_work_max_defer_secs
+    adaptive_tuning                                   = var.adaptive_tuning
     upstream_hostname                                 = var.upstream_hostname
     upstream_api_url                                  = var.upstream_api_url
     upstream_git_url_base                             = coalesce(var.upstream_git_url_base, "https://${var.upstream_hostname}")
@@ -59,6 +60,16 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     request_time_s3_restore_secs                      = var.request_time_s3_restore_secs
     generation_publish_secs                           = var.generation_publish_secs
     local_upload_pack_first_byte_secs                 = var.local_upload_pack_first_byte_secs
+    fetch_schedule_enabled                            = var.fetch_schedule_enabled
+    fetch_schedule_evaluation_interval_secs           = var.fetch_schedule_evaluation_interval_secs
+    fetch_schedule_min_interval_secs                  = var.fetch_schedule_min_interval_secs
+    fetch_schedule_max_interval_secs                  = var.fetch_schedule_max_interval_secs
+    fetch_schedule_candidate_limit_per_tick           = var.fetch_schedule_candidate_limit_per_tick
+    fetch_schedule_max_refreshes_per_tick             = var.fetch_schedule_max_refreshes_per_tick
+    fetch_schedule_request_probability_window_secs    = var.fetch_schedule_request_probability_window_secs
+    fetch_schedule_churn_window_secs                  = var.fetch_schedule_churn_window_secs
+    fetch_schedule_stale_after_secs                   = var.fetch_schedule_stale_after_secs
+    fetch_schedule_jitter_percent                     = var.fetch_schedule_jitter_percent
     repo_update_mode                                  = var.repo_update_mode
     repo_update_large_repo_size_bytes_threshold       = var.repo_update_large_repo_size_bytes_threshold
     repo_update_large_repo_ref_count_threshold        = var.repo_update_large_repo_ref_count_threshold
@@ -66,8 +77,18 @@ resource "aws_secretsmanager_secret_version" "forgeproxy_config" {
     repo_update_delta_workspace_max_physical_ratio    = var.repo_update_delta_workspace_max_physical_ratio
     repo_update_overrides                             = var.repo_update_overrides
     max_concurrent_upstream_clones                    = var.max_concurrent_upstream_clones
+    max_concurrent_upstream_fetches                   = var.max_concurrent_upstream_fetches
+    reserved_request_time_upstream_fetches            = var.reserved_request_time_upstream_fetches
+    max_concurrent_upstream_clones_per_repo_per_instance = (
+      var.max_concurrent_upstream_clones_per_repo_per_instance
+    )
+    max_concurrent_upstream_clones_per_repo_across_instances = (
+      var.max_concurrent_upstream_clones_per_repo_across_instances
+    )
     max_concurrent_local_upload_packs                 = var.max_concurrent_local_upload_packs
     max_concurrent_local_upload_packs_per_repo        = var.max_concurrent_local_upload_packs_per_repo
+    max_concurrent_tee_captures                       = var.max_concurrent_tee_captures
+    max_concurrent_tee_captures_per_repo_per_instance = var.max_concurrent_tee_captures_per_repo_per_instance
     max_concurrent_deep_validations                   = var.max_concurrent_deep_validations
     local_upload_pack_threads                         = var.local_upload_pack_threads
     index_pack_threads                                = var.index_pack_threads
