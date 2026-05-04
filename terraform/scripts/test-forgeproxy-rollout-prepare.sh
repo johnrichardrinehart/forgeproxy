@@ -35,6 +35,7 @@ asg_name=""
 listener_arn=""
 target_group_arn=""
 desired_capacity=""
+waiter_name=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -62,6 +63,9 @@ while [[ "$#" -gt 0 ]]; do
       shift 2
       ;;
     *)
+      if [[ "${service}" == "ec2" && "${command}" == "wait" && -z "${waiter_name}" ]]; then
+        waiter_name="$1"
+      fi
       shift
       ;;
   esac
@@ -316,6 +320,10 @@ case "${scenario}:${service}:${command}:${query}" in
   cache_seeded:ec2:describe-snapshots:Snapshots\[\].SnapshotId)
     printf '%s\t%s\n' "snap-blue-1" "snap-blue-2"
     ;;
+  cache_seeded:ec2:describe-snapshots:Snapshots\[\].\[SnapshotId,\ State,\ Progress\])
+    printf '%s\t%s\t%s\n' "snap-blue-1" "completed" "100%"
+    printf '%s\t%s\t%s\n' "snap-blue-2" "completed" "100%"
+    ;;
   cache_seeded:ec2:describe-snapshots:Snapshots\[\].\[SnapshotId,\ Tags\[\?Key==\`SourceCacheSlot\`\].Value\ \|\ \[0\]\])
     printf '%s\t%s\n' "snap-blue-1" "dynamic"
     printf '%s\t%s\n' "snap-blue-2" "dynamic"
@@ -340,6 +348,10 @@ case "${scenario}:${service}:${command}:${query}" in
     printf '%s\n' "vol-green-created"
     ;;
   cache_seeded:ec2:wait:*)
+    if [[ "${waiter_name}" == "snapshot-completed" ]]; then
+      echo "unexpected built-in snapshot waiter" >&2
+      exit 1
+    fi
     printf '%s\n' ""
     ;;
   cache_seeded:ec2:create-tags:*)

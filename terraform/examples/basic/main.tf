@@ -40,6 +40,8 @@ module "forgeproxy" {
   forgeproxy_cache_periodic_snapshot_interval_secs     = var.forgeproxy_cache_periodic_snapshot_interval_secs
   forgeproxy_cache_periodic_snapshot_wait_timeout_secs = var.forgeproxy_cache_periodic_snapshot_wait_timeout_secs
   forgeproxy_cache_periodic_snapshot_poll_secs         = var.forgeproxy_cache_periodic_snapshot_poll_secs
+  forgeproxy_cache_seed_snapshot_wait_timeout_secs     = var.forgeproxy_cache_seed_snapshot_wait_timeout_secs
+  forgeproxy_cache_seed_snapshot_poll_secs             = var.forgeproxy_cache_seed_snapshot_poll_secs
   forgeproxy_cache_seed_snapshot_retention_count       = var.forgeproxy_cache_seed_snapshot_retention_count
   forgeproxy_ssh_host_key_secret_arn                   = var.forgeproxy_ssh_host_key_secret_arn
   forgeproxy_ssh_host_key_kms_key_arn                  = var.forgeproxy_ssh_host_key_kms_key_arn

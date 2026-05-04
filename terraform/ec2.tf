@@ -249,6 +249,8 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
     cache_volume_iops             = tostring(var.forgeproxy_cache_volume_iops)
     cache_volume_throughput_mbps  = tostring(var.forgeproxy_cache_volume_throughput_mbps)
     cache_seed_wait_for_snapshots = tostring(var.forgeproxy_cache_seed_wait_for_snapshots)
+    cache_seed_wait_timeout_secs  = tostring(var.forgeproxy_cache_seed_snapshot_wait_timeout_secs)
+    cache_seed_poll_secs          = tostring(var.forgeproxy_cache_seed_snapshot_poll_secs)
     cache_seed_retention_count    = tostring(var.forgeproxy_cache_seed_snapshot_retention_count)
   }
 
@@ -295,6 +297,12 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
       )
       CACHE_SEED_WAIT_FOR_SNAPSHOTS = tostring(
         var.forgeproxy_cache_seed_wait_for_snapshots
+      )
+      CACHE_SEED_SNAPSHOT_WAIT_TIMEOUT_SECS = tostring(
+        var.forgeproxy_cache_seed_snapshot_wait_timeout_secs
+      )
+      CACHE_SEED_SNAPSHOT_POLL_SECS = tostring(
+        var.forgeproxy_cache_seed_snapshot_poll_secs
       )
       BLUE_LAUNCH_TEMPLATE_VERSION = tostring(aws_launch_template.forgeproxy["blue"].latest_version)
       GREEN_LAUNCH_TEMPLATE_VERSION = tostring(
