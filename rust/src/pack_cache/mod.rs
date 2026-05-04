@@ -33,6 +33,18 @@ const PACK_CACHE_METADATA_VERSION: u32 = 4;
 const MAX_RECENT_ENTRIES_PER_REPO: usize = 16;
 const METADATA_HIT_UPDATE_INTERVAL_SECS: u64 = 60;
 const DEFAULT_FULL_TIP_WARMING_TEMPLATE: &[&str] = &["command=fetch", "done", "flush"];
+// Git protocol v2 fetch framing/options ignored when computing packfile cache
+// keys. These lines must be cache-neutral: adding one here lets warmed
+// artifacts be reused by clients that send it.
+const PACK_CACHE_NEUTRAL_FETCH_FRAMING_LINES: &[&str] = &[
+    "delimiter",
+    "thin-pack",
+    "ofs-delta",
+    "no-progress",
+    "include-tag",
+    "sideband-all",
+    "wait-for-done",
+];
 // Capacity for large pack-cache response streams. Production profiles justify
 // extra read-ahead while keeping bounded backpressure between producer and body.
 const PACK_CACHE_STREAM_CHANNEL_CAPACITY: usize = 256;
@@ -510,23 +522,12 @@ impl PackCache {
         request: NormalizedFreshCloneRequest,
         ref_tips: &BTreeMap<String, String>,
     ) -> std::result::Result<PackCacheKey, &'static str> {
-        if ref_tips.is_empty() {
-            return Err("no_refs");
-        }
-        let tip_oids = unique_tip_oids(ref_tips);
-        let ref_tips_digest = repo_ref_tips_digest(ref_tips);
-        let base = Some(PackCacheBaseMetadata {
-            full_tip: request.wants == tip_oids,
-            request_wants: request.wants.clone(),
-            request_template: request.non_want_lines.clone(),
-        });
-
-        Ok(pack_cache_key(
+        key_for_ref_tips_and_request_parts(
             owner_repo,
-            &ref_tips_digest,
-            &request.normalized,
-            base,
-        ))
+            ref_tips,
+            &request.non_want_lines,
+            &request.wants,
+        )
     }
 
     pub fn key_for_warming(
@@ -541,19 +542,7 @@ impl PackCache {
 
         let ref_tips = collect_repo_ref_tips(repo_path)?;
         let tip_oids = unique_tip_oids(&ref_tips);
-        let ref_tips_digest = repo_ref_tips_digest(&ref_tips);
-        let normalized_request = normalized_request_from_parts(request_template, &tip_oids);
-
-        Ok(pack_cache_key(
-            owner_repo,
-            &ref_tips_digest,
-            &normalized_request,
-            Some(PackCacheBaseMetadata {
-                request_wants: tip_oids,
-                request_template: request_template.to_vec(),
-                full_tip: true,
-            }),
-        ))
+        key_for_ref_tips_and_request_parts(owner_repo, &ref_tips, request_template, &tip_oids)
     }
 
     pub fn key_for_default_full_tip_warming(
@@ -1606,6 +1595,38 @@ impl Drop for PackCacheWriter {
     }
 }
 
+fn key_for_ref_tips_and_request_parts(
+    owner_repo: &str,
+    ref_tips: &BTreeMap<String, String>,
+    request_template: &[String],
+    request_wants: &[String],
+) -> std::result::Result<PackCacheKey, &'static str> {
+    if ref_tips.is_empty() {
+        return Err("no_refs");
+    }
+
+    let tip_oids = unique_tip_oids(ref_tips);
+    let request_wants = normalize_oid_list(request_wants.to_vec());
+    if request_wants.is_empty() {
+        return Err("no_wants");
+    }
+
+    let request_template = canonical_request_template(request_template);
+    let ref_tips_digest = repo_ref_tips_digest(ref_tips);
+    let normalized_request = normalized_request_from_parts(&request_template, &request_wants);
+
+    Ok(pack_cache_key(
+        owner_repo,
+        &ref_tips_digest,
+        &normalized_request,
+        Some(PackCacheBaseMetadata {
+            request_wants: request_wants.clone(),
+            request_template,
+            full_tip: request_wants == tip_oids,
+        }),
+    ))
+}
+
 fn pack_cache_key(
     owner_repo: &str,
     ref_tips_digest: &str,
@@ -1626,6 +1647,14 @@ fn pack_cache_key(
         owner_repo,
         base,
     }
+}
+
+fn canonical_request_template(request_template: &[String]) -> Vec<String> {
+    request_template
+        .iter()
+        .filter(|line| !line_is_cache_neutral_fetch_framing(line))
+        .cloned()
+        .collect()
 }
 
 fn insert_recent_entry(
@@ -1745,13 +1774,22 @@ fn unique_tip_oids(tips: &BTreeMap<String, String>) -> Vec<String> {
     oids
 }
 
+fn line_is_cache_neutral_fetch_framing(line: &str) -> bool {
+    // Keep this as an allowlist. Unknown fetch options stay in the key until
+    // we prove they do not affect pack contents or response framing.
+    PACK_CACHE_NEUTRAL_FETCH_FRAMING_LINES.contains(&line)
+}
+
 #[cfg(test)]
 fn normalize_fresh_clone_request(bytes: &[u8]) -> std::result::Result<String, &'static str> {
-    Ok(normalize_fresh_clone_request_parts(bytes)?.normalized)
+    let request = normalize_fresh_clone_request_parts(bytes)?;
+    Ok(normalized_request_from_parts(
+        &request.non_want_lines,
+        &request.wants,
+    ))
 }
 
 struct NormalizedFreshCloneRequest {
-    normalized: String,
     non_want_lines: Vec<String>,
     wants: Vec<String>,
 }
@@ -1773,7 +1811,6 @@ fn normalize_fresh_clone_request_parts(
             continue;
         }
         if len == 1 {
-            normalized.push("delimiter".to_string());
             offset += 4;
             continue;
         }
@@ -1798,6 +1835,9 @@ fn normalize_fresh_clone_request_parts(
             has_done = true;
         }
         if line.starts_with("agent=") || line.starts_with("session-id=") {
+            continue;
+        }
+        if line_is_cache_neutral_fetch_framing(line) {
             continue;
         }
         if line.starts_with("have ") {
@@ -1840,10 +1880,8 @@ fn normalize_fresh_clone_request_parts(
     wants.sort();
     wants.dedup();
     let non_want_lines = normalized;
-    let normalized = normalized_request_from_parts(&non_want_lines, &wants);
 
     Ok(NormalizedFreshCloneRequest {
-        normalized,
         non_want_lines,
         wants,
     })
@@ -2630,10 +2668,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_clone_request_parts_keep_template_and_dedupe_wants() {
+    fn fresh_clone_request_parts_keep_canonical_template_and_dedupe_wants() {
         let mut request = Vec::new();
         request.extend_from_slice(&pkt(b"command=fetch\n"));
         request.extend_from_slice(&pkt(b"thin-pack\n"));
+        request.extend_from_slice(&pkt(b"ofs-delta\n"));
+        request.extend_from_slice(&pkt(b"no-progress\n"));
         request.extend_from_slice(b"0001");
         request.extend_from_slice(&pkt(b"want bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"));
         request.extend_from_slice(&pkt(b"want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"));
@@ -2645,7 +2685,7 @@ mod tests {
 
         assert_eq!(
             parsed.non_want_lines,
-            vec!["command=fetch", "thin-pack", "delimiter", "done", "flush"]
+            vec!["command=fetch", "done", "flush"]
         );
         assert_eq!(
             parsed.wants,
@@ -2693,6 +2733,64 @@ mod tests {
         assert_eq!(
             advertised_key.base_request_wants().unwrap(),
             &["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()]
+        );
+    }
+
+    #[test]
+    fn full_tip_warming_key_matches_client_request_with_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        let refs_heads = temp.path().join("refs").join("heads");
+        std::fs::create_dir_all(&refs_heads).unwrap();
+        std::fs::write(
+            refs_heads.join("main"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        )
+        .unwrap();
+        std::fs::write(
+            refs_heads.join("release"),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        let mut request = Vec::new();
+        request.extend_from_slice(&pkt(b"command=fetch\n"));
+        request.extend_from_slice(&pkt(b"agent=git/2.51.0\n"));
+        request.extend_from_slice(b"0001");
+        request.extend_from_slice(&pkt(b"thin-pack\n"));
+        request.extend_from_slice(&pkt(b"ofs-delta\n"));
+        request.extend_from_slice(&pkt(b"no-progress\n"));
+        request.extend_from_slice(&pkt(b"include-tag\n"));
+        request.extend_from_slice(&pkt(b"want bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"));
+        request.extend_from_slice(&pkt(b"want aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"));
+        request.extend_from_slice(&pkt(b"done\n"));
+        request.extend_from_slice(b"0000");
+
+        let warming_key = cache
+            .key_for_default_full_tip_warming("owner/repo", temp.path())
+            .unwrap();
+        let client_key = cache
+            .key_for_fresh_clone("owner/repo", temp.path(), &request, Some("version=2"))
+            .unwrap();
+
+        assert_eq!(warming_key.as_str(), client_key.as_str());
+        assert_eq!(
+            client_key
+                .base
+                .as_ref()
+                .expect("fresh clone key should carry base metadata")
+                .request_template,
+            vec!["command=fetch", "done", "flush"]
         );
     }
 

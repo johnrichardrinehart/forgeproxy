@@ -497,14 +497,28 @@ pkgs.testers.runNixOSTest {
         wait_for_count_growth("entries", counts_before["entries"])
         assert_no_pack_corruption_logs()
 
-    with subtest("Low-overlap unrelated history falls back to a new full pack"):
+    with subtest("Low-overlap newly unrelated history falls back to a new full pack"):
         counts_before = pack_cache_counts()
-        client.succeed(
-            "rm -rf /tmp/pack-cache-unrelated /tmp/pack-cache-unrelated-hit && "
-            "git clone --single-branch --branch unrelated https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-unrelated && "
-            "git clone --single-branch --branch unrelated https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-unrelated-hit"
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "git clone http://octocat:secret123@localhost:3000/octocat/pack-cache.git $tmp && "
+            "cd $tmp && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "git checkout --orphan late-unrelated && "
+            "git rm -rf . && "
+            "echo 'Pack cache late unrelated branch' > late-unrelated.txt && "
+            "git add late-unrelated.txt && "
+            "git commit -m 'Late unrelated branch commit' && "
+            "git push origin late-unrelated"
         )
-        client.succeed("grep -Fx 'Pack cache unrelated branch' /tmp/pack-cache-unrelated-hit/unrelated.txt")
+        client.succeed(
+            "rm -rf /tmp/pack-cache-late-unrelated /tmp/pack-cache-late-unrelated-hit && "
+            "git clone --single-branch --branch late-unrelated https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-late-unrelated && "
+            "git clone --single-branch --branch late-unrelated https://octocat:secret123@proxy/octocat/pack-cache.git /tmp/pack-cache-late-unrelated-hit"
+        )
+        client.succeed("grep -Fx 'Pack cache late unrelated branch' /tmp/pack-cache-late-unrelated-hit/late-unrelated.txt")
         wait_for_count_growth("entries", counts_before["entries"])
         wait_for_count_same("delta", counts_before["delta"])
         wait_for_count_growth("base", counts_before["base"])
