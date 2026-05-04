@@ -26,6 +26,8 @@ cache_volume_type="${CACHE_VOLUME_TYPE:-gp3}"
 cache_volume_iops="${CACHE_VOLUME_IOPS:-3000}"
 cache_volume_throughput_mbps="${CACHE_VOLUME_THROUGHPUT_MBPS:-125}"
 cache_seed_wait_for_snapshots="${CACHE_SEED_WAIT_FOR_SNAPSHOTS:-true}"
+cache_seed_snapshot_wait_timeout_secs="${CACHE_SEED_SNAPSHOT_WAIT_TIMEOUT_SECS:-5400}"
+cache_seed_snapshot_poll_secs="${CACHE_SEED_SNAPSHOT_POLL_SECS:-60}"
 cache_seed_snapshot_retention_count="${CACHE_SEED_SNAPSHOT_RETENTION_COUNT:-1}"
 
 case "${active_slot}" in
@@ -44,6 +46,16 @@ case "${active_slot}" in
 esac
 
 aws_args=(--region "${aws_region}")
+
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  if ! [[ "${value}" =~ ^[0-9]+$ ]] || (( value < 1 )); then
+    echo "Invalid ${name}=${value}; expected a positive integer" >&2
+    return 1
+  fi
+}
 
 asg_for_slot() {
   local slot="$1"
@@ -371,6 +383,68 @@ current_seed_snapshot_ids_any_status() {
     | tr '\t' '\n'
 }
 
+wait_for_seed_snapshots_completed() {
+  local snapshot_ids=("$@")
+  local deadline snapshot_rows pending failed snapshot_id state progress remaining sleep_secs
+
+  if [[ "${#snapshot_ids[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  require_positive_integer "CACHE_SEED_SNAPSHOT_WAIT_TIMEOUT_SECS" "${cache_seed_snapshot_wait_timeout_secs}"
+  require_positive_integer "CACHE_SEED_SNAPSHOT_POLL_SECS" "${cache_seed_snapshot_poll_secs}"
+
+  deadline=$((SECONDS + cache_seed_snapshot_wait_timeout_secs))
+  while true; do
+    snapshot_rows="$(aws "${aws_args[@]}" ec2 describe-snapshots \
+      --snapshot-ids "${snapshot_ids[@]}" \
+      --query 'Snapshots[].[SnapshotId, State, Progress]' \
+      --output text)"
+
+    if [[ -z "${snapshot_rows}" || "${snapshot_rows}" == "None" ]]; then
+      echo "Unable to find cache seed snapshots: ${snapshot_ids[*]}" >&2
+      return 1
+    fi
+
+    pending=()
+    failed=()
+    while read -r snapshot_id state progress; do
+      [[ -n "${snapshot_id}" ]] || continue
+      case "${state}" in
+        completed)
+          ;;
+        error)
+          failed+=("${snapshot_id}")
+          ;;
+        *)
+          pending+=("${snapshot_id}:${state}:${progress:-unknown}")
+          ;;
+      esac
+    done <<<"${snapshot_rows}"
+
+    if [[ "${#failed[@]}" -gt 0 ]]; then
+      echo "Cache seed snapshots failed: ${failed[*]}" >&2
+      return 1
+    fi
+    if [[ "${#pending[@]}" -eq 0 ]]; then
+      return 0
+    fi
+
+    remaining=$((deadline - SECONDS))
+    if (( remaining <= 0 )); then
+      echo "Timed out after ${cache_seed_snapshot_wait_timeout_secs}s waiting for cache seed snapshots: ${pending[*]}" >&2
+      return 1
+    fi
+
+    echo "Waiting for cache seed snapshots: ${pending[*]}"
+    sleep_secs="${cache_seed_snapshot_poll_secs}"
+    if (( sleep_secs > remaining )); then
+      sleep_secs="${remaining}"
+    fi
+    sleep "${sleep_secs}"
+  done
+}
+
 delete_old_target_seed_snapshots() {
   local rows snapshot_ids snapshot_id
 
@@ -538,7 +612,7 @@ prepare_cache_seed_volumes() {
     mapfile -t snapshot_ids < <(current_seed_snapshot_ids_any_status)
     if [[ "${#snapshot_ids[@]}" -gt 0 && "${cache_seed_wait_for_snapshots}" == "true" ]]; then
       echo "Waiting for ${#snapshot_ids[@]} cache seed snapshots to complete"
-      aws "${aws_args[@]}" ec2 wait snapshot-completed --snapshot-ids "${snapshot_ids[@]}"
+      wait_for_seed_snapshots_completed "${snapshot_ids[@]}"
     fi
     mapfile -t snapshot_ids < <(current_seed_snapshot_ids)
     snapshot_count="${#snapshot_ids[@]}"

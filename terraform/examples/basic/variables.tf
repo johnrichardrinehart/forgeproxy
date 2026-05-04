@@ -216,6 +216,18 @@ variable "forgeproxy_cache_periodic_snapshot_poll_secs" {
   description = "Polling interval in seconds while waiting for periodic EBS cache snapshots to complete."
 }
 
+variable "forgeproxy_cache_seed_snapshot_wait_timeout_secs" {
+  type        = number
+  default     = 5400
+  description = "Maximum seconds rollout preparation waits for cache seed snapshots to complete before failing the rollout."
+}
+
+variable "forgeproxy_cache_seed_snapshot_poll_secs" {
+  type        = number
+  default     = 60
+  description = "Polling interval in seconds while rollout preparation waits for cache seed snapshots to complete."
+}
+
 variable "forgeproxy_cache_seed_snapshot_retention_count" {
   type        = number
   default     = 1

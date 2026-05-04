@@ -348,6 +348,28 @@ variable "forgeproxy_cache_seed_wait_for_snapshots" {
   description = "When true, rollout preparation waits for active-slot cache snapshots to complete before creating standby-slot cache volumes from them."
 }
 
+variable "forgeproxy_cache_seed_snapshot_wait_timeout_secs" {
+  type        = number
+  default     = 5400
+  description = "Maximum seconds rollout preparation waits for cache seed snapshots to complete before failing the rollout."
+
+  validation {
+    condition     = var.forgeproxy_cache_seed_snapshot_wait_timeout_secs > 0
+    error_message = "forgeproxy_cache_seed_snapshot_wait_timeout_secs must be greater than 0."
+  }
+}
+
+variable "forgeproxy_cache_seed_snapshot_poll_secs" {
+  type        = number
+  default     = 60
+  description = "Polling interval in seconds while rollout preparation waits for cache seed snapshots to complete."
+
+  validation {
+    condition     = var.forgeproxy_cache_seed_snapshot_poll_secs > 0
+    error_message = "forgeproxy_cache_seed_snapshot_poll_secs must be greater than 0."
+  }
+}
+
 variable "forgeproxy_cache_periodic_snapshot_enabled" {
   type        = bool
   default     = false
