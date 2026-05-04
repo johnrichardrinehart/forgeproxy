@@ -81,6 +81,24 @@ The module now exposes these performance controls directly:
   `/var/cache/forgeproxy` onto a retained dedicated EBS volume. During
   blue/green rollout, the standby slot is seeded from live snapshots of the
   currently active slot's cache volumes when available.
+- `forgeproxy_cache_periodic_snapshot_enabled` (default `false`) lets live
+  forgeproxy instances maintain cache seed snapshots for the opposite
+  blue/green slot outside the deploy critical path. Pair it with
+  `forgeproxy_cache_periodic_snapshot_interval_secs` (default `86400`) to keep
+  the EBS snapshot lineage warm; rollout preparation still creates a fresh
+  point-in-time snapshot of the live cache volume, but that snapshot should be
+  incremental instead of starting from the full written dataset. Completed cache
+  seed snapshots are pruned by
+  `forgeproxy_cache_seed_snapshot_retention_count` (default `1`) per target
+  deployment slot and source EBS volume, so normal operation keeps the newest
+  usable seed for each live cache volume that must seed the next rollout. If a
+  periodic snapshot is still pending after
+  `forgeproxy_cache_periodic_snapshot_wait_timeout_secs`, the service leaves the
+  EBS snapshot running and emits a `forgeproxy-cache-snapshot-event
+  event=snapshot_pending_after_wait_timeout` log line for journald/OTLP export.
+  Keep the wait timeout less than or equal to the periodic interval; Terraform
+  enforces this when periodic snapshots are enabled, and the on-instance service
+  logs a `config_warning` event if older user-data violates it.
 - `forgeproxy_cache_volume_gb` (default `1024`), plus gp3
   `forgeproxy_cache_volume_iops` and
   `forgeproxy_cache_volume_throughput_mbps`, size and tune those dedicated

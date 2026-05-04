@@ -282,6 +282,447 @@ let
     ${pkgs.coreutils}/bin/chmod 2775 "$mount_dir" || true
     log "cache volume $volume_id is ready at $mount_dir"
   '';
+
+  cacheVolumeSnapshot = pkgs.writeShellScript "forgeproxy-cache-volume-snapshot" ''
+    set -euo pipefail
+
+    log() {
+      echo "forgeproxy-cache-snapshot: $*" >&2
+    }
+
+    log_event() {
+      local event="$1"
+      shift
+
+      echo "forgeproxy-cache-snapshot-event event=$event $*" >&2
+    }
+
+    validate_nonnegative_integer() {
+      local name="$1"
+      local value="$2"
+
+      case "$value" in
+        ""|None|*[!0-9]*)
+          log "FATAL: $name must be a non-negative integer, got $value"
+          exit 1
+          ;;
+      esac
+    }
+
+    validate_positive_integer() {
+      local name="$1"
+      local value="$2"
+
+      validate_nonnegative_integer "$name" "$value"
+      if [ "$value" -lt 1 ]; then
+        log "FATAL: $name must be a positive integer, got $value"
+        exit 1
+      fi
+    }
+
+    metadata() {
+      ${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" "http://169.254.169.254/latest/$1"
+    }
+
+    user_data_value() {
+      printf '%s\n' "$USER_DATA" \
+        | ${pkgs.gnused}/bin/sed -n "s/^# $1=//p" \
+        | ${pkgs.coreutils}/bin/head -n1
+    }
+
+    IMDS_TOKEN=$(${pkgs.curl}/bin/curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+    USER_DATA=$(metadata "user-data" || true)
+
+    enabled=$(user_data_value FORGEPROXY_CACHE_EBS_ENABLED)
+    snapshot_enabled=$(user_data_value FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_ENABLED)
+    if [ "$enabled" != "true" ] || [ "$snapshot_enabled" != "true" ]; then
+      log "periodic cache snapshots disabled"
+      exit 0
+    fi
+
+    name_prefix=$(user_data_value SM_PREFIX)
+    slot=$(user_data_value FORGEPROXY_DEPLOYMENT_SLOT)
+    interval_secs=$(user_data_value FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_INTERVAL_SECS)
+    interval_secs=''${interval_secs:-86400}
+    wait_timeout_secs=$(user_data_value FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_WAIT_TIMEOUT_SECS)
+    wait_timeout_secs=''${wait_timeout_secs:-86400}
+    poll_secs=$(user_data_value FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_POLL_SECS)
+    poll_secs=''${poll_secs:-60}
+    retention_count=$(user_data_value FORGEPROXY_CACHE_SEED_SNAPSHOT_RETENTION_COUNT)
+    retention_count=''${retention_count:-1}
+
+    validate_positive_integer FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_INTERVAL_SECS "$interval_secs"
+    validate_nonnegative_integer FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_WAIT_TIMEOUT_SECS "$wait_timeout_secs"
+    validate_positive_integer FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_POLL_SECS "$poll_secs"
+    validate_positive_integer FORGEPROXY_CACHE_SEED_SNAPSHOT_RETENTION_COUNT "$retention_count"
+
+    if [ "$wait_timeout_secs" -gt "$interval_secs" ]; then
+      log "warning: FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_WAIT_TIMEOUT_SECS=$wait_timeout_secs exceeds FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_INTERVAL_SECS=$interval_secs"
+      log_event config_warning \
+        "warning=wait_timeout_exceeds_interval" \
+        "wait_timeout_secs=$wait_timeout_secs" \
+        "interval_secs=$interval_secs"
+    fi
+
+    if [ -z "$name_prefix" ] || [ -z "$slot" ]; then
+      log "FATAL: missing SM_PREFIX or FORGEPROXY_DEPLOYMENT_SLOT in EC2 user-data"
+      exit 1
+    fi
+
+    case "$slot" in
+      blue)
+        target_slot=green
+        ;;
+      green)
+        target_slot=blue
+        ;;
+      *)
+        log "FATAL: unknown deployment slot $slot"
+        exit 1
+        ;;
+    esac
+
+    identity=$(metadata "dynamic/instance-identity/document")
+    region=$(printf '%s\n' "$identity" | ${pkgs.jq}/bin/jq -r '.region')
+    instance_id=$(printf '%s\n' "$identity" | ${pkgs.jq}/bin/jq -r '.instanceId')
+    aws=(${pkgs.awscli2}/bin/aws --region "$region")
+
+    attached_cache_volume_row() {
+      "''${aws[@]}" ec2 describe-volumes \
+        --filters \
+          "Name=attachment.instance-id,Values=$instance_id" \
+          "Name=tag:Role,Values=forgeproxy-cache" \
+          "Name=tag:ForgeproxyNamePrefix,Values=$name_prefix" \
+          "Name=tag:DeploymentSlot,Values=$slot" \
+        --query 'Volumes[0].[VolumeId, Tags[?Key==`CacheSlot`].Value | [0]]' \
+        --output text
+    }
+
+    current_seed_snapshots_for_volume() {
+      local source_volume_id="$1"
+
+      "''${aws[@]}" ec2 describe-snapshots \
+        --owner-ids self \
+        --filters \
+          "Name=status,Values=completed" \
+          "Name=tag:Role,Values=forgeproxy-cache-seed" \
+          "Name=tag:ForgeproxyNamePrefix,Values=$name_prefix" \
+          "Name=tag:DeploymentSlot,Values=$target_slot" \
+          "Name=tag:SourceSlot,Values=$slot" \
+          "Name=tag:SourceVolumeId,Values=$source_volume_id" \
+          "Name=tag:CurrentSeed,Values=true" \
+        --query 'Snapshots[].[SnapshotId, Tags[?Key==`CreatedAtUnix`].Value | [0]]' \
+        --output text
+    }
+
+    pending_seed_snapshot_rows() {
+      local volume_id="$1"
+
+      "''${aws[@]}" ec2 describe-snapshots \
+        --owner-ids self \
+        --filters \
+          "Name=tag:Role,Values=forgeproxy-cache-seed" \
+          "Name=tag:ForgeproxyNamePrefix,Values=$name_prefix" \
+          "Name=tag:DeploymentSlot,Values=$target_slot" \
+          "Name=tag:SourceSlot,Values=$slot" \
+          "Name=tag:SourceVolumeId,Values=$volume_id" \
+          "Name=tag:PendingSeed,Values=true" \
+        --query 'Snapshots[].[SnapshotId, State, Tags[?Key==`SourceCacheSlot`].Value | [0]]' \
+        --output text
+    }
+
+    completed_seed_snapshot_rows() {
+      "''${aws[@]}" ec2 describe-snapshots \
+        --owner-ids self \
+        --filters \
+          "Name=status,Values=completed" \
+          "Name=tag:Role,Values=forgeproxy-cache-seed" \
+          "Name=tag:ForgeproxyNamePrefix,Values=$name_prefix" \
+          "Name=tag:DeploymentSlot,Values=$target_slot" \
+          "Name=tag:SourceSlot,Values=$slot" \
+        --query 'Snapshots[].[SnapshotId, Tags[?Key==`SourceVolumeId`].Value | [0], Tags[?Key==`SourceCacheSlot`].Value | [0], Tags[?Key==`CreatedAtUnix`].Value | [0]]' \
+        --output text
+    }
+
+    snapshot_state() {
+      local snapshot_id="$1"
+
+      "''${aws[@]}" ec2 describe-snapshots \
+        --snapshot-ids "$snapshot_id" \
+        --query 'Snapshots[0].State' \
+        --output text
+    }
+
+    snapshot_created_at_unix() {
+      local snapshot_id="$1"
+      local created_at
+
+      created_at=$("''${aws[@]}" ec2 describe-snapshots \
+        --snapshot-ids "$snapshot_id" \
+        --query 'Snapshots[0].Tags[?Key==`CreatedAtUnix`].Value | [0]' \
+        --output text)
+      case "$created_at" in
+        ""|None|*[!0-9]*)
+          created_at=0
+          ;;
+      esac
+
+      printf '%s\n' "$created_at"
+    }
+
+    mark_current_snapshots_inactive() {
+      local source_volume_id="$1"
+      local snapshot_ids
+
+      snapshot_ids=$("''${aws[@]}" ec2 describe-snapshots \
+        --owner-ids self \
+        --filters \
+          "Name=tag:Role,Values=forgeproxy-cache-seed" \
+          "Name=tag:ForgeproxyNamePrefix,Values=$name_prefix" \
+          "Name=tag:DeploymentSlot,Values=$target_slot" \
+          "Name=tag:SourceSlot,Values=$slot" \
+          "Name=tag:SourceVolumeId,Values=$source_volume_id" \
+          "Name=tag:CurrentSeed,Values=true" \
+        --query 'Snapshots[].SnapshotId' \
+        --output text)
+
+      if [ -z "$snapshot_ids" ] || [ "$snapshot_ids" = "None" ]; then
+        return 0
+      fi
+
+      log "marking old $target_slot seed snapshots inactive: $snapshot_ids"
+      "''${aws[@]}" ec2 create-tags \
+        --resources $snapshot_ids \
+        --tags Key=CurrentSeed,Value=false >/dev/null
+    }
+
+    delete_old_seed_snapshots() {
+      local snapshot_ids snapshot_id
+
+      case "$retention_count" in
+        ""|None|*[!0-9]*)
+          log "FATAL: invalid FORGEPROXY_CACHE_SEED_SNAPSHOT_RETENTION_COUNT=$retention_count"
+          return 1
+          ;;
+      esac
+      if [ "$retention_count" -lt 1 ]; then
+        return 0
+      fi
+
+      snapshot_ids=$(completed_seed_snapshot_rows | ${pkgs.gawk}/bin/awk -v keep="$retention_count" '
+        NF >= 1 {
+          snapshot_id = $1
+          source_volume_id = $2
+          cache_slot = $3
+          created_at = $4
+          if (source_volume_id == "" || source_volume_id == "None") {
+            source_volume_id = ""
+          }
+          if (cache_slot == "" || cache_slot == "None") {
+            cache_slot = "dynamic"
+          }
+          if (created_at !~ /^[0-9]+$/) {
+            created_at = 0
+          }
+          group_key = source_volume_id
+          if (group_key == "") {
+            group_key = "cache:" cache_slot
+          }
+          print group_key, created_at, snapshot_id
+        }
+      ' | ${pkgs.coreutils}/bin/sort -k1,1 -k2,2nr | ${pkgs.gawk}/bin/awk -v keep="$retention_count" '
+        {
+          group_key = $1
+          seen[group_key] += 1
+          if (seen[group_key] > keep) {
+            print $3
+          }
+        }
+      ')
+
+      if [ -z "$snapshot_ids" ] || [ "$snapshot_ids" = "None" ]; then
+        return 0
+      fi
+
+      while read -r snapshot_id; do
+        [ -n "$snapshot_id" ] || continue
+        log "deleting old $target_slot cache seed snapshot $snapshot_id"
+        "''${aws[@]}" ec2 delete-snapshot --snapshot-id "$snapshot_id" >/dev/null
+      done <<<"$snapshot_ids"
+    }
+
+    promote_snapshot() {
+      local snapshot_id="$1"
+      local cache_slot="$2"
+      local source_volume_id="$3"
+      local completed_at_unix newest_created_at snapshot_created_at
+
+      snapshot_created_at=$(snapshot_created_at_unix "$snapshot_id")
+      newest_created_at=$(latest_current_seed_created_at "$source_volume_id")
+      if [ "$snapshot_created_at" -lt "$newest_created_at" ]; then
+        "''${aws[@]}" ec2 create-tags \
+          --resources "$snapshot_id" \
+          --tags \
+            Key=CurrentSeed,Value=false \
+            Key=PendingSeed,Value=false \
+            Key=StaleSeed,Value=true >/dev/null
+        log "skipped stale periodic cache seed snapshot $snapshot_id for $target_slot cache slot $cache_slot"
+        return 0
+      fi
+
+      completed_at_unix=$(${pkgs.coreutils}/bin/date -u +%s)
+      mark_current_snapshots_inactive "$source_volume_id"
+      "''${aws[@]}" ec2 create-tags \
+        --resources "$snapshot_id" \
+        --tags \
+          Key=CurrentSeed,Value=true \
+          Key=PendingSeed,Value=false \
+          Key=CompletedAtUnix,Value="$completed_at_unix" >/dev/null
+      delete_old_seed_snapshots
+      log "promoted completed cache seed snapshot $snapshot_id for $target_slot cache slot $cache_slot"
+    }
+
+    complete_pending_snapshot_if_ready() {
+      local row snapshot_id state cache_slot
+
+      while read -r row; do
+        [ -n "$row" ] || continue
+        snapshot_id=$(printf '%s\n' "$row" | ${pkgs.gawk}/bin/awk '{print $1}')
+        state=$(printf '%s\n' "$row" | ${pkgs.gawk}/bin/awk '{print $2}')
+        cache_slot=$(printf '%s\n' "$row" | ${pkgs.gawk}/bin/awk '{print $3}')
+        [ -n "$snapshot_id" ] && [ "$snapshot_id" != "None" ] || continue
+        case "$state" in
+          completed)
+            promote_snapshot "$snapshot_id" "$cache_slot" "$volume_id"
+            return 0
+            ;;
+          error)
+            log "periodic cache seed snapshot $snapshot_id failed"
+            log_event snapshot_error \
+              "snapshot_id=$snapshot_id" \
+              "state=$state" \
+              "volume_id=$volume_id" \
+              "source_slot=$slot" \
+              "target_slot=$target_slot" \
+              "cache_slot=$cache_slot"
+            "''${aws[@]}" ec2 create-tags \
+              --resources "$snapshot_id" \
+              --tags \
+                Key=CurrentSeed,Value=false \
+                Key=PendingSeed,Value=false \
+                Key=StaleSeed,Value=true >/dev/null
+            return 1
+            ;;
+          *)
+            log "periodic cache seed snapshot $snapshot_id is still $state"
+            return 0
+            ;;
+        esac
+      done < <(pending_seed_snapshot_rows "$volume_id")
+      return 1
+    }
+
+    latest_current_seed_created_at() {
+      local source_volume_id="$1"
+      local row snapshot_id created_at newest
+
+      newest=0
+      while read -r row; do
+        [ -n "$row" ] || continue
+        snapshot_id=$(printf '%s\n' "$row" | ${pkgs.gawk}/bin/awk '{print $1}')
+        created_at=$(printf '%s\n' "$row" | ${pkgs.gawk}/bin/awk '{print $2}')
+        [ -n "$snapshot_id" ] && [ "$snapshot_id" != "None" ] || continue
+        case "$created_at" in
+          ""|None|*[!0-9]*)
+            created_at=0
+            ;;
+        esac
+        if [ "$created_at" -gt "$newest" ]; then
+          newest="$created_at"
+        fi
+      done < <(current_seed_snapshots_for_volume "$source_volume_id")
+
+      printf '%s\n' "$newest"
+    }
+
+    wait_for_snapshot_completion() {
+      local snapshot_id="$1"
+      local cache_slot="$2"
+      local start now state
+
+      if [ "$wait_timeout_secs" -eq 0 ]; then
+        return 0
+      fi
+
+      start=$(${pkgs.coreutils}/bin/date -u +%s)
+      while true; do
+        state=$(snapshot_state "$snapshot_id")
+        case "$state" in
+          completed)
+            promote_snapshot "$snapshot_id" "$cache_slot" "$volume_id"
+            return 0
+            ;;
+          error)
+            log "periodic cache seed snapshot $snapshot_id failed"
+            log_event snapshot_error \
+              "snapshot_id=$snapshot_id" \
+              "state=$state" \
+              "volume_id=$volume_id" \
+              "source_slot=$slot" \
+              "target_slot=$target_slot" \
+              "cache_slot=$cache_slot"
+            return 1
+            ;;
+        esac
+
+        now=$(${pkgs.coreutils}/bin/date -u +%s)
+        if [ $(( now - start )) -ge "$wait_timeout_secs" ]; then
+          log "periodic cache seed snapshot $snapshot_id is still $state after ''${wait_timeout_secs}s; a later timer run will promote it"
+          log_event snapshot_pending_after_wait_timeout \
+            "snapshot_id=$snapshot_id" \
+            "state=$state" \
+            "wait_timeout_secs=$wait_timeout_secs" \
+            "poll_secs=$poll_secs" \
+            "volume_id=$volume_id" \
+            "source_slot=$slot" \
+            "target_slot=$target_slot" \
+            "cache_slot=$cache_slot"
+          return 0
+        fi
+        ${pkgs.coreutils}/bin/sleep "$poll_secs"
+      done
+    }
+
+    row=$(attached_cache_volume_row)
+    volume_id=$(printf '%s\n' "$row" | ${pkgs.gawk}/bin/awk '{print $1}')
+    cache_slot=$(printf '%s\n' "$row" | ${pkgs.gawk}/bin/awk '{print $2}')
+    if [ -z "$volume_id" ] || [ "$volume_id" = "None" ]; then
+      log "no attached dedicated cache volume found"
+      exit 0
+    fi
+    [ -n "$cache_slot" ] && [ "$cache_slot" != "None" ] || cache_slot=dynamic
+
+    if complete_pending_snapshot_if_ready; then
+      exit 0
+    fi
+
+    now=$(${pkgs.coreutils}/bin/date -u +%s)
+    latest_created_at=$(latest_current_seed_created_at "$volume_id")
+    if [ "$latest_created_at" -gt 0 ] && [ $(( now - latest_created_at )) -lt "$interval_secs" ]; then
+      log "latest current cache seed snapshot for $target_slot cache slot $cache_slot is younger than ''${interval_secs}s"
+      exit 0
+    fi
+
+    log "creating periodic cache seed snapshot from $slot volume $volume_id for $target_slot cache slot $cache_slot"
+    snapshot_id=$("''${aws[@]}" ec2 create-snapshot \
+      --volume-id "$volume_id" \
+      --description "$name_prefix forgeproxy $slot cache slot $cache_slot periodic seed for $target_slot" \
+      --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=$name_prefix-forgeproxy-$target_slot-cache-seed-$cache_slot-periodic},{Key=Role,Value=forgeproxy-cache-seed},{Key=ForgeproxyNamePrefix,Value=$name_prefix},{Key=DeploymentSlot,Value=$target_slot},{Key=SourceSlot,Value=$slot},{Key=SourceCacheSlot,Value=$cache_slot},{Key=SourceVolumeId,Value=$volume_id},{Key=CurrentSeed,Value=false},{Key=PendingSeed,Value=true},{Key=CreatedAtUnix,Value=$now},{Key=CreatedBy,Value=forgeproxy-cache-volume-snapshot}]" \
+      --query SnapshotId \
+      --output text)
+    log "created periodic cache seed snapshot $snapshot_id"
+    wait_for_snapshot_completion "$snapshot_id" "$cache_slot"
+  '';
 in
 {
   config = lib.mkIf (config.services.forgeproxy.enable or false) {
@@ -318,5 +759,33 @@ in
         {
           after = [ "forgeproxy-cache-volume.service" ];
         };
+
+    systemd.services.forgeproxy-cache-snapshot = {
+      description = "Create periodic forgeproxy dedicated cache EBS seed snapshots";
+      after = [
+        "network-online.target"
+        "forgeproxy-cache-volume.service"
+      ];
+      wants = [ "network-online.target" ];
+
+      serviceConfig = {
+        Type = "oneshot";
+      };
+
+      script = ''
+        exec ${cacheVolumeSnapshot}
+      '';
+    };
+
+    systemd.timers.forgeproxy-cache-snapshot = {
+      description = "Run periodic forgeproxy dedicated cache EBS seed snapshots";
+      wantedBy = [ "timers.target" ];
+
+      timerConfig = {
+        OnBootSec = "15min";
+        OnUnitActiveSec = "1h";
+        Persistent = true;
+      };
+    };
   };
 }
