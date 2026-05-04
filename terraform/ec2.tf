@@ -95,6 +95,11 @@ resource "aws_launch_template" "forgeproxy" {
     # FORGEPROXY_CACHE_VOLUME_LABEL=${var.forgeproxy_cache_volume_label}
     # FORGEPROXY_CACHE_MOUNT_DIR=/var/cache/forgeproxy
     # FORGEPROXY_CACHE_MOUNT_OPTIONS=${var.forgeproxy_cache_volume_mount_options}
+    # FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_ENABLED=${var.forgeproxy_cache_periodic_snapshot_enabled ? "true" : "false"}
+    # FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_INTERVAL_SECS=${var.forgeproxy_cache_periodic_snapshot_interval_secs}
+    # FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_WAIT_TIMEOUT_SECS=${var.forgeproxy_cache_periodic_snapshot_wait_timeout_secs}
+    # FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_POLL_SECS=${var.forgeproxy_cache_periodic_snapshot_poll_secs}
+    # FORGEPROXY_CACHE_SEED_SNAPSHOT_RETENTION_COUNT=${var.forgeproxy_cache_seed_snapshot_retention_count}
     # FORGEPROXY_CACHE_SCRUB_ON_CALENDAR=${var.cache_scrub_on_calendar}
     # FORGEPROXY_CACHE_SCRUB_INTERVAL_SECS=${var.cache_scrub_interval_secs}
     { ... }: {}
@@ -244,6 +249,7 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
     cache_volume_iops             = tostring(var.forgeproxy_cache_volume_iops)
     cache_volume_throughput_mbps  = tostring(var.forgeproxy_cache_volume_throughput_mbps)
     cache_seed_wait_for_snapshots = tostring(var.forgeproxy_cache_seed_wait_for_snapshots)
+    cache_seed_retention_count    = tostring(var.forgeproxy_cache_seed_snapshot_retention_count)
   }
 
   depends_on = [
@@ -251,6 +257,16 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
     aws_lb_target_group.https,
     aws_lb_target_group.ssh,
   ]
+
+  lifecycle {
+    precondition {
+      condition = (
+        !var.forgeproxy_cache_periodic_snapshot_enabled ||
+        var.forgeproxy_cache_periodic_snapshot_wait_timeout_secs <= var.forgeproxy_cache_periodic_snapshot_interval_secs
+      )
+      error_message = "forgeproxy_cache_periodic_snapshot_wait_timeout_secs must be less than or equal to forgeproxy_cache_periodic_snapshot_interval_secs when periodic cache snapshots are enabled."
+    }
+  }
 
   provisioner "local-exec" {
     command = "${path.module}/scripts/forgeproxy-rollout-prepare.sh"
@@ -274,6 +290,9 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
       CACHE_VOLUME_TYPE            = var.forgeproxy_cache_volume_type
       CACHE_VOLUME_IOPS            = tostring(var.forgeproxy_cache_volume_iops)
       CACHE_VOLUME_THROUGHPUT_MBPS = tostring(var.forgeproxy_cache_volume_throughput_mbps)
+      CACHE_SEED_SNAPSHOT_RETENTION_COUNT = tostring(
+        var.forgeproxy_cache_seed_snapshot_retention_count
+      )
       CACHE_SEED_WAIT_FOR_SNAPSHOTS = tostring(
         var.forgeproxy_cache_seed_wait_for_snapshots
       )

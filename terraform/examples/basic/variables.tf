@@ -192,6 +192,36 @@ variable "forgeproxy_cache_volume_throughput_mbps" {
   description = "gp3 throughput in MiB/s for dedicated forgeproxy cache EBS volumes."
 }
 
+variable "forgeproxy_cache_periodic_snapshot_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, forgeproxy instances periodically snapshot their dedicated cache EBS volume for the opposite blue/green slot."
+}
+
+variable "forgeproxy_cache_periodic_snapshot_interval_secs" {
+  type        = number
+  default     = 86400
+  description = "Minimum age in seconds before creating another periodic cache seed snapshot."
+}
+
+variable "forgeproxy_cache_periodic_snapshot_wait_timeout_secs" {
+  type        = number
+  default     = 86400
+  description = "Maximum seconds a periodic cache snapshot service run waits for completion before leaving promotion to a later run."
+}
+
+variable "forgeproxy_cache_periodic_snapshot_poll_secs" {
+  type        = number
+  default     = 60
+  description = "Polling interval in seconds while waiting for periodic EBS cache snapshots to complete."
+}
+
+variable "forgeproxy_cache_seed_snapshot_retention_count" {
+  type        = number
+  default     = 1
+  description = "Number of completed cache seed snapshots to retain per target deployment slot and source EBS volume."
+}
+
 variable "valkey_root_volume_gb" {
   type        = number
   default     = 50

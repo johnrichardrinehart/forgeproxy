@@ -680,7 +680,7 @@ pkgs.testers.runNixOSTest {
         assert 'endpoint: "http://127.0.0.1:4319/v1/logs"' in rendered, rendered
         assert 'endpoint: "http://127.0.0.1:4320/v1/traces"' in rendered, rendered
         assert 'endpoint: "127.0.0.1:4317"' in rendered, rendered
-        assert 'units: ["forgeproxy.service"]' in rendered, rendered
+        assert 'units: ["forgeproxy.service", "forgeproxy-cache-snapshot.service"]' in rendered, rendered
         assert "logs:" in rendered, rendered
         assert "traces:" in rendered, rendered
         assert "transform/resource_to_labels:" in rendered, rendered

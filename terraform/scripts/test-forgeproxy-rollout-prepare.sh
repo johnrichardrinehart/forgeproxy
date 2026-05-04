@@ -300,22 +300,41 @@ case "${scenario}:${service}:${command}:${query}" in
     printf '%s\n' ""
     ;;
   cache_seeded:ec2:describe-volumes:Volumes\[\].\[VolumeId,\ Tags\[\?Key==\`CacheSlot\`\].Value\ \|\ \[0\]\])
-    printf '%s\t%s\n' "vol-blue-1" "0"
+    printf '%s\t%s\n' "vol-blue-1" "dynamic"
+    printf '%s\t%s\n' "vol-blue-2" "dynamic"
     ;;
   cache_seeded:ec2:describe-volumes:length\(Volumes\))
     printf '%s\n' "0"
     ;;
   cache_seeded:ec2:create-snapshot:SnapshotId)
-    printf '%s\n' "snap-blue-1"
+    if [[ "$(next_counter_value "create-snapshot")" == "0" ]]; then
+      printf '%s\n' "snap-blue-1"
+    else
+      printf '%s\n' "snap-blue-2"
+    fi
     ;;
   cache_seeded:ec2:describe-snapshots:Snapshots\[\].SnapshotId)
-    printf '%s\n' "snap-blue-1"
+    printf '%s\t%s\n' "snap-blue-1" "snap-blue-2"
     ;;
   cache_seeded:ec2:describe-snapshots:Snapshots\[\].\[SnapshotId,\ Tags\[\?Key==\`SourceCacheSlot\`\].Value\ \|\ \[0\]\])
-    printf '%s\t%s\n' "snap-blue-1" "0"
+    printf '%s\t%s\n' "snap-blue-1" "dynamic"
+    printf '%s\t%s\n' "snap-blue-2" "dynamic"
+    ;;
+  cache_seeded:ec2:describe-snapshots:Snapshots\[\].\[SnapshotId,\ Tags\[\?Key==\`SourceVolumeId\`\].Value\ \|\ \[0\],\ Tags\[\?Key==\`SourceCacheSlot\`\].Value\ \|\ \[0\]\])
+    printf '%s\t%s\t%s\n' "snap-blue-1" "vol-blue-1" "dynamic"
+    printf '%s\t%s\t%s\n' "snap-blue-2" "vol-blue-2" "dynamic"
+    ;;
+  cache_seeded:ec2:describe-snapshots:Snapshots\[\].\[SnapshotId,\ Tags\[\?Key==\`SourceVolumeId\`\].Value\ \|\ \[0\],\ Tags\[\?Key==\`SourceCacheSlot\`\].Value\ \|\ \[0\],\ Tags\[\?Key==\`CreatedAtUnix\`\].Value\ \|\ \[0\]\])
+    printf '%s\t%s\t%s\t%s\n' "snap-blue-1" "vol-blue-1" "dynamic" "200"
+    printf '%s\t%s\t%s\t%s\n' "snap-blue-2" "vol-blue-2" "dynamic" "200"
+    printf '%s\t%s\t%s\t%s\n' "snap-old-1" "vol-blue-1" "dynamic" "100"
+    printf '%s\t%s\t%s\t%s\n' "snap-old-2" "vol-blue-2" "dynamic" "100"
     ;;
   cache_seeded:ec2:describe-snapshots:Snapshots\[0\].VolumeSize)
     printf '%s\n' "1024"
+    ;;
+  cache_seeded:ec2:delete-snapshot:*)
+    printf '%s\n' ""
     ;;
   cache_seeded:ec2:create-volume:VolumeId)
     printf '%s\n' "vol-green-created"
@@ -437,6 +456,10 @@ env \
   bash "${script_path}" >"${tmpdir}/cache_seeded.out" 2>"${tmpdir}/cache_seeded.err"
 grep -q "Preparing dedicated cache EBS seed volumes for target slot green" "${tmpdir}/cache_seeded.out"
 grep -q "Creating live cache snapshot from blue volume vol-blue-1" "${tmpdir}/cache_seeded.out"
-grep -q "Created green cache volume vol-green-created for cache slot 1 from snap-blue-1" "${tmpdir}/cache_seeded.out"
+grep -q "Creating live cache snapshot from blue volume vol-blue-2" "${tmpdir}/cache_seeded.out"
+grep -q "Deleting old green cache seed snapshot snap-old-1" "${tmpdir}/cache_seeded.out"
+grep -q "Deleting old green cache seed snapshot snap-old-2" "${tmpdir}/cache_seeded.out"
+grep -q "Created green cache volume vol-green-created for cache slot 0 from snap-blue-1" "${tmpdir}/cache_seeded.out"
+grep -q "Created green cache volume vol-green-created for cache slot 1 from snap-blue-2" "${tmpdir}/cache_seeded.out"
 
 echo "forgeproxy-rollout-prepare tests passed"

@@ -356,7 +356,7 @@ let
             "  journald:" \
             "    start_at: end" \
             "    priority: debug" \
-            "    units: [\"forgeproxy.service\"]" \
+            "    units: [\"forgeproxy.service\", \"forgeproxy-cache-snapshot.service\"]" \
             "    storage: file_storage/journald"
         fi
 

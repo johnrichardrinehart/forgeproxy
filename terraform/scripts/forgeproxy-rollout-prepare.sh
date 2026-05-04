@@ -26,6 +26,7 @@ cache_volume_type="${CACHE_VOLUME_TYPE:-gp3}"
 cache_volume_iops="${CACHE_VOLUME_IOPS:-3000}"
 cache_volume_throughput_mbps="${CACHE_VOLUME_THROUGHPUT_MBPS:-125}"
 cache_seed_wait_for_snapshots="${CACHE_SEED_WAIT_FOR_SNAPSHOTS:-true}"
+cache_seed_snapshot_retention_count="${CACHE_SEED_SNAPSHOT_RETENTION_COUNT:-1}"
 
 case "${active_slot}" in
   blue)
@@ -279,20 +280,37 @@ mark_old_target_seed_snapshots_inactive() {
     --query 'Snapshots[].SnapshotId' \
     --output text)"
 
+  if [[ -n "${old_snapshot_ids}" && "${old_snapshot_ids}" != "None" ]]; then
+    echo "Marking old ${active_slot} cache seed snapshots inactive: ${old_snapshot_ids}"
+    aws "${aws_args[@]}" ec2 create-tags \
+      --resources ${old_snapshot_ids} \
+      --tags Key=CurrentSeed,Value=false
+  fi
+
+  old_snapshot_ids="$(aws "${aws_args[@]}" ec2 describe-snapshots \
+    --owner-ids self \
+    --filters \
+      "Name=tag:Role,Values=forgeproxy-cache-seed" \
+      "Name=tag:ForgeproxyNamePrefix,Values=${name_prefix}" \
+      "Name=tag:DeploymentSlot,Values=${active_slot}" \
+      "Name=tag:PendingSeed,Values=true" \
+    --query 'Snapshots[].SnapshotId' \
+    --output text)"
+
   if [[ -z "${old_snapshot_ids}" || "${old_snapshot_ids}" == "None" ]]; then
     return 0
   fi
 
-  echo "Marking old ${active_slot} cache seed snapshots inactive: ${old_snapshot_ids}"
+  echo "Marking pending ${active_slot} cache seed snapshots stale: ${old_snapshot_ids}"
   aws "${aws_args[@]}" ec2 create-tags \
     --resources ${old_snapshot_ids} \
-    --tags Key=CurrentSeed,Value=false
+    --tags Key=PendingSeed,Value=false Key=CurrentSeed,Value=false Key=StaleSeed,Value=true
 }
 
 snapshot_active_cache_volumes() {
   local source_slot="$1"
   local source_asg
-  local instance_ids instance_id volume_rows row volume_id cache_slot snapshot_id
+  local instance_ids instance_id volume_rows row volume_id cache_slot snapshot_id created_at_unix
 
   source_asg="$(asg_for_slot "${source_slot}")" || return 0
   instance_ids="$(asg_instance_ids "${source_asg}")"
@@ -312,11 +330,12 @@ snapshot_active_cache_volumes() {
       volume_id="$(awk '{print $1}' <<<"${row}")"
       cache_slot="$(awk '{print $2}' <<<"${row}")"
       [[ -n "${cache_slot}" && "${cache_slot}" != "None" ]] || cache_slot="dynamic"
+      created_at_unix="$(date -u +%s)"
       echo "Creating live cache snapshot from ${source_slot} volume ${volume_id} attached to ${instance_id} (cache slot ${cache_slot})"
       snapshot_id="$(aws "${aws_args[@]}" ec2 create-snapshot \
         --volume-id "${volume_id}" \
         --description "${name_prefix} forgeproxy ${source_slot} cache slot ${cache_slot} seed for ${active_slot}" \
-        --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=${name_prefix}-forgeproxy-${active_slot}-cache-seed-${cache_slot}},{Key=Role,Value=forgeproxy-cache-seed},{Key=ForgeproxyNamePrefix,Value=${name_prefix}},{Key=DeploymentSlot,Value=${active_slot}},{Key=SourceSlot,Value=${source_slot}},{Key=SourceCacheSlot,Value=${cache_slot}},{Key=SourceVolumeId,Value=${volume_id}},{Key=CurrentSeed,Value=true},{Key=CreatedBy,Value=forgeproxy-rollout-prepare}]" \
+        --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=${name_prefix}-forgeproxy-${active_slot}-cache-seed-${cache_slot}},{Key=Role,Value=forgeproxy-cache-seed},{Key=ForgeproxyNamePrefix,Value=${name_prefix}},{Key=DeploymentSlot,Value=${active_slot}},{Key=SourceSlot,Value=${source_slot}},{Key=SourceCacheSlot,Value=${cache_slot}},{Key=SourceVolumeId,Value=${volume_id}},{Key=CurrentSeed,Value=true},{Key=CreatedAtUnix,Value=${created_at_unix}},{Key=CreatedBy,Value=forgeproxy-rollout-prepare}]" \
         --query SnapshotId \
         --output text)"
       echo "${snapshot_id}"
@@ -333,9 +352,9 @@ current_seed_snapshot_ids() {
       "Name=tag:ForgeproxyNamePrefix,Values=${name_prefix}" \
       "Name=tag:DeploymentSlot,Values=${active_slot}" \
       "Name=tag:CurrentSeed,Values=true" \
-    --query 'Snapshots[].[SnapshotId, Tags[?Key==`SourceCacheSlot`].Value | [0]]' \
+    --query 'Snapshots[].[SnapshotId, Tags[?Key==`SourceVolumeId`].Value | [0], Tags[?Key==`SourceCacheSlot`].Value | [0]]' \
     --output text \
-    | sort -k2,2n \
+    | sort -k2,2 -k3,3n \
     | awk '{print $1}'
 }
 
@@ -350,6 +369,73 @@ current_seed_snapshot_ids_any_status() {
     --query 'Snapshots[].SnapshotId' \
     --output text \
     | tr '\t' '\n'
+}
+
+delete_old_target_seed_snapshots() {
+  local rows snapshot_ids snapshot_id
+
+  if ! [[ "${cache_seed_snapshot_retention_count}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid CACHE_SEED_SNAPSHOT_RETENTION_COUNT=${cache_seed_snapshot_retention_count}" >&2
+    return 1
+  fi
+  if (( cache_seed_snapshot_retention_count < 1 )); then
+    return 0
+  fi
+
+  rows="$(aws "${aws_args[@]}" ec2 describe-snapshots \
+    --owner-ids self \
+    --filters \
+      "Name=status,Values=completed" \
+      "Name=tag:Role,Values=forgeproxy-cache-seed" \
+      "Name=tag:ForgeproxyNamePrefix,Values=${name_prefix}" \
+      "Name=tag:DeploymentSlot,Values=${active_slot}" \
+    --query 'Snapshots[].[SnapshotId, Tags[?Key==`SourceVolumeId`].Value | [0], Tags[?Key==`SourceCacheSlot`].Value | [0], Tags[?Key==`CreatedAtUnix`].Value | [0]]' \
+    --output text)"
+
+  if [[ -z "${rows}" || "${rows}" == "None" ]]; then
+    return 0
+  fi
+
+  snapshot_ids="$(awk -v keep="${cache_seed_snapshot_retention_count}" '
+    NF >= 1 {
+      snapshot_id = $1
+      source_volume_id = $2
+      cache_slot = $3
+      created_at = $4
+      if (source_volume_id == "" || source_volume_id == "None") {
+        source_volume_id = ""
+      }
+      if (cache_slot == "" || cache_slot == "None") {
+        cache_slot = "dynamic"
+      }
+      if (created_at !~ /^[0-9]+$/) {
+        created_at = 0
+      }
+      group_key = source_volume_id
+      if (group_key == "") {
+        group_key = "cache:" cache_slot
+      }
+      print group_key, created_at, snapshot_id
+    }
+  ' <<<"${rows}" | sort -k1,1 -k2,2nr | awk -v keep="${cache_seed_snapshot_retention_count}" '
+    {
+      group_key = $1
+      seen[group_key] += 1
+      if (seen[group_key] > keep) {
+        print $3
+      }
+    }
+  ')"
+
+  if [[ -z "${snapshot_ids}" || "${snapshot_ids}" == "None" ]]; then
+    return 0
+  fi
+
+  while read -r snapshot_id; do
+    [[ -n "${snapshot_id}" ]] || continue
+    echo "Deleting old ${active_slot} cache seed snapshot ${snapshot_id}"
+    aws "${aws_args[@]}" ec2 delete-snapshot --snapshot-id "${snapshot_id}"
+  done <<<"${snapshot_ids}"
 }
 
 snapshot_volume_size_gb() {
@@ -443,11 +529,11 @@ prepare_cache_seed_volumes() {
   fi
 
   mark_old_target_seed_volumes_inactive
-  mark_old_target_seed_snapshots_inactive
 
   if [[ "${source_slot}" == "unknown" || -z "${source_slot}" ]]; then
     echo "No distinct live source slot is available; target cache volumes will be created blank"
   else
+    mark_old_target_seed_snapshots_inactive
     snapshot_active_cache_volumes "${source_slot}"
     mapfile -t snapshot_ids < <(current_seed_snapshot_ids_any_status)
     if [[ "${#snapshot_ids[@]}" -gt 0 && "${cache_seed_wait_for_snapshots}" == "true" ]]; then
@@ -456,6 +542,11 @@ prepare_cache_seed_volumes() {
     fi
     mapfile -t snapshot_ids < <(current_seed_snapshot_ids)
     snapshot_count="${#snapshot_ids[@]}"
+    if (( snapshot_count > 0 )); then
+      delete_old_target_seed_snapshots
+      mapfile -t snapshot_ids < <(current_seed_snapshot_ids)
+      snapshot_count="${#snapshot_ids[@]}"
+    fi
   fi
 
   for ((slot = 0; slot < desired_count; slot++)); do

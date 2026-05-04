@@ -348,6 +348,56 @@ variable "forgeproxy_cache_seed_wait_for_snapshots" {
   description = "When true, rollout preparation waits for active-slot cache snapshots to complete before creating standby-slot cache volumes from them."
 }
 
+variable "forgeproxy_cache_periodic_snapshot_enabled" {
+  type        = bool
+  default     = false
+  description = "When true, forgeproxy instances periodically snapshot their dedicated cache EBS volume for the opposite blue/green slot."
+}
+
+variable "forgeproxy_cache_periodic_snapshot_interval_secs" {
+  type        = number
+  default     = 86400
+  description = "Minimum age in seconds before a forgeproxy instance creates another periodic cache seed snapshot."
+
+  validation {
+    condition     = var.forgeproxy_cache_periodic_snapshot_interval_secs > 0
+    error_message = "forgeproxy_cache_periodic_snapshot_interval_secs must be greater than 0."
+  }
+}
+
+variable "forgeproxy_cache_periodic_snapshot_wait_timeout_secs" {
+  type        = number
+  default     = 86400
+  description = "Maximum seconds a periodic cache snapshot service run waits for the EBS snapshot to complete before leaving it for a later run to promote."
+
+  validation {
+    condition     = var.forgeproxy_cache_periodic_snapshot_wait_timeout_secs >= 0
+    error_message = "forgeproxy_cache_periodic_snapshot_wait_timeout_secs must be non-negative."
+  }
+}
+
+variable "forgeproxy_cache_periodic_snapshot_poll_secs" {
+  type        = number
+  default     = 60
+  description = "Polling interval in seconds while waiting for periodic EBS cache snapshots to complete."
+
+  validation {
+    condition     = var.forgeproxy_cache_periodic_snapshot_poll_secs > 0
+    error_message = "forgeproxy_cache_periodic_snapshot_poll_secs must be greater than 0."
+  }
+}
+
+variable "forgeproxy_cache_seed_snapshot_retention_count" {
+  type        = number
+  default     = 1
+  description = "Number of completed cache seed snapshots to retain per target deployment slot and source EBS volume."
+
+  validation {
+    condition     = var.forgeproxy_cache_seed_snapshot_retention_count >= 1
+    error_message = "forgeproxy_cache_seed_snapshot_retention_count must be at least 1."
+  }
+}
+
 variable "valkey_root_volume_gb" {
   type        = number
   default     = 50
