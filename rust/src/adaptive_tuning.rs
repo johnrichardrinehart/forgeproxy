@@ -16,7 +16,7 @@ use crate::config::{
 };
 
 const CONTROLLER_NAME: &str = "aimd";
-const CONTROLLER_VERSION: &str = "v1";
+const CONTROLLER_VERSION: &str = "v2";
 
 #[derive(Debug)]
 pub struct ResizableGate {
@@ -767,6 +767,13 @@ pub struct AdaptiveObservationCounters {
     first_byte_samples: AtomicU64,
     first_byte_latency_millis_total: AtomicU64,
     upstream_fallbacks: AtomicU64,
+    fallback_local_upload_pack_permit: AtomicU64,
+    fallback_local_upload_pack_first_byte: AtomicU64,
+    fallback_published_generation_lease: AtomicU64,
+    fallback_pack_cache_lookup: AtomicU64,
+    fallback_upstream_clone_global: AtomicU64,
+    fallback_upstream_clone_repo: AtomicU64,
+    fallback_unknown: AtomicU64,
     repo_totals: Mutex<HashMap<String, ObservationTotals>>,
 }
 
@@ -777,6 +784,68 @@ pub struct ObservationTotals {
     pub first_byte_samples: u64,
     pub first_byte_latency_millis_total: u64,
     pub upstream_fallbacks: u64,
+    pub fallback_local_upload_pack_permit: u64,
+    pub fallback_local_upload_pack_first_byte: u64,
+    pub fallback_published_generation_lease: u64,
+    pub fallback_pack_cache_lookup: u64,
+    pub fallback_upstream_clone_global: u64,
+    pub fallback_upstream_clone_repo: u64,
+    pub fallback_unknown: u64,
+}
+
+impl ObservationTotals {
+    fn inc_fallback_target(&mut self, target: FallbackRecoveryTarget) {
+        let counter = match target {
+            FallbackRecoveryTarget::LocalUploadPackPermit => {
+                &mut self.fallback_local_upload_pack_permit
+            }
+            FallbackRecoveryTarget::LocalUploadPackFirstByte => {
+                &mut self.fallback_local_upload_pack_first_byte
+            }
+            FallbackRecoveryTarget::PublishedGenerationLease => {
+                &mut self.fallback_published_generation_lease
+            }
+            FallbackRecoveryTarget::PackCacheLookup => &mut self.fallback_pack_cache_lookup,
+            FallbackRecoveryTarget::UpstreamCloneGlobal => &mut self.fallback_upstream_clone_global,
+            FallbackRecoveryTarget::UpstreamCloneRepo => &mut self.fallback_upstream_clone_repo,
+            FallbackRecoveryTarget::Unknown => &mut self.fallback_unknown,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackRecoveryTarget {
+    LocalUploadPackPermit,
+    LocalUploadPackFirstByte,
+    PublishedGenerationLease,
+    PackCacheLookup,
+    UpstreamCloneGlobal,
+    UpstreamCloneRepo,
+    Unknown,
+}
+
+fn fallback_target_for_reason(reason: &str) -> FallbackRecoveryTarget {
+    match reason {
+        "short_circuit_local_upload_pack_permit" | "local_upload_pack_permit" => {
+            FallbackRecoveryTarget::LocalUploadPackPermit
+        }
+        "short_circuit_local_upload_pack_first_byte" | "local_upload_pack_first_byte" => {
+            FallbackRecoveryTarget::LocalUploadPackFirstByte
+        }
+        "short_circuit_published_generation_lease" | "published_generation_lease" => {
+            FallbackRecoveryTarget::PublishedGenerationLease
+        }
+        "short_circuit_pack_cache_lookup" | "pack_cache_lookup" => {
+            FallbackRecoveryTarget::PackCacheLookup
+        }
+        "clone_global_saturated" => FallbackRecoveryTarget::UpstreamCloneGlobal,
+        "clone_local_repo_saturated" | "clone_distributed_repo_saturated" => {
+            FallbackRecoveryTarget::UpstreamCloneRepo
+        }
+        _ => FallbackRecoveryTarget::Unknown,
+    }
 }
 
 impl AdaptiveObservationCounters {
@@ -817,15 +886,38 @@ impl AdaptiveObservationCounters {
         });
     }
 
-    pub fn inc_upstream_fallback(&self) {
+    pub fn inc_upstream_fallback(&self, reason: &str) {
         self.upstream_fallbacks.fetch_add(1, Ordering::Relaxed);
+        self.inc_fallback_target(fallback_target_for_reason(reason));
     }
 
-    pub fn inc_upstream_fallback_for_repo(&self, owner_repo: &str) {
+    pub fn inc_upstream_fallback_for_repo(&self, owner_repo: &str, reason: &str) {
+        let target = fallback_target_for_reason(reason);
         self.upstream_fallbacks.fetch_add(1, Ordering::Relaxed);
+        self.inc_fallback_target(target);
         self.update_repo(owner_repo, |totals| {
             totals.upstream_fallbacks = totals.upstream_fallbacks.saturating_add(1);
+            totals.inc_fallback_target(target);
         });
+    }
+
+    fn inc_fallback_target(&self, target: FallbackRecoveryTarget) {
+        match target {
+            FallbackRecoveryTarget::LocalUploadPackPermit => {
+                &self.fallback_local_upload_pack_permit
+            }
+            FallbackRecoveryTarget::LocalUploadPackFirstByte => {
+                &self.fallback_local_upload_pack_first_byte
+            }
+            FallbackRecoveryTarget::PublishedGenerationLease => {
+                &self.fallback_published_generation_lease
+            }
+            FallbackRecoveryTarget::PackCacheLookup => &self.fallback_pack_cache_lookup,
+            FallbackRecoveryTarget::UpstreamCloneGlobal => &self.fallback_upstream_clone_global,
+            FallbackRecoveryTarget::UpstreamCloneRepo => &self.fallback_upstream_clone_repo,
+            FallbackRecoveryTarget::Unknown => &self.fallback_unknown,
+        }
+        .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> ObservationTotals {
@@ -837,6 +929,21 @@ impl AdaptiveObservationCounters {
                 .first_byte_latency_millis_total
                 .load(Ordering::Relaxed),
             upstream_fallbacks: self.upstream_fallbacks.load(Ordering::Relaxed),
+            fallback_local_upload_pack_permit: self
+                .fallback_local_upload_pack_permit
+                .load(Ordering::Relaxed),
+            fallback_local_upload_pack_first_byte: self
+                .fallback_local_upload_pack_first_byte
+                .load(Ordering::Relaxed),
+            fallback_published_generation_lease: self
+                .fallback_published_generation_lease
+                .load(Ordering::Relaxed),
+            fallback_pack_cache_lookup: self.fallback_pack_cache_lookup.load(Ordering::Relaxed),
+            fallback_upstream_clone_global: self
+                .fallback_upstream_clone_global
+                .load(Ordering::Relaxed),
+            fallback_upstream_clone_repo: self.fallback_upstream_clone_repo.load(Ordering::Relaxed),
+            fallback_unknown: self.fallback_unknown.load(Ordering::Relaxed),
         }
     }
 
@@ -874,6 +981,7 @@ pub struct ObservationSnapshot {
     pub clone_latency_secs_avg: Option<f64>,
     pub first_byte_latency_secs_avg: Option<f64>,
     pub fallback_rate: f64,
+    pub dominant_fallback_target: Option<FallbackRecoveryTarget>,
     pub host_pressure: HostPressure,
     pub current: EffectivePolicy,
     pub config: AdaptiveTuningConfig,
@@ -911,7 +1019,16 @@ impl Controller for AimdController {
             return recommendation(policy, "decrease", reason, 0.8);
         }
 
-        if let Some(reason) = slo_reason(snapshot) {
+        if fallback_rate_exceeds_slo(snapshot) {
+            let (policy, decision) = increase_fallback_recovery_capacity_or_waits(
+                snapshot.current,
+                &snapshot.config.bounds,
+                snapshot.dominant_fallback_target,
+            );
+            return recommendation(policy, decision, "fallback_rate_slo", 0.9);
+        }
+
+        if let Some(reason) = latency_slo_reason(snapshot) {
             let policy =
                 decrease_foreground_and_background(snapshot.current, &snapshot.config.bounds);
             return recommendation(policy, "decrease", reason, 0.9);
@@ -962,7 +1079,11 @@ fn pressure_reason(snapshot: &ObservationSnapshot) -> Option<&'static str> {
     None
 }
 
-fn slo_reason(snapshot: &ObservationSnapshot) -> Option<&'static str> {
+fn fallback_rate_exceeds_slo(snapshot: &ObservationSnapshot) -> bool {
+    snapshot.fallback_rate >= snapshot.config.slo.fallback_rate
+}
+
+fn latency_slo_reason(snapshot: &ObservationSnapshot) -> Option<&'static str> {
     let slo = &snapshot.config.slo;
     if snapshot
         .clone_latency_secs_avg
@@ -975,9 +1096,6 @@ fn slo_reason(snapshot: &ObservationSnapshot) -> Option<&'static str> {
         .is_some_and(|value| value >= slo.first_byte_latency_secs)
     {
         return Some("first_byte_latency_slo");
-    }
-    if snapshot.fallback_rate >= slo.fallback_rate {
-        return Some("fallback_rate_slo");
     }
     None
 }
@@ -1091,6 +1209,248 @@ fn decrease_background_first(
     }
 }
 
+fn increase_request_waits(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+) -> EffectivePolicy {
+    EffectivePolicy {
+        request_wait_for_local_catch_up_secs: step_up(
+            policy.request_wait_for_local_catch_up_secs,
+            bounds.request_wait_for_local_catch_up_secs,
+        ),
+        request_time_s3_restore_secs: step_up(
+            policy.request_time_s3_restore_secs,
+            bounds.request_time_s3_restore_secs,
+        ),
+        generation_publish_secs: step_up(
+            policy.generation_publish_secs,
+            bounds.generation_publish_secs,
+        ),
+        local_upload_pack_first_byte_secs: step_up(
+            policy.local_upload_pack_first_byte_secs,
+            bounds.local_upload_pack_first_byte_secs,
+        ),
+        ..policy
+    }
+}
+
+fn increase_fallback_recovery_capacity_or_waits(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+    target: Option<FallbackRecoveryTarget>,
+) -> (EffectivePolicy, &'static str) {
+    let target = target.unwrap_or(FallbackRecoveryTarget::Unknown);
+    if let Some(policy) = increase_capacity_for_fallback_target(policy, bounds, target) {
+        return (policy, "increase_capacity");
+    }
+
+    if let Some(policy) = increase_waits_for_fallback_target(policy, bounds, target) {
+        return (policy, "increase_timeouts");
+    }
+
+    (policy, "hold")
+}
+
+fn increase_capacity_for_fallback_target(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+    target: FallbackRecoveryTarget,
+) -> Option<EffectivePolicy> {
+    match target {
+        FallbackRecoveryTarget::LocalUploadPackPermit
+        | FallbackRecoveryTarget::LocalUploadPackFirstByte => {
+            increase_local_upload_pack_capacity(policy, bounds)
+        }
+        FallbackRecoveryTarget::PublishedGenerationLease => {
+            increase_generation_recovery_capacity(policy, bounds)
+        }
+        FallbackRecoveryTarget::PackCacheLookup => {
+            increase_pack_cache_lookup_capacity(policy, bounds)
+        }
+        FallbackRecoveryTarget::UpstreamCloneGlobal => {
+            increase_upstream_clone_global_capacity(policy, bounds)
+        }
+        FallbackRecoveryTarget::UpstreamCloneRepo => {
+            increase_upstream_clone_repo_capacity(policy, bounds)
+        }
+        FallbackRecoveryTarget::Unknown => increase_local_upload_pack_capacity(policy, bounds)
+            .or_else(|| increase_upstream_clone_global_capacity(policy, bounds))
+            .or_else(|| increase_upstream_clone_repo_capacity(policy, bounds))
+            .or_else(|| increase_pack_cache_lookup_capacity(policy, bounds)),
+    }
+}
+
+fn increase_local_upload_pack_capacity(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+) -> Option<EffectivePolicy> {
+    capacity_available([
+        (
+            policy.local_upload_pack_concurrency,
+            bounds.local_upload_pack_concurrency,
+        ),
+        (
+            policy.local_upload_pack_per_repo,
+            bounds.local_upload_pack_per_repo,
+        ),
+        (
+            policy.local_upload_pack_threads,
+            bounds.local_upload_pack_threads,
+        ),
+    ])
+    .then_some(EffectivePolicy {
+        local_upload_pack_concurrency: step_up(
+            policy.local_upload_pack_concurrency,
+            bounds.local_upload_pack_concurrency,
+        ),
+        local_upload_pack_per_repo: step_up(
+            policy.local_upload_pack_per_repo,
+            bounds.local_upload_pack_per_repo,
+        ),
+        local_upload_pack_threads: step_up(
+            policy.local_upload_pack_threads,
+            bounds.local_upload_pack_threads,
+        ),
+        ..policy
+    })
+}
+
+fn increase_generation_recovery_capacity(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+) -> Option<EffectivePolicy> {
+    capacity_available([
+        (
+            policy.upstream_clone_concurrency,
+            bounds.upstream_clone_concurrency,
+        ),
+        (
+            policy.upstream_fetch_concurrency,
+            bounds.upstream_fetch_concurrency,
+        ),
+        (
+            policy.upstream_clone_per_repo_per_instance,
+            bounds.upstream_clone_per_repo_per_instance,
+        ),
+        (
+            policy.upstream_clone_per_repo_across_instances,
+            bounds.upstream_clone_per_repo_across_instances,
+        ),
+    ])
+    .then_some(EffectivePolicy {
+        upstream_clone_concurrency: step_up(
+            policy.upstream_clone_concurrency,
+            bounds.upstream_clone_concurrency,
+        ),
+        upstream_fetch_concurrency: step_up(
+            policy.upstream_fetch_concurrency,
+            bounds.upstream_fetch_concurrency,
+        ),
+        upstream_clone_per_repo_per_instance: step_up(
+            policy.upstream_clone_per_repo_per_instance,
+            bounds.upstream_clone_per_repo_per_instance,
+        ),
+        upstream_clone_per_repo_across_instances: step_up(
+            policy.upstream_clone_per_repo_across_instances,
+            bounds.upstream_clone_per_repo_across_instances,
+        ),
+        ..policy
+    })
+}
+
+fn increase_pack_cache_lookup_capacity(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+) -> Option<EffectivePolicy> {
+    capacity_available([(
+        policy.pack_cache_request_delta_concurrency,
+        bounds.pack_cache_request_delta_concurrency,
+    )])
+    .then_some(EffectivePolicy {
+        pack_cache_request_delta_concurrency: step_up(
+            policy.pack_cache_request_delta_concurrency,
+            bounds.pack_cache_request_delta_concurrency,
+        ),
+        ..policy
+    })
+}
+
+fn increase_upstream_clone_global_capacity(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+) -> Option<EffectivePolicy> {
+    capacity_available([(
+        policy.upstream_clone_concurrency,
+        bounds.upstream_clone_concurrency,
+    )])
+    .then_some(EffectivePolicy {
+        upstream_clone_concurrency: step_up(
+            policy.upstream_clone_concurrency,
+            bounds.upstream_clone_concurrency,
+        ),
+        ..policy
+    })
+}
+
+fn increase_upstream_clone_repo_capacity(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+) -> Option<EffectivePolicy> {
+    capacity_available([
+        (
+            policy.upstream_clone_per_repo_per_instance,
+            bounds.upstream_clone_per_repo_per_instance,
+        ),
+        (
+            policy.upstream_clone_per_repo_across_instances,
+            bounds.upstream_clone_per_repo_across_instances,
+        ),
+    ])
+    .then_some(EffectivePolicy {
+        upstream_clone_per_repo_per_instance: step_up(
+            policy.upstream_clone_per_repo_per_instance,
+            bounds.upstream_clone_per_repo_per_instance,
+        ),
+        upstream_clone_per_repo_across_instances: step_up(
+            policy.upstream_clone_per_repo_across_instances,
+            bounds.upstream_clone_per_repo_across_instances,
+        ),
+        ..policy
+    })
+}
+
+fn increase_waits_for_fallback_target(
+    policy: EffectivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+    target: FallbackRecoveryTarget,
+) -> Option<EffectivePolicy> {
+    match target {
+        FallbackRecoveryTarget::LocalUploadPackFirstByte => capacity_available([(
+            policy.local_upload_pack_first_byte_secs,
+            bounds.local_upload_pack_first_byte_secs,
+        )])
+        .then_some(EffectivePolicy {
+            local_upload_pack_first_byte_secs: step_up(
+                policy.local_upload_pack_first_byte_secs,
+                bounds.local_upload_pack_first_byte_secs,
+            ),
+            ..policy
+        }),
+        FallbackRecoveryTarget::PublishedGenerationLease => {
+            Some(increase_request_waits(policy, bounds))
+        }
+        FallbackRecoveryTarget::Unknown => Some(increase_request_waits(policy, bounds)),
+        FallbackRecoveryTarget::LocalUploadPackPermit
+        | FallbackRecoveryTarget::PackCacheLookup
+        | FallbackRecoveryTarget::UpstreamCloneGlobal
+        | FallbackRecoveryTarget::UpstreamCloneRepo => None,
+    }
+}
+
+fn capacity_available<const N: usize>(knobs: [(usize, AdaptiveTuningKnobBoundsConfig); N]) -> bool {
+    knobs.into_iter().any(|(value, bounds)| value < bounds.max)
+}
+
 fn decrease_foreground_and_background(
     policy: EffectivePolicy,
     bounds: &AdaptiveTuningBoundsConfig,
@@ -1177,6 +1537,7 @@ pub struct RecommendationInputSummary {
     pub clone_latency_secs_avg: Option<f64>,
     pub first_byte_latency_secs_avg: Option<f64>,
     pub fallback_rate: f64,
+    pub dominant_fallback_target: Option<FallbackRecoveryTarget>,
     pub host_pressure: HostPressure,
     pub decision: String,
     pub reason: String,
@@ -1189,6 +1550,7 @@ pub struct RepoObservationSnapshot {
     pub clone_latency_secs_avg: Option<f64>,
     pub first_byte_latency_secs_avg: Option<f64>,
     pub fallback_rate: f64,
+    pub dominant_fallback_target: Option<FallbackRecoveryTarget>,
     pub host_pressure: HostPressure,
     pub current: RepoAdaptivePolicy,
     pub config: AdaptiveTuningConfig,
@@ -1432,9 +1794,12 @@ fn recommend_repo_policy(snapshot: &RepoObservationSnapshot) -> RepoRecommendati
     }
 
     if snapshot.fallback_rate >= snapshot.config.slo.fallback_rate {
-        let policy =
-            increase_repo_timeouts_decrease_capacity(snapshot.current, &snapshot.config.bounds);
-        return repo_recommendation(policy, "increase_timeouts", "fallback_rate_slo", 0.9);
+        let (policy, decision) = increase_repo_fallback_capacity_or_waits(
+            snapshot.current,
+            &snapshot.config.bounds,
+            snapshot.dominant_fallback_target,
+        );
+        return repo_recommendation(policy, decision, "fallback_rate_slo", 0.9);
     }
 
     if snapshot
@@ -1519,7 +1884,7 @@ fn increase_repo_capacity_decrease_timeouts(
     }
 }
 
-fn increase_repo_timeouts_decrease_capacity(
+fn increase_repo_timeouts_preserve_capacity(
     policy: RepoAdaptivePolicy,
     bounds: &AdaptiveTuningBoundsConfig,
 ) -> RepoAdaptivePolicy {
@@ -1540,7 +1905,116 @@ fn increase_repo_timeouts_decrease_capacity(
             policy.local_upload_pack_first_byte_secs,
             bounds.local_upload_pack_first_byte_secs,
         ),
-        ..decrease_repo_capacity(policy, bounds)
+        ..policy
+    }
+}
+
+fn increase_repo_fallback_capacity_or_waits(
+    policy: RepoAdaptivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+    target: Option<FallbackRecoveryTarget>,
+) -> (RepoAdaptivePolicy, &'static str) {
+    let target = target.unwrap_or(FallbackRecoveryTarget::Unknown);
+    if let Some(policy) = increase_repo_capacity_for_fallback_target(policy, bounds, target) {
+        return (policy, "increase_capacity");
+    }
+
+    if let Some(policy) = increase_repo_waits_for_fallback_target(policy, bounds, target) {
+        return (policy, "increase_timeouts");
+    }
+
+    (policy, "hold")
+}
+
+fn increase_repo_capacity_for_fallback_target(
+    policy: RepoAdaptivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+    target: FallbackRecoveryTarget,
+) -> Option<RepoAdaptivePolicy> {
+    match target {
+        FallbackRecoveryTarget::LocalUploadPackPermit
+        | FallbackRecoveryTarget::LocalUploadPackFirstByte => {
+            increase_repo_local_upload_pack_capacity(policy, bounds)
+        }
+        FallbackRecoveryTarget::PublishedGenerationLease
+        | FallbackRecoveryTarget::UpstreamCloneRepo => {
+            increase_repo_upstream_clone_capacity(policy, bounds)
+        }
+        FallbackRecoveryTarget::UpstreamCloneGlobal => None,
+        FallbackRecoveryTarget::PackCacheLookup => None,
+        FallbackRecoveryTarget::Unknown => increase_repo_local_upload_pack_capacity(policy, bounds)
+            .or_else(|| increase_repo_upstream_clone_capacity(policy, bounds)),
+    }
+}
+
+fn increase_repo_local_upload_pack_capacity(
+    policy: RepoAdaptivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+) -> Option<RepoAdaptivePolicy> {
+    capacity_available([(
+        policy.local_upload_pack_per_repo,
+        bounds.local_upload_pack_per_repo,
+    )])
+    .then_some(RepoAdaptivePolicy {
+        local_upload_pack_per_repo: step_up(
+            policy.local_upload_pack_per_repo,
+            bounds.local_upload_pack_per_repo,
+        ),
+        ..policy
+    })
+}
+
+fn increase_repo_upstream_clone_capacity(
+    policy: RepoAdaptivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+) -> Option<RepoAdaptivePolicy> {
+    capacity_available([
+        (
+            policy.upstream_clone_per_repo_per_instance,
+            bounds.upstream_clone_per_repo_per_instance,
+        ),
+        (
+            policy.upstream_clone_per_repo_across_instances,
+            bounds.upstream_clone_per_repo_across_instances,
+        ),
+    ])
+    .then_some(RepoAdaptivePolicy {
+        upstream_clone_per_repo_per_instance: step_up(
+            policy.upstream_clone_per_repo_per_instance,
+            bounds.upstream_clone_per_repo_per_instance,
+        ),
+        upstream_clone_per_repo_across_instances: step_up(
+            policy.upstream_clone_per_repo_across_instances,
+            bounds.upstream_clone_per_repo_across_instances,
+        ),
+        ..policy
+    })
+}
+
+fn increase_repo_waits_for_fallback_target(
+    policy: RepoAdaptivePolicy,
+    bounds: &AdaptiveTuningBoundsConfig,
+    target: FallbackRecoveryTarget,
+) -> Option<RepoAdaptivePolicy> {
+    match target {
+        FallbackRecoveryTarget::LocalUploadPackFirstByte => capacity_available([(
+            policy.local_upload_pack_first_byte_secs,
+            bounds.local_upload_pack_first_byte_secs,
+        )])
+        .then_some(RepoAdaptivePolicy {
+            local_upload_pack_first_byte_secs: step_up(
+                policy.local_upload_pack_first_byte_secs,
+                bounds.local_upload_pack_first_byte_secs,
+            ),
+            ..policy
+        }),
+        FallbackRecoveryTarget::PublishedGenerationLease | FallbackRecoveryTarget::Unknown => {
+            Some(increase_repo_timeouts_preserve_capacity(policy, bounds))
+        }
+        FallbackRecoveryTarget::LocalUploadPackPermit
+        | FallbackRecoveryTarget::PackCacheLookup
+        | FallbackRecoveryTarget::UpstreamCloneGlobal
+        | FallbackRecoveryTarget::UpstreamCloneRepo => None,
     }
 }
 
@@ -1707,6 +2181,7 @@ impl RuntimeController {
                 window.first_byte_samples,
             ),
             fallback_rate: rate(window.upstream_fallbacks, window.clone_samples),
+            dominant_fallback_target: dominant_fallback_target(window),
             host_pressure,
             current: self.policy_state.snapshot(),
             config: config.adaptive_tuning.clone(),
@@ -1734,6 +2209,7 @@ impl RuntimeController {
             clone_latency_secs_avg = ?snapshot.clone_latency_secs_avg,
             first_byte_latency_secs_avg = ?snapshot.first_byte_latency_secs_avg,
             fallback_rate = snapshot.fallback_rate,
+            dominant_fallback_target = ?snapshot.dominant_fallback_target,
             cpu_busy_fraction = ?snapshot.host_pressure.cpu_busy_fraction,
             disk_busy_fraction = ?snapshot.host_pressure.disk_busy_fraction,
             memory_available_percent = ?snapshot.host_pressure.memory_available_percent,
@@ -1763,6 +2239,7 @@ impl RuntimeController {
                 clone_latency_secs_avg: snapshot.clone_latency_secs_avg,
                 first_byte_latency_secs_avg: snapshot.first_byte_latency_secs_avg,
                 fallback_rate: snapshot.fallback_rate,
+                dominant_fallback_target: snapshot.dominant_fallback_target,
                 host_pressure: snapshot.host_pressure,
                 decision: recommendation.decision.clone(),
                 reason: recommendation.reason.clone(),
@@ -1847,6 +2324,7 @@ impl RuntimeController {
                     window.first_byte_samples,
                 ),
                 fallback_rate: rate(window.upstream_fallbacks, sample_count),
+                dominant_fallback_target: dominant_fallback_target(window),
                 host_pressure,
                 current,
                 config: config.adaptive_tuning.clone(),
@@ -1872,6 +2350,7 @@ impl RuntimeController {
                 clone_latency_secs_avg = ?snapshot.clone_latency_secs_avg,
                 first_byte_latency_secs_avg = ?snapshot.first_byte_latency_secs_avg,
                 fallback_rate = snapshot.fallback_rate,
+                dominant_fallback_target = ?snapshot.dominant_fallback_target,
                 cpu_busy_fraction = ?snapshot.host_pressure.cpu_busy_fraction,
                 disk_busy_fraction = ?snapshot.host_pressure.disk_busy_fraction,
                 memory_available_percent = ?snapshot.host_pressure.memory_available_percent,
@@ -1892,6 +2371,7 @@ impl RuntimeController {
                     clone_latency_secs_avg: snapshot.clone_latency_secs_avg,
                     first_byte_latency_secs_avg: snapshot.first_byte_latency_secs_avg,
                     fallback_rate: snapshot.fallback_rate,
+                    dominant_fallback_target: snapshot.dominant_fallback_target,
                     host_pressure: snapshot.host_pressure,
                     decision: recommendation.decision.clone(),
                     reason: recommendation.reason.clone(),
@@ -1977,6 +2457,27 @@ fn delta(previous: ObservationTotals, next: ObservationTotals) -> ObservationTot
         upstream_fallbacks: next
             .upstream_fallbacks
             .saturating_sub(previous.upstream_fallbacks),
+        fallback_local_upload_pack_permit: next
+            .fallback_local_upload_pack_permit
+            .saturating_sub(previous.fallback_local_upload_pack_permit),
+        fallback_local_upload_pack_first_byte: next
+            .fallback_local_upload_pack_first_byte
+            .saturating_sub(previous.fallback_local_upload_pack_first_byte),
+        fallback_published_generation_lease: next
+            .fallback_published_generation_lease
+            .saturating_sub(previous.fallback_published_generation_lease),
+        fallback_pack_cache_lookup: next
+            .fallback_pack_cache_lookup
+            .saturating_sub(previous.fallback_pack_cache_lookup),
+        fallback_upstream_clone_global: next
+            .fallback_upstream_clone_global
+            .saturating_sub(previous.fallback_upstream_clone_global),
+        fallback_upstream_clone_repo: next
+            .fallback_upstream_clone_repo
+            .saturating_sub(previous.fallback_upstream_clone_repo),
+        fallback_unknown: next
+            .fallback_unknown
+            .saturating_sub(previous.fallback_unknown),
     }
 }
 
@@ -1999,6 +2500,39 @@ fn repo_sample_count(window: ObservationTotals) -> u64 {
         .clone_samples
         .max(window.first_byte_samples)
         .max(window.upstream_fallbacks)
+}
+
+fn dominant_fallback_target(window: ObservationTotals) -> Option<FallbackRecoveryTarget> {
+    [
+        (
+            FallbackRecoveryTarget::LocalUploadPackPermit,
+            window.fallback_local_upload_pack_permit,
+        ),
+        (
+            FallbackRecoveryTarget::LocalUploadPackFirstByte,
+            window.fallback_local_upload_pack_first_byte,
+        ),
+        (
+            FallbackRecoveryTarget::PublishedGenerationLease,
+            window.fallback_published_generation_lease,
+        ),
+        (
+            FallbackRecoveryTarget::PackCacheLookup,
+            window.fallback_pack_cache_lookup,
+        ),
+        (
+            FallbackRecoveryTarget::UpstreamCloneGlobal,
+            window.fallback_upstream_clone_global,
+        ),
+        (
+            FallbackRecoveryTarget::UpstreamCloneRepo,
+            window.fallback_upstream_clone_repo,
+        ),
+        (FallbackRecoveryTarget::Unknown, window.fallback_unknown),
+    ]
+    .into_iter()
+    .max_by_key(|(_, count)| *count)
+    .and_then(|(target, count)| (count > 0).then_some(target))
 }
 
 fn avg_seconds(total_millis: u64, samples: u64) -> Option<f64> {
@@ -2282,6 +2816,7 @@ mod tests {
             clone_latency_secs_avg: Some(1.0),
             first_byte_latency_secs_avg: Some(0.2),
             fallback_rate: 0.0,
+            dominant_fallback_target: None,
             host_pressure: HostPressure::default(),
             current,
             config: config(),
@@ -2309,6 +2844,68 @@ mod tests {
     }
 
     #[test]
+    fn local_upload_pack_fallback_increases_local_capacity_before_waits() {
+        let mut observed = snapshot(policy(5));
+        observed.fallback_rate = 1.0;
+        observed.dominant_fallback_target = Some(FallbackRecoveryTarget::LocalUploadPackPermit);
+        observed.first_byte_latency_secs_avg = Some(60.0);
+
+        let recommendation = AimdController.observe(&observed);
+
+        assert_eq!(recommendation.decision, "increase_capacity");
+        assert_eq!(recommendation.reason, "fallback_rate_slo");
+        assert_eq!(recommendation.policy.upstream_clone_concurrency, 5);
+        assert_eq!(recommendation.policy.local_upload_pack_concurrency, 6);
+        assert_eq!(recommendation.policy.local_upload_pack_threads, 6);
+        assert_eq!(
+            recommendation.policy.request_wait_for_local_catch_up_secs,
+            5
+        );
+        assert_eq!(recommendation.policy.local_upload_pack_first_byte_secs, 5);
+    }
+
+    #[test]
+    fn nginx_fallback_increases_upstream_clone_capacity_not_local_capacity() {
+        let mut observed = snapshot(policy(5));
+        observed.fallback_rate = 1.0;
+        observed.dominant_fallback_target = Some(FallbackRecoveryTarget::UpstreamCloneGlobal);
+
+        let recommendation = AimdController.observe(&observed);
+
+        assert_eq!(recommendation.decision, "increase_capacity");
+        assert_eq!(recommendation.reason, "fallback_rate_slo");
+        assert_eq!(recommendation.policy.upstream_clone_concurrency, 6);
+        assert_eq!(recommendation.policy.local_upload_pack_concurrency, 5);
+        assert_eq!(recommendation.policy.local_upload_pack_threads, 5);
+    }
+
+    #[test]
+    fn local_first_byte_fallback_increases_waits_after_local_capacity_is_maxed() {
+        let mut observed = snapshot(policy(5));
+        observed.fallback_rate = 1.0;
+        observed.dominant_fallback_target = Some(FallbackRecoveryTarget::LocalUploadPackFirstByte);
+        observed.config.bounds.local_upload_pack_concurrency.max = 5;
+        observed.config.bounds.local_upload_pack_per_repo.max = 5;
+        observed.config.bounds.local_upload_pack_threads.max = 5;
+
+        let recommendation = AimdController.observe(&observed);
+
+        assert_eq!(recommendation.decision, "increase_timeouts");
+        assert_eq!(recommendation.reason, "fallback_rate_slo");
+        assert_eq!(recommendation.policy.upstream_clone_concurrency, 5);
+        assert_eq!(recommendation.policy.local_upload_pack_concurrency, 5);
+        assert_eq!(recommendation.policy.local_upload_pack_threads, 5);
+        assert_eq!(
+            recommendation.policy.request_wait_for_local_catch_up_secs,
+            5
+        );
+        assert_eq!(
+            recommendation.policy.local_upload_pack_first_byte_secs,
+            step_up(5, observed.config.bounds.local_upload_pack_first_byte_secs)
+        );
+    }
+
+    #[test]
     fn insufficient_samples_hold_current_values() {
         let mut observed = snapshot(policy(5));
         observed.sample_count = 2;
@@ -2325,7 +2922,7 @@ mod tests {
         assert_eq!(recommendation.policy.upstream_clone_concurrency, 64);
 
         let mut observed = snapshot(policy(1));
-        observed.fallback_rate = 1.0;
+        observed.clone_latency_secs_avg = Some(60.0);
         let recommendation = AimdController.observe(&observed);
         assert_eq!(recommendation.policy.upstream_clone_concurrency, 1);
     }
@@ -2363,13 +2960,14 @@ mod tests {
     }
 
     #[test]
-    fn repo_fallback_pressure_increases_timeouts_and_decreases_capacity() {
+    fn repo_fallback_pressure_increases_capacity_before_timeouts() {
         let observed = RepoObservationSnapshot {
             owner_repo: "acme/widgets".to_string(),
             sample_count: 20,
             clone_latency_secs_avg: Some(1.0),
             first_byte_latency_secs_avg: Some(0.2),
             fallback_rate: 1.0,
+            dominant_fallback_target: Some(FallbackRecoveryTarget::LocalUploadPackPermit),
             host_pressure: HostPressure::default(),
             current: repo_policy(5),
             config: config(),
@@ -2378,23 +2976,17 @@ mod tests {
 
         let recommendation = recommend_repo_policy(&observed);
 
-        assert_eq!(recommendation.decision, "increase_timeouts");
+        assert_eq!(recommendation.decision, "increase_capacity");
         assert_eq!(
             recommendation.policy.request_wait_for_local_catch_up_secs,
-            step_up(
-                5,
-                observed.config.bounds.request_wait_for_local_catch_up_secs
-            )
+            5
         );
-        assert_eq!(
-            recommendation.policy.local_upload_pack_first_byte_secs,
-            step_up(5, observed.config.bounds.local_upload_pack_first_byte_secs)
-        );
+        assert_eq!(recommendation.policy.local_upload_pack_first_byte_secs, 5);
         assert_eq!(
             recommendation.policy.upstream_clone_per_repo_per_instance,
-            3
+            5
         );
-        assert_eq!(recommendation.policy.local_upload_pack_per_repo, 3);
+        assert_eq!(recommendation.policy.local_upload_pack_per_repo, 6);
     }
 
     #[test]

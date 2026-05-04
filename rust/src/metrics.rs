@@ -1865,7 +1865,7 @@ pub fn inc_upstream_fallback_for_repo(
 ) {
     metrics
         .adaptive_observations
-        .inc_upstream_fallback_for_repo(repo);
+        .inc_upstream_fallback_for_repo(repo, reason);
     metrics
         .metrics
         .upstream_fallback
@@ -1884,7 +1884,7 @@ pub fn inc_short_circuit_upstream_for_repo(
 ) {
     metrics
         .adaptive_observations
-        .inc_upstream_fallback_for_repo(repo);
+        .inc_upstream_fallback_for_repo(repo, stage);
     metrics
         .metrics
         .short_circuit_upstream_total
