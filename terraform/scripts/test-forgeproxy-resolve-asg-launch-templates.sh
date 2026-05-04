@@ -14,6 +14,8 @@ cat >"${mock_bin}/aws" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+scenario="${TEST_SCENARIO:?TEST_SCENARIO is required}"
+
 if [[ "$1" == "--region" ]]; then
   shift 2
 fi
@@ -44,33 +46,49 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-case "${service}:${command}:${asg_name}:${query}" in
-  autoscaling:describe-auto-scaling-groups:blue-asg:AutoScalingGroups\[0\].LaunchTemplate.Version)
+case "${scenario}:${service}:${command}:${asg_name}:${query}" in
+  mixed_instance_versions:autoscaling:describe-auto-scaling-groups:blue-asg:AutoScalingGroups\[0\].Instances\[\].LaunchTemplate.Version)
+    printf '%s\n' "9 7 8"
+    ;;
+  mixed_instance_versions:autoscaling:describe-auto-scaling-groups:green-asg:AutoScalingGroups\[0\].Instances\[\].LaunchTemplate.Version)
+    printf '%s\n' "16 15"
+    ;;
+  no_instances_falls_back_to_asg:autoscaling:describe-auto-scaling-groups:blue-asg:AutoScalingGroups\[0\].Instances\[\].LaunchTemplate.Version)
+    printf '%s\n' "None"
+    ;;
+  no_instances_falls_back_to_asg:autoscaling:describe-auto-scaling-groups:green-asg:AutoScalingGroups\[0\].Instances\[\].LaunchTemplate.Version)
+    printf '%s\n' "None"
+    ;;
+  no_instances_falls_back_to_asg:autoscaling:describe-auto-scaling-groups:blue-asg:AutoScalingGroups\[0\].LaunchTemplate.Version)
     printf '%s\n' "7"
     ;;
-  autoscaling:describe-auto-scaling-groups:green-asg:AutoScalingGroups\[0\].LaunchTemplate.Version)
+  no_instances_falls_back_to_asg:autoscaling:describe-auto-scaling-groups:green-asg:AutoScalingGroups\[0\].LaunchTemplate.Version)
     printf '%s\n' '$Latest'
     ;;
-  autoscaling:describe-auto-scaling-groups:green-asg:AutoScalingGroups\[0\].Instances\[0\].LaunchTemplate.Version)
-    printf '%s\n' "8"
-    ;;
   *)
-    echo "unexpected aws invocation: service=${service} command=${command} asg=${asg_name} query=${query}" >&2
+    echo "unexpected aws invocation: scenario=${scenario} service=${service} command=${command} asg=${asg_name} query=${query}" >&2
     exit 1
     ;;
 esac
 EOF
 chmod +x "${mock_bin}/aws"
 
-result="$(
+run_resolver() {
+  local scenario="$1"
+
   env \
     PATH="${mock_bin}:${PATH}" \
+    TEST_SCENARIO="${scenario}" \
     AWS_REGION="us-east-1" \
     BLUE_ASG_NAME="blue-asg" \
     GREEN_ASG_NAME="green-asg" \
     bash "${script_path}"
-)"
+}
 
-[[ "${result}" == '{"blue_version":"7","green_version":"8"}' ]]
+result="$(run_resolver mixed_instance_versions)"
+[[ "${result}" == '{"blue_version":"7","green_version":"15"}' ]]
+
+result="$(run_resolver no_instances_falls_back_to_asg)"
+[[ "${result}" == '{"blue_version":"7","green_version":""}' ]]
 
 echo "forgeproxy-resolve-asg-launch-templates tests passed"

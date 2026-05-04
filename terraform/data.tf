@@ -45,12 +45,13 @@ locals {
       || data.external.forgeproxy_asg_launch_template_versions.result["${slot}_version"] != tostring(aws_launch_template.forgeproxy[slot].latest_version)
     )
   ]
+  forgeproxy_standby_slot = local.forgeproxy_default_live_slot == "blue" ? "green" : "blue"
   forgeproxy_auto_target_slot = (
     length(local.forgeproxy_rollout_slots_needing_update) == 0
     ? local.forgeproxy_default_live_slot
     : (
-      length(local.forgeproxy_rollout_slots_needing_update) == 1
-      ? local.forgeproxy_rollout_slots_needing_update[0]
+      contains(["blue", "green"], local.forgeproxy_current_live_slot) && contains(local.forgeproxy_rollout_slots_needing_update, local.forgeproxy_standby_slot)
+      ? local.forgeproxy_standby_slot
       : data.external.forgeproxy_rollout_slot.result.target_slot
     )
   )
