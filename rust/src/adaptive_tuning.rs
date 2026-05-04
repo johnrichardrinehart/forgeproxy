@@ -1034,8 +1034,8 @@ impl Controller for AimdController {
             return recommendation(policy, "decrease", reason, 0.9);
         }
 
-        let policy = increase_gradually(snapshot.current, &snapshot.config.bounds);
-        recommendation(policy, "increase", "healthy", 0.7)
+        let policy = probe_capacity_and_tighten_waits(snapshot.current, &snapshot.config.bounds);
+        recommendation(policy, "probe", "healthy", 0.7)
     }
 }
 
@@ -1100,7 +1100,7 @@ fn latency_slo_reason(snapshot: &ObservationSnapshot) -> Option<&'static str> {
     None
 }
 
-fn increase_gradually(
+fn probe_capacity_and_tighten_waits(
     policy: EffectivePolicy,
     bounds: &AdaptiveTuningBoundsConfig,
 ) -> EffectivePolicy {
@@ -1157,19 +1157,19 @@ fn increase_gradually(
             bounds.local_upload_pack_threads,
         ),
         index_pack_threads: step_up(policy.index_pack_threads, bounds.index_pack_threads),
-        request_wait_for_local_catch_up_secs: step_up(
+        request_wait_for_local_catch_up_secs: step_down(
             policy.request_wait_for_local_catch_up_secs,
             bounds.request_wait_for_local_catch_up_secs,
         ),
-        request_time_s3_restore_secs: step_up(
+        request_time_s3_restore_secs: step_down(
             policy.request_time_s3_restore_secs,
             bounds.request_time_s3_restore_secs,
         ),
-        generation_publish_secs: step_up(
+        generation_publish_secs: step_down(
             policy.generation_publish_secs,
             bounds.generation_publish_secs,
         ),
-        local_upload_pack_first_byte_secs: step_up(
+        local_upload_pack_first_byte_secs: step_down(
             policy.local_upload_pack_first_byte_secs,
             bounds.local_upload_pack_first_byte_secs,
         ),
@@ -1484,22 +1484,6 @@ fn decrease_foreground_and_background(
         local_upload_pack_threads: step_down(
             background.local_upload_pack_threads,
             bounds.local_upload_pack_threads,
-        ),
-        request_wait_for_local_catch_up_secs: step_down(
-            background.request_wait_for_local_catch_up_secs,
-            bounds.request_wait_for_local_catch_up_secs,
-        ),
-        request_time_s3_restore_secs: step_down(
-            background.request_time_s3_restore_secs,
-            bounds.request_time_s3_restore_secs,
-        ),
-        generation_publish_secs: step_down(
-            background.generation_publish_secs,
-            bounds.generation_publish_secs,
-        ),
-        local_upload_pack_first_byte_secs: step_down(
-            background.local_upload_pack_first_byte_secs,
-            bounds.local_upload_pack_first_byte_secs,
         ),
         ..background
     }
@@ -2827,9 +2811,14 @@ mod tests {
     #[test]
     fn healthy_window_increases_gradually() {
         let recommendation = AimdController.observe(&snapshot(policy(2)));
-        assert_eq!(recommendation.decision, "increase");
+        assert_eq!(recommendation.decision, "probe");
         assert_eq!(recommendation.policy.upstream_clone_concurrency, 3);
         assert_eq!(recommendation.policy.bundle_pack_threads, 3);
+        assert_eq!(
+            recommendation.policy.request_wait_for_local_catch_up_secs,
+            0
+        );
+        assert_eq!(recommendation.policy.local_upload_pack_first_byte_secs, 0);
     }
 
     #[test]
@@ -2841,6 +2830,48 @@ mod tests {
         assert_eq!(recommendation.reason, "clone_latency_slo");
         assert_eq!(recommendation.policy.upstream_clone_concurrency, 3);
         assert_eq!(recommendation.policy.bundle_generation_concurrency, 3);
+        assert_eq!(
+            recommendation.policy.request_wait_for_local_catch_up_secs,
+            5
+        );
+        assert_eq!(recommendation.policy.local_upload_pack_first_byte_secs, 5);
+    }
+
+    #[test]
+    fn first_byte_slo_preserves_request_patience() {
+        let mut observed = snapshot(policy(30));
+        observed.first_byte_latency_secs_avg = Some(60.0);
+
+        let recommendation = AimdController.observe(&observed);
+
+        assert_eq!(recommendation.decision, "decrease");
+        assert_eq!(recommendation.reason, "first_byte_latency_slo");
+        assert_eq!(recommendation.policy.local_upload_pack_concurrency, 28);
+        assert_eq!(
+            recommendation.policy.request_wait_for_local_catch_up_secs,
+            30
+        );
+        assert_eq!(recommendation.policy.request_time_s3_restore_secs, 30);
+        assert_eq!(recommendation.policy.generation_publish_secs, 30);
+        assert_eq!(recommendation.policy.local_upload_pack_first_byte_secs, 30);
+    }
+
+    #[test]
+    fn host_pressure_preserves_request_patience() {
+        let mut observed = snapshot(policy(30));
+        observed.host_pressure.cpu_busy_fraction = Some(1.0);
+
+        let recommendation = AimdController.observe(&observed);
+
+        assert_eq!(recommendation.decision, "decrease");
+        assert_eq!(recommendation.reason, "cpu_busy");
+        assert_eq!(recommendation.policy.bundle_generation_concurrency, 28);
+        assert_eq!(recommendation.policy.upstream_clone_concurrency, 30);
+        assert_eq!(
+            recommendation.policy.request_wait_for_local_catch_up_secs,
+            30
+        );
+        assert_eq!(recommendation.policy.local_upload_pack_first_byte_secs, 30);
     }
 
     #[test]
