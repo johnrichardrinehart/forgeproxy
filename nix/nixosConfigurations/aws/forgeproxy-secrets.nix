@@ -143,10 +143,18 @@ let
                     _USER_DATA=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/user-data" || true)
                     _IDENTITY=$(${pkgs.curl}/bin/curl -sf -H "X-aws-ec2-metadata-token: $_IMDS_TOKEN" "http://169.254.169.254/latest/dynamic/instance-identity/document")
                     SM_PREFIX=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# SM_PREFIX=//p' | ${pkgs.coreutils}/bin/head -n1)
+                    NGINX_SSH_LISTEN_BACKLOG=$(printf '%s\n' "$_USER_DATA" | ${pkgs.gnused}/bin/sed -n 's/^# FORGEPROXY_NGINX_SSH_LISTEN_BACKLOG=//p' | ${pkgs.coreutils}/bin/head -n1)
                     INSTANCE_ID=$(printf '%s\n' "$_IDENTITY" | ${pkgs.jq}/bin/jq -r '.instanceId')
                     REGION=$(printf '%s\n' "$_IDENTITY" | ${pkgs.jq}/bin/jq -r '.region')
                     if [ -z "$SM_PREFIX" ]; then
                       echo "FATAL: Could not resolve SM_PREFIX from EC2 user_data" >&2
+                      exit 1
+                    fi
+                    if [ -z "''${NGINX_SSH_LISTEN_BACKLOG:-}" ]; then
+                      NGINX_SSH_LISTEN_BACKLOG=${toString nginxCfg.sshProxy.listenBacklog}
+                    fi
+                    if ! [[ "$NGINX_SSH_LISTEN_BACKLOG" =~ ^[1-9][0-9]*$ ]]; then
+                      echo "FATAL: invalid FORGEPROXY_NGINX_SSH_LISTEN_BACKLOG=$NGINX_SSH_LISTEN_BACKLOG" >&2
                       exit 1
                     fi
 
@@ -222,6 +230,10 @@ let
     EOF
 
                     # Stream-level variables for SSH traffic.
+                    cat > /run/nginx/forgeproxy-stream-listen.conf <<EOF
+    listen ${nginxCfg.sshProxy.listenAddress}:${toString nginxCfg.sshProxy.listenPort} backlog=$NGINX_SSH_LISTEN_BACKLOG;
+    EOF
+
                     cat > /run/nginx/forgeproxy-stream.conf <<EOF
     map \$time_iso8601 \$forgeproxy_disabled {
       default "$FORGEPROXY_DISABLED";

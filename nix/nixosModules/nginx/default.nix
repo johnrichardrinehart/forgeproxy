@@ -97,6 +97,12 @@ in
         description = "Port for nginx to listen on for client SSH Git traffic.";
       };
 
+      listenBacklog = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 8192;
+        description = "TCP listen backlog for nginx client SSH Git traffic.";
+      };
+
       localAddress = lib.mkOption {
         type = lib.types.str;
         default = "127.0.0.1";
@@ -162,7 +168,7 @@ in
           'forgeproxy_disabled="$forgeproxy_disabled" ssh_target="$forgeproxy_ssh_target"';
 
         server {
-          listen ${cfg.sshProxy.listenAddress}:${toString cfg.sshProxy.listenPort};
+          include /run/nginx/forgeproxy-stream-listen.conf;
           proxy_pass $forgeproxy_ssh_target;
           proxy_connect_timeout 30s;
           proxy_timeout 15m;
@@ -500,6 +506,11 @@ in
           > /run/nginx/forgeproxy-server.conf
       fi
       if ${lib.boolToString cfg.sshProxy.enable}; then
+        if [ ! -f /run/nginx/forgeproxy-stream-listen.conf ]; then
+          printf '%s\n' \
+            'listen ${cfg.sshProxy.listenAddress}:${toString cfg.sshProxy.listenPort} backlog=${toString cfg.sshProxy.listenBacklog};' \
+            > /run/nginx/forgeproxy-stream-listen.conf
+        fi
         if [ ! -f /run/nginx/forgeproxy-stream.conf ]; then
           {
             printf '%s\n' 'map $time_iso8601 $forgeproxy_disabled {'

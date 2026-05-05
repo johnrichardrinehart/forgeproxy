@@ -66,6 +66,20 @@ variable "upstream_ssh_port" {
   }
 }
 
+variable "nginx_ssh_listen_backlog" {
+  type        = number
+  default     = 8192
+  description = "TCP listen backlog for the nginx stream listener that accepts client SSH Git traffic."
+
+  validation {
+    condition = (
+      var.nginx_ssh_listen_backlog >= 1 &&
+      floor(var.nginx_ssh_listen_backlog) == var.nginx_ssh_listen_backlog
+    )
+    error_message = "nginx_ssh_listen_backlog must be a positive whole number."
+  }
+}
+
 variable "upstream_api_url" {
   type        = string
   description = "API URL of the upstream forge (e.g., https://ghe.example.com/api/v3)"

@@ -102,6 +102,7 @@ resource "aws_launch_template" "forgeproxy" {
     # FORGEPROXY_CACHE_SEED_SNAPSHOT_RETENTION_COUNT=${var.forgeproxy_cache_seed_snapshot_retention_count}
     # FORGEPROXY_CACHE_SCRUB_ON_CALENDAR=${var.cache_scrub_on_calendar}
     # FORGEPROXY_CACHE_SCRUB_INTERVAL_SECS=${var.cache_scrub_interval_secs}
+    # FORGEPROXY_NGINX_SSH_LISTEN_BACKLOG=${var.nginx_ssh_listen_backlog}
     { ... }: {}
   EOT
   )
