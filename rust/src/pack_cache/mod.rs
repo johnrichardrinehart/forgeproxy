@@ -730,6 +730,8 @@ impl PackCache {
                         self.packstore_pack_dir().display()
                     )
                 })?;
+            self.scrub_invalid_artifacts()
+                .with_context(|| format!("scrub pack cache artifacts {}", self.root.display()))?;
             self.reload_recent_metadata()
                 .with_context(|| format!("reload pack cache metadata {}", self.root.display()))?;
             self.refresh_size_metric().await;
@@ -1313,18 +1315,7 @@ impl PackCache {
     }
 
     fn remove_entry_files(&self, key: &PackCacheKey) {
-        let manifest_path = self.entry_manifest_path(key);
-        if let Err(error) = std::fs::remove_file(&manifest_path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(path = %manifest_path.display(), error = %error, "failed to remove invalid pack cache entry manifest");
-        }
-        let stale_metadata_path = metadata_path(&self.root, key.as_str());
-        if let Err(error) = std::fs::remove_file(&stale_metadata_path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(path = %stale_metadata_path.display(), error = %error, "failed to remove invalid pack cache metadata");
-        }
+        remove_entry_sidecars(&self.root, key.as_str());
         if let Err(error) = garbage_collect_unreferenced_pack_files(&self.root)
             && !matches!(error.kind(), std::io::ErrorKind::NotFound)
         {
@@ -1406,6 +1397,24 @@ impl PackCache {
 
     fn packstore_pack_dir(&self) -> PathBuf {
         self.packstore_object_dir().join(PACKSTORE_PACK_DIR)
+    }
+
+    fn scrub_invalid_artifacts(&self) -> Result<()> {
+        let invalid_keys = collect_invalid_pack_cache_keys(&self.root)?;
+        if invalid_keys.is_empty() {
+            return Ok(());
+        }
+
+        for key in invalid_keys {
+            warn!(
+                key,
+                "removing invalid pack cache entry and related unreferenced pack files"
+            );
+            remove_entry_sidecars(&self.root, &key);
+        }
+        garbage_collect_unreferenced_pack_files(&self.root)
+            .with_context(|| format!("garbage collect pack cache {}", self.root.display()))?;
+        Ok(())
     }
 
     fn pack_path_for_id(&self, pack_id: &str) -> PathBuf {
@@ -2386,6 +2395,155 @@ fn read_pack_cache_metadata(root: &Path, key: &str) -> Result<PackCacheMetadata>
     Ok(metadata)
 }
 
+fn entry_manifest_path(root: &Path, key: &str) -> PathBuf {
+    root.join(format!("{key}.{ENTRY_MANIFEST_EXT}"))
+}
+
+fn read_pack_entry_manifest(root: &Path, key: &str) -> Result<PackEntryManifest> {
+    let path = entry_manifest_path(root, key);
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read pack cache entry manifest {}", path.display()))?;
+    let manifest: PackEntryManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse pack cache entry manifest {}", path.display()))?;
+    anyhow::ensure!(
+        manifest.version == PACK_ENTRY_MANIFEST_VERSION,
+        "unsupported pack cache entry manifest version {}",
+        manifest.version
+    );
+    anyhow::ensure!(
+        !manifest.pack_ids.is_empty(),
+        "pack cache entry manifest has no packs"
+    );
+    if let Some(trailer) = manifest.stitched_trailer_sha1.as_deref() {
+        parse_sha1_hex(trailer).context("parse stitched pack trailer")?;
+    }
+    Ok(manifest)
+}
+
+fn packstore_pack_dir(root: &Path) -> PathBuf {
+    root.join(PACKSTORE_DIR)
+        .join(PACKSTORE_OBJECTS_DIR)
+        .join(PACKSTORE_PACK_DIR)
+}
+
+fn pack_path_for_id(root: &Path, pack_id: &str) -> PathBuf {
+    packstore_pack_dir(root).join(format!("pack-{pack_id}.pack"))
+}
+
+fn validate_pack_file_presence(path: &Path) -> Result<()> {
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("stat pack {}", path.display()))?
+        .len();
+    anyhow::ensure!(
+        len >= 32,
+        "pack {} is too small to contain a header and trailer",
+        path.display()
+    );
+    Ok(())
+}
+
+fn collect_invalid_pack_cache_keys(root: &Path) -> Result<Vec<String>> {
+    let mut invalid_keys = HashSet::new();
+    let mut manifests = HashMap::<String, PackEntryManifest>::new();
+    let mut bad_pack_ids = HashSet::new();
+
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("read pack cache root {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(ENTRY_MANIFEST_EXT) || name.contains(".tmp.") {
+            continue;
+        }
+        let Some(key) = pack_cache_key_from_file_name(name) else {
+            continue;
+        };
+
+        let manifest = match read_pack_entry_manifest(root, &key) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "invalid pack cache entry manifest"
+                );
+                invalid_keys.insert(key);
+                continue;
+            }
+        };
+
+        for pack_id in &manifest.pack_ids {
+            let pack_path = pack_path_for_id(root, pack_id);
+            if let Err(error) = validate_pack_file_presence(&pack_path) {
+                warn!(
+                    key,
+                    pack_id,
+                    path = %pack_path.display(),
+                    error = %error,
+                    "invalid pack cache pack file reference"
+                );
+                bad_pack_ids.insert(pack_id.clone());
+            }
+        }
+        manifests.insert(key, manifest);
+    }
+
+    for (key, manifest) in manifests {
+        if manifest
+            .pack_ids
+            .iter()
+            .any(|pack_id| bad_pack_ids.contains(pack_id))
+        {
+            invalid_keys.insert(key);
+        }
+    }
+
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("read pack cache root {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(METADATA_EXT) || name.contains(".tmp.") {
+            continue;
+        }
+        let Some(key) = pack_cache_key_from_file_name(name) else {
+            continue;
+        };
+        if let Err(error) = read_pack_cache_metadata(root, &key) {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "invalid pack cache metadata"
+            );
+            invalid_keys.insert(key);
+        }
+    }
+
+    let mut invalid_keys = invalid_keys.into_iter().collect::<Vec<_>>();
+    invalid_keys.sort();
+    Ok(invalid_keys)
+}
+
+fn remove_entry_sidecars(root: &Path, key: &str) {
+    for path in [entry_manifest_path(root, key), metadata_path(root, key)] {
+        if let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), error = %error, "failed to remove invalid pack cache sidecar");
+        }
+    }
+}
+
 fn write_pack_cache_metadata(root: &Path, metadata: &PackCacheMetadata) -> Result<()> {
     let path = metadata_path(root, &metadata.key);
     let tmp_path = root.join(format!(
@@ -2968,6 +3126,7 @@ mod tests {
     }
 
     fn write_test_entry_manifest(cache: &PackCache, key: &PackCacheKey, pack_ids: &[String]) {
+        std::fs::create_dir_all(&cache.root).unwrap();
         std::fs::write(
             cache.entry_manifest_path(key),
             serde_json::to_vec(&super::PackEntryManifest {
@@ -2976,6 +3135,37 @@ mod tests {
                 stitched_trailer_sha1: None,
             })
             .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_test_metadata(cache: &PackCache, key: &PackCacheKey) {
+        write_pack_cache_metadata(
+            &cache.root,
+            &PackCacheMetadata {
+                version: super::PACK_CACHE_METADATA_VERSION,
+                key: key.as_str().to_string(),
+                owner_repo: key.owner_repo.clone(),
+                request_wants: key
+                    .base
+                    .as_ref()
+                    .map(|base| base.request_wants.clone())
+                    .unwrap_or_default(),
+                covered_wants: key
+                    .base
+                    .as_ref()
+                    .map(|base| base.request_wants.clone())
+                    .unwrap_or_default(),
+                request_template: key
+                    .base
+                    .as_ref()
+                    .map(|base| base.request_template.clone())
+                    .unwrap_or_default(),
+                full_tip: key.base.as_ref().is_some_and(|base| base.full_tip),
+                created_at_unix_secs: 1,
+                last_accessed_unix_secs: 1,
+                hit_count: 0,
+            },
         )
         .unwrap();
     }
@@ -3630,6 +3820,154 @@ mod tests {
         }
         assert_eq!(super::stitch::extract_raw_pack(&replayed).unwrap(), pack);
         assert!(cache.pack_paths_for_key(&key).is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_removes_zero_byte_metadata_and_related_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+
+        let key = PackCacheKey {
+            digest: "empty-metadata".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        write_test_pack(&cache, key.as_str(), &raw_pack(1, b"valid-pack"));
+        write_test_entry_manifest(&cache, &key, &[key.as_str().to_string()]);
+        std::fs::write(metadata_path(&cache.root, key.as_str()), []).unwrap();
+
+        cache.ensure_ready().await.unwrap();
+
+        assert!(!cache.entry_manifest_path(&key).exists());
+        assert!(!metadata_path(&cache.root, key.as_str()).exists());
+        assert!(!cache.pack_path_for_id(key.as_str()).exists());
+        assert!(cache.lookup_by_key(&key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_removes_composites_that_reference_corrupt_base_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+
+        let base_key = PackCacheKey {
+            digest: "corrupt-base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        let composite_key = PackCacheKey {
+            digest: "composite-on-corrupt-base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+        let delta_pack_id = format!("{}-delta", composite_key.as_str());
+
+        std::fs::create_dir_all(cache.packstore_pack_dir()).unwrap();
+        std::fs::write(cache.pack_path_for_id(base_key.as_str()), []).unwrap();
+        write_test_pack(&cache, &delta_pack_id, &raw_pack(1, b"valid-delta-pack"));
+        write_test_entry_manifest(&cache, &base_key, &[base_key.as_str().to_string()]);
+        write_test_entry_manifest(
+            &cache,
+            &composite_key,
+            &[base_key.as_str().to_string(), delta_pack_id.clone()],
+        );
+        write_test_metadata(&cache, &base_key);
+        write_test_metadata(&cache, &composite_key);
+
+        cache.ensure_ready().await.unwrap();
+
+        assert!(!cache.entry_manifest_path(&base_key).exists());
+        assert!(!cache.entry_manifest_path(&composite_key).exists());
+        assert!(!metadata_path(&cache.root, base_key.as_str()).exists());
+        assert!(!metadata_path(&cache.root, composite_key.as_str()).exists());
+        assert!(!cache.pack_path_for_id(base_key.as_str()).exists());
+        assert!(!cache.pack_path_for_id(&delta_pack_id).exists());
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_removes_corrupt_delta_without_removing_base_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+
+        let base_key = PackCacheKey {
+            digest: "valid-base".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+        let composite_key = PackCacheKey {
+            digest: "composite-with-corrupt-delta".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: Some(PackCacheBaseMetadata {
+                request_wants: vec!["cccccccccccccccccccccccccccccccccccccccc".to_string()],
+                request_template: vec![
+                    "command=fetch".to_string(),
+                    "done".to_string(),
+                    "flush".to_string(),
+                ],
+                full_tip: false,
+            }),
+        };
+        let delta_pack_id = format!("{}-delta", composite_key.as_str());
+
+        write_test_pack(&cache, base_key.as_str(), &raw_pack(1, b"valid-base-pack"));
+        write_test_pack(&cache, &delta_pack_id, b"not-a-pack");
+        write_test_entry_manifest(&cache, &base_key, &[base_key.as_str().to_string()]);
+        write_test_entry_manifest(
+            &cache,
+            &composite_key,
+            &[base_key.as_str().to_string(), delta_pack_id.clone()],
+        );
+        write_test_metadata(&cache, &base_key);
+        write_test_metadata(&cache, &composite_key);
+
+        cache.ensure_ready().await.unwrap();
+
+        assert!(cache.entry_manifest_path(&base_key).exists());
+        assert!(metadata_path(&cache.root, base_key.as_str()).exists());
+        assert!(cache.pack_path_for_id(base_key.as_str()).exists());
+        assert!(!cache.entry_manifest_path(&composite_key).exists());
+        assert!(!metadata_path(&cache.root, composite_key.as_str()).exists());
+        assert!(!cache.pack_path_for_id(&delta_pack_id).exists());
     }
 
     #[tokio::test]

@@ -342,6 +342,8 @@ let
 
     name_prefix=$(user_data_value SM_PREFIX)
     slot=$(user_data_value FORGEPROXY_DEPLOYMENT_SLOT)
+    mount_dir=$(user_data_value FORGEPROXY_CACHE_MOUNT_DIR)
+    mount_dir=''${mount_dir:-/var/cache/forgeproxy}
     interval_secs=$(user_data_value FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_INTERVAL_SECS)
     interval_secs=''${interval_secs:-86400}
     wait_timeout_secs=$(user_data_value FORGEPROXY_CACHE_PERIODIC_SNAPSHOT_WAIT_TIMEOUT_SECS)
@@ -386,6 +388,53 @@ let
     region=$(printf '%s\n' "$identity" | ${pkgs.jq}/bin/jq -r '.region')
     instance_id=$(printf '%s\n' "$identity" | ${pkgs.jq}/bin/jq -r '.instanceId')
     aws=(${pkgs.awscli2}/bin/aws --region "$region")
+    cache_mount_frozen=false
+
+    thaw_cache_mount() {
+      if [ "$cache_mount_frozen" = "true" ]; then
+        log "thawing $mount_dir after cache seed snapshot"
+        if ${pkgs.util-linux}/bin/fsfreeze -u "$mount_dir"; then
+          cache_mount_frozen=false
+        else
+          log_event snapshot_thaw_error \
+            "volume_id=''${volume_id:-unknown}" \
+            "mount_dir=$mount_dir" \
+            "source_slot=$slot" \
+            "target_slot=$target_slot" \
+            "cache_slot=''${cache_slot:-unknown}"
+          return 1
+        fi
+      fi
+    }
+
+    freeze_cache_mount() {
+      if ! ${pkgs.util-linux}/bin/mountpoint -q "$mount_dir"; then
+        log "FATAL: cache mount $mount_dir is not a mountpoint"
+        exit 1
+      fi
+
+      log "freezing $mount_dir before cache seed snapshot"
+      ${pkgs.util-linux}/bin/fsfreeze -f "$mount_dir"
+      cache_mount_frozen=true
+    }
+
+    create_frozen_cache_snapshot() {
+      local description="$1"
+      local tag_spec="$2"
+      local snapshot_id
+
+      freeze_cache_mount
+      trap 'thaw_cache_mount || true' EXIT
+      snapshot_id=$("''${aws[@]}" ec2 create-snapshot \
+        --volume-id "$volume_id" \
+        --description "$description" \
+        --tag-specifications "$tag_spec" \
+        --query SnapshotId \
+        --output text)
+      thaw_cache_mount
+      trap - EXIT
+      printf '%s\n' "$snapshot_id"
+    }
 
     attached_cache_volume_row() {
       "''${aws[@]}" ec2 describe-volumes \
@@ -714,12 +763,9 @@ let
     fi
 
     log "creating periodic cache seed snapshot from $slot volume $volume_id for $target_slot cache slot $cache_slot"
-    snapshot_id=$("''${aws[@]}" ec2 create-snapshot \
-      --volume-id "$volume_id" \
-      --description "$name_prefix forgeproxy $slot cache slot $cache_slot periodic seed for $target_slot" \
-      --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=$name_prefix-forgeproxy-$target_slot-cache-seed-$cache_slot-periodic},{Key=Role,Value=forgeproxy-cache-seed},{Key=ForgeproxyNamePrefix,Value=$name_prefix},{Key=DeploymentSlot,Value=$target_slot},{Key=SourceSlot,Value=$slot},{Key=SourceCacheSlot,Value=$cache_slot},{Key=SourceVolumeId,Value=$volume_id},{Key=CurrentSeed,Value=false},{Key=PendingSeed,Value=true},{Key=CreatedAtUnix,Value=$now},{Key=CreatedBy,Value=forgeproxy-cache-volume-snapshot}]" \
-      --query SnapshotId \
-      --output text)
+    snapshot_id=$(create_frozen_cache_snapshot \
+      "$name_prefix forgeproxy $slot cache slot $cache_slot periodic seed for $target_slot" \
+      "ResourceType=snapshot,Tags=[{Key=Name,Value=$name_prefix-forgeproxy-$target_slot-cache-seed-$cache_slot-periodic},{Key=Role,Value=forgeproxy-cache-seed},{Key=ForgeproxyNamePrefix,Value=$name_prefix},{Key=DeploymentSlot,Value=$target_slot},{Key=SourceSlot,Value=$slot},{Key=SourceCacheSlot,Value=$cache_slot},{Key=SourceVolumeId,Value=$volume_id},{Key=CurrentSeed,Value=false},{Key=PendingSeed,Value=true},{Key=CreatedAtUnix,Value=$now},{Key=CreatedBy,Value=forgeproxy-cache-volume-snapshot}]")
     log "created periodic cache seed snapshot $snapshot_id"
     wait_for_snapshot_completion "$snapshot_id" "$cache_slot"
   '';

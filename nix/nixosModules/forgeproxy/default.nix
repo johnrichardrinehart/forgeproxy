@@ -26,7 +26,9 @@ let
 
       cache_root=${lib.escapeShellArg "${cfg.cacheDir}"}
       generations_root=${lib.escapeShellArg cacheLayout.generationsRoot}
+      mirrors_root=${lib.escapeShellArg cacheLayout.mirrorsRoot}
       state_generations_root=${lib.escapeShellArg cacheLayout.stateGenerationsRoot}
+      state_delta_root=${lib.escapeShellArg cacheLayout.stateDeltaRoot}
       bundle_tmp_root=${lib.escapeShellArg cacheLayout.stateBundleTmpRoot}
       tee_root=${lib.escapeShellArg cacheLayout.stateTeeRoot}
       tee_max_age_minutes=15
@@ -62,6 +64,24 @@ let
         repo_name=$(basename "$repo_entry" .git)
         owner_name=$(basename "$(dirname "$repo_entry")")
         printf '%s\n' "$state_generations_root/$owner_name/$repo_name.git"
+      }
+
+      repo_delta_dir() {
+        local repo_entry=$1
+        local repo_name owner_name
+
+        repo_name=$(basename "$repo_entry" .git)
+        owner_name=$(basename "$(dirname "$repo_entry")")
+        printf '%s\n' "$state_delta_root/$owner_name/$repo_name.git"
+      }
+
+      published_entry_for_mirror() {
+        local mirror_path=$1
+        local repo_name owner_name
+
+        repo_name=$(basename "$mirror_path" .git)
+        owner_name=$(basename "$(dirname "$mirror_path")")
+        printf '%s\n' "$generations_root/$owner_name/$repo_name.git"
       }
 
       canonical_path() {
@@ -153,6 +173,28 @@ let
         publish_latest_valid_generation "$repo_entry" "$repo_target" || true
       }
 
+      remove_repo_cache_family() {
+        local repo_entry=$1
+        local mirror_path=$2
+        local reason=$3
+        local active_path generations_dir delta_dir repo_target
+
+        generations_dir=$(repo_generation_dir "$repo_entry")
+        delta_dir=$(repo_delta_dir "$repo_entry")
+        repo_target=$(canonical_path "$repo_entry")
+
+        for active_path in "$repo_target" "$generations_dir" "$mirror_path" "$delta_dir"; do
+          [[ -n "$active_path" && -d "$active_path" ]] || continue
+          if repo_is_active "$active_path"; then
+            echo "forgeproxy-cache-scrub: skipping $reason mirror cache family for active related path $active_path" >&2
+            return 0
+          fi
+        done
+
+        echo "forgeproxy-cache-scrub: removing $reason mirror and related cache state for $repo_entry" >&2
+        rm -rf "$repo_entry" "$generations_dir" "$mirror_path" "$delta_dir"
+      }
+
       repo_is_active() {
         local repo_path=$1
         lsof +D "$repo_path" >/dev/null 2>&1
@@ -242,6 +284,38 @@ let
           remove_generation_target "$repo_path" "$repo_target" "invalid"
         fi
       done < <(find "$generations_root" -mindepth 2 -maxdepth 2 \( -type d -o -type l \) -name '*.git' -print 2>/dev/null)
+
+      if [[ -d "$mirrors_root" ]]; then
+        while IFS= read -r mirror_path; do
+          [[ -n "$mirror_path" ]] || continue
+
+          repo_entry=$(published_entry_for_mirror "$mirror_path")
+          if repo_is_active "$mirror_path"; then
+            echo "forgeproxy-cache-scrub: skipping active mirror $mirror_path" >&2
+            continue
+          fi
+
+          if ! is_usable_bare_repo "$mirror_path"; then
+            remove_repo_cache_family "$repo_entry" "$mirror_path" "unusable"
+            continue
+          fi
+
+          if ! git_repo_check "$mirror_path" rev-parse --is-bare-repository >/dev/null 2>&1; then
+            remove_repo_cache_family "$repo_entry" "$mirror_path" "non-bare"
+            continue
+          fi
+
+          fsck_status=0
+          run_interruptible_full_fsck "$repo_entry" "$mirror_path" || fsck_status=$?
+          if [[ "$fsck_status" -eq 75 ]]; then
+            echo "forgeproxy-cache-scrub: skipping mirror with client activity $mirror_path" >&2
+            continue
+          fi
+          if [[ "$fsck_status" -ne 0 ]]; then
+            remove_repo_cache_family "$repo_entry" "$mirror_path" "invalid"
+          fi
+        done < <(find "$mirrors_root" -mindepth 2 -maxdepth 2 -type d -name '*.git' -print 2>/dev/null)
+      fi
 
       if [[ -d "$tee_root" ]]; then
         while IFS= read -r capture_dir; do

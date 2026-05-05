@@ -36,6 +36,7 @@ listener_arn=""
 target_group_arn=""
 desired_capacity=""
 waiter_name=""
+command_id=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -60,6 +61,10 @@ while [[ "$#" -gt 0 ]]; do
       shift 2
       ;;
     --output)
+      shift 2
+      ;;
+    --command-id)
+      command_id="$2"
       shift 2
       ;;
     *)
@@ -266,49 +271,68 @@ case "${scenario}:${service}:${command}:${query}" in
   attached_healthy:elbv2:describe-target-groups:length\(TargetGroups\[0\].LoadBalancerArns\))
     printf '%s\n' "1"
     ;;
-  cache_seeded:elbv2:describe-listeners:*)
+  cache_seeded:elbv2:describe-listeners:*|cache_freeze_timeout:elbv2:describe-listeners:*)
     if [[ -n "${listener_arn}" ]]; then
       printf '%s\n' "blue-https"
     else
       printf '%s\n' "https-listener"
     fi
     ;;
-  cache_seeded:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].Instances\[\].InstanceId)
+  cache_seeded:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].Instances\[\].InstanceId|cache_freeze_timeout:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].Instances\[\].InstanceId)
     printf '%s\n' "i-blue-1"
     ;;
-  cache_seeded:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].AvailabilityZones\[0\])
+  cache_seeded:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].AvailabilityZones\[0\]|cache_freeze_timeout:autoscaling:describe-auto-scaling-groups:AutoScalingGroups\[0\].AvailabilityZones\[0\])
     printf '%s\n' "us-east-1a"
     ;;
-  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\))
+  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\)|cache_freeze_timeout:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\))
     if [[ "${asg_name}" == "green-asg" ]]; then
       asg_count_for "${asg_name}" "2"
     else
       printf '%s\n' "2"
     fi
     ;;
-  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\]\))
+  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\]\)|cache_freeze_timeout:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\]\))
     if [[ "${asg_name}" == "green-asg" ]]; then
       asg_count_for "${asg_name}" "2"
     else
       printf '%s\n' "2"
     fi
     ;;
-  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\ \&\&\ HealthStatus==\'Healthy\'\]\))
+  cache_seeded:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\ \&\&\ HealthStatus==\'Healthy\'\]\)|cache_freeze_timeout:autoscaling:describe-auto-scaling-groups:length\(AutoScalingGroups\[0\].Instances\[\?LifecycleState==\'InService\'\ \&\&\ HealthStatus==\'Healthy\'\]\))
     if [[ "${asg_name}" == "green-asg" ]]; then
       asg_count_for "${asg_name}" "2"
     else
       printf '%s\n' "2"
     fi
     ;;
-  cache_seeded:ec2:describe-volumes:Volumes\[\].VolumeId)
+  cache_seeded:ec2:describe-volumes:Volumes\[\].VolumeId|cache_freeze_timeout:ec2:describe-volumes:Volumes\[\].VolumeId)
     printf '%s\n' ""
     ;;
-  cache_seeded:ec2:describe-volumes:Volumes\[\].\[VolumeId,\ Tags\[\?Key==\`CacheSlot\`\].Value\ \|\ \[0\]\])
+  cache_seeded:ec2:describe-volumes:Volumes\[\].\[VolumeId,\ Tags\[\?Key==\`CacheSlot\`\].Value\ \|\ \[0\]\]|cache_freeze_timeout:ec2:describe-volumes:Volumes\[\].\[VolumeId,\ Tags\[\?Key==\`CacheSlot\`\].Value\ \|\ \[0\]\])
     printf '%s\t%s\n' "vol-blue-1" "dynamic"
     printf '%s\t%s\n' "vol-blue-2" "dynamic"
     ;;
-  cache_seeded:ec2:describe-volumes:length\(Volumes\))
+  cache_seeded:ec2:describe-volumes:length\(Volumes\)|cache_freeze_timeout:ec2:describe-volumes:length\(Volumes\))
     printf '%s\n' "0"
+    ;;
+  cache_seeded:ssm:describe-instance-information:InstanceInformationList\[0\].PingStatus|cache_freeze_timeout:ssm:describe-instance-information:InstanceInformationList\[0\].PingStatus)
+    printf '%s\n' "Online"
+    ;;
+  cache_seeded:ssm:send-command:Command.CommandId|cache_freeze_timeout:ssm:send-command:Command.CommandId)
+    printf 'cmd-%s\n' "$(next_counter_value "ssm-command")"
+    ;;
+  cache_seeded:ssm:get-command-invocation:Status)
+    printf '%s\n' "Success"
+    ;;
+  cache_freeze_timeout:ssm:get-command-invocation:Status)
+    if [[ "${command_id}" == "cmd-0" ]]; then
+      printf '%s\n' "InProgress"
+    else
+      printf '%s\n' "Success"
+    fi
+    ;;
+  cache_freeze_timeout:ssm:cancel-command:*)
+    printf '%s\n' ""
     ;;
   cache_seeded:ec2:create-snapshot:SnapshotId)
     if [[ "$(next_counter_value "create-snapshot")" == "0" ]]; then
@@ -316,6 +340,9 @@ case "${scenario}:${service}:${command}:${query}" in
     else
       printf '%s\n' "snap-blue-2"
     fi
+    ;;
+  cache_freeze_timeout:ec2:describe-snapshots:Snapshots\[\].SnapshotId)
+    printf '%s\n' ""
     ;;
   cache_seeded:ec2:describe-snapshots:Snapshots\[\].SnapshotId)
     printf '%s\t%s\n' "snap-blue-1" "snap-blue-2"
@@ -469,9 +496,37 @@ env \
 grep -q "Preparing dedicated cache EBS seed volumes for target slot green" "${tmpdir}/cache_seeded.out"
 grep -q "Creating live cache snapshot from blue volume vol-blue-1" "${tmpdir}/cache_seeded.out"
 grep -q "Creating live cache snapshot from blue volume vol-blue-2" "${tmpdir}/cache_seeded.out"
+grep -q "Freezing /var/cache/forgeproxy on i-blue-1 before cache snapshot" "${tmpdir}/cache_seeded.out"
+grep -q "Thawing /var/cache/forgeproxy on i-blue-1 after cache snapshot" "${tmpdir}/cache_seeded.out"
 grep -q "Deleting old green cache seed snapshot snap-old-1" "${tmpdir}/cache_seeded.out"
 grep -q "Deleting old green cache seed snapshot snap-old-2" "${tmpdir}/cache_seeded.out"
 grep -q "Created green cache volume vol-green-created for cache slot 0 from snap-blue-1" "${tmpdir}/cache_seeded.out"
 grep -q "Created green cache volume vol-green-created for cache slot 1 from snap-blue-2" "${tmpdir}/cache_seeded.out"
+
+rm -f "${tmpdir}/state"/*
+if env \
+  "${base_env[@]}" \
+  TEST_SCENARIO="cache_freeze_timeout" \
+  ACTIVE_SLOT="green" \
+  CURRENT_LIVE_SLOT="blue" \
+  DESIRED_COUNT="2" \
+  MAX_COUNT="4" \
+  ACTIVE_HTTPS_TARGET_ARN="green-https" \
+  ACTIVE_SSH_TARGET_ARN="green-ssh" \
+  CACHE_EBS_ENABLED="true" \
+  CACHE_VOLUME_GB="4096" \
+  CACHE_SNAPSHOT_FREEZE_WAIT_TIMEOUT_SECS="1" \
+  bash "${script_path}" >"${tmpdir}/cache_freeze_timeout.out" 2>"${tmpdir}/cache_freeze_timeout.err"; then
+  echo "expected cache_freeze_timeout to fail" >&2
+  exit 1
+fi
+grep -q "Freeze command .* did not complete cleanly on i-blue-1; cancelling and sending best-effort thaw" "${tmpdir}/cache_freeze_timeout.err" || {
+  cat "${tmpdir}/cache_freeze_timeout.err" >&2
+  exit 1
+}
+grep -q "Thawing /var/cache/forgeproxy on i-blue-1 after cache snapshot" "${tmpdir}/cache_freeze_timeout.out" || {
+  cat "${tmpdir}/cache_freeze_timeout.out" >&2
+  exit 1
+}
 
 echo "forgeproxy-rollout-prepare tests passed"

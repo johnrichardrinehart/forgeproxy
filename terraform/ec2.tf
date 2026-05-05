@@ -231,7 +231,7 @@ resource "aws_autoscaling_group" "forgeproxy" {
 
 resource "null_resource" "forgeproxy_rollout_prepare" {
   triggers = {
-    behavior_revision            = "reset-standby-target-v1"
+    behavior_revision            = "freeze-cache-snapshots-v1"
     active_slot                  = local.forgeproxy_target_slot
     desired_count                = tostring(var.forgeproxy_count)
     max_count                    = tostring(local.forgeproxy_max_count)
@@ -253,6 +253,7 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
     cache_seed_wait_timeout_secs  = tostring(var.forgeproxy_cache_seed_snapshot_wait_timeout_secs)
     cache_seed_poll_secs          = tostring(var.forgeproxy_cache_seed_snapshot_poll_secs)
     cache_seed_retention_count    = tostring(var.forgeproxy_cache_seed_snapshot_retention_count)
+    cache_mount_dir               = "/var/cache/forgeproxy"
   }
 
   depends_on = [
@@ -293,6 +294,7 @@ resource "null_resource" "forgeproxy_rollout_prepare" {
       CACHE_VOLUME_TYPE            = var.forgeproxy_cache_volume_type
       CACHE_VOLUME_IOPS            = tostring(var.forgeproxy_cache_volume_iops)
       CACHE_VOLUME_THROUGHPUT_MBPS = tostring(var.forgeproxy_cache_volume_throughput_mbps)
+      CACHE_MOUNT_DIR              = "/var/cache/forgeproxy"
       CACHE_SEED_SNAPSHOT_RETENTION_COUNT = tostring(
         var.forgeproxy_cache_seed_snapshot_retention_count
       )

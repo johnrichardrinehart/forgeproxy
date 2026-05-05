@@ -29,6 +29,8 @@ cache_seed_wait_for_snapshots="${CACHE_SEED_WAIT_FOR_SNAPSHOTS:-true}"
 cache_seed_snapshot_wait_timeout_secs="${CACHE_SEED_SNAPSHOT_WAIT_TIMEOUT_SECS:-5400}"
 cache_seed_snapshot_poll_secs="${CACHE_SEED_SNAPSHOT_POLL_SECS:-60}"
 cache_seed_snapshot_retention_count="${CACHE_SEED_SNAPSHOT_RETENTION_COUNT:-1}"
+cache_mount_dir="${CACHE_MOUNT_DIR:-/var/cache/forgeproxy}"
+cache_snapshot_freeze_wait_timeout_secs="${CACHE_SNAPSHOT_FREEZE_WAIT_TIMEOUT_SECS:-120}"
 
 case "${active_slot}" in
   blue)
@@ -55,6 +57,19 @@ require_positive_integer() {
     echo "Invalid ${name}=${value}; expected a positive integer" >&2
     return 1
   fi
+}
+
+json_string() {
+  local value="$1"
+
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  printf '"%s"' "${value}"
+}
+
+shell_quote() {
+  printf '%q' "$1"
 }
 
 asg_for_slot() {
@@ -257,6 +272,138 @@ source_cache_volumes_for_instance() {
     --output text
 }
 
+require_managed_instance_online() {
+  local instance_id="$1"
+  local deadline now ping_status
+
+  deadline="$(( $(date +%s) + cache_snapshot_freeze_wait_timeout_secs ))"
+  echo "Waiting for SSM managed instance status before cache snapshot: ${instance_id}"
+  while true; do
+    ping_status="$(aws "${aws_args[@]}" ssm describe-instance-information \
+      --filters "Key=InstanceIds,Values=${instance_id}" \
+      --query 'InstanceInformationList[0].PingStatus' \
+      --output text 2>/dev/null || true)"
+
+    if [[ "${ping_status}" == "Online" ]]; then
+      return 0
+    fi
+
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      echo "Timed out waiting for SSM online status for ${instance_id}" >&2
+      return 1
+    fi
+
+    sleep 3
+  done
+}
+
+wait_for_ssm_command() {
+  local instance_id="$1"
+  local command_id="$2"
+  local label="$3"
+  local deadline now status
+
+  deadline="$(( $(date +%s) + cache_snapshot_freeze_wait_timeout_secs ))"
+  while true; do
+    status="$(aws "${aws_args[@]}" ssm get-command-invocation \
+      --command-id "${command_id}" \
+      --instance-id "${instance_id}" \
+      --query 'Status' \
+      --output text 2>/dev/null || true)"
+
+    case "${status}" in
+      Success)
+        return 0
+        ;;
+      Pending|InProgress|Delayed|"")
+        ;;
+      *)
+        echo "SSM cache snapshot ${label} command ${command_id} failed on ${instance_id}" >&2
+        aws "${aws_args[@]}" ssm get-command-invocation \
+          --command-id "${command_id}" \
+          --instance-id "${instance_id}" \
+          --query '{Status:Status,ResponseCode:ResponseCode,StandardOutputContent:StandardOutputContent,StandardErrorContent:StandardErrorContent}' \
+          --output json || true
+        return 1
+        ;;
+    esac
+
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      echo "Timed out waiting for SSM cache snapshot ${label} command ${command_id} on ${instance_id}" >&2
+      return 1
+    fi
+
+    sleep 2
+  done
+}
+
+send_ssm_shell_command() {
+  local instance_id="$1"
+  local label="$2"
+  local shell_command="$3"
+  local command_id
+
+  command_id="$(aws "${aws_args[@]}" ssm send-command \
+    --document-name "AWS-RunShellScript" \
+    --instance-ids "${instance_id}" \
+    --parameters "commands=[$(json_string "${shell_command}")]" \
+    --query 'Command.CommandId' \
+    --output text)"
+
+  if [[ -z "${command_id}" || "${command_id}" == "None" ]]; then
+    echo "Failed to start SSM cache snapshot ${label} command on ${instance_id}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "${command_id}"
+}
+
+run_ssm_shell_command() {
+  local instance_id="$1"
+  local label="$2"
+  local shell_command="$3"
+  local command_id
+
+  command_id="$(send_ssm_shell_command "${instance_id}" "${label}" "${shell_command}")"
+  wait_for_ssm_command "${instance_id}" "${command_id}" "${label}"
+}
+
+freeze_cache_mount_for_snapshot() {
+  local instance_id="$1"
+  local quoted_mount command_id remote_thaw_delay_secs
+
+  require_managed_instance_online "${instance_id}"
+  quoted_mount="$(shell_quote "${cache_mount_dir}")"
+  remote_thaw_delay_secs="$(( cache_snapshot_freeze_wait_timeout_secs + 30 ))"
+  echo "Freezing ${cache_mount_dir} on ${instance_id} before cache snapshot"
+  command_id="$(send_ssm_shell_command \
+    "${instance_id}" \
+    "freeze" \
+    "set -euo pipefail; if ! mountpoint -q ${quoted_mount}; then echo cache mount is not a mountpoint: ${quoted_mount} >&2; exit 1; fi; ( sleep ${remote_thaw_delay_secs}; fsfreeze -u ${quoted_mount} >/dev/null 2>&1 || true ) >/dev/null 2>&1 </dev/null & fsfreeze -f ${quoted_mount}")"
+  if ! wait_for_ssm_command "${instance_id}" "${command_id}" "freeze"; then
+    echo "Freeze command ${command_id} did not complete cleanly on ${instance_id}; cancelling and sending best-effort thaw" >&2
+    aws "${aws_args[@]}" ssm cancel-command \
+      --command-id "${command_id}" \
+      --instance-ids "${instance_id}" >/dev/null 2>&1 || true
+    thaw_cache_mount_after_snapshot "${instance_id}" || true
+    return 1
+  fi
+}
+
+thaw_cache_mount_after_snapshot() {
+  local instance_id="$1"
+  local quoted_mount
+
+  quoted_mount="$(shell_quote "${cache_mount_dir}")"
+  echo "Thawing ${cache_mount_dir} on ${instance_id} after cache snapshot"
+  run_ssm_shell_command \
+    "${instance_id}" \
+    "thaw" \
+    "set -euo pipefail; fsfreeze -u ${quoted_mount}"
+}
+
 mark_old_target_seed_volumes_inactive() {
   local old_volume_ids
 
@@ -344,12 +491,23 @@ snapshot_active_cache_volumes() {
       [[ -n "${cache_slot}" && "${cache_slot}" != "None" ]] || cache_slot="dynamic"
       created_at_unix="$(date -u +%s)"
       echo "Creating live cache snapshot from ${source_slot} volume ${volume_id} attached to ${instance_id} (cache slot ${cache_slot})"
+      frozen_instance_id="${instance_id}"
+      thaw_frozen_cache_mount() {
+        if [[ -n "${frozen_instance_id}" ]]; then
+          thaw_cache_mount_after_snapshot "${frozen_instance_id}"
+          frozen_instance_id=""
+        fi
+      }
+      trap 'thaw_frozen_cache_mount || true' EXIT
+      freeze_cache_mount_for_snapshot "${instance_id}"
       snapshot_id="$(aws "${aws_args[@]}" ec2 create-snapshot \
         --volume-id "${volume_id}" \
         --description "${name_prefix} forgeproxy ${source_slot} cache slot ${cache_slot} seed for ${active_slot}" \
         --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=${name_prefix}-forgeproxy-${active_slot}-cache-seed-${cache_slot}},{Key=Role,Value=forgeproxy-cache-seed},{Key=ForgeproxyNamePrefix,Value=${name_prefix}},{Key=DeploymentSlot,Value=${active_slot}},{Key=SourceSlot,Value=${source_slot}},{Key=SourceCacheSlot,Value=${cache_slot}},{Key=SourceVolumeId,Value=${volume_id}},{Key=CurrentSeed,Value=true},{Key=CreatedAtUnix,Value=${created_at_unix}},{Key=CreatedBy,Value=forgeproxy-rollout-prepare}]" \
         --query SnapshotId \
         --output text)"
+      thaw_frozen_cache_mount
+      trap - EXIT
       echo "${snapshot_id}"
     done <<<"${volume_rows}"
   done
@@ -595,6 +753,7 @@ prepare_cache_seed_volumes() {
   if [[ "${cache_ebs_enabled}" != "true" ]]; then
     return 0
   fi
+  require_positive_integer "CACHE_SNAPSHOT_FREEZE_WAIT_TIMEOUT_SECS" "${cache_snapshot_freeze_wait_timeout_secs}"
 
   echo "Preparing dedicated cache EBS seed volumes for target slot ${active_slot}"
   if [[ "${source_slot}" == "${active_slot}" ]]; then
