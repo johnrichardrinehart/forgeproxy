@@ -1512,21 +1512,13 @@ async fn main() -> Result<()> {
     let http_handle = tokio::spawn({
         let s = state.clone();
         let shutdown_rx = http_shutdown_rx.clone();
-        async move {
-            if let Err(e) = run_http_server(s, shutdown_rx).await {
-                tracing::error!(error = %e, "HTTP server failed");
-            }
-        }
+        async move { run_http_server(s, shutdown_rx).await }
     });
 
     let ssh_handle = tokio::spawn({
         let s = state.clone();
         let shutdown_rx = ssh_shutdown_rx.clone();
-        async move {
-            if let Err(e) = run_ssh_server(s, shutdown_rx).await {
-                tracing::error!(error = %e, "SSH server failed");
-            }
-        }
+        async move { run_ssh_server(s, shutdown_rx).await }
     });
 
     let (bundle_handle, bundle_monitor) = spawn_monitored_background_task("bundle_lifecycle", {
@@ -1678,10 +1670,46 @@ async fn main() -> Result<()> {
             let _ = (&mut http_handle).await;
             tracing::info!("HTTP server drain completed");
         }
+        result = &mut http_handle => {
+            for h in &abort_handles { h.abort(); }
+            let _ = ssh_shutdown_tx.send(true);
+            let _ = (&mut ssh_handle).await;
+            match result {
+                Ok(Ok(())) if state.is_draining() => {
+                    tracing::info!("HTTP server completed during drain");
+                }
+                Ok(Ok(())) => {
+                    return Err(anyhow::anyhow!("HTTP server exited unexpectedly; listener is dead"));
+                }
+                Ok(Err(e)) => {
+                    return Err(e.context("HTTP server failed; listener is dead"));
+                }
+                Err(join_err) => {
+                    return Err(anyhow::anyhow!("HTTP server task failed: {join_err}"));
+                }
+            }
+        }
+        result = &mut ssh_handle => {
+            for h in &abort_handles { h.abort(); }
+            let _ = http_shutdown_tx.send(true);
+            let _ = (&mut http_handle).await;
+            match result {
+                Ok(Ok(())) if state.is_draining() => {
+                    tracing::info!("SSH server completed during drain");
+                }
+                Ok(Ok(())) => {
+                    return Err(anyhow::anyhow!("SSH server exited unexpectedly; listener is dead"));
+                }
+                Ok(Err(e)) => {
+                    return Err(e.context("SSH server failed; listener is dead"));
+                }
+                Err(join_err) => {
+                    return Err(anyhow::anyhow!("SSH server task failed: {join_err}"));
+                }
+            }
+        }
         _ = async {
             let _ = tokio::try_join!(
-                &mut http_handle,
-                &mut ssh_handle,
                 &mut bundle_handle,
                 &mut repo_refresh_scheduler_handle,
                 &mut tee_cleanup_handle,

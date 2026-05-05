@@ -129,8 +129,12 @@ pub async fn start_ssh_server(
     let listener = TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("failed to bind SSH listener on {listen_addr}"))?;
+    const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 100;
+    const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
     let (error_tx, mut error_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut ssh_server = SshServer::new(Arc::clone(&state));
+    let mut consecutive_accept_errors: u32 = 0;
 
     loop {
         tokio::select! {
@@ -143,6 +147,7 @@ pub async fn start_ssh_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((socket, _)) => {
+                        consecutive_accept_errors = 0;
                         if state.is_draining() {
                             info!(
                                 peer = ?socket.peer_addr().ok(),
@@ -176,7 +181,26 @@ pub async fn start_ssh_server(
                             );
                         });
                     }
-                    Err(error) => return Err(error).context("SSH accept loop failed"),
+                    Err(error) => {
+                        consecutive_accept_errors += 1;
+                        if consecutive_accept_errors >= MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                            tracing::error!(
+                                error = %error,
+                                consecutive_accept_errors,
+                                "SSH accept loop exceeded error threshold; aborting"
+                            );
+                            return Err(error).context(
+                                "SSH accept loop exceeded consecutive error threshold"
+                            );
+                        }
+                        warn!(
+                            error = %error,
+                            consecutive_accept_errors,
+                            max = MAX_CONSECUTIVE_ACCEPT_ERRORS,
+                            "SSH accept() failed, retrying"
+                        );
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    }
                 }
             }
             Some(error) = error_rx.recv() => {
