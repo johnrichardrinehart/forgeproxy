@@ -43,6 +43,17 @@ let
           -extfile <(printf "subjectAltName=DNS:proxy")
       '';
 
+  testSshKeys =
+    pkgs.runCommand "forgeproxy-pack-cache-test-ssh-keys"
+      {
+        nativeBuildInputs = [ pkgs.openssh ];
+      }
+      ''
+        mkdir -p $out
+        ssh-keygen -t ed25519 -f $out/alice -N "" -C "alice@pack-cache-test"
+        ssh-keygen -l -f $out/alice.pub -E sha256 | awk '{print $2}' > $out/alice.fp
+      '';
+
   testConfigYaml = pkgs.writeText "forgeproxy-pack-cache-test-config.yaml" ''
     backend_type: "gitea"
 
@@ -279,6 +290,7 @@ pkgs.testers.runNixOSTest {
           git
           curl
           jq
+          openssh
         ];
         security.pki.certificateFiles = [ "${testCerts}/ca.crt" ];
       };
@@ -286,6 +298,7 @@ pkgs.testers.runNixOSTest {
 
   testScript = ''
     import re
+    import shlex
     import time
 
     def pack_cache_counts():
@@ -360,6 +373,137 @@ pkgs.testers.runNixOSTest {
             "| grep -E 'same object .* appears twice|REF_DELTA .* already resolved|invalid index-pack output'"
         )
 
+    def live_subscription_count(protocol: str):
+        metrics = proxy.succeed("curl -sf http://localhost:8080/metrics")
+        total = 0.0
+        for line in metrics.splitlines():
+            if (
+                line.startswith("forgeproxy_pack_cache_live_subscriptions_total{")
+                and f'protocol="{protocol}"' in line
+                and 'result="success"' in line
+            ):
+                total += float(line.rsplit(" ", 1)[1])
+        return total
+
+    def wait_for_live_subscription_growth(protocol: str, previous: float, timeout: int = 30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            current = live_subscription_count(protocol)
+            if current > previous:
+                return
+            time.sleep(1)
+        recent_logs = proxy.succeed(
+            "journalctl -u forgeproxy --since '2m ago' --no-pager -o cat || true"
+        )
+        raise Exception(
+            f"timed out waiting for {protocol} live subscription growth above {previous}\n"
+            f"recent forgeproxy logs:\n{recent_logs}"
+        )
+
+    def clone_command(protocol: str, branch: str, dest: str):
+        if protocol == "https":
+            return (
+                "git -c protocol.version=2 clone --single-branch "
+                f"--branch {branch} "
+                f"https://${common.giteaAdminUser}:${common.giteaAdminPassword}@proxy/"
+                f"${common.giteaAdminUser}/pack-cache-fanout.git {dest}"
+            )
+        if protocol == "ssh":
+            return (
+                "GIT_SSH_COMMAND='ssh -i /tmp/alice_key "
+                "-o StrictHostKeyChecking=no "
+                "-o UserKnownHostsFile=/dev/null "
+                "-p 2222' "
+                "git -c protocol.version=2 clone --single-branch "
+                f"--branch {branch} "
+                f"git@proxy:${common.giteaAdminUser}/pack-cache-fanout.git {dest}"
+            )
+        raise Exception(f"unknown clone protocol {protocol}")
+
+    def clone_background_command(protocol: str, branch: str, dest: str, log: str, status: str):
+        command = (
+            f"{clone_command(protocol, branch, dest)} >{log} 2>&1; "
+            f"printf '%s' \"$?\" >{status}"
+        )
+        return f"nohup sh -c {shlex.quote(command)} >/dev/null 2>&1 </dev/null &"
+
+    def start_clone_background(protocol: str, branch: str, dest: str, log: str, status: str):
+        client.succeed(clone_background_command(protocol, branch, dest, log, status))
+
+    def forgeproxy_journal_cursor():
+        return proxy.succeed(
+            "journalctl -u forgeproxy -n 0 --show-cursor --no-pager "
+            "| sed -n 's/^-- cursor: //p'"
+        ).strip()
+
+    def wait_for_producer_fetch_reached_proxy(protocol: str, cursor: str, timeout: int = 30):
+        if protocol == "https":
+            needles = [
+                '"message":"received git-upload-pack request"',
+                '"repo":"octocat/pack-cache-fanout"',
+                '"git_phase":"v2-fetch"',
+            ]
+        elif protocol == "ssh":
+            needles = [
+                '"message":"SSH exec request"',
+                "pack-cache-fanout",
+            ]
+        else:
+            raise Exception(f"unknown clone protocol {protocol}")
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            logs = proxy.succeed(
+                f"journalctl -u forgeproxy --after-cursor {shlex.quote(cursor)} --no-pager -o cat || true"
+            )
+            if any(all(needle in line for needle in needles) for line in logs.splitlines()):
+                return
+            time.sleep(0.2)
+        raise Exception(
+            f"timed out waiting for {protocol} producer fetch to reach forgeproxy\n"
+            f"recent forgeproxy logs:\n{logs}"
+        )
+
+    def run_fanout_clone_pair(
+        name: str,
+        first_protocol: str,
+        second_protocol: str,
+        branch: str,
+    ):
+        first_dest = f"/tmp/{name}-first"
+        second_dest = f"/tmp/{name}-second"
+        first_status = f"/tmp/{name}-first.status"
+        second_status = f"/tmp/{name}-second.status"
+        first_log = f"/tmp/{name}-first.log"
+        second_log = f"/tmp/{name}-second.log"
+        subscriber_before = live_subscription_count(second_protocol)
+
+        client.succeed(
+            f"rm -rf {first_dest} {second_dest} "
+            f"{first_status} {second_status} {first_log} {second_log}"
+        )
+        cursor = forgeproxy_journal_cursor()
+        start_clone_background(first_protocol, branch, first_dest, first_log, first_status)
+        wait_for_producer_fetch_reached_proxy(first_protocol, cursor)
+        start_clone_background(second_protocol, branch, second_dest, second_log, second_status)
+        wait_for_live_subscription_growth(second_protocol, subscriber_before)
+        client.wait_until_succeeds(
+            f"test -f {first_status} && test -f {second_status}",
+            timeout=120,
+        )
+        client.succeed(
+            f"test \"$(cat {first_status})\" = 0 && test \"$(cat {second_status})\" = 0 || "
+            f"(cat {first_log}; cat {second_log}; false)"
+        )
+        client.succeed(
+            f"git -C {first_dest} rev-parse HEAD >/dev/null && "
+            f"git -C {second_dest} rev-parse HEAD >/dev/null"
+        )
+        client.succeed(
+            f"rm -rf {first_dest} {second_dest} "
+            f"{first_status} {second_status} {first_log} {second_log}"
+        )
+
     ghe.start()
     valkey.start()
     s3.start()
@@ -397,6 +541,13 @@ pkgs.testers.runNixOSTest {
             " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
             ' -d \'{"name": "pack-cache", "auto_init": false}\'''
         )
+        ghe.succeed(
+            "curl -sf"
+            " -X POST http://localhost:3000/api/v1/user/repos"
+            " -H 'Content-Type: application/json'"
+            " -u ${common.giteaAdminUser}:${common.giteaAdminPassword}"
+            ' -d \'{"name": "pack-cache-fanout", "auto_init": false}\'''
+        )
 
         ghe.succeed(
             "set -e && "
@@ -421,6 +572,28 @@ pkgs.testers.runNixOSTest {
             "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/pack-cache.git && "
             "git push -u origin main side unrelated"
         )
+        ghe.succeed(
+            "set -e && "
+            "tmp=$(mktemp -d) && "
+            "cd $tmp && "
+            "git init -b main && "
+            "git config user.email test@test.local && "
+            "git config user.name Test && "
+            "echo 'Pack cache fanout repo' > README.md && "
+            "git add README.md && "
+            "git commit -m 'Initial commit' && "
+            "for branch in fanout-http-ssh fanout-ssh-http fanout-http-http fanout-ssh-ssh; do "
+            "  git checkout -B $branch main && "
+            "  mkdir -p payload-$branch && "
+            "  for i in $(seq 1 64); do "
+            "    head -c 1048576 /dev/urandom > payload-$branch/blob-$i.bin; "
+            "  done && "
+            "  git add payload-$branch && "
+            "  git commit -m \"payload $branch\"; "
+            "done && "
+            "git remote add origin http://${common.giteaAdminUser}:${common.giteaAdminPassword}@localhost:3000/${common.giteaAdminUser}/pack-cache-fanout.git && "
+            "git push -u origin main fanout-http-ssh fanout-ssh-http fanout-http-http fanout-ssh-ssh"
+        )
     with subtest("Start proxy and client VMs after upstream is ready"):
         proxy.start()
         client.start()
@@ -428,10 +601,23 @@ pkgs.testers.runNixOSTest {
     with subtest("forgeproxy service starts"):
         proxy.wait_for_unit("forgeproxy.service")
         proxy.wait_for_open_port(8080)
+        proxy.wait_for_open_port(2222)
 
     with subtest("Proxy nginx starts"):
         proxy.wait_for_unit("nginx.service")
         proxy.wait_for_open_port(443)
+
+    with subtest("Prepare SSH identity for pack-cache fanout clones"):
+        client.succeed(
+            "cp ${testSshKeys}/alice /tmp/alice_key && chmod 600 /tmp/alice_key"
+        )
+        alice_fp = valkey.succeed("cat ${testSshKeys}/alice.fp").strip()
+        valkey.succeed(
+            f"redis-cli SET 'forgeproxy:ssh:auth:{alice_fp}' '${common.giteaAdminUser}' EX 3600"
+        )
+        valkey.succeed(
+            f"redis-cli SET 'forgeproxy:ssh:access:{alice_fp}:${common.giteaAdminUser}/pack-cache-fanout' 'read' EX 3600"
+        )
 
     with subtest("Repeated warm HTTPS clone uses the full pack cache"):
         client.succeed(
@@ -567,6 +753,49 @@ pkgs.testers.runNixOSTest {
             "journalctl -u forgeproxy --no-pager | "
             "grep -F '\"message\":\"clone served\"' | "
             "grep -F '\"path\":\"local_upload_pack\"'"
+        )
+
+    with subtest("Warm fanout repo mirror without caching full branch responses"):
+        client.succeed(
+            "rm -rf /tmp/pack-cache-fanout-warm && "
+            "git -c protocol.version=2 clone --filter=blob:none --no-checkout "
+            "https://octocat:secret123@proxy/octocat/pack-cache-fanout.git "
+            "/tmp/pack-cache-fanout-warm"
+        )
+        proxy.wait_until_succeeds(
+            "test -L ${cacheLayout.repoPath "octocat/pack-cache-fanout"}"
+        )
+
+    with subtest("HTTPS producer live-fanouts to concurrent SSH clone"):
+        run_fanout_clone_pair(
+            "fanout-http-ssh",
+            "https",
+            "ssh",
+            "fanout-http-ssh",
+        )
+
+    with subtest("SSH producer live-fanouts to concurrent HTTPS clone"):
+        run_fanout_clone_pair(
+            "fanout-ssh-http",
+            "ssh",
+            "https",
+            "fanout-ssh-http",
+        )
+
+    with subtest("HTTPS producer live-fanouts to concurrent HTTPS clone"):
+        run_fanout_clone_pair(
+            "fanout-http-http",
+            "https",
+            "https",
+            "fanout-http-http",
+        )
+
+    with subtest("SSH producer live-fanouts to concurrent SSH clone"):
+        run_fanout_clone_pair(
+            "fanout-ssh-ssh",
+            "ssh",
+            "ssh",
+            "fanout-ssh-ssh",
         )
   '';
 }

@@ -44,6 +44,29 @@ pub fn min_timeout(left: Option<Duration>, right: Option<Duration>) -> Option<Du
     }
 }
 
+pub fn local_upload_pack_permit_timeout_after_optional_cache_wait(
+    budget: Option<RequestBudget>,
+    optional_cache_wait_timed_out: bool,
+) -> Option<Duration> {
+    if optional_cache_wait_timed_out {
+        Some(Duration::ZERO)
+    } else {
+        budget.and_then(RequestBudget::remaining)
+    }
+}
+
+pub fn local_upload_pack_first_byte_timeout_after_optional_cache_wait(
+    budget: Option<RequestBudget>,
+    first_byte_secs: u64,
+    optional_cache_wait_timed_out: bool,
+) -> Option<Duration> {
+    if optional_cache_wait_timed_out {
+        duration_from_secs(first_byte_secs)
+    } else {
+        budget.and_then(|budget| budget.stage_timeout_secs(first_byte_secs))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +88,48 @@ mod tests {
             Some(Duration::from_secs(10))
         );
         assert_eq!(min_timeout(None, None), None);
+    }
+
+    #[test]
+    fn optional_cache_timeout_still_tries_local_upload_pack_permit() {
+        let budget = RequestBudget {
+            started_at: Instant::now() - Duration::from_secs(30),
+            global: Some(Duration::from_secs(15)),
+        };
+
+        assert_eq!(
+            local_upload_pack_permit_timeout_after_optional_cache_wait(Some(budget), true),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn optional_cache_timeout_preserves_configured_local_first_byte_timeout() {
+        let budget = RequestBudget {
+            started_at: Instant::now() - Duration::from_secs(30),
+            global: Some(Duration::from_secs(15)),
+        };
+
+        assert_eq!(
+            local_upload_pack_first_byte_timeout_after_optional_cache_wait(Some(budget), 5, true),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn local_upload_pack_timeouts_preserve_budget_without_optional_cache_timeout() {
+        let budget = RequestBudget {
+            started_at: Instant::now(),
+            global: None,
+        };
+
+        assert_eq!(
+            local_upload_pack_permit_timeout_after_optional_cache_wait(Some(budget), false),
+            None
+        );
+        assert_eq!(
+            local_upload_pack_first_byte_timeout_after_optional_cache_wait(Some(budget), 5, false),
+            Some(Duration::from_secs(5))
+        );
     }
 }

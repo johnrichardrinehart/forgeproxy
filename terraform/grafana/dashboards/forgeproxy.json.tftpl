@@ -778,6 +778,11 @@
           "refId": "E"
         },
         {
+          "expr": "sum by (protocol, result) (rate(forgeproxy_pack_cache_live_subscriptions_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
+          "legendFormat": "Pack cache live {{protocol}} {{result}}",
+          "refId": "O"
+        },
+        {
           "expr": "sum by (result) (rate(forgeproxy_generation_coalescing_total{service\\.instance\\.id=~\"$instance\"}[$__rate_interval])) * 60",
           "legendFormat": "Generation coalescing {{result}}",
           "refId": "F"

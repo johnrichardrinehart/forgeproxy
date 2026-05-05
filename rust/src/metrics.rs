@@ -255,6 +255,12 @@ pub struct PackCacheInflightWaitLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PackCacheLiveSubscriptionLabels {
+    pub protocol: Protocol,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct PackCacheKeyBypassLabels {
     pub protocol: Protocol,
     pub owner_repo: String,
@@ -648,6 +654,7 @@ pub struct Metrics {
     pub pack_cache_apparent_usage_bytes: Gauge,
     pub pack_cache_physical_usage_bytes: Gauge,
     pub pack_cache_inflight_waits_total: Family<PackCacheInflightWaitLabels, Counter>,
+    pub pack_cache_live_subscriptions_total: Family<PackCacheLiveSubscriptionLabels, Counter>,
     pub pack_cache_key_bypasses_total: Family<PackCacheKeyBypassLabels, Counter>,
     pub pack_cache_recent_entries: Family<PackCacheRecentEntriesLabels, Gauge>,
     pub pack_cache_warming_skips_total: Family<PackCacheWarmingSkipLabels, Counter>,
@@ -1036,6 +1043,14 @@ impl Metrics {
             pack_cache_inflight_waits_total.clone(),
         );
 
+        let pack_cache_live_subscriptions_total =
+            Family::<PackCacheLiveSubscriptionLabels, Counter>::default();
+        registry.register(
+            "forgeproxy_pack_cache_live_subscriptions",
+            "Pack response cache in-memory live fanout subscriptions by result",
+            pack_cache_live_subscriptions_total.clone(),
+        );
+
         let pack_cache_key_bypasses_total = Family::<PackCacheKeyBypassLabels, Counter>::default();
         registry.register(
             "forgeproxy_pack_cache_key_bypasses",
@@ -1396,6 +1411,7 @@ impl Metrics {
             pack_cache_apparent_usage_bytes,
             pack_cache_physical_usage_bytes,
             pack_cache_inflight_waits_total,
+            pack_cache_live_subscriptions_total,
             pack_cache_key_bypasses_total,
             pack_cache_recent_entries,
             pack_cache_warming_skips_total,
@@ -1932,6 +1948,21 @@ pub fn inc_pack_cache_inflight_wait(metrics: &MetricsRegistry, protocol: Protoco
         .metrics
         .pack_cache_inflight_waits_total
         .get_or_create(&PackCacheInflightWaitLabels {
+            protocol,
+            result: result.to_string(),
+        })
+        .inc();
+}
+
+pub fn inc_pack_cache_live_subscription(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    result: &str,
+) {
+    metrics
+        .metrics
+        .pack_cache_live_subscriptions_total
+        .get_or_create(&PackCacheLiveSubscriptionLabels {
             protocol,
             result: result.to_string(),
         })

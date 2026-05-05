@@ -2966,6 +2966,7 @@ async fn warm_pack_cache_base_for_generation(
         .await
     {
         Ok(crate::pack_cache::PackCacheLookup::Hit(_)) => return Ok(()),
+        Ok(crate::pack_cache::PackCacheLookup::Live(_)) => return Ok(()),
         Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => writer,
         Ok(crate::pack_cache::PackCacheLookup::BypassAfterWait) => {
             return Err(PackCacheStitchFailure::new(
@@ -3050,6 +3051,7 @@ async fn warm_pack_cache_for_generation(
         .await
     {
         Ok(crate::pack_cache::PackCacheLookup::Hit(_)) => return Ok(()),
+        Ok(crate::pack_cache::PackCacheLookup::Live(_)) => return Ok(()),
         Ok(crate::pack_cache::PackCacheLookup::Generate(writer)) => writer,
         Ok(crate::pack_cache::PackCacheLookup::BypassAfterWait) => {
             return Err(PackCacheStitchFailure::new(

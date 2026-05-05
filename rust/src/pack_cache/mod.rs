@@ -21,7 +21,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{EvictionPolicy, PackCacheConfig};
 use crate::metrics::{MetricsRegistry, Protocol};
@@ -59,7 +59,8 @@ pub struct PackCache {
     config: PackCacheConfig,
     local_cache_max_percent: f64,
     index_pack_threads: IndexPackThreadSource,
-    inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    inflight: Arc<Mutex<HashMap<String, Arc<PackCacheInflight>>>>,
+    repo_arrivals: Arc<std::sync::Mutex<HashMap<String, Arc<PackCacheRepoArrival>>>>,
     artifact_lifecycle: Arc<std::sync::Mutex<()>>,
     active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
@@ -285,7 +286,187 @@ impl PackCacheMetadata {
 pub enum PackCacheLookup {
     Hit(PackCacheReadLease),
     Generate(Box<PackCacheWriter>),
+    Live(PackCacheLiveSubscriber),
     BypassAfterWait,
+}
+
+struct PackCacheInflight {
+    notify: Arc<Notify>,
+    live: Arc<PackCacheLiveState>,
+}
+
+enum PackCacheInflightLookup {
+    Live(PackCacheLiveSubscriber),
+    WaitForLive(Arc<PackCacheInflight>),
+}
+
+enum PackCacheInflightLiveWait {
+    Live(PackCacheLiveSubscriber),
+    FinishedBeforeLive,
+}
+
+impl PackCacheInflight {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            live: Arc::new(PackCacheLiveState::new()),
+        }
+    }
+
+    fn subscribe_if_started(&self) -> Option<PackCacheLiveSubscriber> {
+        self.live.started().then(|| PackCacheLiveSubscriber {
+            state: Arc::clone(&self.live),
+            next_chunk: 0,
+            waiting: None,
+            emitted_terminal_error: false,
+        })
+    }
+
+    async fn wait_for_live_start_or_finish(&self) -> PackCacheInflightLiveWait {
+        loop {
+            let notified = self.live.notify.clone().notified_owned();
+            if let Some(subscriber) = self.subscribe_if_started() {
+                return PackCacheInflightLiveWait::Live(subscriber);
+            }
+            if self.live.finished() {
+                return PackCacheInflightLiveWait::FinishedBeforeLive;
+            }
+            notified.await;
+        }
+    }
+
+    fn notify_waiters(&self) {
+        self.notify.notify_waiters();
+    }
+}
+
+struct PackCacheLiveState {
+    inner: std::sync::Mutex<PackCacheLiveInner>,
+    notify: Arc<Notify>,
+}
+
+struct PackCacheLiveInner {
+    started: bool,
+    chunks: Vec<Bytes>,
+    finished: Option<PackCacheLiveFinish>,
+}
+
+#[derive(Clone)]
+enum PackCacheLiveFinish {
+    Success,
+    Error(String),
+}
+
+impl PackCacheLiveState {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(PackCacheLiveInner {
+                started: false,
+                chunks: Vec::new(),
+                finished: None,
+            }),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn started(&self) -> bool {
+        self.inner.lock().unwrap().started
+    }
+
+    fn finished(&self) -> bool {
+        self.inner.lock().unwrap().finished.is_some()
+    }
+
+    fn publish(&self, bytes: Bytes) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.finished.is_none() {
+            inner.started = true;
+            inner.chunks.push(bytes);
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn begin(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.finished.is_none() && !inner.started {
+            inner.started = true;
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn finish_success(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.finished.is_none() {
+            inner.finished = Some(PackCacheLiveFinish::Success);
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn finish_error(&self, error: impl Into<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.finished.is_none() {
+            inner.finished = Some(PackCacheLiveFinish::Error(error.into()));
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+pub struct PackCacheLiveSubscriber {
+    state: Arc<PackCacheLiveState>,
+    next_chunk: usize,
+    waiting: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    emitted_terminal_error: bool,
+}
+
+impl Stream for PackCacheLiveSubscriber {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.waiting.is_none() {
+                self.waiting = Some(Box::pin(self.state.notify.clone().notified_owned()));
+            }
+
+            let next = {
+                let inner = self.state.inner.lock().unwrap();
+                if let Some(bytes) = inner.chunks.get(self.next_chunk) {
+                    Some(Ok(bytes.clone()))
+                } else {
+                    match inner.finished.clone() {
+                        Some(PackCacheLiveFinish::Success) => return Poll::Ready(None),
+                        Some(PackCacheLiveFinish::Error(error)) => {
+                            if self.emitted_terminal_error {
+                                return Poll::Ready(None);
+                            }
+                            Some(Err(io::Error::other(error)))
+                        }
+                        None => None,
+                    }
+                }
+            };
+
+            if let Some(item) = next {
+                self.waiting = None;
+                match &item {
+                    Ok(_) => self.next_chunk += 1,
+                    Err(_) => self.emitted_terminal_error = true,
+                }
+                return Poll::Ready(Some(item));
+            }
+
+            if let Some(waiting) = self.waiting.as_mut() {
+                match waiting.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        self.waiting = None;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+    }
 }
 
 pub struct PackCacheWriter {
@@ -301,15 +482,34 @@ pub struct PackCacheWriter {
     raw_pack_bytes_written: u64,
     min_response_bytes: u64,
     started_at: Instant,
-    inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    inflight: Arc<Mutex<HashMap<String, Arc<PackCacheInflight>>>>,
     artifact_lifecycle: Arc<std::sync::Mutex<()>>,
     active_readers: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     recent_pack_cache_keys: Arc<std::sync::Mutex<HashMap<String, Vec<PackCacheRecentEntry>>>>,
     packstore_midx_refresh_gate: Arc<Semaphore>,
     packstore_midx_refresh_requested: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    inflight_entry: Arc<PackCacheInflight>,
+    repo_arrival: Option<PackCacheRepoArrivalGuard>,
     metrics: MetricsRegistry,
     completed: bool,
+}
+
+struct PackCacheRepoArrival {
+    state: std::sync::Mutex<PackCacheRepoArrivalState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct PackCacheRepoArrivalState {
+    waiters: usize,
+    live_started: bool,
+    closed: bool,
+}
+
+pub struct PackCacheRepoArrivalGuard {
+    owner_repo: String,
+    arrival: Arc<PackCacheRepoArrival>,
+    arrivals: Arc<std::sync::Mutex<HashMap<String, Arc<PackCacheRepoArrival>>>>,
 }
 
 #[derive(Default)]
@@ -377,6 +577,86 @@ impl RawPackExtractor {
     }
 }
 
+impl PackCacheRepoArrival {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(PackCacheRepoArrivalState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn mark_waiter(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && !state.closed
+            && !state.live_started
+        {
+            state.waiters = state.waiters.saturating_add(1);
+        }
+    }
+
+    fn has_waiters(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.waiters > 0)
+            .unwrap_or(false)
+    }
+
+    fn is_closed_or_live(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.closed || state.live_started)
+            .unwrap_or(true)
+    }
+
+    fn mark_live_started(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.live_started = true;
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+        }
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_for_live_or_closed(&self) {
+        while !self.is_closed_or_live() {
+            self.notify.notified().await;
+        }
+    }
+}
+
+impl PackCacheRepoArrivalGuard {
+    fn has_waiters(&self) -> bool {
+        self.arrival.has_waiters()
+    }
+
+    fn mark_live_started(&self) {
+        self.arrival.mark_live_started();
+        self.remove_if_current();
+    }
+
+    fn remove_if_current(&self) {
+        if let Ok(mut arrivals) = self.arrivals.lock()
+            && arrivals
+                .get(&self.owner_repo)
+                .is_some_and(|arrival| Arc::ptr_eq(arrival, &self.arrival))
+        {
+            arrivals.remove(&self.owner_repo);
+        }
+    }
+}
+
+impl Drop for PackCacheRepoArrivalGuard {
+    fn drop(&mut self) {
+        self.arrival.close();
+        self.remove_if_current();
+    }
+}
+
 impl PackCache {
     pub fn new(
         base_path: &Path,
@@ -408,6 +688,7 @@ impl PackCache {
             local_cache_max_percent,
             index_pack_threads: IndexPackThreadSource::Static(index_pack_threads),
             inflight: Arc::new(Mutex::new(HashMap::new())),
+            repo_arrivals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             artifact_lifecycle: Arc::new(std::sync::Mutex::new(())),
             active_readers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             recent_pack_cache_keys: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -593,24 +874,102 @@ impl PackCache {
             .collect()
     }
 
+    pub async fn begin_repo_arrival(&self, owner_repo: &str) -> Option<PackCacheRepoArrivalGuard> {
+        if !self.config.enabled {
+            return None;
+        }
+
+        let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+        let existing = self
+            .repo_arrivals
+            .lock()
+            .ok()
+            .and_then(|arrivals| arrivals.get(&owner_repo).cloned());
+        if let Some(existing) = existing
+            && !existing.is_closed_or_live()
+        {
+            existing.mark_waiter();
+            let wait = existing.wait_for_live_or_closed();
+            let timeout = Duration::from_secs(self.config.wait_for_inflight_secs);
+            let _ = tokio::time::timeout(timeout, wait).await;
+            return None;
+        }
+
+        let arrival = Arc::new(PackCacheRepoArrival::new());
+        if let Ok(mut arrivals) = self.repo_arrivals.lock() {
+            arrivals.insert(owner_repo.clone(), Arc::clone(&arrival));
+        }
+        Some(PackCacheRepoArrivalGuard {
+            owner_repo,
+            arrival,
+            arrivals: Arc::clone(&self.repo_arrivals),
+        })
+    }
+
+    pub fn mark_repo_arrival_waiter(&self, owner_repo: &str) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+
+        let owner_repo = crate::repo_identity::canonicalize_owner_repo(owner_repo);
+        let existing = self
+            .repo_arrivals
+            .lock()
+            .ok()
+            .and_then(|arrivals| arrivals.get(&owner_repo).cloned());
+        if let Some(existing) = existing
+            && !existing.is_closed_or_live()
+        {
+            existing.mark_waiter();
+            return true;
+        }
+        false
+    }
+
     pub async fn lookup_or_reserve(
         &self,
         protocol: Protocol,
         key: PackCacheKey,
     ) -> Result<PackCacheLookup> {
+        self.lookup_or_reserve_with_arrival(protocol, key, None)
+            .await
+    }
+
+    pub async fn lookup_or_reserve_with_arrival(
+        &self,
+        protocol: Protocol,
+        key: PackCacheKey,
+        repo_arrival: Option<PackCacheRepoArrivalGuard>,
+    ) -> Result<PackCacheLookup> {
+        let mut force_live_producer = repo_arrival
+            .as_ref()
+            .is_some_and(PackCacheRepoArrivalGuard::has_waiters);
         if let Some(hit) = self.lookup_read_lease(&key)? {
             crate::metrics::inc_pack_cache_request(&self.metrics, protocol, "hit", "ready");
             return Ok(PackCacheLookup::Hit(hit));
         }
-        if let Some(hit) = self.lookup_compatible_read_lease(&key)? {
+        if repo_arrival.is_some() && key.base.is_some() && !force_live_producer {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            force_live_producer = repo_arrival
+                .as_ref()
+                .is_some_and(PackCacheRepoArrivalGuard::has_waiters);
+        }
+        if !force_live_producer && let Some(hit) = self.lookup_compatible_read_lease(&key)? {
             crate::metrics::inc_pack_cache_request(&self.metrics, protocol, "hit", "compatible");
             return Ok(PackCacheLookup::Hit(hit));
         }
 
-        let notified = {
+        let inflight_lookup = {
             let mut inflight = self.inflight.lock().await;
-            if let Some(notify) = inflight.get(key.as_str()) {
-                Some(Arc::clone(notify).notified_owned())
+            if let Some(inflight) = inflight.get(key.as_str()) {
+                Some(
+                    inflight
+                        .subscribe_if_started()
+                        .map(PackCacheInflightLookup::Live)
+                        .unwrap_or_else(|| {
+                            PackCacheInflightLookup::WaitForLive(Arc::clone(inflight))
+                        }),
+                )
             } else {
                 if let Some(hit) = self.lookup_read_lease(&key)? {
                     crate::metrics::inc_pack_cache_request(
@@ -621,7 +980,9 @@ impl PackCache {
                     );
                     return Ok(PackCacheLookup::Hit(hit));
                 }
-                if let Some(hit) = self.lookup_compatible_read_lease(&key)? {
+                if !force_live_producer
+                    && let Some(hit) = self.lookup_compatible_read_lease(&key)?
+                {
                     crate::metrics::inc_pack_cache_request(
                         &self.metrics,
                         protocol,
@@ -630,84 +991,138 @@ impl PackCache {
                     );
                     return Ok(PackCacheLookup::Hit(hit));
                 }
-                let notify = Arc::new(Notify::new());
-                inflight.insert(key.as_str().to_string(), Arc::clone(&notify));
+                inflight.insert(key.as_str().to_string(), Arc::new(PackCacheInflight::new()));
                 None
             }
         };
 
-        if let Some(notified) = notified {
-            crate::metrics::inc_pack_cache_request(
-                &self.metrics,
-                protocol.clone(),
-                "wait",
-                "inflight",
-            );
-            let timeout = Duration::from_secs(self.config.wait_for_inflight_secs);
-            let wait_result = tokio::time::timeout(timeout, notified).await;
-            match wait_result {
-                Ok(()) => {
-                    if let Some(hit) = self.lookup_read_lease(&key)? {
-                        crate::metrics::inc_pack_cache_inflight_wait(
-                            &self.metrics,
-                            protocol.clone(),
-                            "hit",
-                        );
-                        crate::metrics::inc_pack_cache_request(
-                            &self.metrics,
-                            protocol,
-                            "hit",
-                            "after_wait",
-                        );
-                        return Ok(PackCacheLookup::Hit(hit));
-                    }
-                    if let Some(hit) = self.lookup_compatible_read_lease(&key)? {
-                        crate::metrics::inc_pack_cache_inflight_wait(
-                            &self.metrics,
-                            protocol.clone(),
-                            "hit",
-                        );
-                        crate::metrics::inc_pack_cache_request(
-                            &self.metrics,
-                            protocol,
-                            "hit",
-                            "compatible_after_wait",
-                        );
-                        return Ok(PackCacheLookup::Hit(hit));
-                    }
-                    crate::metrics::inc_pack_cache_inflight_wait(
-                        &self.metrics,
-                        protocol.clone(),
-                        "miss",
-                    );
+        if let Some(inflight_lookup) = inflight_lookup {
+            match inflight_lookup {
+                PackCacheInflightLookup::Live(subscriber) => {
                     crate::metrics::inc_pack_cache_request(
                         &self.metrics,
-                        protocol,
-                        "miss",
-                        "after_wait",
+                        protocol.clone(),
+                        "hit",
+                        "inflight_live",
                     );
-                }
-                Err(_) => {
-                    debug!(
+                    crate::metrics::inc_pack_cache_live_subscription(
+                        &self.metrics,
+                        protocol.clone(),
+                        "success",
+                    );
+                    info!(
                         owner_repo = %key.owner_repo,
                         key = %key.as_str(),
-                        wait_timeout_secs = self.config.wait_for_inflight_secs,
-                        "pack cache inflight wait timed out; bypassing cache for request"
+                        protocol = ?protocol,
+                        wait_result = "already_live",
+                        "pack cache live subscription established"
                     );
-                    crate::metrics::inc_pack_cache_inflight_wait(
-                        &self.metrics,
-                        protocol.clone(),
-                        "timeout",
-                    );
+                    return Ok(PackCacheLookup::Live(subscriber));
+                }
+                PackCacheInflightLookup::WaitForLive(inflight) => {
                     crate::metrics::inc_pack_cache_request(
                         &self.metrics,
-                        protocol,
-                        "bypass",
-                        "wait_timeout",
+                        protocol.clone(),
+                        "wait",
+                        "inflight_live_start",
                     );
+                    let timeout = Duration::from_secs(self.config.wait_for_inflight_secs);
+                    let wait_result =
+                        tokio::time::timeout(timeout, inflight.wait_for_live_start_or_finish())
+                            .await;
+                    match wait_result {
+                        Ok(PackCacheInflightLiveWait::Live(subscriber)) => {
+                            crate::metrics::inc_pack_cache_inflight_wait(
+                                &self.metrics,
+                                protocol.clone(),
+                                "live",
+                            );
+                            crate::metrics::inc_pack_cache_request(
+                                &self.metrics,
+                                protocol.clone(),
+                                "hit",
+                                "inflight_live_after_wait",
+                            );
+                            crate::metrics::inc_pack_cache_live_subscription(
+                                &self.metrics,
+                                protocol.clone(),
+                                "success",
+                            );
+                            info!(
+                                owner_repo = %key.owner_repo,
+                                key = %key.as_str(),
+                                protocol = ?protocol,
+                                wait_result = "live_after_wait",
+                                "pack cache live subscription established"
+                            );
+                            return Ok(PackCacheLookup::Live(subscriber));
+                        }
+                        Ok(PackCacheInflightLiveWait::FinishedBeforeLive) => {
+                            if let Some(hit) = self.lookup_read_lease(&key)? {
+                                crate::metrics::inc_pack_cache_inflight_wait(
+                                    &self.metrics,
+                                    protocol.clone(),
+                                    "hit",
+                                );
+                                crate::metrics::inc_pack_cache_request(
+                                    &self.metrics,
+                                    protocol,
+                                    "hit",
+                                    "after_wait",
+                                );
+                                return Ok(PackCacheLookup::Hit(hit));
+                            }
+                            if !force_live_producer
+                                && let Some(hit) = self.lookup_compatible_read_lease(&key)?
+                            {
+                                crate::metrics::inc_pack_cache_inflight_wait(
+                                    &self.metrics,
+                                    protocol.clone(),
+                                    "hit",
+                                );
+                                crate::metrics::inc_pack_cache_request(
+                                    &self.metrics,
+                                    protocol,
+                                    "hit",
+                                    "compatible_after_wait",
+                                );
+                                return Ok(PackCacheLookup::Hit(hit));
+                            }
+                            crate::metrics::inc_pack_cache_inflight_wait(
+                                &self.metrics,
+                                protocol.clone(),
+                                "miss",
+                            );
+                            crate::metrics::inc_pack_cache_request(
+                                &self.metrics,
+                                protocol,
+                                "miss",
+                                "after_wait",
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                owner_repo = %key.owner_repo,
+                                key = %key.as_str(),
+                                wait_timeout_secs = self.config.wait_for_inflight_secs,
+                                "pack cache inflight wait timed out; bypassing cache for request"
+                            );
+                            crate::metrics::inc_pack_cache_inflight_wait(
+                                &self.metrics,
+                                protocol.clone(),
+                                "timeout",
+                            );
+                            crate::metrics::inc_pack_cache_request(
+                                &self.metrics,
+                                protocol,
+                                "bypass",
+                                "wait_timeout",
+                            );
+                        }
+                    }
+                    return Ok(PackCacheLookup::BypassAfterWait);
                 }
             }
-            return Ok(PackCacheLookup::BypassAfterWait);
         }
 
         let compatible_candidates = self.lookup_recent_compatible_keys(&key).len();
@@ -720,7 +1135,7 @@ impl PackCache {
             "pack cache miss reserved for generation"
         );
         crate::metrics::inc_pack_cache_request(&self.metrics, protocol, "miss", "reserved");
-        match self.open_writer(key.clone()).await {
+        match self.open_writer(key.clone(), repo_arrival).await {
             Ok(writer) => Ok(PackCacheLookup::Generate(Box::new(writer))),
             Err(error) => {
                 if let Some(notify) = self.inflight.lock().await.remove(key.as_str()) {
@@ -917,7 +1332,11 @@ impl PackCache {
         }
     }
 
-    async fn open_writer(&self, key: PackCacheKey) -> Result<PackCacheWriter> {
+    async fn open_writer(
+        &self,
+        key: PackCacheKey,
+        repo_arrival: Option<PackCacheRepoArrivalGuard>,
+    ) -> Result<PackCacheWriter> {
         tokio::fs::create_dir_all(&self.root)
             .await
             .with_context(|| format!("create pack cache root {}", self.root.display()))?;
@@ -938,7 +1357,7 @@ impl PackCache {
         let file = File::create(&tmp_pack_path)
             .await
             .with_context(|| format!("create pack cache temp pack {}", tmp_pack_path.display()))?;
-        let notify = self
+        let inflight_entry = self
             .inflight
             .lock()
             .await
@@ -965,7 +1384,8 @@ impl PackCache {
             recent_pack_cache_keys: Arc::clone(&self.recent_pack_cache_keys),
             packstore_midx_refresh_gate: Arc::clone(&self.packstore_midx_refresh_gate),
             packstore_midx_refresh_requested: Arc::clone(&self.packstore_midx_refresh_requested),
-            notify,
+            inflight_entry,
+            repo_arrival,
             metrics: self.metrics.clone(),
             completed: false,
         })
@@ -1108,7 +1528,21 @@ impl PackCacheWriter {
         &self.key
     }
 
+    pub fn has_repo_arrival(&self) -> bool {
+        self.repo_arrival.is_some()
+    }
+
+    pub fn begin_live_response(&self) {
+        if let Some(arrival) = &self.repo_arrival {
+            arrival.mark_live_started();
+        }
+        self.inflight_entry.live.begin();
+    }
+
     pub async fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        self.inflight_entry
+            .live
+            .publish(Bytes::copy_from_slice(bytes));
         self.response_bytes_written = self
             .response_bytes_written
             .saturating_add(bytes.len() as u64);
@@ -1143,6 +1577,7 @@ impl PackCacheWriter {
             self.completed = true;
             self.record_ready_entry(None);
             self.record_pack_cache_usage_metric();
+            self.inflight_entry.live.finish_success();
             self.release_inflight().await;
             let pack_id = self.key.as_str().to_string();
             self.spawn_indexed_promotion(pack_id, None);
@@ -1153,12 +1588,14 @@ impl PackCacheWriter {
             warn!(path = %self.tmp_pack_path.display(), error = %error, "failed to remove undersized pack cache temp pack");
             self.completed = true;
             self.record_pack_cache_usage_metric();
+            self.inflight_entry.live.finish_success();
             self.release_inflight().await;
             return Ok(());
         }
         if !self.completed {
             self.completed = true;
             self.record_pack_cache_usage_metric();
+            self.inflight_entry.live.finish_success();
             self.release_inflight().await;
         }
         Ok(())
@@ -1198,6 +1635,7 @@ impl PackCacheWriter {
         self.completed = true;
         self.record_ready_entry(Some(base_key));
         self.record_pack_cache_usage_metric();
+        self.inflight_entry.live.finish_success();
         self.release_inflight().await;
         let pack_id = format!("{}-delta", self.key.as_str());
         self.spawn_indexed_promotion(pack_id, Some(base_key.clone()));
@@ -1225,6 +1663,7 @@ impl PackCacheWriter {
         self.completed = true;
         self.record_ready_entry(None);
         self.record_pack_cache_usage_metric();
+        self.inflight_entry.live.finish_success();
         self.release_inflight().await;
         self.spawn_indexed_promotion(pack_id, None);
         Ok(())
@@ -1247,6 +1686,7 @@ impl PackCacheWriter {
         self.completed = true;
         self.record_ready_entry(Some(base_key));
         self.record_pack_cache_usage_metric();
+        self.inflight_entry.live.finish_success();
         self.release_inflight().await;
         crate::metrics::observe_pack_cache_artifact_generation(
             &self.metrics,
@@ -1256,6 +1696,9 @@ impl PackCacheWriter {
     }
 
     pub async fn abort(mut self) {
+        self.inflight_entry
+            .live
+            .finish_error("pack cache generation aborted");
         if let Err(error) = tokio::fs::remove_file(&self.tmp_pack_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -1268,7 +1711,7 @@ impl PackCacheWriter {
 
     async fn release_inflight(&self) {
         self.inflight.lock().await.remove(self.key.as_str());
-        self.notify.notify_waiters();
+        self.inflight_entry.notify_waiters();
     }
 
     fn record_ready_entry(&self, composite_base_key: Option<&PackCacheKey>) {
@@ -1583,15 +2026,18 @@ impl Drop for PackCacheWriter {
         let key = self.key.as_str().to_string();
         let tmp_path = self.tmp_pack_path.clone();
         let inflight = Arc::clone(&self.inflight);
-        let notify = Arc::clone(&self.notify);
+        let inflight_entry = Arc::clone(&self.inflight_entry);
         tokio::spawn(async move {
+            inflight_entry
+                .live
+                .finish_error("pack cache writer dropped before completion");
             if let Err(error) = tokio::fs::remove_file(&tmp_path).await
                 && error.kind() != std::io::ErrorKind::NotFound
             {
                 warn!(path = %tmp_path.display(), error = %error, "failed to remove dropped pack cache temp raw pack");
             }
             inflight.lock().await.remove(&key);
-            notify.notify_waiters();
+            inflight_entry.notify_waiters();
         });
     }
 }
@@ -2978,6 +3424,81 @@ mod tests {
         assert!(metadata_path(root, "composite").exists());
         assert!(pack_dir.join("pack-base.pack").exists());
         assert!(pack_dir.join("pack-composite-delta.pack").exists());
+    }
+
+    #[tokio::test]
+    async fn pending_inflight_subscribes_when_live_response_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+        cache.ensure_ready().await.unwrap();
+        let key = PackCacheKey {
+            digest: "same-key".to_string(),
+            owner_repo: "owner/repo".to_string(),
+            base: None,
+        };
+
+        let lookup = cache
+            .lookup_or_reserve(Protocol::Ssh, key.clone())
+            .await
+            .unwrap();
+        let PackCacheLookup::Generate(writer) = lookup else {
+            panic!("expected first request to reserve generation");
+        };
+
+        let mut second = Box::pin(cache.lookup_or_reserve(Protocol::Https, key));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), second.as_mut())
+                .await
+                .is_err(),
+            "second request should wait until the producer starts its live response"
+        );
+
+        writer.begin_live_response();
+        let lookup = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+        if !matches!(lookup, PackCacheLookup::Live(_)) {
+            panic!("expected second request to subscribe to the first live response");
+        }
+
+        writer.abort().await;
+    }
+
+    #[tokio::test]
+    async fn repo_arrival_waiters_use_canonical_repo_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = PackCache::new(
+            temp.path(),
+            PackCacheConfig {
+                enabled: true,
+                max_percent: 1.0,
+                wait_for_inflight_secs: 1,
+                min_response_bytes: 0,
+                ..PackCacheConfig::default()
+            },
+            1.0,
+            MetricsRegistry::new(),
+        );
+
+        let arrival = cache
+            .begin_repo_arrival("owner/repo.git")
+            .await
+            .expect("first arrival should become producer");
+
+        assert!(cache.mark_repo_arrival_waiter("owner/repo"));
+        assert!(arrival.has_waiters());
     }
 
     #[tokio::test]
