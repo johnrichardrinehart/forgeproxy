@@ -769,6 +769,7 @@ pub struct AdaptiveObservationCounters {
     upstream_fallbacks: AtomicU64,
     fallback_local_upload_pack_permit: AtomicU64,
     fallback_local_upload_pack_first_byte: AtomicU64,
+    fallback_local_catch_up: AtomicU64,
     fallback_published_generation_lease: AtomicU64,
     fallback_pack_cache_lookup: AtomicU64,
     fallback_upstream_clone_global: AtomicU64,
@@ -786,6 +787,7 @@ pub struct ObservationTotals {
     pub upstream_fallbacks: u64,
     pub fallback_local_upload_pack_permit: u64,
     pub fallback_local_upload_pack_first_byte: u64,
+    pub fallback_local_catch_up: u64,
     pub fallback_published_generation_lease: u64,
     pub fallback_pack_cache_lookup: u64,
     pub fallback_upstream_clone_global: u64,
@@ -802,6 +804,7 @@ impl ObservationTotals {
             FallbackRecoveryTarget::LocalUploadPackFirstByte => {
                 &mut self.fallback_local_upload_pack_first_byte
             }
+            FallbackRecoveryTarget::LocalCatchUp => &mut self.fallback_local_catch_up,
             FallbackRecoveryTarget::PublishedGenerationLease => {
                 &mut self.fallback_published_generation_lease
             }
@@ -819,6 +822,7 @@ impl ObservationTotals {
 pub enum FallbackRecoveryTarget {
     LocalUploadPackPermit,
     LocalUploadPackFirstByte,
+    LocalCatchUp,
     PublishedGenerationLease,
     PackCacheLookup,
     UpstreamCloneGlobal,
@@ -834,6 +838,7 @@ fn fallback_target_for_reason(reason: &str) -> FallbackRecoveryTarget {
         "short_circuit_local_upload_pack_first_byte" | "local_upload_pack_first_byte" => {
             FallbackRecoveryTarget::LocalUploadPackFirstByte
         }
+        "local_catch_up" => FallbackRecoveryTarget::LocalCatchUp,
         "short_circuit_published_generation_lease" | "published_generation_lease" => {
             FallbackRecoveryTarget::PublishedGenerationLease
         }
@@ -909,6 +914,7 @@ impl AdaptiveObservationCounters {
             FallbackRecoveryTarget::LocalUploadPackFirstByte => {
                 &self.fallback_local_upload_pack_first_byte
             }
+            FallbackRecoveryTarget::LocalCatchUp => &self.fallback_local_catch_up,
             FallbackRecoveryTarget::PublishedGenerationLease => {
                 &self.fallback_published_generation_lease
             }
@@ -935,6 +941,7 @@ impl AdaptiveObservationCounters {
             fallback_local_upload_pack_first_byte: self
                 .fallback_local_upload_pack_first_byte
                 .load(Ordering::Relaxed),
+            fallback_local_catch_up: self.fallback_local_catch_up.load(Ordering::Relaxed),
             fallback_published_generation_lease: self
                 .fallback_published_generation_lease
                 .load(Ordering::Relaxed),
@@ -1264,6 +1271,7 @@ fn increase_capacity_for_fallback_target(
         FallbackRecoveryTarget::PublishedGenerationLease => {
             increase_generation_recovery_capacity(policy, bounds)
         }
+        FallbackRecoveryTarget::LocalCatchUp => None,
         FallbackRecoveryTarget::PackCacheLookup => {
             increase_pack_cache_lookup_capacity(policy, bounds)
         }
@@ -1436,7 +1444,7 @@ fn increase_waits_for_fallback_target(
             ),
             ..policy
         }),
-        FallbackRecoveryTarget::PublishedGenerationLease => {
+        FallbackRecoveryTarget::LocalCatchUp | FallbackRecoveryTarget::PublishedGenerationLease => {
             Some(increase_request_waits(policy, bounds))
         }
         FallbackRecoveryTarget::Unknown => Some(increase_request_waits(policy, bounds)),
@@ -1924,6 +1932,7 @@ fn increase_repo_capacity_for_fallback_target(
         | FallbackRecoveryTarget::UpstreamCloneRepo => {
             increase_repo_upstream_clone_capacity(policy, bounds)
         }
+        FallbackRecoveryTarget::LocalCatchUp => None,
         FallbackRecoveryTarget::UpstreamCloneGlobal => None,
         FallbackRecoveryTarget::PackCacheLookup => None,
         FallbackRecoveryTarget::Unknown => increase_repo_local_upload_pack_capacity(policy, bounds)
@@ -1992,7 +2001,9 @@ fn increase_repo_waits_for_fallback_target(
             ),
             ..policy
         }),
-        FallbackRecoveryTarget::PublishedGenerationLease | FallbackRecoveryTarget::Unknown => {
+        FallbackRecoveryTarget::LocalCatchUp
+        | FallbackRecoveryTarget::PublishedGenerationLease
+        | FallbackRecoveryTarget::Unknown => {
             Some(increase_repo_timeouts_preserve_capacity(policy, bounds))
         }
         FallbackRecoveryTarget::LocalUploadPackPermit
@@ -2447,6 +2458,9 @@ fn delta(previous: ObservationTotals, next: ObservationTotals) -> ObservationTot
         fallback_local_upload_pack_first_byte: next
             .fallback_local_upload_pack_first_byte
             .saturating_sub(previous.fallback_local_upload_pack_first_byte),
+        fallback_local_catch_up: next
+            .fallback_local_catch_up
+            .saturating_sub(previous.fallback_local_catch_up),
         fallback_published_generation_lease: next
             .fallback_published_generation_lease
             .saturating_sub(previous.fallback_published_generation_lease),
@@ -2495,6 +2509,10 @@ fn dominant_fallback_target(window: ObservationTotals) -> Option<FallbackRecover
         (
             FallbackRecoveryTarget::LocalUploadPackFirstByte,
             window.fallback_local_upload_pack_first_byte,
+        ),
+        (
+            FallbackRecoveryTarget::LocalCatchUp,
+            window.fallback_local_catch_up,
         ),
         (
             FallbackRecoveryTarget::PublishedGenerationLease,
@@ -3018,6 +3036,44 @@ mod tests {
             5
         );
         assert_eq!(recommendation.policy.local_upload_pack_per_repo, 6);
+    }
+
+    #[test]
+    fn local_catch_up_reason_maps_to_timeout_target() {
+        assert_eq!(
+            fallback_target_for_reason("local_catch_up"),
+            FallbackRecoveryTarget::LocalCatchUp
+        );
+    }
+
+    #[test]
+    fn repo_local_catch_up_fallback_increases_timeouts_before_capacity() {
+        let observed = RepoObservationSnapshot {
+            owner_repo: "acme/widgets".to_string(),
+            sample_count: 20,
+            clone_latency_secs_avg: Some(1.0),
+            first_byte_latency_secs_avg: Some(0.2),
+            fallback_rate: 1.0,
+            dominant_fallback_target: Some(FallbackRecoveryTarget::LocalCatchUp),
+            host_pressure: HostPressure::default(),
+            current: repo_policy(5),
+            config: config(),
+            warmup_complete: true,
+        };
+
+        let recommendation = recommend_repo_policy(&observed);
+
+        assert_eq!(recommendation.decision, "increase_timeouts");
+        assert_eq!(
+            recommendation.policy.request_wait_for_local_catch_up_secs,
+            10
+        );
+        assert_eq!(recommendation.policy.generation_publish_secs, 10);
+        assert_eq!(
+            recommendation.policy.upstream_clone_per_repo_per_instance,
+            5
+        );
+        assert_eq!(recommendation.policy.local_upload_pack_per_repo, 5);
     }
 
     #[test]
