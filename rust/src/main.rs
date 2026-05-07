@@ -178,6 +178,10 @@ pub struct AppState {
         Arc<Mutex<std::collections::HashMap<String, CachedResizableGate>>>,
     /// Shared disk-backed upload-pack response cache.
     pub pack_cache: Arc<pack_cache::PackCache>,
+    /// Per-repo latest-wins scheduler for expensive published-generation bitmap
+    /// preparation. MIDX is per-generation; bitmap is best-effort and coalesced.
+    pub published_generation_bitmap_scheduler:
+        Arc<crate::coordination::registry::PublishedGenerationBitmapScheduler>,
     /// Per-repo refcounts for published reader generations currently in use by
     /// local clone/fetch handlers on this node.
     pub published_generation_leases: Arc<
@@ -2000,6 +2004,9 @@ async fn build_app_state(
         local_upload_pack_semaphore: Arc::clone(&effective_policy_state.local_upload_pack_gate),
         repo_upload_pack_semaphores: Arc::new(Mutex::new(std::collections::HashMap::new())),
         pack_cache,
+        published_generation_bitmap_scheduler: Arc::new(
+            crate::coordination::registry::PublishedGenerationBitmapScheduler::new(),
+        ),
         published_generation_leases: Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

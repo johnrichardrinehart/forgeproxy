@@ -72,6 +72,152 @@ pub struct RepoUpdateProfile {
     pub last_selected_mode: String,
 }
 
+struct PublishedGenerationBitmapRequest {
+    owner_repo: String,
+    published_path: PathBuf,
+    source: String,
+    _published_lease: Option<PublishedGenerationLease>,
+}
+
+#[derive(Default)]
+struct PublishedGenerationBitmapRepoState {
+    running: bool,
+    pending: Option<PublishedGenerationBitmapRequest>,
+}
+
+enum PublishedGenerationBitmapScheduleAction {
+    Start(PublishedGenerationBitmapRequest),
+    Pending {
+        pending_path: PathBuf,
+        replaced_path: Option<PathBuf>,
+    },
+}
+
+/// Per-repo latest-wins scheduler for expensive MIDX bitmap preparation.
+///
+/// MIDX preparation is cheap enough to run for every published generation, but
+/// bitmaps are best-effort and should not form a FIFO backlog. This scheduler
+/// allows one active bitmap worker per repo and keeps only the latest pending
+/// generation while that worker runs.
+#[derive(Default)]
+pub struct PublishedGenerationBitmapScheduler {
+    repos: std::sync::Mutex<HashMap<String, PublishedGenerationBitmapRepoState>>,
+}
+
+impl PublishedGenerationBitmapScheduler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn request(
+        self: &Arc<Self>,
+        state: crate::AppState,
+        request: PublishedGenerationBitmapRequest,
+    ) {
+        match self.record_request(request) {
+            PublishedGenerationBitmapScheduleAction::Start(request) => {
+                info!(
+                    repo = %request.owner_repo,
+                    source = %request.source,
+                    path = %request.published_path.display(),
+                    "starting published generation bitmap scheduler worker"
+                );
+                self.spawn_worker(state, request);
+            }
+            PublishedGenerationBitmapScheduleAction::Pending {
+                pending_path,
+                replaced_path,
+            } => {
+                if let Some(replaced_path) = replaced_path {
+                    crate::metrics::inc_published_generation_index_decision(
+                        &state.metrics,
+                        "bitmap",
+                        "scheduler",
+                        "skip",
+                        "coalesced",
+                    );
+                    info!(
+                        pending = %pending_path.display(),
+                        replaced = %replaced_path.display(),
+                        "replaced pending published generation bitmap request with newer generation"
+                    );
+                } else {
+                    info!(
+                        pending = %pending_path.display(),
+                        "queued latest published generation bitmap request behind active worker"
+                    );
+                }
+            }
+        }
+    }
+
+    fn record_request(
+        &self,
+        request: PublishedGenerationBitmapRequest,
+    ) -> PublishedGenerationBitmapScheduleAction {
+        let owner_repo = request.owner_repo.clone();
+        let pending_path = request.published_path.clone();
+        let mut repos = self.repos.lock().unwrap();
+        let repo = repos.entry(owner_repo).or_default();
+        if repo.running {
+            let replaced_path = repo
+                .pending
+                .replace(request)
+                .map(|request| request.published_path);
+            PublishedGenerationBitmapScheduleAction::Pending {
+                pending_path,
+                replaced_path,
+            }
+        } else {
+            repo.running = true;
+            PublishedGenerationBitmapScheduleAction::Start(request)
+        }
+    }
+
+    fn spawn_worker(
+        self: &Arc<Self>,
+        state: crate::AppState,
+        request: PublishedGenerationBitmapRequest,
+    ) {
+        let scheduler = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut next_request = Some(request);
+            while let Some(request) = next_request {
+                let PublishedGenerationBitmapRequest {
+                    owner_repo,
+                    published_path,
+                    source,
+                    _published_lease,
+                } = request;
+                let published_lease = _published_lease;
+                run_published_generation_bitmap_preparation(
+                    state.clone(),
+                    owner_repo.clone(),
+                    published_path,
+                    source,
+                )
+                .await;
+                drop(published_lease);
+                next_request = scheduler.finish_and_take_pending(&owner_repo);
+            }
+        });
+    }
+
+    fn finish_and_take_pending(
+        &self,
+        owner_repo: &str,
+    ) -> Option<PublishedGenerationBitmapRequest> {
+        let mut repos = self.repos.lock().unwrap();
+        let repo = repos.get_mut(owner_repo)?;
+        if let Some(request) = repo.pending.take() {
+            Some(request)
+        } else {
+            repos.remove(owner_repo);
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RepoRefreshScheduleState {
     version: u64,
@@ -2294,6 +2440,35 @@ async fn run_published_generation_index_preparation(
         }
     }
 
+    let published_lease = lease_published_generation_path(&state, &owner_repo, &published_path);
+    state.published_generation_bitmap_scheduler.request(
+        state.clone(),
+        PublishedGenerationBitmapRequest {
+            owner_repo,
+            published_path,
+            source,
+            _published_lease: Some(published_lease),
+        },
+    );
+}
+
+async fn run_published_generation_bitmap_preparation(
+    state: crate::AppState,
+    owner_repo: String,
+    published_path: PathBuf,
+    source: String,
+) {
+    let clone_config = state.config().clone.clone();
+    if !confirm_current_published_generation_for_bitmap(
+        &state,
+        &owner_repo,
+        &published_path,
+        &source,
+        clone_config.published_generation_bitmap_policy.as_label(),
+    ) {
+        return;
+    }
+
     let bitmap_decision =
         match should_generate_published_generation_bitmap(&state, &owner_repo, &published_path)
             .await
@@ -2404,6 +2579,17 @@ async fn run_published_generation_index_preparation(
         return;
     }
 
+    if !confirm_current_published_generation_for_bitmap(
+        &state,
+        &owner_repo,
+        &published_path,
+        &source,
+        bitmap_decision.policy,
+    ) {
+        drop(permit);
+        return;
+    }
+
     crate::metrics::inc_published_generation_index_decision(
         &state.metrics,
         "bitmap",
@@ -2486,6 +2672,55 @@ async fn run_published_generation_index_preparation(
                 error = %error,
                 "background bitmap preparation failed for published generation"
             );
+        }
+    }
+}
+
+fn confirm_current_published_generation_for_bitmap(
+    state: &crate::AppState,
+    owner_repo: &str,
+    published_path: &Path,
+    source: &str,
+    policy: &'static str,
+) -> bool {
+    match state.cache_manager.current_repo_target(owner_repo) {
+        Ok(current_target) if current_target.as_deref() == Some(published_path) => true,
+        Ok(current_target) => {
+            crate::metrics::inc_published_generation_index_decision(
+                &state.metrics,
+                "bitmap",
+                policy,
+                "skip",
+                "stale_generation",
+            );
+            info!(
+                repo = %owner_repo,
+                source,
+                path = %published_path.display(),
+                current = %current_target
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                "skipping published generation bitmap preparation for stale generation"
+            );
+            false
+        }
+        Err(error) => {
+            crate::metrics::inc_published_generation_index_decision(
+                &state.metrics,
+                "bitmap",
+                policy,
+                "error",
+                "current_generation_failed",
+            );
+            warn!(
+                repo = %owner_repo,
+                source,
+                path = %published_path.display(),
+                error = %error,
+                "failed to confirm current published generation before bitmap preparation"
+            );
+            false
         }
     }
 }
@@ -7669,6 +7904,101 @@ mod tests {
             IdleLocalUploadPackGate::Busy
         );
         assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    fn bitmap_request(path: &str) -> PublishedGenerationBitmapRequest {
+        PublishedGenerationBitmapRequest {
+            owner_repo: "octocat/widgets".to_string(),
+            published_path: PathBuf::from(path),
+            source: "test".to_string(),
+            _published_lease: None,
+        }
+    }
+
+    #[test]
+    fn bitmap_scheduler_starts_first_request() {
+        let scheduler = PublishedGenerationBitmapScheduler::new();
+        let request = bitmap_request("/cache/octocat/widgets/gen-1.git");
+
+        match scheduler.record_request(request) {
+            PublishedGenerationBitmapScheduleAction::Start(request) => {
+                assert_eq!(
+                    request.published_path,
+                    PathBuf::from("/cache/octocat/widgets/gen-1.git")
+                );
+            }
+            PublishedGenerationBitmapScheduleAction::Pending { .. } => {
+                panic!("first bitmap request should start a worker")
+            }
+        }
+        assert!(
+            scheduler
+                .finish_and_take_pending("octocat/widgets")
+                .is_none(),
+            "no pending bitmap remains after the only active request finishes"
+        );
+    }
+
+    #[test]
+    fn bitmap_scheduler_keeps_only_latest_pending_generation() {
+        let scheduler = PublishedGenerationBitmapScheduler::new();
+        let active = bitmap_request("/cache/octocat/widgets/gen-1.git");
+        let older_pending = bitmap_request("/cache/octocat/widgets/gen-2.git");
+        let latest_pending = bitmap_request("/cache/octocat/widgets/gen-3.git");
+
+        assert!(matches!(
+            scheduler.record_request(active),
+            PublishedGenerationBitmapScheduleAction::Start(_)
+        ));
+        match scheduler.record_request(older_pending) {
+            PublishedGenerationBitmapScheduleAction::Pending {
+                pending_path,
+                replaced_path,
+            } => {
+                assert_eq!(
+                    pending_path,
+                    PathBuf::from("/cache/octocat/widgets/gen-2.git")
+                );
+                assert_eq!(replaced_path, None);
+            }
+            PublishedGenerationBitmapScheduleAction::Start(_) => {
+                panic!("second bitmap request should wait behind the active worker")
+            }
+        }
+        match scheduler.record_request(latest_pending) {
+            PublishedGenerationBitmapScheduleAction::Pending {
+                pending_path,
+                replaced_path,
+            } => {
+                assert_eq!(
+                    pending_path,
+                    PathBuf::from("/cache/octocat/widgets/gen-3.git")
+                );
+                assert_eq!(
+                    replaced_path,
+                    Some(PathBuf::from("/cache/octocat/widgets/gen-2.git"))
+                );
+            }
+            PublishedGenerationBitmapScheduleAction::Start(_) => {
+                panic!("newer bitmap request should replace the pending request")
+            }
+        }
+
+        let next = scheduler
+            .finish_and_take_pending("octocat/widgets")
+            .expect("latest pending generation should run next");
+        assert_eq!(next.owner_repo, "octocat/widgets");
+        assert_eq!(
+            next.published_path,
+            PathBuf::from("/cache/octocat/widgets/gen-3.git")
+        );
+        assert_eq!(next.source, "test");
+        assert!(
+            scheduler
+                .finish_and_take_pending("octocat/widgets")
+                .is_none(),
+            "the repo queue is empty after the latest pending bitmap finishes"
+        );
     }
 
     #[test]
