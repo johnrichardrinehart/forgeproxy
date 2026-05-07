@@ -24,6 +24,7 @@ load on the upstream forge and speeding up clones.
 - **Auth caching** — SSH fingerprint and HTTP token auth results cached in Valkey with configurable TTLs
 - **Webhook-driven invalidation** — push webhooks trigger immediate re-fetch of affected repos
 - **Forge API rate-limit awareness** — self-throttles when the upstream API rate-limit budget runs low
+- **Adaptive runtime tuning** — optional AIMD or demand/resource controllers adjust runtime concurrency, thread, and request-wait budgets within operator bounds
 - **Prometheus metrics** — counters, gauges, and histograms for clone latency, cache hit rate, bundle generation, and more
 - **FIPS 140 build** — optional `fips` Cargo feature for FIPS-validated TLS via rustls
 - **NixOS module** — declarative deployment with systemd hardening out of the box
@@ -284,6 +285,7 @@ nix flake check
 
 ## Design Notes
 
+- [`docs/adaptive-tuning.md`](docs/adaptive-tuning.md)
 - [`docs/consolidation-locking.md`](docs/consolidation-locking.md)
 - [`docs/repository-rename-shortcoming.md`](docs/repository-rename-shortcoming.md)
 

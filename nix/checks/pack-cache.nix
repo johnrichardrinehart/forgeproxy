@@ -143,7 +143,10 @@ let
 in
 pkgs.testers.runNixOSTest {
   name = "forgeproxy-pack-cache";
-  globalTimeout = 60 * 8;
+  # This scenario seeds a fanout repository with hundreds of MiB of random pack
+  # data before exercising HTTP/SSH cache reuse. Parallel flake checks on slower
+  # builders can spend most of the old timeout in git push compression.
+  globalTimeout = 60 * 20;
 
   nodes = {
     ghe =

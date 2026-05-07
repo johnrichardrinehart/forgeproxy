@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -206,6 +207,8 @@ pub struct AdaptiveTuningConfig {
     pub enabled: bool,
     #[serde(default)]
     pub mode: AdaptiveTuningMode,
+    #[serde(default)]
+    pub controller: AdaptiveTuningController,
     #[serde(default = "default_adaptive_evaluation_interval_secs")]
     pub evaluation_interval_secs: u64,
     #[serde(default = "default_adaptive_cpu_poll_interval_secs")]
@@ -217,7 +220,11 @@ pub struct AdaptiveTuningConfig {
     #[serde(default)]
     pub slo: AdaptiveTuningSloConfig,
     #[serde(default)]
+    pub slo_policy: AdaptiveTuningSloPolicyConfig,
+    #[serde(default)]
     pub resource_pressure: AdaptiveTuningResourcePressureConfig,
+    #[serde(default)]
+    pub demand_resource: AdaptiveTuningDemandResourceConfig,
     #[serde(default)]
     pub bounds: AdaptiveTuningBoundsConfig,
     #[serde(default = "default_adaptive_recommendation_ttl_secs")]
@@ -231,15 +238,35 @@ impl Default for AdaptiveTuningConfig {
         Self {
             enabled: false,
             mode: AdaptiveTuningMode::Active,
+            controller: AdaptiveTuningController::Aimd,
             evaluation_interval_secs: default_adaptive_evaluation_interval_secs(),
             cpu_poll_interval_secs: default_adaptive_cpu_poll_interval_secs(),
             warmup_interval_secs: default_adaptive_warmup_interval_secs(),
             min_sample_count: default_adaptive_min_sample_count(),
             slo: AdaptiveTuningSloConfig::default(),
+            slo_policy: AdaptiveTuningSloPolicyConfig::default(),
             resource_pressure: AdaptiveTuningResourcePressureConfig::default(),
+            demand_resource: AdaptiveTuningDemandResourceConfig::default(),
             bounds: AdaptiveTuningBoundsConfig::default(),
             recommendation_ttl_secs: default_adaptive_recommendation_ttl_secs(),
             recommendation_max_staleness_secs: default_adaptive_recommendation_max_staleness_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveTuningController {
+    #[default]
+    Aimd,
+    DemandResource,
+}
+
+impl AdaptiveTuningController {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Aimd => "aimd",
+            Self::DemandResource => "demand_resource",
         }
     }
 }
@@ -264,6 +291,24 @@ impl AdaptiveTuningMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AdaptiveTuningDemandResourceConfig {
+    #[serde(default = "default_adaptive_demand_cpu_provisioning_fraction")]
+    pub cpu_provisioning_fraction: f64,
+    #[serde(default = "default_adaptive_demand_cpu_provisioning_fraction_when_memory_constrained")]
+    pub cpu_provisioning_fraction_when_memory_constrained: f64,
+}
+
+impl Default for AdaptiveTuningDemandResourceConfig {
+    fn default() -> Self {
+        Self {
+            cpu_provisioning_fraction: default_adaptive_demand_cpu_provisioning_fraction(),
+            cpu_provisioning_fraction_when_memory_constrained:
+                default_adaptive_demand_cpu_provisioning_fraction_when_memory_constrained(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct AdaptiveTuningSloConfig {
     #[serde(default = "default_adaptive_clone_latency_slo_secs")]
     pub clone_latency_secs: f64,
@@ -279,6 +324,33 @@ impl Default for AdaptiveTuningSloConfig {
             clone_latency_secs: default_adaptive_clone_latency_slo_secs(),
             first_byte_latency_secs: default_adaptive_first_byte_latency_slo_secs(),
             fallback_rate: default_adaptive_fallback_rate_slo(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct AdaptiveTuningSloPolicyConfig {
+    #[serde(default = "default_adaptive_slo_policy_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_adaptive_slo_policy_min_sample_count")]
+    pub min_sample_count: u64,
+    #[serde(default = "default_adaptive_slo_policy_near_miss_grace_fraction")]
+    pub near_miss_grace_fraction: f64,
+    #[serde(default = "default_adaptive_slo_policy_near_miss_grace_secs")]
+    pub near_miss_grace_secs: f64,
+    #[serde(default = "default_adaptive_slo_policy_early_abort_overrun_fraction")]
+    pub early_abort_overrun_fraction: f64,
+}
+
+impl Default for AdaptiveTuningSloPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_adaptive_slo_policy_enabled(),
+            min_sample_count: default_adaptive_slo_policy_min_sample_count(),
+            near_miss_grace_fraction: default_adaptive_slo_policy_near_miss_grace_fraction(),
+            near_miss_grace_secs: default_adaptive_slo_policy_near_miss_grace_secs(),
+            early_abort_overrun_fraction: default_adaptive_slo_policy_early_abort_overrun_fraction(
+            ),
         }
     }
 }
@@ -447,6 +519,26 @@ fn default_adaptive_fallback_rate_slo() -> f64 {
     0.05
 }
 
+fn default_adaptive_slo_policy_enabled() -> bool {
+    true
+}
+
+fn default_adaptive_slo_policy_min_sample_count() -> u64 {
+    5
+}
+
+fn default_adaptive_slo_policy_near_miss_grace_fraction() -> f64 {
+    0.10
+}
+
+fn default_adaptive_slo_policy_near_miss_grace_secs() -> f64 {
+    3.0
+}
+
+fn default_adaptive_slo_policy_early_abort_overrun_fraction() -> f64 {
+    0.25
+}
+
 fn default_adaptive_cpu_busy_high_watermark() -> f64 {
     0.85
 }
@@ -461,6 +553,14 @@ fn default_adaptive_cpu_poll_interval_secs() -> u64 {
 
 fn default_adaptive_memory_available_min_percent() -> f64 {
     10.0
+}
+
+fn default_adaptive_demand_cpu_provisioning_fraction() -> f64 {
+    1.5
+}
+
+fn default_adaptive_demand_cpu_provisioning_fraction_when_memory_constrained() -> f64 {
+    0.5
 }
 
 fn default_adaptive_knob_min() -> usize {
@@ -989,9 +1089,9 @@ pub struct CloneConfig {
     #[serde(default)]
     pub generation_coalescing_window_secs: u64,
     /// Request path: coarse maximum time a client request may spend waiting on
-    /// forgeproxy-local work before it proxies upstream. Zero disables the
-    /// coarse budget.
-    #[serde(default)]
+    /// forgeproxy-local work before it proxies upstream. Zero immediately
+    /// exhausts the coarse budget and forces upstream short-circuiting.
+    #[serde(default = "default_global_short_circuit_upstream_secs")]
     pub global_short_circuit_upstream_secs: u64,
     /// Maximum time a client request should wait for a local mirror catch-up
     /// publish before falling back to proxying upstream.
@@ -1014,9 +1114,9 @@ pub struct CloneConfig {
     #[serde(default)]
     pub generation_publish_secs: u64,
     /// Request path: maximum time the client waits for the first byte from a
-    /// local git upload-pack subprocess before proxying upstream. Zero disables
-    /// this stage-specific budget.
-    #[serde(default)]
+    /// local git upload-pack subprocess before proxying upstream. Zero
+    /// immediately forces upstream short-circuiting and bypasses SLO policy.
+    #[serde(default = "default_local_upload_pack_first_byte_secs")]
     pub local_upload_pack_first_byte_secs: u64,
     /// How often to scan `_tee` for abandoned captures.
     #[serde(default = "default_tee_cleanup_interval_secs")]
@@ -1063,13 +1163,13 @@ impl Default for CloneConfig {
             published_generation_bitmap_max_interval_ratio:
                 default_published_generation_bitmap_max_interval_ratio(),
             generation_coalescing_window_secs: 0,
-            global_short_circuit_upstream_secs: 0,
+            global_short_circuit_upstream_secs: default_global_short_circuit_upstream_secs(),
             request_wait_for_local_catch_up_secs: default_request_wait_for_local_catch_up_secs(),
             request_wait_for_active_local_catch_up_secs:
                 default_request_wait_for_active_local_catch_up_secs(),
             request_time_s3_restore_secs: 0,
             generation_publish_secs: 0,
-            local_upload_pack_first_byte_secs: 0,
+            local_upload_pack_first_byte_secs: default_local_upload_pack_first_byte_secs(),
             tee_cleanup_interval_secs: default_tee_cleanup_interval_secs(),
             tee_retention_secs: default_tee_retention_secs(),
             ssh_upload_pack_close_grace_secs: default_ssh_upload_pack_close_grace_secs(),
@@ -1118,6 +1218,14 @@ fn default_request_wait_for_local_catch_up_secs() -> u64 {
 
 fn default_request_wait_for_active_local_catch_up_secs() -> u64 {
     360
+}
+
+fn default_global_short_circuit_upstream_secs() -> u64 {
+    10
+}
+
+fn default_local_upload_pack_first_byte_secs() -> u64 {
+    10
 }
 
 fn default_tee_cleanup_interval_secs() -> u64 {
@@ -1674,7 +1782,9 @@ enum ConfigSchemaNode {
     BackgroundWork,
     AdaptiveTuning,
     AdaptiveTuningSlo,
+    AdaptiveTuningSloPolicy,
     AdaptiveTuningResourcePressure,
+    AdaptiveTuningDemandResource,
     AdaptiveTuningBounds,
     AdaptiveTuningKnobBounds,
     ConfigReload,
@@ -1749,12 +1859,15 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
         ConfigSchemaNode::AdaptiveTuning => &[
             "enabled",
             "mode",
+            "controller",
             "evaluation_interval_secs",
             "cpu_poll_interval_secs",
             "warmup_interval_secs",
             "min_sample_count",
             "slo",
+            "slo_policy",
             "resource_pressure",
+            "demand_resource",
             "bounds",
             "recommendation_ttl_secs",
             "recommendation_max_staleness_secs",
@@ -1764,10 +1877,21 @@ fn schema_allowed_fields(node: ConfigSchemaNode) -> &'static [&'static str] {
             "first_byte_latency_secs",
             "fallback_rate",
         ],
+        ConfigSchemaNode::AdaptiveTuningSloPolicy => &[
+            "enabled",
+            "min_sample_count",
+            "near_miss_grace_fraction",
+            "near_miss_grace_secs",
+            "early_abort_overrun_fraction",
+        ],
         ConfigSchemaNode::AdaptiveTuningResourcePressure => &[
             "cpu_busy_high_watermark",
             "disk_busy_high_watermark",
             "memory_available_min_percent",
+        ],
+        ConfigSchemaNode::AdaptiveTuningDemandResource => &[
+            "cpu_provisioning_fraction",
+            "cpu_provisioning_fraction_when_memory_constrained",
         ],
         ConfigSchemaNode::AdaptiveTuningBounds => &[
             "upstream_clone_concurrency",
@@ -1939,8 +2063,14 @@ fn schema_child(node: ConfigSchemaNode, key: &str) -> ConfigSchemaChild {
         (ConfigSchemaNode::AdaptiveTuning, "slo") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningSlo)
         }
+        (ConfigSchemaNode::AdaptiveTuning, "slo_policy") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningSloPolicy)
+        }
         (ConfigSchemaNode::AdaptiveTuning, "resource_pressure") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningResourcePressure)
+        }
+        (ConfigSchemaNode::AdaptiveTuning, "demand_resource") => {
+            ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningDemandResource)
         }
         (ConfigSchemaNode::AdaptiveTuning, "bounds") => {
             ConfigSchemaChild::Object(ConfigSchemaNode::AdaptiveTuningBounds)
@@ -2365,22 +2495,24 @@ fn validate_config(config: &Config) -> Result<()> {
 }
 
 fn validate_adaptive_tuning_config(config: &AdaptiveTuningConfig) -> Result<()> {
-    anyhow::ensure!(
-        config.evaluation_interval_secs > 0,
-        "adaptive_tuning.evaluation_interval_secs must be greater than 0"
-    );
-    anyhow::ensure!(
-        config.cpu_poll_interval_secs > 0,
-        "adaptive_tuning.cpu_poll_interval_secs must be greater than 0"
-    );
-    anyhow::ensure!(
-        config.cpu_poll_interval_secs <= config.evaluation_interval_secs,
-        "adaptive_tuning.cpu_poll_interval_secs must be less than or equal to adaptive_tuning.evaluation_interval_secs"
-    );
-    anyhow::ensure!(
-        config.warmup_interval_secs > 0,
-        "adaptive_tuning.warmup_interval_secs must be greater than 0"
-    );
+    if config.controller == AdaptiveTuningController::Aimd {
+        anyhow::ensure!(
+            config.evaluation_interval_secs > 0,
+            "adaptive_tuning.evaluation_interval_secs must be greater than 0"
+        );
+        anyhow::ensure!(
+            config.cpu_poll_interval_secs > 0,
+            "adaptive_tuning.cpu_poll_interval_secs must be greater than 0"
+        );
+        anyhow::ensure!(
+            config.cpu_poll_interval_secs <= config.evaluation_interval_secs,
+            "adaptive_tuning.cpu_poll_interval_secs must be less than or equal to adaptive_tuning.evaluation_interval_secs"
+        );
+        anyhow::ensure!(
+            config.warmup_interval_secs > 0,
+            "adaptive_tuning.warmup_interval_secs must be greater than 0"
+        );
+    }
     anyhow::ensure!(
         config.min_sample_count > 0,
         "adaptive_tuning.min_sample_count must be greater than 0"
@@ -2398,12 +2530,30 @@ fn validate_adaptive_tuning_config(config: &AdaptiveTuningConfig) -> Result<()> 
         "adaptive_tuning.slo.clone_latency_secs must be greater than 0"
     );
     anyhow::ensure!(
-        config.slo.first_byte_latency_secs > 0.0,
-        "adaptive_tuning.slo.first_byte_latency_secs must be greater than 0"
+        config.slo.first_byte_latency_secs > 0.0
+            && Duration::try_from_secs_f64(config.slo.first_byte_latency_secs).is_ok(),
+        "adaptive_tuning.slo.first_byte_latency_secs must be a finite positive duration within std::time::Duration range"
     );
     anyhow::ensure!(
         (0.0..=1.0).contains(&config.slo.fallback_rate),
         "adaptive_tuning.slo.fallback_rate must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        config.slo_policy.min_sample_count > 0,
+        "adaptive_tuning.slo_policy.min_sample_count must be greater than 0"
+    );
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&config.slo_policy.near_miss_grace_fraction),
+        "adaptive_tuning.slo_policy.near_miss_grace_fraction must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        config.slo_policy.near_miss_grace_secs >= 0.0
+            && Duration::try_from_secs_f64(config.slo_policy.near_miss_grace_secs).is_ok(),
+        "adaptive_tuning.slo_policy.near_miss_grace_secs must be a finite non-negative duration within std::time::Duration range"
+    );
+    anyhow::ensure!(
+        (0.0..=10.0).contains(&config.slo_policy.early_abort_overrun_fraction),
+        "adaptive_tuning.slo_policy.early_abort_overrun_fraction must be between 0 and 10"
     );
     anyhow::ensure!(
         (0.0..=1.0).contains(&config.resource_pressure.cpu_busy_high_watermark),
@@ -2416,6 +2566,22 @@ fn validate_adaptive_tuning_config(config: &AdaptiveTuningConfig) -> Result<()> 
     anyhow::ensure!(
         (0.0..=100.0).contains(&config.resource_pressure.memory_available_min_percent),
         "adaptive_tuning.resource_pressure.memory_available_min_percent must be between 0 and 100"
+    );
+    anyhow::ensure!(
+        (0.0..=16.0).contains(&config.demand_resource.cpu_provisioning_fraction)
+            && config.demand_resource.cpu_provisioning_fraction > 0.0,
+        "adaptive_tuning.demand_resource.cpu_provisioning_fraction must be greater than 0 and less than or equal to 16"
+    );
+    anyhow::ensure!(
+        (0.0..=config.demand_resource.cpu_provisioning_fraction).contains(
+            &config
+                .demand_resource
+                .cpu_provisioning_fraction_when_memory_constrained
+        ) && config
+            .demand_resource
+            .cpu_provisioning_fraction_when_memory_constrained
+            > 0.0,
+        "adaptive_tuning.demand_resource.cpu_provisioning_fraction_when_memory_constrained must be greater than 0 and less than or equal to cpu_provisioning_fraction"
     );
 
     for (path, bounds) in [
@@ -2520,8 +2686,9 @@ fn validate_adaptive_tuning_config(config: &AdaptiveTuningConfig) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendType, BundleConfig, ConfigSchemaChild, ConfigSchemaNode, RepoUpdateMode,
-        parse_config_str, parse_config_str_with_warnings, schema_allowed_fields, schema_child,
+        AdaptiveTuningController, BackendType, BundleConfig, ConfigSchemaChild, ConfigSchemaNode,
+        RepoUpdateMode, parse_config_str, parse_config_str_with_warnings, schema_allowed_fields,
+        schema_child,
     };
 
     #[test]
@@ -2566,7 +2733,30 @@ mod tests {
         assert_eq!(config.background_work.retry_interval_secs, 60);
         assert_eq!(config.background_work.max_defer_retries, 10);
         assert_eq!(config.background_work.max_defer_secs, 1800);
+        assert_eq!(config.clone.global_short_circuit_upstream_secs, 10);
+        assert_eq!(config.clone.local_upload_pack_first_byte_secs, 10);
+        assert_eq!(
+            config.adaptive_tuning.controller,
+            AdaptiveTuningController::Aimd
+        );
+        assert_eq!(
+            config
+                .adaptive_tuning
+                .demand_resource
+                .cpu_provisioning_fraction,
+            1.5
+        );
         assert!(config.repository_is_delegated("org/problem-repo.git"));
+    }
+
+    #[test]
+    fn omitted_short_circuit_budgets_default_to_ten_seconds() {
+        let config = include_str!("../../config.example.yaml")
+            .replace("  global_short_circuit_upstream_secs: 10\n", "")
+            .replace("  local_upload_pack_first_byte_secs: 10\n", "");
+        let config = parse_config_str(&config).unwrap();
+        assert_eq!(config.clone.global_short_circuit_upstream_secs, 10);
+        assert_eq!(config.clone.local_upload_pack_first_byte_secs, 10);
     }
 
     #[test]
@@ -2769,6 +2959,30 @@ mod tests {
             "  delta_workspace_max_physical_ratio: 0\n",
         );
         assert!(parse_config_str(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_slo_duration_values_that_duration_cannot_represent() {
+        let config = include_str!("../../config.example.yaml").replace(
+            "    first_byte_latency_secs: 5.0\n",
+            "    first_byte_latency_secs: .inf\n",
+        );
+        let err = parse_config_str(&config).unwrap_err().to_string();
+        assert!(err.contains("adaptive_tuning.slo.first_byte_latency_secs"));
+
+        let config = include_str!("../../config.example.yaml").replace(
+            "    near_miss_grace_secs: 3.0\n",
+            "    near_miss_grace_secs: .inf\n",
+        );
+        let err = parse_config_str(&config).unwrap_err().to_string();
+        assert!(err.contains("adaptive_tuning.slo_policy.near_miss_grace_secs"));
+
+        let config = include_str!("../../config.example.yaml").replace(
+            "    near_miss_grace_secs: 3.0\n",
+            "    near_miss_grace_secs: 2.0e19\n",
+        );
+        let err = parse_config_str(&config).unwrap_err().to_string();
+        assert!(err.contains("adaptive_tuning.slo_policy.near_miss_grace_secs"));
     }
 
     #[test]

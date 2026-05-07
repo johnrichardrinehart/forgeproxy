@@ -738,8 +738,8 @@ variable "generation_coalescing_window_secs" {
 
 variable "global_short_circuit_upstream_secs" {
   type        = number
-  default     = 0
-  description = "Coarse request-path seconds budget before forgeproxy proxies upstream while local work continues in the background. Zero disables the global budget."
+  default     = 10
+  description = "Coarse request-path seconds budget before forgeproxy proxies upstream while local work continues in the background. Zero immediately exhausts the global budget and forces upstream short-circuiting."
 }
 
 variable "request_wait_for_local_catch_up_secs" {
@@ -768,8 +768,8 @@ variable "generation_publish_secs" {
 
 variable "local_upload_pack_first_byte_secs" {
   type        = number
-  default     = 0
-  description = "Request path: seconds a client may wait for first byte from local git upload-pack before proxying upstream. Zero disables this stage budget."
+  default     = 10
+  description = "Request path: seconds a client may wait for first byte from local git upload-pack before proxying upstream. Zero immediately forces upstream short-circuiting and bypasses SLO policy."
 }
 
 variable "fetch_schedule_enabled" {
@@ -1412,23 +1412,30 @@ variable "background_work_max_defer_secs" {
 variable "adaptive_tuning" {
   type = any
   default = {
-    enabled                           = false
-    mode                              = "active"
-    evaluation_interval_secs          = 60
-    cpu_poll_interval_secs            = 10
-    warmup_interval_secs              = 300
-    min_sample_count                  = 20
-    recommendation_ttl_secs           = 300
-    recommendation_max_staleness_secs = 300
+    enabled          = false
+    mode             = "active"
+    controller       = "aimd"
+    min_sample_count = 20
     slo = {
       clone_latency_secs      = 30.0
       first_byte_latency_secs = 5.0
       fallback_rate           = 0.05
     }
+    slo_policy = {
+      enabled                      = true
+      min_sample_count             = 5
+      near_miss_grace_fraction     = 0.10
+      near_miss_grace_secs         = 3.0
+      early_abort_overrun_fraction = 0.25
+    }
     resource_pressure = {
       cpu_busy_high_watermark      = 0.85
       disk_busy_high_watermark     = 0.85
       memory_available_min_percent = 10.0
+    }
+    demand_resource = {
+      cpu_provisioning_fraction                         = 1.5
+      cpu_provisioning_fraction_when_memory_constrained = 0.5
     }
     bounds = {
       upstream_clone_concurrency                = { min = 1, max = 16, max_increase_step = 1, max_decrease_step = 2 }

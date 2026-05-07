@@ -15,7 +15,8 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
 use crate::adaptive_tuning::{
-    AdaptiveObservationCounters, EffectivePolicy, HostPressure, RecommendationSet,
+    AdaptiveObservationCounters, EffectivePolicy, HostPressure, RecommendationSet, TtfbStage,
+    TtfbStageBreakdown,
 };
 use crate::config::BackendType;
 
@@ -110,6 +111,17 @@ pub struct CloneServedRecord<'a> {
     pub cache_status: CacheStatus,
 }
 
+pub struct UploadPackFirstByteTtfbStageRecord<'a> {
+    pub protocol: Protocol,
+    pub source: &'a str,
+    pub cache_status: CacheStatus,
+    pub repo: &'a str,
+    pub elapsed: Duration,
+    pub result: &'a str,
+    pub breakdown: TtfbStageBreakdown,
+    pub request_cost_shape: Option<&'a crate::adaptive_tuning::RequestCostShape>,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Protocol {
     Ssh,
@@ -139,6 +151,13 @@ pub struct UploadPackFirstByteLabels {
     pub protocol: Protocol,
     pub source: String,
     pub cache_status: CacheStatus,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UploadPackTtfbStageLabels {
+    pub protocol: Protocol,
+    pub stage: String,
+    pub result: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -595,6 +614,7 @@ pub struct Metrics {
     pub clone_duration_seconds: Family<CloneDurationLabels, Histogram>,
     pub upload_pack_duration_seconds: Family<UploadPackDurationLabels, Histogram>,
     pub upload_pack_first_byte_seconds: Family<UploadPackFirstByteLabels, Histogram>,
+    pub upload_pack_ttfb_stage_seconds: Family<UploadPackTtfbStageLabels, Histogram>,
     pub clone_upstream_bytes: Family<CloneUpstreamBytesLabels, Counter>,
     pub clone_downstream_bytes: Family<CloneDownstreamBytesLabels, Counter>,
 
@@ -770,6 +790,16 @@ impl Metrics {
             "forgeproxy_upload_pack_first_byte_seconds",
             "Upload-pack latency to first downstream byte in seconds by protocol, source, and cache status",
             upload_pack_first_byte_seconds.clone(),
+        );
+
+        let upload_pack_ttfb_stage_seconds =
+            Family::<UploadPackTtfbStageLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(exponential_buckets(0.001, 2.0, 19))
+            });
+        registry.register(
+            "forgeproxy_upload_pack_ttfb_stage_seconds",
+            "Local upload-pack time-to-first-byte stage duration in seconds by protocol, stage, and result",
+            upload_pack_ttfb_stage_seconds.clone(),
         );
 
         let clone_upstream_bytes = Family::<CloneUpstreamBytesLabels, Counter>::default();
@@ -1374,6 +1404,7 @@ impl Metrics {
             clone_duration_seconds,
             upload_pack_duration_seconds,
             upload_pack_first_byte_seconds,
+            upload_pack_ttfb_stage_seconds,
             clone_upstream_bytes,
             clone_downstream_bytes,
             bundle_generation_total,
@@ -1677,6 +1708,46 @@ pub fn observe_upload_pack_first_byte(
     metrics
         .adaptive_observations
         .observe_first_byte_latency_for_repo(repo, elapsed);
+    observe_upload_pack_first_byte_histogram(metrics, protocol, source, cache_status, elapsed);
+}
+
+pub fn observe_upload_pack_first_byte_and_ttfb_stage_breakdown(
+    metrics: &MetricsRegistry,
+    record: UploadPackFirstByteTtfbStageRecord<'_>,
+) {
+    metrics
+        .adaptive_observations
+        .observe_first_byte_latency_and_ttfb_stage_breakdown_for_repo(
+            record.repo,
+            record.elapsed,
+            record.breakdown,
+            record.request_cost_shape,
+        );
+    observe_upload_pack_first_byte_histogram(
+        metrics,
+        record.protocol.clone(),
+        record.source,
+        record.cache_status,
+        record.elapsed,
+    );
+    observe_upload_pack_ttfb_stage_breakdown_inner(
+        metrics,
+        record.protocol,
+        record.repo,
+        record.result,
+        record.breakdown,
+        false,
+        None,
+    );
+}
+
+fn observe_upload_pack_first_byte_histogram(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    source: &str,
+    cache_status: CacheStatus,
+    elapsed: Duration,
+) {
     metrics
         .metrics
         .upload_pack_first_byte_seconds
@@ -1686,6 +1757,68 @@ pub fn observe_upload_pack_first_byte(
             cache_status,
         })
         .observe(elapsed.as_secs_f64());
+}
+
+pub fn observe_upload_pack_ttfb_stage_breakdown_without_adaptive_history(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    repo: &str,
+    result: &str,
+    breakdown: TtfbStageBreakdown,
+) {
+    observe_upload_pack_ttfb_stage_breakdown_inner(
+        metrics, protocol, repo, result, breakdown, false, None,
+    );
+}
+
+pub fn observe_upload_pack_ttfb_stage_breakdown_for_request_cost(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    repo: &str,
+    result: &str,
+    breakdown: TtfbStageBreakdown,
+    request_cost_shape: Option<&crate::adaptive_tuning::RequestCostShape>,
+) {
+    observe_upload_pack_ttfb_stage_breakdown_inner(
+        metrics,
+        protocol,
+        repo,
+        result,
+        breakdown,
+        true,
+        request_cost_shape,
+    );
+}
+
+fn observe_upload_pack_ttfb_stage_breakdown_inner(
+    metrics: &MetricsRegistry,
+    protocol: Protocol,
+    repo: &str,
+    result: &str,
+    breakdown: TtfbStageBreakdown,
+    record_adaptive_history: bool,
+    request_cost_shape: Option<&crate::adaptive_tuning::RequestCostShape>,
+) {
+    if record_adaptive_history {
+        metrics
+            .adaptive_observations
+            .observe_ttfb_stage_breakdown_for_repo(repo, breakdown, request_cost_shape);
+    }
+    for stage in TtfbStage::ALL {
+        let millis = breakdown.stage_millis(stage);
+        if millis == 0 {
+            continue;
+        }
+        metrics
+            .metrics
+            .upload_pack_ttfb_stage_seconds
+            .get_or_create(&UploadPackTtfbStageLabels {
+                protocol: protocol.clone(),
+                stage: stage.as_label().to_string(),
+                result: result.to_string(),
+            })
+            .observe(millis as f64 / 1000.0);
+    }
 }
 
 pub fn inc_bundle_uri_advertisement(metrics: &MetricsRegistry, repo: &str, result: &str) {
@@ -2836,6 +2969,16 @@ mod tests {
             "acme/widgets",
             Duration::from_millis(125),
         );
+        let mut ttfb_stage_breakdown = TtfbStageBreakdown::default();
+        ttfb_stage_breakdown.add_stage_millis(TtfbStage::LocalUploadPackFirstByteWait, 75);
+        observe_upload_pack_ttfb_stage_breakdown_for_request_cost(
+            &metrics,
+            Protocol::Https,
+            "acme/widgets",
+            "success",
+            ttfb_stage_breakdown,
+            None,
+        );
         inc_bundle_uri_advertisement(&metrics, "acme/widgets", "injected");
         inc_bundle_list_request(&metrics, "acme/widgets", "served");
         inc_hydration_skipped(&metrics, HydrationSkipReason::SemaphoreSaturated);
@@ -2864,6 +3007,14 @@ mod tests {
                 && !line.contains("repo=")
                 && line.contains(" 0.125")
         }));
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_upload_pack_ttfb_stage_seconds_sum{")
+                && line.contains("protocol=\"https\"")
+                && line.contains("result=\"success\"")
+                && line.contains("stage=\"local_upload_pack_first_byte_wait\"")
+                && !line.contains("repo=")
+                && line.contains(" 0.075")
+        }));
         assert!(encoded.lines().any(
             |line| line.starts_with("forgeproxy_hydration_skipped_total{") && line.ends_with(" 1")
         ));
@@ -2889,6 +3040,37 @@ mod tests {
                 && line.contains("repo=\"acme/widgets\"")
                 && line.contains("result=\"served\"")
                 && line.ends_with(" 1")
+        }));
+    }
+
+    #[test]
+    fn partial_ttfb_fallback_metrics_skip_adaptive_history() {
+        let metrics = MetricsRegistry::new();
+        let mut ttfb_stage_breakdown = TtfbStageBreakdown::default();
+        ttfb_stage_breakdown.add_stage_millis(TtfbStage::PublishedGenerationLeaseWait, 80);
+
+        observe_upload_pack_ttfb_stage_breakdown_without_adaptive_history(
+            &metrics,
+            Protocol::Https,
+            "acme/widgets",
+            "fallback_published_generation_lease",
+            ttfb_stage_breakdown,
+        );
+
+        assert!(
+            metrics
+                .adaptive_observations
+                .ttfb_stage_estimate_for_repo("acme/widgets")
+                .is_none()
+        );
+
+        let encoded = encode_metrics(&metrics.registry);
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_upload_pack_ttfb_stage_seconds_sum{")
+                && line.contains("protocol=\"https\"")
+                && line.contains("result=\"fallback_published_generation_lease\"")
+                && line.contains("stage=\"published_generation_lease_wait\"")
+                && line.contains(" 0.08")
         }));
     }
 

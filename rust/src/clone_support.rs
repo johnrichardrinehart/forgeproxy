@@ -13,6 +13,7 @@ use crate::coordination::registry::{
     LocalServeRepoLease, LocalServeRepoSource, RequestAdvertisedRefs, TeeCapturePermits,
 };
 use crate::metrics::{CacheStatus, CloneServedBy, CloneServedRecord, MetricsRegistry, Protocol};
+use crate::short_circuit::{FlexibleSloDecision, FlexibleSloDecisionAction};
 
 #[derive(Clone)]
 pub struct CloneCompletion {
@@ -108,6 +109,7 @@ pub struct LocalUploadPackProcess {
     pub _lease: LocalServeRepoLease,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_local_upload_pack_timeout(
     state: &AppState,
     owner_repo: &str,
@@ -115,6 +117,7 @@ pub async fn spawn_local_upload_pack_timeout(
     serve_from: LocalServeRepoSource,
     mode: LocalUploadPackMode,
     git_protocol: Option<&str>,
+    request_cost_shape: Option<&crate::adaptive_tuning::RequestCostShape>,
     permit_timeout: Option<Duration>,
 ) -> Result<Option<LocalUploadPackProcess>> {
     let permit_wait_started = Instant::now();
@@ -139,6 +142,7 @@ pub async fn spawn_local_upload_pack_timeout(
         repo_lease,
         mode,
         git_protocol,
+        request_cost_shape,
         remaining_timeout,
     )
     .await
@@ -153,6 +157,7 @@ pub async fn spawn_local_upload_pack_with_lease_timeout(
     repo_lease: LocalServeRepoLease,
     mode: LocalUploadPackMode,
     git_protocol: Option<&str>,
+    request_cost_shape: Option<&crate::adaptive_tuning::RequestCostShape>,
     permit_timeout: Option<Duration>,
 ) -> Result<Option<LocalUploadPackProcess>> {
     let permit_wait_started = Instant::now();
@@ -174,7 +179,8 @@ pub async fn spawn_local_upload_pack_with_lease_timeout(
     };
     let repo_path = repo_lease.repo_path().to_path_buf();
 
-    let pack_threads = state.local_upload_pack_threads();
+    let pack_threads =
+        state.local_upload_pack_threads_for_request_cost(owner_repo, request_cost_shape);
     let mut cmd = Command::new("git");
     cmd.arg("-c")
         .arg(format!("pack.threads={pack_threads}"))
@@ -295,6 +301,106 @@ pub async fn wait_for_local_upload_pack_exit(
         stderr: stderr_buf,
         cpu_seconds,
     })
+}
+
+pub async fn interrupt_then_kill_local_upload_pack(
+    child: &mut Child,
+    stderr: &mut ChildStderr,
+    interrupt_grace: Duration,
+) -> std::io::Result<LocalUploadPackExit> {
+    if let Some(pid) = child.id() {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+        if rc != 0 {
+            warn!(
+                pid,
+                error = %std::io::Error::last_os_error(),
+                "failed to send SIGINT to local git upload-pack"
+            );
+        }
+    }
+
+    match tokio::time::timeout(
+        interrupt_grace,
+        wait_for_local_upload_pack_exit(child, stderr),
+    )
+    .await
+    {
+        Ok(exit) => exit,
+        Err(_) => {
+            if let Err(error) = child.start_kill() {
+                warn!(error = %error, "failed to send SIGKILL to local git upload-pack");
+            }
+            wait_for_local_upload_pack_exit(child, stderr).await
+        }
+    }
+}
+
+pub fn log_local_upload_pack_first_byte_slo_decision(
+    protocol: Protocol,
+    owner_repo: &str,
+    decision: FlexibleSloDecision,
+) {
+    let timeout_secs = decision.timeout.map(|timeout| timeout.as_secs_f64());
+    let historical_estimate_secs = decision
+        .historical_estimate
+        .map(|estimate| estimate.as_secs_f64());
+    let live_stage = decision.live_estimate.map(|estimate| estimate.stage);
+    let request_shape = decision
+        .live_estimate
+        .map(|estimate| estimate.request_shape);
+    let historical_weight = decision
+        .live_estimate
+        .map(|estimate| estimate.historical_weight);
+    let live_elapsed_secs = decision
+        .live_estimate
+        .map(|estimate| estimate.elapsed.as_secs_f64());
+    let live_estimated_total_secs = decision
+        .live_estimate
+        .map(|estimate| estimate.estimated_total.as_secs_f64());
+    let effective_estimate_secs = decision
+        .effective_estimate
+        .map(|estimate| estimate.as_secs_f64());
+    let near_miss_limit_secs = decision.near_miss_limit.map(|limit| limit.as_secs_f64());
+    let early_abort_limit_secs = decision.early_abort_limit.map(|limit| limit.as_secs_f64());
+
+    if matches!(
+        decision.action,
+        FlexibleSloDecisionAction::ConfiguredTimeout
+    ) {
+        tracing::debug!(
+            ?protocol,
+            repo = %owner_repo,
+            action = decision.action.as_label(),
+            timeout_secs,
+            historical_estimate_secs,
+            live_stage,
+            request_shape,
+            historical_weight,
+            live_elapsed_secs,
+            live_estimated_total_secs,
+            effective_estimate_secs,
+            near_miss_limit_secs,
+            early_abort_limit_secs,
+            "local upload-pack first-byte SLO decision"
+        );
+    } else {
+        tracing::info!(
+            ?protocol,
+            repo = %owner_repo,
+            action = decision.action.as_label(),
+            timeout_secs,
+            historical_estimate_secs,
+            live_stage,
+            request_shape,
+            historical_weight,
+            live_elapsed_secs,
+            live_estimated_total_secs,
+            effective_estimate_secs,
+            near_miss_limit_secs,
+            early_abort_limit_secs,
+            "local upload-pack first-byte SLO decision"
+        );
+    }
 }
 
 fn read_linux_process_cpu_seconds(pid: u32) -> Option<f64> {

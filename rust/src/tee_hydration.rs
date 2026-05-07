@@ -325,9 +325,163 @@ pub struct CapturedRefMetadata {
 pub struct CapturedFetchMetadata {
     pub want_oids: Vec<String>,
     pub uses_shallow: bool,
+    pub deepen_depth: Option<u32>,
+    pub uses_deepen_since_or_not: bool,
+    pub filter_specs: Vec<String>,
+    pub has_haves: bool,
     pub request_phase: UploadPackRequestPhase,
     pub agent: Option<String>,
     pub client_session_id: Option<String>,
+}
+
+impl CapturedFetchMetadata {
+    pub fn request_cost_shape(
+        &self,
+        advertised_ref_tips: Option<&BTreeMap<String, String>>,
+    ) -> crate::adaptive_tuning::RequestCostShape {
+        crate::adaptive_tuning::RequestCostShape {
+            want_width: self.request_want_width(advertised_ref_tips),
+            ref_shape: self.request_ref_shape(advertised_ref_tips),
+            filter: self.request_filter_shape(),
+            shallow: self.request_shallow_shape(),
+            negotiation: if self.has_haves {
+                crate::adaptive_tuning::RequestNegotiationShape::HasHaves
+            } else if self.want_oids.is_empty() {
+                crate::adaptive_tuning::RequestNegotiationShape::Unknown
+            } else {
+                crate::adaptive_tuning::RequestNegotiationShape::NoHaves
+            },
+        }
+    }
+
+    fn request_want_width(
+        &self,
+        advertised_ref_tips: Option<&BTreeMap<String, String>>,
+    ) -> crate::adaptive_tuning::RequestWantWidth {
+        if self.want_oids.is_empty() {
+            return crate::adaptive_tuning::RequestWantWidth::Unknown;
+        }
+        if let Some(tips) = advertised_ref_tips {
+            let mut advertised_tips = tips.values().cloned().collect::<Vec<String>>();
+            advertised_tips.sort();
+            advertised_tips.dedup();
+            if !advertised_tips.is_empty() && advertised_tips == self.want_oids {
+                return crate::adaptive_tuning::RequestWantWidth::FullTipSet;
+            }
+        }
+        match self.want_oids.len() {
+            1 => crate::adaptive_tuning::RequestWantWidth::One,
+            2..=4 => crate::adaptive_tuning::RequestWantWidth::Few,
+            5..=16 => crate::adaptive_tuning::RequestWantWidth::Many,
+            _ => crate::adaptive_tuning::RequestWantWidth::VeryMany,
+        }
+    }
+
+    fn request_ref_shape(
+        &self,
+        advertised_ref_tips: Option<&BTreeMap<String, String>>,
+    ) -> crate::adaptive_tuning::RequestRefShape {
+        use crate::adaptive_tuning::RequestRefShape;
+
+        if self.want_oids.is_empty() {
+            return RequestRefShape::Unknown;
+        }
+        let Some(tips) = advertised_ref_tips else {
+            return if self.want_oids.len() == 1 {
+                RequestRefShape::UnmatchedOid
+            } else {
+                RequestRefShape::MultiRefSet
+            };
+        };
+        let mut advertised_tips = tips.values().cloned().collect::<Vec<String>>();
+        advertised_tips.sort();
+        advertised_tips.dedup();
+        if !advertised_tips.is_empty() && advertised_tips == self.want_oids {
+            return RequestRefShape::FullTipSet;
+        }
+        if self.want_oids.len() != 1 {
+            return RequestRefShape::MultiRefSet;
+        }
+        let want = &self.want_oids[0];
+        let Some(refname) = tips
+            .iter()
+            .filter(|(_, oid)| *oid == want)
+            .map(|(refname, _)| refname.as_str())
+            .min_by_key(|refname| ref_preference_rank(refname))
+        else {
+            return RequestRefShape::UnmatchedOid;
+        };
+
+        let fingerprint = stable_ref_fingerprint(refname);
+        if refname == "refs/heads/main" || refname == "refs/heads/master" {
+            RequestRefShape::DefaultBranch
+        } else if refname.starts_with("refs/heads/") {
+            RequestRefShape::NamedBranch { fingerprint }
+        } else if refname.starts_with("refs/tags/") {
+            RequestRefShape::Tag { fingerprint }
+        } else if refname.starts_with("refs/pull/") || refname.starts_with("refs/merge-requests/") {
+            RequestRefShape::PullRef { fingerprint }
+        } else {
+            RequestRefShape::OtherRef { fingerprint }
+        }
+    }
+
+    fn request_filter_shape(&self) -> crate::adaptive_tuning::RequestFilterShape {
+        if self.filter_specs.is_empty() {
+            return crate::adaptive_tuning::RequestFilterShape::None;
+        }
+        if self.filter_specs.iter().any(|filter| filter == "blob:none") {
+            crate::adaptive_tuning::RequestFilterShape::BlobNone
+        } else if self.filter_specs.iter().any(|filter| filter == "tree:0") {
+            crate::adaptive_tuning::RequestFilterShape::TreeZero
+        } else if self
+            .filter_specs
+            .iter()
+            .any(|filter| filter.starts_with("blob:limit="))
+        {
+            crate::adaptive_tuning::RequestFilterShape::BlobLimit
+        } else {
+            crate::adaptive_tuning::RequestFilterShape::Other
+        }
+    }
+
+    fn request_shallow_shape(&self) -> crate::adaptive_tuning::RequestShallowShape {
+        use crate::adaptive_tuning::RequestShallowShape;
+
+        if self.uses_deepen_since_or_not {
+            return RequestShallowShape::SinceOrNot;
+        }
+        match self.deepen_depth {
+            Some(1) => RequestShallowShape::Depth1,
+            Some(2..=50) => RequestShallowShape::DepthSmall,
+            Some(_) => RequestShallowShape::DepthLarge,
+            None if self.uses_shallow => RequestShallowShape::Other,
+            None => RequestShallowShape::None,
+        }
+    }
+}
+
+fn ref_preference_rank(refname: &str) -> (u8, &str) {
+    let rank = if refname == "refs/heads/main" || refname == "refs/heads/master" {
+        0
+    } else if refname.starts_with("refs/heads/") {
+        1
+    } else if refname.starts_with("refs/tags/") {
+        2
+    } else if refname.starts_with("refs/pull/") || refname.starts_with("refs/merge-requests/") {
+        3
+    } else {
+        4
+    };
+    (rank, refname)
+}
+
+fn stable_ref_fingerprint(refname: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    refname.as_bytes().iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -589,6 +743,10 @@ fn parse_captured_fetch_request(
 ) -> Result<CapturedFetchMetadata> {
     let mut wants = BTreeSet::new();
     let mut uses_shallow = false;
+    let mut deepen_depth = None;
+    let mut uses_deepen_since_or_not = false;
+    let mut filters = BTreeSet::new();
+    let mut has_haves = false;
     let mut v2_command = None;
     let mut agent = None;
     let mut client_session_id = None;
@@ -615,13 +773,24 @@ fn parse_captured_fetch_request(
                 wants.insert(String::from_utf8_lossy(oid).into_owned());
             }
         }
+        if let Some(rest) = payload.strip_prefix(b"filter ") {
+            filters.insert(String::from_utf8_lossy(rest).into_owned());
+        }
+        if payload.starts_with(b"have ") {
+            has_haves = true;
+        }
 
-        if payload.starts_with(b"deepen ")
-            || payload.starts_with(b"deepen-not ")
-            || payload.starts_with(b"deepen-since ")
-            || payload == b"deepen-relative"
-            || payload.starts_with(b"shallow ")
-        {
+        if let Some(rest) = payload.strip_prefix(b"deepen ") {
+            uses_shallow = true;
+            if let Ok(depth_text) = std::str::from_utf8(rest)
+                && let Ok(depth) = depth_text.trim().parse::<u32>()
+            {
+                deepen_depth = Some(depth);
+            }
+        } else if payload.starts_with(b"deepen-not ") || payload.starts_with(b"deepen-since ") {
+            uses_shallow = true;
+            uses_deepen_since_or_not = true;
+        } else if payload == b"deepen-relative" || payload.starts_with(b"shallow ") {
             uses_shallow = true;
         }
     })?;
@@ -639,6 +808,10 @@ fn parse_captured_fetch_request(
     Ok(CapturedFetchMetadata {
         want_oids: wants.into_iter().collect(),
         uses_shallow,
+        deepen_depth,
+        uses_deepen_since_or_not,
+        filter_specs: filters.into_iter().collect(),
+        has_haves,
         request_phase,
         agent,
         client_session_id,
@@ -1036,6 +1209,111 @@ mod tests {
             metadata.want_oids,
             vec!["0123456789abcdef0123456789abcdef01234567".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_upload_pack_request_metadata_marks_filtered_requests() {
+        let mut request = Vec::new();
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"command=fetch\n",
+        ));
+        request.extend_from_slice(b"0001");
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want 0123456789abcdef0123456789abcdef01234567\n",
+        ));
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"filter blob:none\n",
+        ));
+        request.extend_from_slice(b"0000");
+
+        let metadata = parse_upload_pack_request_metadata(&request, Some("version=2")).unwrap();
+
+        assert_eq!(metadata.filter_specs, vec!["blob:none".to_string()]);
+        let shape = metadata.request_cost_shape(None);
+        assert_eq!(
+            shape.filter,
+            crate::adaptive_tuning::RequestFilterShape::BlobNone
+        );
+        assert_eq!(shape.label(), "blobless");
+    }
+
+    #[test]
+    fn empty_upload_pack_request_metadata_uses_unknown_cost_shape() {
+        let metadata = CapturedFetchMetadata::default();
+
+        let shape = metadata.request_cost_shape(None);
+        assert_eq!(
+            shape.want_width,
+            crate::adaptive_tuning::RequestWantWidth::Unknown
+        );
+        assert_eq!(shape.label(), "unknown");
+    }
+
+    #[test]
+    fn single_branch_request_cost_shape_uses_stable_ref_identity() {
+        let mut request = Vec::new();
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want 0123456789abcdef0123456789abcdef01234567\n",
+        ));
+        request.extend_from_slice(b"0000");
+        let metadata = parse_upload_pack_request_metadata(&request, Some("version=2")).unwrap();
+        let advertised_refs = BTreeMap::from([
+            (
+                "refs/heads/main".to_string(),
+                "0123456789abcdef0123456789abcdef01234567".to_string(),
+            ),
+            (
+                "refs/heads/release".to_string(),
+                "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+            ),
+        ]);
+
+        let shape = metadata.request_cost_shape(Some(&advertised_refs));
+
+        assert_eq!(
+            shape.want_width,
+            crate::adaptive_tuning::RequestWantWidth::One
+        );
+        assert_eq!(
+            shape.ref_shape,
+            crate::adaptive_tuning::RequestRefShape::DefaultBranch
+        );
+        assert_eq!(shape.label(), "single_default_branch");
+    }
+
+    #[test]
+    fn all_advertised_tips_request_cost_shape_marks_full_tip_set() {
+        let mut request = Vec::new();
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want 0123456789abcdef0123456789abcdef01234567\n",
+        ));
+        request.extend_from_slice(&crate::http::protocolv2::encode_pkt_line(
+            b"want fedcba9876543210fedcba9876543210fedcba98\n",
+        ));
+        request.extend_from_slice(b"0000");
+        let metadata = parse_upload_pack_request_metadata(&request, Some("version=2")).unwrap();
+        let advertised_refs = BTreeMap::from([
+            (
+                "refs/heads/main".to_string(),
+                "0123456789abcdef0123456789abcdef01234567".to_string(),
+            ),
+            (
+                "refs/heads/release".to_string(),
+                "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+            ),
+        ]);
+
+        let shape = metadata.request_cost_shape(Some(&advertised_refs));
+
+        assert_eq!(
+            shape.want_width,
+            crate::adaptive_tuning::RequestWantWidth::FullTipSet
+        );
+        assert_eq!(
+            shape.ref_shape,
+            crate::adaptive_tuning::RequestRefShape::FullTipSet
+        );
+        assert_eq!(shape.label(), "full_tip_set");
     }
 
     #[tokio::test]

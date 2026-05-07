@@ -25,10 +25,12 @@ use tokio::sync::Mutex;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::AppState;
+use crate::adaptive_tuning::{TtfbStage, TtfbStageBreakdown};
 use crate::cache::CacheManager;
 use crate::clone_support::{
     CloneCompletion, CloneServeOutcome, LocalUploadPackMode, UpstreamHydrationRequest,
-    UpstreamHydrationTracker, spawn_local_upload_pack_timeout,
+    UpstreamHydrationTracker, interrupt_then_kill_local_upload_pack,
+    log_local_upload_pack_first_byte_slo_decision, spawn_local_upload_pack_timeout,
     spawn_local_upload_pack_with_lease_timeout, wait_for_local_upload_pack_exit,
 };
 use crate::coordination::registry::{
@@ -40,8 +42,9 @@ use crate::metrics::{
 };
 use crate::observability::GitRequestObservation;
 use crate::short_circuit::{
-    RequestBudget, duration_from_secs, local_upload_pack_permit_timeout_after_optional_cache_wait,
-    min_timeout,
+    RequestBudget, duration_from_secs, forces_short_circuit_without_polling,
+    local_upload_pack_first_byte_timeout_decision_after_optional_cache_wait_with_slo_policy,
+    local_upload_pack_permit_timeout_after_optional_cache_wait, min_timeout,
 };
 
 /// Upper bound for a single SSH channel data message payload.
@@ -719,6 +722,8 @@ async fn serve_local_upload_pack_once(
         should_close_channel,
     } = response;
 
+    let mut ttfb_stages = TtfbStageBreakdown::default();
+    let stage_started = Instant::now();
     let repo_lease =
         match crate::coordination::registry::acquire_local_serve_repo_lease_with_timeout(
             state,
@@ -730,6 +735,17 @@ async fn serve_local_upload_pack_once(
         {
             Ok(Some(lease)) => lease,
             Ok(None) => {
+                ttfb_stages.add_stage(
+                    TtfbStage::PublishedGenerationLeaseWait,
+                    stage_started.elapsed(),
+                );
+                crate::metrics::observe_upload_pack_ttfb_stage_breakdown_without_adaptive_history(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    owner_repo,
+                    "fallback_published_generation_lease",
+                    ttfb_stages,
+                );
                 warn!(
                     repo = %owner_repo,
                     "short-circuiting SSH fetch to upstream before published generation lease was acquired"
@@ -758,6 +774,10 @@ async fn serve_local_upload_pack_once(
                 return true;
             }
         };
+    ttfb_stages.add_stage(
+        TtfbStage::PublishedGenerationLeaseWait,
+        stage_started.elapsed(),
+    );
     let mut pack_cache_writer = None;
     let mut optional_pack_cache_wait_timed_out = false;
 
@@ -780,6 +800,7 @@ async fn serve_local_upload_pack_once(
             )
         }) {
         Ok(key) => {
+            let stage_started = Instant::now();
             let lookup = state.pack_cache.lookup_or_reserve_with_arrival(
                 Protocol::Ssh,
                 key,
@@ -811,6 +832,7 @@ async fn serve_local_upload_pack_once(
                 },
                 None => lookup.await,
             };
+            ttfb_stages.add_stage(TtfbStage::PackCacheLookupWait, stage_started.elapsed());
             match lookup {
                 Ok(crate::pack_cache::PackCacheLookup::Hit(hit)) => {
                     match replay_ssh_pack_cache_hit(
@@ -890,6 +912,7 @@ async fn serve_local_upload_pack_once(
                                 ),
                             ))
                         });
+                        let stage_started = Instant::now();
                         let composite_result = if let Some(timeout) = composite_timeout {
                             let state_for_task = state.clone();
                             let owner_repo_for_task = owner_repo.to_string();
@@ -961,6 +984,8 @@ async fn serve_local_upload_pack_once(
                             )
                             .await
                         };
+                        ttfb_stages
+                            .add_stage(TtfbStage::PackCacheCompositeWait, stage_started.elapsed());
                         match composite_result {
                             Ok(hit) => {
                                 match replay_ssh_pack_cache_hit(
@@ -1029,6 +1054,14 @@ async fn serve_local_upload_pack_once(
         }
     }
 
+    let request_metadata = crate::tee_hydration::parse_upload_pack_request_metadata(
+        request_body,
+        pack_cache_key_context.git_protocol,
+    )
+    .unwrap_or_default();
+    let request_cost_shape =
+        request_metadata.request_cost_shape(pack_cache_key_context.advertised_ref_tips);
+    let stage_started = Instant::now();
     let mut process = match spawn_local_upload_pack_with_lease_timeout(
         state,
         owner_repo,
@@ -1037,6 +1070,7 @@ async fn serve_local_upload_pack_once(
         repo_lease,
         LocalUploadPackMode::StatelessRpc,
         pack_cache_key_context.git_protocol,
+        Some(&request_cost_shape),
         local_upload_pack_permit_timeout_after_optional_cache_wait(
             budget,
             optional_pack_cache_wait_timed_out,
@@ -1044,8 +1078,25 @@ async fn serve_local_upload_pack_once(
     )
     .await
     {
-        Ok(Some(process)) => process,
+        Ok(Some(process)) => {
+            ttfb_stages.add_stage(
+                TtfbStage::LocalUploadPackPermitWait,
+                stage_started.elapsed(),
+            );
+            process
+        }
         Ok(None) => {
+            ttfb_stages.add_stage(
+                TtfbStage::LocalUploadPackPermitWait,
+                stage_started.elapsed(),
+            );
+            crate::metrics::observe_upload_pack_ttfb_stage_breakdown_without_adaptive_history(
+                &state.metrics,
+                Protocol::Ssh,
+                owner_repo,
+                "fallback_local_upload_pack_permit",
+                ttfb_stages,
+            );
             warn!(
                 repo = %owner_repo,
                 "short-circuiting SSH fetch to upstream before local upload-pack permit was acquired"
@@ -1068,6 +1119,10 @@ async fn serve_local_upload_pack_once(
             return false;
         }
         Err(error) => {
+            ttfb_stages.add_stage(
+                TtfbStage::LocalUploadPackPermitWait,
+                stage_started.elapsed(),
+            );
             error!(repo = %owner_repo, error = %error, "failed to spawn local git upload-pack");
             if let Some(writer) = pack_cache_writer.take() {
                 writer.abort().await;
@@ -1086,11 +1141,16 @@ async fn serve_local_upload_pack_once(
             return true;
         }
     };
+    let stage_started = Instant::now();
     if let Some(mut stdin) = process.stdin.take()
         && let Err(error) = stdin.write_all(request_body).await
     {
         error!(repo = %owner_repo, error = %error, "failed to write buffered request to local git upload-pack");
     }
+    ttfb_stages.add_stage(
+        TtfbStage::LocalUploadPackSpawnAndStdin,
+        stage_started.elapsed(),
+    );
 
     let Some(mut stdout) = process.stdout.take() else {
         error!(repo = %owner_repo, "missing stdout from local git upload-pack");
@@ -1141,8 +1201,133 @@ async fn serve_local_upload_pack_once(
     if let Some(writer) = pack_cache_writer.as_ref() {
         writer.begin_live_response();
     }
+    let first_byte_stage_started = Instant::now();
+    let live_estimate = state.local_upload_pack_live_ttfb_estimate(
+        owner_repo,
+        ttfb_stages,
+        TtfbStage::LocalUploadPackFirstByteWait,
+        first_byte_stage_started.elapsed(),
+        Some(&request_cost_shape),
+    );
+    let first_byte_decision =
+        local_upload_pack_first_byte_timeout_decision_after_optional_cache_wait_with_slo_policy(
+            budget,
+            state.local_upload_pack_first_byte_secs(Some(owner_repo)),
+            optional_pack_cache_wait_timed_out,
+            state.local_upload_pack_first_byte_slo_policy_with_live_estimate(
+                owner_repo,
+                Some(&request_cost_shape),
+                Some(live_estimate),
+            ),
+        );
+    log_local_upload_pack_first_byte_slo_decision(Protocol::Ssh, owner_repo, first_byte_decision);
+    let force_first_byte_short_circuit =
+        forces_short_circuit_without_polling(first_byte_decision.timeout);
+    let first_byte_timeout = if force_first_byte_short_circuit {
+        None
+    } else {
+        first_byte_decision.timeout
+    };
+    let mut first_byte_stage_started = Some(first_byte_stage_started);
+    enum FirstByteRead {
+        Read(std::io::Result<usize>),
+        TimedOut,
+    }
     loop {
-        match stdout.read(&mut stdout_buf).await {
+        let first_byte_read = if observed_first_byte {
+            FirstByteRead::Read(stdout.read(&mut stdout_buf).await)
+        } else if force_first_byte_short_circuit {
+            FirstByteRead::TimedOut
+        } else if let Some(timeout) = first_byte_timeout {
+            match tokio::time::timeout(timeout, stdout.read(&mut stdout_buf)).await {
+                Ok(result) => FirstByteRead::Read(result),
+                Err(_) => FirstByteRead::TimedOut,
+            }
+        } else {
+            FirstByteRead::Read(stdout.read(&mut stdout_buf).await)
+        };
+        let read_result = match first_byte_read {
+            FirstByteRead::Read(result) => result,
+            FirstByteRead::TimedOut => {
+                state
+                    .metrics
+                    .adaptive_observations
+                    .observe_local_upload_pack_first_byte_fallback_for_request_cost(
+                        owner_repo,
+                        &request_cost_shape,
+                    );
+                if !first_byte_decision.is_early_abort() {
+                    if let Some(stage_started) = first_byte_stage_started.take() {
+                        ttfb_stages.add_stage(
+                            TtfbStage::LocalUploadPackFirstByteWait,
+                            stage_started.elapsed(),
+                        );
+                    }
+                    crate::metrics::observe_upload_pack_ttfb_stage_breakdown_for_request_cost(
+                        &state.metrics,
+                        Protocol::Ssh,
+                        owner_repo,
+                        "fallback_local_upload_pack_first_byte",
+                        ttfb_stages,
+                        Some(&request_cost_shape),
+                    );
+                }
+                warn!(
+                    repo = %owner_repo,
+                    "short-circuiting SSH fetch to upstream before local upload-pack produced a first byte"
+                );
+                info!(
+                    repo = %owner_repo,
+                    action = first_byte_decision.action.as_label(),
+                    "cancelling local upload-pack before SSH request is redirected upstream"
+                );
+                crate::metrics::inc_upstream_fallback_for_repo(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    "short_circuit_local_upload_pack_first_byte",
+                    owner_repo,
+                );
+                crate::metrics::inc_short_circuit_upstream_for_repo(
+                    &state.metrics,
+                    Protocol::Ssh,
+                    "local_upload_pack_first_byte",
+                    owner_repo,
+                );
+                if let Some(writer) = pack_cache_writer.take() {
+                    writer.abort().await;
+                }
+                match interrupt_then_kill_local_upload_pack(
+                    &mut child,
+                    &mut stderr,
+                    Duration::from_millis(500),
+                )
+                .await
+                {
+                    Ok(exit) => {
+                        crate::metrics::inc_upload_pack_cpu_seconds(
+                            &state.metrics,
+                            Protocol::Ssh,
+                            "local",
+                            exit.cpu_seconds,
+                        );
+                        info!(
+                            repo = %owner_repo,
+                            status = %exit.status,
+                            "cancelled local git upload-pack after SSH upstream redirection decision"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            repo = %owner_repo,
+                            error = %error,
+                            "failed to cancel local git upload-pack after SSH upstream redirection decision"
+                        );
+                    }
+                }
+                return false;
+            }
+        };
+        match read_result {
             Ok(0) => break,
             Ok(read) => {
                 let chunk = &stdout_buf[..read];
@@ -1182,13 +1367,24 @@ async fn serve_local_upload_pack_once(
                 }
                 if !observed_first_byte && read > 0 {
                     observed_first_byte = true;
-                    crate::metrics::observe_upload_pack_first_byte(
+                    if let Some(stage_started) = first_byte_stage_started.take() {
+                        ttfb_stages.add_stage(
+                            TtfbStage::LocalUploadPackFirstByteWait,
+                            stage_started.elapsed(),
+                        );
+                    }
+                    crate::metrics::observe_upload_pack_first_byte_and_ttfb_stage_breakdown(
                         &state.metrics,
-                        Protocol::Ssh,
-                        "local_upload_pack",
-                        completion.cache_status.clone(),
-                        &completion.metric_repo,
-                        completion.started_at.elapsed(),
+                        crate::metrics::UploadPackFirstByteTtfbStageRecord {
+                            protocol: Protocol::Ssh,
+                            source: "local_upload_pack",
+                            cache_status: completion.cache_status.clone(),
+                            repo: &completion.metric_repo,
+                            elapsed: completion.started_at.elapsed(),
+                            result: "success",
+                            breakdown: ttfb_stages,
+                            request_cost_shape: Some(&request_cost_shape),
+                        },
                     );
                 }
                 total_bytes += read as u64;
@@ -1205,7 +1401,7 @@ async fn serve_local_upload_pack_once(
     }
 
     if disconnected {
-        let _ = child.kill().await;
+        let _ = child.start_kill();
     }
     let completed_successfully =
         match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
@@ -2218,6 +2414,7 @@ impl Handler for SshSession {
                         LocalServeRepoSource::PublishedGeneration,
                         LocalUploadPackMode::Interactive,
                         self.git_protocol.as_deref(),
+                        None,
                         spawn_timeout,
                     )
                     .await
@@ -2355,7 +2552,7 @@ impl Handler for SshSession {
                                 }
 
                                 if disconnected {
-                                    let _ = child.kill().await;
+                                    let _ = child.start_kill();
                                 }
                                 let exit_code =
                                     match wait_for_local_upload_pack_exit(&mut child, &mut stderr)

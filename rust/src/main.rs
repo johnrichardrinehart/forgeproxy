@@ -59,6 +59,12 @@ use crate::runtime_resource::RuntimeResourceAttributes;
 
 const CLONE_CAPTURE_MEMORY_HEADROOM_BYTES: u64 = 1024 * 1024 * 1024;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForcedShortCircuitUpstreamReason {
+    GlobalTimeoutZero,
+    LocalUploadPackFirstByteTimeoutZero,
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -316,6 +322,34 @@ impl AppState {
         self.effective_policy.snapshot().local_upload_pack_threads
     }
 
+    pub fn local_upload_pack_threads_for_request_cost(
+        &self,
+        owner_repo: &str,
+        request_cost_shape: Option<&crate::adaptive_tuning::RequestCostShape>,
+    ) -> usize {
+        let config = self.config();
+        let min_sample_count = config.adaptive_tuning.slo_policy.min_sample_count;
+        let historical_stages = self
+            .metrics
+            .adaptive_observations
+            .ttfb_stage_estimate_for_request_cost(owner_repo, request_cost_shape, min_sample_count);
+        let first_byte_fallbacks = self
+            .metrics
+            .adaptive_observations
+            .local_upload_pack_first_byte_fallbacks_for_request_cost(
+                owner_repo,
+                request_cost_shape,
+            );
+
+        crate::adaptive_tuning::pack_threads_for_request_cost(
+            self.local_upload_pack_threads(),
+            request_cost_shape.copied(),
+            historical_stages,
+            first_byte_fallbacks > 0,
+            Duration::from_secs_f64(config.adaptive_tuning.slo.first_byte_latency_secs),
+        )
+    }
+
     pub fn request_wait_for_local_catch_up_secs(&self, owner_repo: Option<&str>) -> u64 {
         let value = owner_repo.map_or_else(
             || {
@@ -374,6 +408,76 @@ impl AppState {
             },
         );
         policy_secs(value)
+    }
+
+    pub fn local_upload_pack_first_byte_slo_policy(
+        &self,
+        owner_repo: &str,
+    ) -> Option<crate::short_circuit::FlexibleSloPolicy> {
+        self.local_upload_pack_first_byte_slo_policy_with_live_estimate(owner_repo, None, None)
+    }
+
+    pub fn local_upload_pack_first_byte_slo_policy_with_live_estimate(
+        &self,
+        owner_repo: &str,
+        request_cost_shape: Option<&crate::adaptive_tuning::RequestCostShape>,
+        live_estimate: Option<crate::short_circuit::LiveLatencyEstimate>,
+    ) -> Option<crate::short_circuit::FlexibleSloPolicy> {
+        let config = self.config();
+        let policy = &config.adaptive_tuning.slo_policy;
+        let min_sample_count = policy.min_sample_count;
+        policy
+            .enabled
+            .then(|| crate::short_circuit::FlexibleSloPolicy {
+                enabled: policy.enabled,
+                slo: Duration::from_secs_f64(config.adaptive_tuning.slo.first_byte_latency_secs),
+                estimate: self
+                    .metrics
+                    .adaptive_observations
+                    .first_byte_latency_estimate_for_repo_and_request_cost(
+                        owner_repo,
+                        request_cost_shape,
+                        min_sample_count,
+                    ),
+                live_estimate,
+                min_sample_count,
+                near_miss_grace_fraction: policy.near_miss_grace_fraction,
+                near_miss_grace: Duration::from_secs_f64(policy.near_miss_grace_secs),
+                early_abort_overrun_fraction: policy.early_abort_overrun_fraction,
+            })
+    }
+
+    pub fn local_upload_pack_live_ttfb_estimate(
+        &self,
+        owner_repo: &str,
+        completed: crate::adaptive_tuning::TtfbStageBreakdown,
+        current_stage: crate::adaptive_tuning::TtfbStage,
+        current_elapsed: Duration,
+        request_cost_shape: Option<&crate::adaptive_tuning::RequestCostShape>,
+    ) -> crate::short_circuit::LiveLatencyEstimate {
+        let min_sample_count = self.config().adaptive_tuning.slo_policy.min_sample_count;
+        let weighted_estimate = self
+            .metrics
+            .adaptive_observations
+            .ttfb_stage_estimate_for_repo_and_request_cost(
+                owner_repo,
+                request_cost_shape,
+                min_sample_count,
+            );
+        crate::adaptive_tuning::live_ttfb_latency_estimate(
+            completed,
+            current_stage,
+            current_elapsed,
+            weighted_estimate.map(|estimate| estimate.estimate),
+            min_sample_count,
+            weighted_estimate
+                .map(|estimate| estimate.historical_weight)
+                .unwrap_or(0.0),
+            request_cost_shape
+                .copied()
+                .map(crate::adaptive_tuning::RequestCostShape::label)
+                .unwrap_or("unknown"),
+        )
     }
 
     pub async fn wait_for_background_work_admission(
@@ -742,6 +846,49 @@ fn resolve_clone_concurrency_limit(config: &Config) -> usize {
     }
 
     resolved
+}
+
+fn forced_short_circuit_upstream_reasons(
+    config: &Config,
+    effective_policy: crate::adaptive_tuning::EffectivePolicy,
+) -> Vec<ForcedShortCircuitUpstreamReason> {
+    let mut reasons = Vec::new();
+    if config.clone.global_short_circuit_upstream_secs == 0 {
+        reasons.push(ForcedShortCircuitUpstreamReason::GlobalTimeoutZero);
+    }
+    if effective_policy.local_upload_pack_first_byte_secs == 0 {
+        reasons.push(ForcedShortCircuitUpstreamReason::LocalUploadPackFirstByteTimeoutZero);
+    }
+    reasons
+}
+
+fn warn_for_forced_short_circuit_upstream_config(
+    config: &Config,
+    effective_policy: crate::adaptive_tuning::EffectivePolicy,
+) {
+    for reason in forced_short_circuit_upstream_reasons(config, effective_policy) {
+        match reason {
+            ForcedShortCircuitUpstreamReason::GlobalTimeoutZero => {
+                tracing::warn!(
+                    global_short_circuit_upstream_secs =
+                        config.clone.global_short_circuit_upstream_secs,
+                    slo_policy_enabled = config.adaptive_tuning.slo_policy.enabled,
+                    "clone.global_short_circuit_upstream_secs is 0; request-path short-circuit budget is exhausted at request start, so forgeproxy will short-circuit upstream without considering the local upload-pack first-byte SLO policy"
+                );
+            }
+            ForcedShortCircuitUpstreamReason::LocalUploadPackFirstByteTimeoutZero => {
+                tracing::warn!(
+                    configured_local_upload_pack_first_byte_secs =
+                        config.clone.local_upload_pack_first_byte_secs,
+                    effective_local_upload_pack_first_byte_secs =
+                        effective_policy.local_upload_pack_first_byte_secs,
+                    adaptive_tuning_enabled = config.adaptive_tuning.enabled,
+                    slo_policy_enabled = config.adaptive_tuning.slo_policy.enabled,
+                    "effective local_upload_pack_first_byte_secs is 0; local upload-pack first-byte waits will short-circuit upstream immediately and the SLO policy is not considered"
+                );
+            }
+        }
+    }
 }
 
 async fn probe_valkey(config: &Config) -> Result<()> {
@@ -1794,6 +1941,7 @@ async fn build_app_state(
     } else {
         fallback_policy
     };
+    warn_for_forced_short_circuit_upstream_config(&config, effective_policy);
     tracing::info!(
         max_concurrent_generations = effective_policy.bundle_generation_concurrency,
         pack_threads = effective_policy.bundle_pack_threads,
@@ -2059,6 +2207,36 @@ mod tests {
             .keyring_key_name = "pat-acme-next".to_string();
 
         ensure_reload_compatible(&current, &next).unwrap();
+    }
+
+    #[test]
+    fn forced_short_circuit_reasons_report_zero_timeouts() {
+        let mut config = example_config();
+        config.clone.global_short_circuit_upstream_secs = 0;
+        let effective_policy = crate::adaptive_tuning::EffectivePolicy {
+            local_upload_pack_first_byte_secs: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            forced_short_circuit_upstream_reasons(&config, effective_policy),
+            vec![
+                ForcedShortCircuitUpstreamReason::GlobalTimeoutZero,
+                ForcedShortCircuitUpstreamReason::LocalUploadPackFirstByteTimeoutZero,
+            ]
+        );
+    }
+
+    #[test]
+    fn forced_short_circuit_reasons_ignore_nonzero_timeouts() {
+        let mut config = example_config();
+        config.clone.global_short_circuit_upstream_secs = 30;
+        let effective_policy = crate::adaptive_tuning::EffectivePolicy {
+            local_upload_pack_first_byte_secs: 5,
+            ..Default::default()
+        };
+
+        assert!(forced_short_circuit_upstream_reasons(&config, effective_policy).is_empty());
     }
 
     #[test]

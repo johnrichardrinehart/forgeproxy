@@ -11,7 +11,7 @@
 //! - `GET  /metrics`                       - Prometheus metrics
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -36,16 +36,18 @@ use prometheus_client::metrics::counter::Counter;
 use serde::Deserialize;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::ReaderStream;
 use tracing::{Instrument, debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::adaptive_tuning::{TtfbStage, TtfbStageBreakdown};
 use crate::clone_support::{
     CloneCompletion, CloneServeOutcome, LocalUploadPackMode, UpstreamHydrationRequest,
-    UpstreamHydrationTracker, spawn_local_upload_pack_with_lease_timeout,
+    UpstreamHydrationTracker, interrupt_then_kill_local_upload_pack,
+    log_local_upload_pack_first_byte_slo_decision, spawn_local_upload_pack_with_lease_timeout,
     wait_for_local_upload_pack_exit,
 };
 use crate::coordination::registry::{
@@ -58,7 +60,8 @@ use crate::metrics::{
 };
 use crate::observability::GitRequestObservation;
 use crate::short_circuit::{
-    RequestBudget, local_upload_pack_first_byte_timeout_after_optional_cache_wait,
+    RequestBudget, forces_short_circuit_without_polling,
+    local_upload_pack_first_byte_timeout_decision_after_optional_cache_wait_with_slo_policy,
     local_upload_pack_permit_timeout_after_optional_cache_wait,
 };
 
@@ -77,6 +80,44 @@ impl<S> LeasedReaderStream<S> {
             inner,
             lease: Some(lease),
         }
+    }
+}
+
+struct CancelOnDropStream<S> {
+    inner: S,
+    cancel_on_drop: Option<watch::Sender<bool>>,
+}
+
+impl<S> CancelOnDropStream<S> {
+    fn new(inner: S, cancel_on_drop: watch::Sender<bool>) -> Self {
+        Self {
+            inner,
+            cancel_on_drop: Some(cancel_on_drop),
+        }
+    }
+}
+
+impl<S> Drop for CancelOnDropStream<S> {
+    fn drop(&mut self) {
+        if let Some(cancel_on_drop) = self.cancel_on_drop.take() {
+            let _ = cancel_on_drop.send(true);
+        }
+    }
+}
+
+impl<S> Stream for CancelOnDropStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            this.cancel_on_drop.take();
+        }
+        poll
     }
 }
 
@@ -136,6 +177,8 @@ struct FirstByteMetricContext {
     cache_status: CacheStatus,
     repo: String,
     started_at: Instant,
+    ttfb_stage_breakdown: Option<TtfbStageBreakdown>,
+    request_cost_shape: Option<crate::adaptive_tuning::RequestCostShape>,
 }
 
 impl<S> FirstByteMetricStream<S> {
@@ -165,7 +208,22 @@ impl FirstByteMetricContext {
             cache_status,
             repo,
             started_at,
+            ttfb_stage_breakdown: None,
+            request_cost_shape: None,
         }
+    }
+
+    fn with_ttfb_stage_breakdown(mut self, breakdown: TtfbStageBreakdown) -> Self {
+        self.ttfb_stage_breakdown = Some(breakdown);
+        self
+    }
+
+    fn with_request_cost_shape(
+        mut self,
+        request_cost_shape: crate::adaptive_tuning::RequestCostShape,
+    ) -> Self {
+        self.request_cost_shape = Some(request_cost_shape);
+        self
     }
 }
 
@@ -200,6 +258,9 @@ async fn await_first_local_upload_pack_chunk(
     let Some(timeout) = timeout else {
         return Some(stream);
     };
+    if forces_short_circuit_without_polling(Some(timeout)) {
+        return None;
+    }
     match tokio::time::timeout(timeout, stream.next()).await {
         Ok(Some(first)) => Some(Box::pin(
             futures::stream::once(async move { first }).chain(stream),
@@ -222,14 +283,31 @@ where
             && matches!(&poll, Poll::Ready(Some(Ok(bytes))) if !bytes.is_empty())
         {
             self.observed = true;
-            crate::metrics::observe_upload_pack_first_byte(
-                &self.context.metrics,
-                self.context.protocol.clone(),
-                self.context.source,
-                self.context.cache_status.clone(),
-                &self.context.repo,
-                self.context.started_at.elapsed(),
-            );
+            let elapsed = self.context.started_at.elapsed();
+            if let Some(breakdown) = self.context.ttfb_stage_breakdown {
+                crate::metrics::observe_upload_pack_first_byte_and_ttfb_stage_breakdown(
+                    &self.context.metrics,
+                    crate::metrics::UploadPackFirstByteTtfbStageRecord {
+                        protocol: self.context.protocol.clone(),
+                        source: self.context.source,
+                        cache_status: self.context.cache_status.clone(),
+                        repo: &self.context.repo,
+                        elapsed,
+                        result: "success",
+                        breakdown,
+                        request_cost_shape: self.context.request_cost_shape.as_ref(),
+                    },
+                );
+            } else {
+                crate::metrics::observe_upload_pack_first_byte(
+                    &self.context.metrics,
+                    self.context.protocol.clone(),
+                    self.context.source,
+                    self.context.cache_status.clone(),
+                    &self.context.repo,
+                    elapsed,
+                );
+            }
         }
         poll
     }
@@ -1116,6 +1194,7 @@ async fn handle_upload_pack(
                             advertised_ref_tips: advertised_ref_tips.as_ref(),
                         },
                         pack_cache_repo_arrival.take(),
+                        request_metadata.clone(),
                         CloneCompletion {
                             cache_status: effective_cache_status.clone(),
                             started_at,
@@ -1955,6 +2034,12 @@ async fn serve_http_pack_cache_live_response(
     ))
 }
 
+fn pack_cache_live_first_byte_timeout(
+    budget: Option<crate::short_circuit::RequestBudget>,
+) -> Option<std::time::Duration> {
+    budget.and_then(crate::short_circuit::RequestBudget::remaining)
+}
+
 struct FreshClonePackCacheKeyContext<'a> {
     git_protocol: Option<&'a str>,
     advertised_ref_tips: Option<&'a std::collections::BTreeMap<String, String>>,
@@ -1969,10 +2054,13 @@ async fn serve_local_upload_pack(
     request_body: &[u8],
     pack_cache_key_context: FreshClonePackCacheKeyContext<'_>,
     pack_cache_repo_arrival: Option<crate::pack_cache::PackCacheRepoArrivalGuard>,
+    request_metadata: crate::tee_hydration::CapturedFetchMetadata,
     completion: CloneCompletion,
     budget: Option<RequestBudget>,
 ) -> Result<Option<Response>, AppError> {
     let owner_repo = crate::repo_identity::canonical_owner_repo(owner, repo);
+    let mut ttfb_stages = TtfbStageBreakdown::default();
+    let stage_started = Instant::now();
     let Some(repo_lease) =
         crate::coordination::registry::acquire_local_serve_repo_lease_with_timeout(
             state,
@@ -1982,6 +2070,17 @@ async fn serve_local_upload_pack(
         )
         .await?
     else {
+        ttfb_stages.add_stage(
+            TtfbStage::PublishedGenerationLeaseWait,
+            stage_started.elapsed(),
+        );
+        crate::metrics::observe_upload_pack_ttfb_stage_breakdown_without_adaptive_history(
+            &state.metrics,
+            Protocol::Https,
+            &owner_repo,
+            "fallback_published_generation_lease",
+            ttfb_stages,
+        );
         warn!(
             repo = %owner_repo,
             "short-circuiting to upstream before published generation lease was acquired"
@@ -2000,6 +2099,10 @@ async fn serve_local_upload_pack(
         );
         return Ok(None);
     };
+    ttfb_stages.add_stage(
+        TtfbStage::PublishedGenerationLeaseWait,
+        stage_started.elapsed(),
+    );
     let pack_cache_key = pack_cache_key_context
         .advertised_ref_tips
         .map(|ref_tips| {
@@ -2021,6 +2124,7 @@ async fn serve_local_upload_pack(
     let mut optional_pack_cache_wait_timed_out = false;
     let mut pack_cache_lookup = match pack_cache_key {
         Ok(key) => {
+            let stage_started = Instant::now();
             let lookup = state.pack_cache.lookup_or_reserve_with_arrival(
                 Protocol::Https,
                 key,
@@ -2052,6 +2156,7 @@ async fn serve_local_upload_pack(
                 },
                 None => lookup.await,
             };
+            ttfb_stages.add_stage(TtfbStage::PackCacheLookupWait, stage_started.elapsed());
             Some(lookup.map_err(AppError::Internal)?)
         }
         Err(reason) => {
@@ -2097,11 +2202,7 @@ async fn serve_local_upload_pack(
                 &owner_repo,
                 live,
                 completion.clone(),
-                budget.and_then(|budget| {
-                    budget.stage_timeout_secs(
-                        state.local_upload_pack_first_byte_secs(Some(&owner_repo)),
-                    )
-                }),
+                pack_cache_live_first_byte_timeout(budget),
             )
             .await
             .map_err(AppError::Internal);
@@ -2124,6 +2225,7 @@ async fn serve_local_upload_pack(
                         ),
                     ))
                 });
+                let stage_started = Instant::now();
                 let composite_result = if let Some(timeout) = composite_timeout {
                     let state_for_task = state.clone();
                     let owner_repo_for_task = owner_repo.clone();
@@ -2195,6 +2297,7 @@ async fn serve_local_upload_pack(
                     )
                     .await
                 };
+                ttfb_stages.add_stage(TtfbStage::PackCacheCompositeWait, stage_started.elapsed());
                 match composite_result {
                     Ok(hit) => {
                         match serve_http_pack_cache_hit_response(state, hit, completion.clone())
@@ -2232,6 +2335,9 @@ async fn serve_local_upload_pack(
         Some(crate::pack_cache::PackCacheLookup::Live(_)) => unreachable!(),
     };
 
+    let request_cost_shape =
+        request_metadata.request_cost_shape(pack_cache_key_context.advertised_ref_tips);
+    let stage_started = Instant::now();
     let Some(mut process) = spawn_local_upload_pack_with_lease_timeout(
         state,
         &owner_repo,
@@ -2240,6 +2346,7 @@ async fn serve_local_upload_pack(
         repo_lease,
         LocalUploadPackMode::StatelessRpc,
         pack_cache_key_context.git_protocol,
+        Some(&request_cost_shape),
         local_upload_pack_permit_timeout_after_optional_cache_wait(
             budget,
             optional_pack_cache_wait_timed_out,
@@ -2247,6 +2354,17 @@ async fn serve_local_upload_pack(
     )
     .await?
     else {
+        ttfb_stages.add_stage(
+            TtfbStage::LocalUploadPackPermitWait,
+            stage_started.elapsed(),
+        );
+        crate::metrics::observe_upload_pack_ttfb_stage_breakdown_without_adaptive_history(
+            &state.metrics,
+            Protocol::Https,
+            &owner_repo,
+            "fallback_local_upload_pack_permit",
+            ttfb_stages,
+        );
         warn!(
             repo = %owner_repo,
             "short-circuiting to upstream before local upload-pack permit was acquired"
@@ -2268,13 +2386,22 @@ async fn serve_local_upload_pack(
         }
         return Ok(None);
     };
+    ttfb_stages.add_stage(
+        TtfbStage::LocalUploadPackPermitWait,
+        stage_started.elapsed(),
+    );
 
     // Write the request body to stdin.
+    let stage_started = Instant::now();
     if let Some(mut stdin) = process.stdin.take() {
         use tokio::io::AsyncWriteExt;
         stdin.write_all(request_body).await.ok();
         // Drop stdin to signal EOF.
     }
+    ttfb_stages.add_stage(
+        TtfbStage::LocalUploadPackSpawnAndStdin,
+        stage_started.elapsed(),
+    );
 
     let stdout = process
         .stdout
@@ -2310,6 +2437,7 @@ async fn serve_local_upload_pack(
         completion.serve_outcome.reason,
     );
     let upload_pack_cpu_metrics = state.metrics.clone();
+    let (cancel_upload_pack_tx, cancel_upload_pack_rx) = watch::channel(false);
     let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> = if let Some(
         pack_cache_writer,
     ) =
@@ -2317,8 +2445,11 @@ async fn serve_local_upload_pack(
     {
         pack_cache_writer.begin_live_response();
         let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+        let cancel_upload_pack_tx_keepalive = cancel_upload_pack_tx.clone();
+        let mut cancel_upload_pack_rx = cancel_upload_pack_rx;
         tokio::spawn(
             async move {
+                let _cancel_upload_pack_tx_keepalive = cancel_upload_pack_tx_keepalive;
                 let _repo_lease = repo_lease;
                 let _upload_pack_guard = upload_pack_guard;
                 let _global_upload_pack_permit = global_upload_pack_permit;
@@ -2330,7 +2461,48 @@ async fn serve_local_upload_pack(
                 let mut writer = Some(pack_cache_writer);
                 let mut downstream_open = true;
 
-                while let Some(item) = stdout_stream.next().await {
+                loop {
+                    let item = tokio::select! {
+                        changed = cancel_upload_pack_rx.changed() => {
+                            if changed.is_ok() && *cancel_upload_pack_rx.borrow() {
+                                if let Some(active_writer) = writer.take() {
+                                    active_writer.abort().await;
+                                }
+                                match interrupt_then_kill_local_upload_pack(
+                                    &mut child,
+                                    &mut stderr,
+                                    Duration::from_millis(500),
+                                )
+                                .await
+                                {
+                                    Ok(exit) => {
+                                        crate::metrics::inc_upload_pack_cpu_seconds(
+                                            &upload_pack_cpu_metrics,
+                                            Protocol::Https,
+                                            "pack_cache_generation",
+                                            exit.cpu_seconds,
+                                        );
+                                        info!(
+                                            status = %exit.status,
+                                            "cancelled local git upload-pack after HTTP upstream fallback decision"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            error = %error,
+                                            "failed to cancel local git upload-pack after HTTP upstream fallback decision"
+                                        );
+                                    }
+                                }
+                                return;
+                            }
+                            continue;
+                        }
+                        item = stdout_stream.next() => item,
+                    };
+                    let Some(item) = item else {
+                        break;
+                    };
                     match item {
                         Ok(bytes) => {
                             if let Some(active_writer) = writer.as_mut()
@@ -2355,7 +2527,7 @@ async fn serve_local_upload_pack(
                             if downstream_open {
                                 let _ = tx.send(Err(error)).await;
                             }
-                            let _ = child.kill().await;
+                            let _ = child.start_kill();
                             if let Ok(exit) =
                                 wait_for_local_upload_pack_exit(&mut child, &mut stderr).await
                             {
@@ -2411,17 +2583,52 @@ async fn serve_local_upload_pack(
             }
             .instrument(tracing::Span::current()),
         );
+        // Once live pack-cache generation has started, a client disconnect should
+        // only close the downstream channel. The task keeps draining
+        // upload-pack so the cache artifact can still be finalized.
         Box::pin(ReceiverStream::new(rx))
     } else {
         let mut child = child;
         let mut stderr = stderr;
         let upload_pack_cpu_metrics = upload_pack_cpu_metrics.clone();
+        let mut cancel_upload_pack_rx = cancel_upload_pack_rx;
         tokio::spawn(
             async move {
                 let _upload_pack_guard = upload_pack_guard;
                 let _global_upload_pack_permit = global_upload_pack_permit;
                 let _repo_upload_pack_permit = repo_upload_pack_permit;
-                match wait_for_local_upload_pack_exit(&mut child, &mut stderr).await {
+                enum UploadPackWait {
+                    CancelRequested,
+                    WaitNormally,
+                    Exited(std::io::Result<crate::clone_support::LocalUploadPackExit>),
+                }
+                let wait = tokio::select! {
+                    changed = cancel_upload_pack_rx.changed() => {
+                        if changed.is_ok() && *cancel_upload_pack_rx.borrow() {
+                            UploadPackWait::CancelRequested
+                        } else {
+                            UploadPackWait::WaitNormally
+                        }
+                    }
+                    exit = wait_for_local_upload_pack_exit(&mut child, &mut stderr) => {
+                        UploadPackWait::Exited(exit)
+                    }
+                };
+                let exit_result = match wait {
+                    UploadPackWait::CancelRequested => {
+                        interrupt_then_kill_local_upload_pack(
+                            &mut child,
+                            &mut stderr,
+                            Duration::from_millis(500),
+                        )
+                        .await
+                    }
+                    UploadPackWait::WaitNormally => {
+                        wait_for_local_upload_pack_exit(&mut child, &mut stderr).await
+                    }
+                    UploadPackWait::Exited(exit) => exit,
+                };
+                match exit_result {
                     Ok(exit) if !exit.status.success() => {
                         crate::metrics::inc_upload_pack_cpu_seconds(
                             &upload_pack_cpu_metrics,
@@ -2450,25 +2657,72 @@ async fn serve_local_upload_pack(
             }
             .instrument(tracing::Span::current()),
         );
-        Box::pin(LeasedReaderStream::new(
-            ReaderStream::with_capacity(stdout, MAX_SIDEBAND_PACK_CHUNK_LEN),
-            repo_lease,
+        Box::pin(CancelOnDropStream::new(
+            LeasedReaderStream::new(
+                ReaderStream::with_capacity(stdout, MAX_SIDEBAND_PACK_CHUNK_LEN),
+                repo_lease,
+            ),
+            cancel_upload_pack_tx.clone(),
         ))
     };
-    let Some(stream) = await_first_local_upload_pack_chunk(
-        stream,
-        local_upload_pack_first_byte_timeout_after_optional_cache_wait(
+    let stage_started = Instant::now();
+    let live_estimate = state.local_upload_pack_live_ttfb_estimate(
+        &owner_repo,
+        ttfb_stages,
+        TtfbStage::LocalUploadPackFirstByteWait,
+        stage_started.elapsed(),
+        Some(&request_cost_shape),
+    );
+    let first_byte_decision =
+        local_upload_pack_first_byte_timeout_decision_after_optional_cache_wait_with_slo_policy(
             budget,
             state.local_upload_pack_first_byte_secs(Some(&owner_repo)),
             optional_pack_cache_wait_timed_out,
-        ),
-    )
-    .await
+            state.local_upload_pack_first_byte_slo_policy_with_live_estimate(
+                &owner_repo,
+                Some(&request_cost_shape),
+                Some(live_estimate),
+            ),
+        );
+    log_local_upload_pack_first_byte_slo_decision(
+        Protocol::Https,
+        &owner_repo,
+        first_byte_decision,
+    );
+    let Some(stream) =
+        await_first_local_upload_pack_chunk(stream, first_byte_decision.timeout).await
     else {
+        state
+            .metrics
+            .adaptive_observations
+            .observe_local_upload_pack_first_byte_fallback_for_request_cost(
+                &owner_repo,
+                &request_cost_shape,
+            );
+        if !first_byte_decision.is_early_abort() {
+            ttfb_stages.add_stage(
+                TtfbStage::LocalUploadPackFirstByteWait,
+                stage_started.elapsed(),
+            );
+            crate::metrics::observe_upload_pack_ttfb_stage_breakdown_for_request_cost(
+                &state.metrics,
+                Protocol::Https,
+                &owner_repo,
+                "fallback_local_upload_pack_first_byte",
+                ttfb_stages,
+                Some(&request_cost_shape),
+            );
+        }
         warn!(
             repo = %owner_repo,
             "short-circuiting to upstream before local upload-pack produced a first byte"
         );
+        info!(
+            repo = %owner_repo,
+            action = first_byte_decision.action.as_label(),
+            "cancelling local upload-pack before HTTP request is proxied upstream"
+        );
+        let _ = cancel_upload_pack_tx.send(true);
         crate::metrics::inc_upstream_fallback_for_repo(
             &state.metrics,
             Protocol::Https,
@@ -2483,6 +2737,10 @@ async fn serve_local_upload_pack(
         );
         return Ok(None);
     };
+    ttfb_stages.add_stage(
+        TtfbStage::LocalUploadPackFirstByteWait,
+        stage_started.elapsed(),
+    );
     let stream = CloneCompletionStream::new(
         CountingBytesStream::new(
             FirstByteMetricStream::new(
@@ -2494,7 +2752,9 @@ async fn serve_local_upload_pack(
                     completion.cache_status.clone(),
                     completion.metric_repo.clone(),
                     completion.started_at,
-                ),
+                )
+                .with_ttfb_stage_breakdown(ttfb_stages)
+                .with_request_cost_shape(request_cost_shape),
                 true,
             ),
             downstream_counter,
@@ -3035,6 +3295,34 @@ mod tests {
         encoded
     }
 
+    #[test]
+    fn pack_cache_live_first_byte_timeout_uses_remaining_request_budget_only() {
+        let mut config =
+            crate::config::parse_config_str(include_str!("../../../config.example.yaml")).unwrap();
+        config.clone.global_short_circuit_upstream_secs = 30;
+        config.clone.local_upload_pack_first_byte_secs = 1;
+        let budget = crate::short_circuit::RequestBudget::from_config(&config, Instant::now());
+
+        let timeout = pack_cache_live_first_byte_timeout(Some(budget))
+            .expect("global request budget should produce a timeout");
+
+        assert!(timeout > Duration::from_secs(20));
+        assert!(timeout <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn pack_cache_live_first_byte_timeout_is_zero_when_request_budget_forces_upstream() {
+        let mut config =
+            crate::config::parse_config_str(include_str!("../../../config.example.yaml")).unwrap();
+        config.clone.global_short_circuit_upstream_secs = 0;
+        let budget = crate::short_circuit::RequestBudget::from_config(&config, Instant::now());
+
+        assert_eq!(
+            pack_cache_live_first_byte_timeout(Some(budget)),
+            Some(Duration::ZERO)
+        );
+    }
+
     fn deflate_body(body: &[u8]) -> Vec<u8> {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(body).unwrap();
@@ -3058,6 +3346,18 @@ mod tests {
 
         let stream =
             await_first_local_upload_pack_chunk(stream, Some(Duration::from_millis(1))).await;
+
+        assert!(stream.is_none());
+    }
+
+    #[tokio::test]
+    async fn await_first_local_upload_pack_chunk_zero_timeout_does_not_poll_ready_stream() {
+        let stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+            Box::pin(futures::stream::once(async {
+                Ok(Bytes::from_static(b"pack"))
+            }));
+
+        let stream = await_first_local_upload_pack_chunk(stream, Some(Duration::ZERO)).await;
 
         assert!(stream.is_none());
     }
@@ -3183,6 +3483,49 @@ mod tests {
                 && line.contains("cache_status=\"warm\"")
                 && line.contains("protocol=\"https\"")
                 && line.contains("source=\"pack_cache\"")
+                && line.ends_with(" 1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn first_byte_metric_stream_records_deferred_ttfb_stages_with_first_byte() {
+        let metrics = crate::metrics::MetricsRegistry::new();
+        let mut ttfb_stages = TtfbStageBreakdown::default();
+        ttfb_stages.add_stage_millis(TtfbStage::LocalUploadPackFirstByteWait, 250);
+        let mut stream = FirstByteMetricStream::new(
+            futures::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"PACK",
+            ))]),
+            FirstByteMetricContext::new(
+                metrics.clone(),
+                Protocol::Https,
+                "local_upload_pack",
+                CacheStatus::Warm,
+                "acme/widgets".to_string(),
+                Instant::now(),
+            )
+            .with_ttfb_stage_breakdown(ttfb_stages),
+            true,
+        );
+
+        while stream.next().await.is_some() {}
+
+        let snapshot = metrics.adaptive_observations.snapshot();
+        assert_eq!(snapshot.first_byte_samples, 1);
+        assert_eq!(snapshot.ttfb_stage_samples, 1);
+        assert_eq!(
+            snapshot
+                .ttfb_stage_millis_total
+                .stage_millis(TtfbStage::LocalUploadPackFirstByteWait),
+            250
+        );
+
+        let encoded = encode_registry(&metrics.registry);
+        assert!(encoded.lines().any(|line| {
+            line.starts_with("forgeproxy_upload_pack_ttfb_stage_seconds_count{")
+                && line.contains("protocol=\"https\"")
+                && line.contains("result=\"success\"")
+                && line.contains("stage=\"local_upload_pack_first_byte_wait\"")
                 && line.ends_with(" 1")
         }));
     }
