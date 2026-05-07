@@ -772,6 +772,33 @@ pub struct RuntimeDemandSnapshot {
 }
 
 impl RuntimeDemandSnapshot {
+    fn max_with(self, other: Self) -> Self {
+        Self {
+            upstream_clone_claims: self.upstream_clone_claims.max(other.upstream_clone_claims),
+            upstream_fetch_claims: self.upstream_fetch_claims.max(other.upstream_fetch_claims),
+            low_priority_fetch_claims: self
+                .low_priority_fetch_claims
+                .max(other.low_priority_fetch_claims),
+            tee_capture_claims: self.tee_capture_claims.max(other.tee_capture_claims),
+            bundle_generation_claims: self
+                .bundle_generation_claims
+                .max(other.bundle_generation_claims),
+            pack_cache_background_warming_claims: self
+                .pack_cache_background_warming_claims
+                .max(other.pack_cache_background_warming_claims),
+            request_pack_delta_claims: self
+                .request_pack_delta_claims
+                .max(other.request_pack_delta_claims),
+            local_upload_pack_claims: self
+                .local_upload_pack_claims
+                .max(other.local_upload_pack_claims),
+            deep_validation_claims: self
+                .deep_validation_claims
+                .max(other.deep_validation_claims),
+            prewarm_claims: self.prewarm_claims.max(other.prewarm_claims),
+        }
+    }
+
     fn has_active_claims(self) -> bool {
         self.foreground_claims()
             .saturating_add(self.tee_capture_claims)
@@ -3970,32 +3997,42 @@ impl RuntimeController {
                 )
             };
 
-            let host_pressure = match (enabled, controller) {
+            let (host_pressure, demand_snapshot) = match (enabled, controller) {
                 (false, _) => {
                     tokio::time::sleep(interval).await;
                     continue;
                 }
-                (true, AdaptiveTuningController::Aimd) => {
-                    sample_host_pressure(interval, cpu_poll_interval).await
-                }
+                (true, AdaptiveTuningController::Aimd) => (
+                    sample_host_pressure(interval, cpu_poll_interval).await,
+                    self.policy_state.demand_snapshot(),
+                ),
                 (true, AdaptiveTuningController::DemandResource) => {
                     tokio::select! {
                         _ = self.observations.notified() => {}
                         _ = resource_events.notified() => {}
                     };
-                    if !self.policy_state.demand_snapshot().has_active_claims() {
+                    let event_demand = self.policy_state.demand_snapshot();
+                    if !event_demand.has_active_claims() {
                         continue;
                     }
-                    sample_event_host_pressure().await
+                    let host_pressure = sample_event_host_pressure().await;
+                    let demand_snapshot =
+                        event_demand.max_with(self.policy_state.demand_snapshot());
+                    (host_pressure, demand_snapshot)
                 }
             };
-            if let Err(error) = self.tick(&state, host_pressure).await {
+            if let Err(error) = self.tick(&state, host_pressure, demand_snapshot).await {
                 tracing::warn!(error = %error, "adaptive tuning tick failed");
             }
         }
     }
 
-    async fn tick(&mut self, state: &crate::AppState, host_pressure: HostPressure) -> Result<()> {
+    async fn tick(
+        &mut self,
+        state: &crate::AppState,
+        host_pressure: HostPressure,
+        demand_snapshot: RuntimeDemandSnapshot,
+    ) -> Result<()> {
         let config = state.config();
         if !config.adaptive_tuning.enabled
             || config.adaptive_tuning.mode == AdaptiveTuningMode::Disabled
@@ -4031,7 +4068,7 @@ impl RuntimeController {
             fallback_rate: rate(model.upstream_fallbacks, sample_count),
             dominant_fallback_target: dominant_fallback_target(model),
             host_pressure,
-            demand: self.policy_state.demand_snapshot(),
+            demand: demand_snapshot,
             host_cpu_threads: host_cpu_threads(),
             current: self.policy_state.snapshot(),
             config: config.adaptive_tuning.clone(),
@@ -5558,6 +5595,24 @@ mod tests {
         };
 
         assert_eq!(mixed_demand.foreground_claims(), 3);
+    }
+
+    #[test]
+    fn demand_snapshot_max_preserves_short_lived_claims() {
+        let event = RuntimeDemandSnapshot {
+            upstream_clone_claims: 1,
+            ..RuntimeDemandSnapshot::default()
+        };
+        let after_pressure = RuntimeDemandSnapshot {
+            deep_validation_claims: 1,
+            ..RuntimeDemandSnapshot::default()
+        };
+
+        let demand = event.max_with(after_pressure);
+
+        assert_eq!(demand.upstream_clone_claims, 1);
+        assert_eq!(demand.deep_validation_claims, 1);
+        assert_eq!(demand.foreground_claims(), 1);
     }
 
     #[test]
