@@ -61,4 +61,14 @@ jobs:
 
           echo "Detected ${cpu_count} CPUs and ${mem_mib} MiB memory"
           echo "Running nix flake check with --max-jobs ${max_jobs} --cores ${cores}"
-          nix flake check --max-jobs "$max_jobs" --cores "$cores"
+
+          while true; do
+            sleep 60
+            available_mem_mib=$(awk '/MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
+            load_avg=$(cut -d' ' -f1-3 /proc/loadavg)
+            echo "CI heartbeat: nix flake check still running; load=${load_avg}; available_mem_mib=${available_mem_mib}"
+          done &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+          nix flake check --quiet --max-jobs "$max_jobs" --cores "$cores"
