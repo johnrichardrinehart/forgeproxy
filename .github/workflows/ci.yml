@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
@@ -62,11 +62,16 @@ jobs:
           echo "Detected ${cpu_count} CPUs and ${mem_mib} MiB memory"
           echo "Running nix flake check with --max-jobs ${max_jobs} --cores ${cores}"
 
+          heartbeat_tick=0
           while true; do
             sleep 60
+            heartbeat_tick=$((heartbeat_tick + 1))
             available_mem_mib=$(awk '/MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
             load_avg=$(cut -d' ' -f1-3 /proc/loadavg)
             echo "CI heartbeat: nix flake check still running; load=${load_avg}; available_mem_mib=${available_mem_mib}"
+            if [ "$available_mem_mib" -lt 512 ] || [ $((heartbeat_tick % 5)) -eq 0 ]; then
+              ps -eo pid,ppid,comm,%cpu,%mem,rss,args --sort=-rss | head -n 8
+            fi
           done &
           heartbeat_pid=$!
           trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
