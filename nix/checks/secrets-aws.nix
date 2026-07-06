@@ -10,7 +10,7 @@ let
   awsProvider = pkgs.writeShellScript "aws-keyring-provider" ''
     set -euo pipefail
     for SECRET_NAME in $SECRETS; do
-      SECRET_VALUE=$(${pkgs.coreutils}/bin/timeout 30s ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
+      SECRET_VALUE=$(${pkgs.coreutils}/bin/timeout 120s ${pkgs.awscli2}/bin/aws secretsmanager get-secret-value \
         --secret-id "$SECRET_NAME" \
         --query 'SecretString' --output text)
       KEY_DESC="''${SECRET_NAME//\//-}"
@@ -87,10 +87,10 @@ pkgs.testers.runNixOSTest {
             RemainAfterExit = true;
             ExecStart = pkgs.writeShellScript "seed-moto-secrets" ''
               set -euo pipefail
-              ${pkgs.coreutils}/bin/timeout 30s aws secretsmanager create-secret \
+              ${pkgs.coreutils}/bin/timeout 120s aws secretsmanager create-secret \
                 --name forgeproxy/default-pat \
                 --secret-string "ghp_AWSTEST1234567890abcdef"
-              ${pkgs.coreutils}/bin/timeout 30s aws secretsmanager create-secret \
+              ${pkgs.coreutils}/bin/timeout 120s aws secretsmanager create-secret \
                 --name forgeproxy/webhook-secret \
                 --secret-string "whsec_awstest456"
             '';
