@@ -14,4 +14,4 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@v3
         with:
           flakehub: false
-      - run: nix flake check --print-build-logs
+      - run: nix flake check -j2 --print-build-logs
