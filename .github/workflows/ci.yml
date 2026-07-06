@@ -74,8 +74,6 @@ jobs:
           heartbeat_pid=$!
           trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
 
-          nix flake check --quiet --no-build --max-jobs "$max_jobs" --cores "$cores"
-
           checks=(
             lambda-health-check
             nixos-module-performance
@@ -97,6 +95,16 @@ jobs:
             terraform-config-sync
             treefmt
           )
+
+          expected_checks=$(printf '%s\n' "${checks[@]}" | sort | paste -sd, -)
+          actual_checks=$(nix eval --raw .#checks.x86_64-linux --apply \
+            'checks: builtins.concatStringsSep "," (builtins.sort builtins.lessThan (builtins.attrNames checks))')
+          if [ "$actual_checks" != "$expected_checks" ]; then
+            echo "Check list is stale"
+            echo "expected: $expected_checks"
+            echo "actual:   $actual_checks"
+            exit 1
+          fi
 
           for check in "${checks[@]}"; do
             echo "Building checks.x86_64-linux.${check}"
