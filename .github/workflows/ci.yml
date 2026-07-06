@@ -14,4 +14,51 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@v3
         with:
           flakehub: false
-      - run: nix flake check -j2
+      - name: Run nix flake check
+        run: |
+          set -euo pipefail
+
+          cpu_count=$(nproc)
+          mem_mib=$(awk '/MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+          if [ -r /sys/fs/cgroup/memory.max ]; then
+            cgroup_memory_max=$(cat /sys/fs/cgroup/memory.max)
+            if [ "$cgroup_memory_max" != "max" ]; then
+              cgroup_mem_mib=$((cgroup_memory_max / 1024 / 1024))
+              if [ "$cgroup_mem_mib" -gt 0 ] && [ "$cgroup_mem_mib" -lt "$mem_mib" ]; then
+                mem_mib=$cgroup_mem_mib
+              fi
+            fi
+          fi
+
+          reserved_cpu=1
+          reserved_mem_mib=2048
+          mib_per_job=8192
+
+          usable_cpu=$((cpu_count - reserved_cpu))
+          if [ "$usable_cpu" -lt 1 ]; then
+            usable_cpu=1
+          fi
+
+          usable_mem_mib=$((mem_mib - reserved_mem_mib))
+          if [ "$usable_mem_mib" -lt "$mib_per_job" ]; then
+            usable_mem_mib=$mib_per_job
+          fi
+
+          jobs_by_cpu=$usable_cpu
+          jobs_by_mem=$((usable_mem_mib / mib_per_job))
+          max_jobs=$jobs_by_cpu
+          if [ "$jobs_by_mem" -lt "$max_jobs" ]; then
+            max_jobs=$jobs_by_mem
+          fi
+          if [ "$max_jobs" -lt 1 ]; then
+            max_jobs=1
+          fi
+
+          cores=$((usable_cpu / max_jobs))
+          if [ "$cores" -lt 1 ]; then
+            cores=1
+          fi
+
+          echo "Detected ${cpu_count} CPUs and ${mem_mib} MiB memory"
+          echo "Running nix flake check with --max-jobs ${max_jobs} --cores ${cores}"
+          nix flake check --max-jobs "$max_jobs" --cores "$cores"
