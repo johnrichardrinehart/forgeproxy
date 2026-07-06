@@ -12,8 +12,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/determinate-nix-action@v3
-        with:
-          flakehub: false
       - name: Run nix flake check
         run: |
           set -euo pipefail
@@ -60,7 +58,7 @@ jobs:
           fi
 
           echo "Detected ${cpu_count} CPUs and ${mem_mib} MiB memory"
-          echo "Running nix flake check with --max-jobs ${max_jobs} --cores ${cores}"
+          echo "Running Nix validation with --max-jobs ${max_jobs} --cores ${cores}"
 
           heartbeat_tick=0
           while true; do
@@ -68,7 +66,7 @@ jobs:
             heartbeat_tick=$((heartbeat_tick + 1))
             available_mem_mib=$(awk '/MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
             load_avg=$(cut -d' ' -f1-3 /proc/loadavg)
-            echo "CI heartbeat: nix flake check still running; load=${load_avg}; available_mem_mib=${available_mem_mib}"
+            echo "CI heartbeat: Nix validation still running; load=${load_avg}; available_mem_mib=${available_mem_mib}"
             if [ "$available_mem_mib" -lt 512 ] || [ $((heartbeat_tick % 5)) -eq 0 ]; then
               ps -eo pid,ppid,comm,%cpu,%mem,rss,args --sort=-rss | head -n 8
             fi
@@ -76,4 +74,32 @@ jobs:
           heartbeat_pid=$!
           trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
 
-          nix flake check --quiet --max-jobs "$max_jobs" --cores "$cores"
+          nix flake check --quiet --no-build --max-jobs "$max_jobs" --cores "$cores"
+
+          checks=(
+            lambda-health-check
+            nixos-module-performance
+            nixos-vm-test-adaptive-tuning
+            nixos-vm-test-backend
+            nixos-vm-test-basic
+            nixos-vm-test-compliance
+            nixos-vm-test-eviction-lfu
+            nixos-vm-test-eviction-lru
+            nixos-vm-test-filtered-bundles
+            nixos-vm-test-ghe-key-lookup-keyring
+            nixos-vm-test-keyring-creds
+            nixos-vm-test-pack-cache
+            nixos-vm-test-secrets-aws
+            nixos-vm-test-secrets-sops
+            nixos-vm-test-ssh-authz
+            nixos-vm-test-ssh-large-lsrefs
+            nixos-vm-test-startup-init-failure
+            terraform-config-sync
+            treefmt
+          )
+
+          for check in "${checks[@]}"; do
+            echo "Building checks.x86_64-linux.${check}"
+            nix build --quiet --no-link --max-jobs "$max_jobs" --cores "$cores" ".#checks.x86_64-linux.${check}"
+            echo "✅ checks.x86_64-linux.${check}"
+          done
